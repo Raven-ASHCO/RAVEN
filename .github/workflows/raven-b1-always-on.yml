@@ -1,7 +1,6 @@
 # Thin always-on B1 gate. No path filters: docs-only PRs still get a required
-# status after required-check pin. Not Full Braid / ML-KEM lab.
-# Target: under two minutes. Full terminal Rust suite lives on
-# Raven Serverless Node (also unfiltered so those names always report).
+# status. Runnable terminal smoke bots can re-trigger via workflow_dispatch.
+# Not Full Braid / ML-KEM lab. Cross-OS proof stays on Raven Serverless Node.
 name: Raven B1 Always-On
 
 on:
@@ -17,7 +16,7 @@ jobs:
   b1-always-on:
     name: B1 always-on gate
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -26,12 +25,16 @@ jobs:
         run: bash scripts/secret_history_scan.sh --ci
       - name: Messaging-only product boundary
         run: bash node/scripts/messaging_product_boundary_gate.sh
-      - name: rustfmt when the node tree is present
-        if: hashFiles('node/Cargo.toml') != ''
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: cargo fmt --check
-        if: hashFiles('node/Cargo.toml') != ''
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+          prefix-key: b1-always-on
+      - name: rustfmt (shipping crates)
         working-directory: node
         run: cargo fmt --all -- --check
+      - name: Terminal ash/raven-node smoke
+        working-directory: node
+        run: bash ./scripts/terminal_help_smoke.sh

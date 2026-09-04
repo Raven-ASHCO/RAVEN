@@ -259,7 +259,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: node
-      - name: test raven-core + ash (no bash smoke scripts)
+      - name: test raven-core + ash
         run: |
           cargo test -p raven-core -p ash -p raven-node
           cargo build -p raven-node -p raven-swarm -p ash
@@ -294,7 +294,9 @@ jobs:
             (Resolve-Path $p), [ref]$null, [ref]$errs)
           if ($errs) { $errs | ForEach-Object { $_ }; throw "parse errors" }
           Write-Host "windows_service.ps1 OK"
-      # bash libp2p/bootstrap smokes are Linux/macOS-only on this workflow.
+      - name: bootstrap manual-peer smoke
+        shell: bash
+        run: ./scripts/bootstrap_manual_peer_smoke.sh
 
   go-bridge:
     name: Go libp2p bridge security
