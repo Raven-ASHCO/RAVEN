@@ -333,6 +333,28 @@ jobs:
             (Resolve-Path $p), [ref]$tokens, [ref]$errs)
           if ($errs) { $errs | ForEach-Object { $_ }; throw "parse errors" }
           Write-Host "windows_service.ps1 OK"
+      - name: windows_service.ps1 exercise (temp dirs)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $script = "scripts/install/windows_service.ps1"
+          if (-not (Test-Path $script)) { throw "missing $script" }
+          $root = Join-Path $env:RUNNER_TEMP "raven-windows-service-exercise"
+          $dataDir = Join-Path $root "data"
+          $binDir = Join-Path $root "bin"
+          try {
+            New-Item -ItemType Directory -Force -Path $dataDir, $binDir | Out-Null
+            & (Resolve-Path $script) -DataDir $dataDir -BinDir $binDir -SkipScheduledTask
+            foreach ($name in @("raven-node.exe", "ash.exe", "raven.exe")) {
+              $path = Join-Path $binDir $name
+              if (-not (Test-Path -LiteralPath $path)) { throw "missing $path" }
+              Write-Host "ok $path"
+            }
+          } finally {
+            if (Test-Path -LiteralPath $root) {
+              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
       - name: bootstrap manual-peer smoke
         shell: bash
         run: ./scripts/bootstrap_manual_peer_smoke.sh
