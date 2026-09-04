@@ -168,6 +168,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Signal SPQR (full-braid-lab → prost-build) needs protoc on the runner.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: node
@@ -273,6 +279,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      # raven-fb-ffi → raven-core/full-braid-lab → SPQR prost-build needs protoc.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: node
