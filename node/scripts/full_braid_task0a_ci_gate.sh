@@ -182,6 +182,7 @@ scoped_paths=(
   ios-native/RAVEN/RAVEN/Core/Security/ATSAM/Durable
   ios-native/RAVEN/RAVENTests/ATSAMFullBraidSQLCipherProfileV1Tests.swift
   .github/workflows/raven-serverless.yml
+  .github/workflows/raven-serverless-lab.yml
 )
 
 # Emulate `git diff --check` for a working-tree file (tracked or untracked).

@@ -1579,7 +1579,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let (id, _) = load_or_create_identity(dir).unwrap();
+        #[cfg(target_os = "macos")]
         let original_pub = id.public_key_bytes();
+        #[cfg(not(target_os = "macos"))]
+        let _ = id;
         let mut binding = std::fs::read(binding_path(dir)).unwrap();
         assert_eq!(binding.len(), IDENTITY_BINDING_LEN);
         binding[44] ^= 0x80;

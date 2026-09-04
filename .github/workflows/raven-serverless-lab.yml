@@ -1,0 +1,465 @@
+# Raven serverless lab CI — ML-KEM incremental, Full Braid Slice 2, Task 0A*.
+# Fail-closed without opt-in. NOT B1 required checks. Split from
+# raven-serverless.yml so a lab failure cannot fail the product workflow.
+name: Raven Serverless Lab
+
+on:
+  push:
+    paths:
+      - "node/**"
+      - "protocol/**"
+      - "shared-vectors/**"
+      - "ios-native/RAVEN/Libp2pBridge/**"
+      - "ios-native/RAVEN/RAVEN/Core/Config/FeatureFlags.swift"
+      - "ios-native/RAVEN/RAVEN/Core/Protocol/**"
+      - "ios-native/RAVEN/RAVEN/Core/Mesh/**"
+      - "ios-native/RAVEN/RAVEN/Core/Transport/**"
+      - "ios-native/RAVEN/RAVEN/Core/Messaging/**"
+      - "ios-native/RAVEN/RAVEN/Core/Security/ATSAM/**"
+      - "ios-native/RAVEN/RAVEN/Core/Security/LAN/**"
+      - "ios-native/RAVEN/RAVEN/Core/Security/MessageContentSealer.swift"
+      - "ios-native/RAVEN/RAVEN.xcodeproj/**"
+      - "ios-native/RAVEN/RAVEN/App/**"
+      - "ios-native/RAVEN/RAVEN/Features/Contacts/**"
+      - "ios-native/RAVEN/RAVEN/Features/QRCode/**"
+      - "ios-native/RAVEN/RAVEN/Features/Settings/RavenServerlessLanSettingsView.swift"
+      - "ios-native/RAVEN/RAVENTests/**"
+      - "ios-native/RAVEN/RAVEN/**/*.swift"
+      - "RAVEN-WatchApp/RAVEN-Watch/**/*.swift"
+      - "node/scripts/ios_lan_kat.sh"
+      - "node/scripts/ios_lan_lab_checklist.md"
+      - "scripts/secret_history_scan.sh"
+      - "docs/MIGRATION_SERVERLESS_V1.md"
+      - ".github/workflows/raven-serverless.yml"
+      - ".github/workflows/raven-serverless-lab.yml"
+  pull_request:
+    paths:
+      - "node/**"
+      - "protocol/**"
+      - "shared-vectors/**"
+      - "ios-native/RAVEN/Libp2pBridge/**"
+      - "ios-native/RAVEN/RAVEN/Core/Config/FeatureFlags.swift"
+      - "ios-native/RAVEN/RAVEN/Core/Protocol/**"
+      - "ios-native/RAVEN/RAVEN/Core/Mesh/**"
+      - "ios-native/RAVEN/RAVEN/Core/Transport/**"
+      - "ios-native/RAVEN/RAVEN/Core/Messaging/**"
+      - "ios-native/RAVEN/RAVEN/Core/Security/ATSAM/**"
+      - "ios-native/RAVEN/RAVEN/Core/Security/LAN/**"
+      - "ios-native/RAVEN/RAVEN/Core/Security/MessageContentSealer.swift"
+      - "ios-native/RAVEN/RAVEN.xcodeproj/**"
+      - "ios-native/RAVEN/RAVEN/App/**"
+      - "ios-native/RAVEN/RAVEN/Features/Contacts/**"
+      - "ios-native/RAVEN/RAVEN/Features/QRCode/**"
+      - "ios-native/RAVEN/RAVEN/Features/Settings/RavenServerlessLanSettingsView.swift"
+      - "ios-native/RAVEN/RAVENTests/**"
+      - "ios-native/RAVEN/RAVEN/**/*.swift"
+      - "RAVEN-WatchApp/RAVEN-Watch/**/*.swift"
+      - "node/scripts/ios_lan_kat.sh"
+      - "node/scripts/ios_lan_lab_checklist.md"
+      - "scripts/secret_history_scan.sh"
+      - "docs/MIGRATION_SERVERLESS_V1.md"
+      - ".github/workflows/raven-serverless.yml"
+      - ".github/workflows/raven-serverless-lab.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: raven-serverless-lab-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tree-presence:
+    name: Detect optional product trees
+    runs-on: ubuntu-latest
+    outputs:
+      ios_app: ${{ steps.detect.outputs.ios_app }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        name: Record whether ios-native/RAVEN exists
+        run: |
+          set -euo pipefail
+          if [[ -f ios-native/RAVEN/RAVEN.xcodeproj/project.pbxproj ]]; then
+            echo "ios_app=true" >> "$GITHUB_OUTPUT"
+            echo "ios-native/RAVEN present"
+          else
+            echo "ios_app=false" >> "$GITHUB_OUTPUT"
+            echo "ios-native/RAVEN absent — iOS lab jobs will skip; Linux/Windows lab stays fail-closed"
+          fi
+
+  mlkem768-incremental-portable:
+    name: ML-KEM-768 incremental (portable)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: node
+    env:
+      CARGO_TARGET_DIR: target/libcrux-portable
+      LIBCRUX_DISABLE_SIMD128: "1"
+      LIBCRUX_DISABLE_SIMD256: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test portable incremental ML-KEM-768
+        run: cargo test -p raven-core --features mlkem768-incremental-lab --lib mlkem768_incremental
+      - name: Dump portable Encaps1 state
+        env:
+          RAVEN_DUMP_ENCAPS1_STATE: "1"
+          RAVEN_DUMP_ENCAPS1_STATE_PATH: ${{ github.workspace }}/node/target/libcrux-portable/mlkem768-encaps1-state.hex
+        run: |
+          set -euo pipefail
+          rm -f "$RAVEN_DUMP_ENCAPS1_STATE_PATH"
+          cargo test -p raven-core --features mlkem768-incremental-lab \
+            --lib mlkem768_incremental::feature_smoke::dump_mlkem768_incremental_encaps1_state \
+            -- --exact --ignored
+          test -s "$RAVEN_DUMP_ENCAPS1_STATE_PATH"
+      - name: Upload portable Encaps1 state
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlkem768-encaps1-portable
+          path: node/target/libcrux-portable/mlkem768-encaps1-state.hex
+          if-no-files-found: error
+      - name: Guard against libcrux from_seed expansion
+        run: |
+          set -euo pipefail
+          if grep -Fq -- \
+            "KeyPairCompressedBytes::from_seed" \
+            crates/raven-core/src/mlkem768_incremental.rs; then
+            echo "forbidden KeyPairCompressedBytes::from_seed path found" >&2
+            exit 1
+          fi
+      - name: Check incremental ML-KEM-768 fixture
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 -m pip install -q -r protocol/reference/requirements.txt
+          python3 -m pytest protocol/reference/tests/test_mlkem768_incremental_check.py -q
+      - name: Build incremental ML-KEM-768 FFI (debug)
+        run: cargo build -p raven-mlkem768-incremental-ffi
+      - name: Release incremental ML-KEM-768 feature gate
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          if cargo build --release -p raven-core \
+            --features mlkem768-incremental-lab >"$log" 2>&1; then
+            echo "mlkem768-incremental-lab unexpectedly built in release mode" >&2
+            rm -f "$log"
+            exit 1
+          fi
+          if ! grep -Fq -- \
+            "mlkem768-incremental-lab is forbidden in release builds" "$log"; then
+            echo "mlkem768-incremental-lab release gate failed for an unrelated reason" >&2
+            tail -n 80 "$log" >&2
+            rm -f "$log"
+            exit 1
+          fi
+          rm -f "$log"
+
+  full-braid-lab:
+    name: Full Braid Slice 2 lab
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: node
+    env:
+      CARGO_TARGET_DIR: target/full-braid-lab
+      LIBCRUX_DISABLE_SIMD128: "1"
+      LIBCRUX_DISABLE_SIMD256: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+          prefix-key: full-braid-lab
+      - name: Test Full Braid (Rust)
+        run: |
+          cargo test -p raven-core --features full-braid-lab --lib hybrid_ratchet_v2_full_braid
+          cargo test -p raven-fb-ffi --lib
+          cargo test -p raven-core --features full-braid-lab --test adversarial_atsam
+      - name: Clippy Full Braid
+        run: |
+          cargo clippy -p raven-core --features full-braid-lab --all-targets -- -D warnings
+          cargo clippy -p raven-fb-ffi --all-targets -- -D warnings
+      - name: rustfmt Full Braid
+        run: |
+          rustfmt --check crates/raven-core/src/hybrid_ratchet_v2_full_braid/*.rs
+          rustfmt --check crates/raven-fb-ffi/src/lib.rs
+      - name: Python Full Braid reference
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 -m pip install -q -r protocol/reference/requirements.txt
+          python3 -m pytest protocol/reference/tests/test_full_braid.py -q
+      - name: Build Full Braid FFI (debug)
+        run: cargo build -p raven-fb-ffi
+      - name: Release Full Braid feature gate
+        run: |
+          set -euo pipefail
+          core_log="$(mktemp)"
+          if cargo build --release -p raven-core \
+            --features full-braid-lab >"$core_log" 2>&1; then
+            echo "full-braid-lab unexpectedly built in release mode" >&2
+            rm -f "$core_log"
+            exit 1
+          fi
+          if ! grep -Fq -- \
+            "mlkem768-incremental-lab is forbidden in release builds" \
+            "$core_log"; then
+            echo "raven-core full-braid-lab release gate missed exact diagnostic" >&2
+            tail -n 80 "$core_log" >&2
+            rm -f "$core_log"
+            exit 1
+          fi
+          rm -f "$core_log"
+
+          ffi_log="$(mktemp)"
+          if cargo build --release -p raven-fb-ffi --no-default-features >"$ffi_log" 2>&1; then
+            echo "raven-fb-ffi unexpectedly built in release mode" >&2
+            rm -f "$ffi_log"
+            exit 1
+          fi
+          if ! grep -Fq -- \
+            "raven-fb-ffi is lab-only and must not be linked in Release/App Store builds" \
+            "$ffi_log"; then
+            echo "raven-fb-ffi release gate missed exact diagnostic" >&2
+            tail -n 80 "$ffi_log" >&2
+            rm -f "$ffi_log"
+            exit 1
+          fi
+          rm -f "$ffi_log"
+      - name: Production remains off (vectors + no app callsites)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path(".")
+          for name in (
+              "full_braid_sm_round_001.json",
+              "full_braid_full_exchange_2pq_2dh_001.json",
+          ):
+              vector = root / "shared-vectors/rvn1/atsam" / name
+              data = json.loads(vector.read_text())
+              assert data.get("production_enabled") is False, (name, data.get("production_enabled"))
+              assert data.get("lab_only") is True, (name, data.get("lab_only"))
+          exchange = json.loads(
+              (root / "shared-vectors/rvn1/atsam/full_braid_full_exchange_2pq_2dh_001.json").read_text()
+          )
+          assert len(exchange.get("aead_checkpoints") or []) == 4, "expected 4 AEAD checkpoints"
+          app = root / "ios-native/RAVEN/RAVEN"
+          hits = []
+          for path in app.rglob("*.swift"):
+              text = path.read_text(errors="ignore")
+              if "ATSAMFullBraid" in text or "raven_fb_" in text or "RAVEN_FULL_BRAID_FFI" in text:
+                  hits.append(str(path))
+          if hits:
+              raise SystemExit(f"Full Braid production callsites: {hits}")
+          print("production_off OK")
+          PY
+
+  full-braid-lab-ios:
+    name: Full Braid Slice 2 lab (iOS)
+    needs: tree-presence
+    if: needs.tree-presence.outputs.ios_app == 'true'
+    runs-on: macos-14
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/node/target/full-braid-ios-lab
+      LIBCRUX_DISABLE_SIMD128: "1"
+      LIBCRUX_DISABLE_SIMD256: "1"
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+          prefix-key: full-braid-lab-ios
+      - name: Ensure ripgrep
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            brew install ripgrep
+          fi
+      - name: Full Braid Swift FFI lab gate
+        run: bash ./node/scripts/ios_full_braid_lab_gate.sh
+
+  # Task 0A.5 — SQLCipher packaging aggregate stop-line (0A.1–0A.4).
+  # Does not authorize Task 0B / production / commit.
+  full-braid-task0a-provenance:
+    name: Full Braid Task 0A provenance (0A.1)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Hermetic SQLCipher regen/verify selftest
+        working-directory: ${{ github.workspace }}
+        env:
+          RAVEN_0A5_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash ./node/scripts/full_braid_task0a_ci_gate.sh provenance
+
+  full-braid-task0a-linux:
+    name: Full Braid Task 0A Linux (0A.2/0A.4/0A.5)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: node
+    env:
+      CARGO_TARGET_DIR: target/full-braid-task0a
+      RAVEN_EXPECT_SQLCIPHER_4_17_0: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+          prefix-key: full-braid-task0a-linux
+      - name: Task 0A Linux CI gate
+        working-directory: ${{ github.workspace }}
+        env:
+          RAVEN_0A5_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash ./node/scripts/full_braid_task0a_ci_gate.sh linux
+
+  full-braid-task0a-macos:
+    name: Full Braid Task 0A macOS + iOS (0A.2–0A.4)
+    needs: tree-presence
+    if: needs.tree-presence.outputs.ios_app == 'true'
+    runs-on: macos-14
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/node/target/full-braid-task0a-macos
+      RAVEN_EXPECT_SQLCIPHER_4_17_0: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+          prefix-key: full-braid-task0a-macos
+      - name: Task 0A macOS/iOS CI gate (incl. cross-provider)
+        working-directory: ${{ github.workspace }}
+        env:
+          RAVEN_0A5_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash ./node/scripts/full_braid_task0a_ci_gate.sh macos
+
+  full-braid-task0a-windows:
+    name: Full Braid Task 0A Windows MSVC (0A.2/0A.4)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: node
+        shell: bash
+    env:
+      CARGO_TARGET_DIR: target/full-braid-task0a-windows
+      RAVEN_EXPECT_SQLCIPHER_4_17_0: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+          prefix-key: full-braid-task0a-windows
+      - name: Task 0A Windows CI gate
+        working-directory: ${{ github.workspace }}
+        run: bash ./node/scripts/full_braid_task0a_ci_gate.sh windows
+
+  mlkem768-incremental-avx2:
+    name: ML-KEM-768 incremental (AVX2)
+    runs-on: ubuntu-latest
+    needs: mlkem768-incremental-portable
+    defaults:
+      run:
+        working-directory: node
+    env:
+      CARGO_TARGET_DIR: target/libcrux-avx2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Confirm AVX2 available
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          if ! grep -qw avx2 /proc/cpuinfo; then
+            echo "AVX2 CPU feature required for this job; x86_64 alone is insufficient" >&2
+            exit 1
+          fi
+      - name: Assert Rust runtime AVX2 detection
+        env:
+          RAVEN_REQUIRE_AVX2: "1"
+        run: |
+          cargo test -p raven-core --features mlkem768-incremental-lab \
+            --lib mlkem768_incremental::feature_smoke::require_avx2_when_gated \
+            -- --exact --nocapture
+      - name: Test AVX2 incremental ML-KEM-768
+        run: cargo test -p raven-core --features mlkem768-incremental-lab --lib mlkem768_incremental
+      - name: Dump AVX2 Encaps1 state
+        env:
+          RAVEN_DUMP_ENCAPS1_STATE: "1"
+          RAVEN_DUMP_ENCAPS1_STATE_PATH: ${{ github.workspace }}/node/target/libcrux-avx2/mlkem768-encaps1-state.hex
+        run: |
+          set -euo pipefail
+          rm -f "$RAVEN_DUMP_ENCAPS1_STATE_PATH"
+          cargo test -p raven-core --features mlkem768-incremental-lab \
+            --lib mlkem768_incremental::feature_smoke::dump_mlkem768_incremental_encaps1_state \
+            -- --exact --ignored
+          test -s "$RAVEN_DUMP_ENCAPS1_STATE_PATH"
+      - name: Download portable Encaps1 state
+        uses: actions/download-artifact@v4
+        with:
+          name: mlkem768-encaps1-portable
+          path: node/target/libcrux-portable
+      - name: Compare portable and AVX2 Encaps1 states
+        run: |
+          diff -u \
+            target/libcrux-portable/mlkem768-encaps1-state.hex \
+            target/libcrux-avx2/mlkem768-encaps1-state.hex
+
+  mlkem768-incremental-neon:
+    name: ML-KEM-768 incremental (NEON)
+    runs-on: macos-14
+    needs: mlkem768-incremental-portable
+    defaults:
+      run:
+        working-directory: node
+    env:
+      CARGO_TARGET_DIR: target/libcrux-neon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Confirm arm64 runner
+        run: test "$(uname -m)" = arm64
+      - name: Test NEON incremental ML-KEM-768
+        run: cargo test -p raven-core --features mlkem768-incremental-lab --lib mlkem768_incremental
+      - name: Dump NEON Encaps1 state
+        env:
+          RAVEN_DUMP_ENCAPS1_STATE: "1"
+          RAVEN_DUMP_ENCAPS1_STATE_PATH: ${{ github.workspace }}/node/target/libcrux-neon/mlkem768-encaps1-state.hex
+        run: |
+          set -euo pipefail
+          rm -f "$RAVEN_DUMP_ENCAPS1_STATE_PATH"
+          cargo test -p raven-core --features mlkem768-incremental-lab \
+            --lib mlkem768_incremental::feature_smoke::dump_mlkem768_incremental_encaps1_state \
+            -- --exact --ignored
+          test -s "$RAVEN_DUMP_ENCAPS1_STATE_PATH"
+      - name: Download portable Encaps1 state
+        uses: actions/download-artifact@v4
+        with:
+          name: mlkem768-encaps1-portable
+          path: node/target/libcrux-portable
+      - name: Compare portable and NEON Encaps1 states
+        run: |
+          diff -u \
+            target/libcrux-portable/mlkem768-encaps1-state.hex \
+            target/libcrux-neon/mlkem768-encaps1-state.hex

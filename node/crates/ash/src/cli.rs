@@ -3,6 +3,10 @@
 //! This is the **product** CLI in `node/` — not Cursor/ash-autonomous automation.
 //! Never prints private keys, seeds, session keys, recovery secrets, or plaintext.
 
+// Clap/interactive handlers are wired incrementally; unused argv arms must not
+// fail the product clippy gate.
+#![allow(dead_code)]
+
 mod ext;
 mod ipc_client;
 mod pair_init_lab;
