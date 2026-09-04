@@ -178,10 +178,34 @@ count_sym() {
   set +e
   case "$SYMBOL_TOOL" in
     nm|llvm-nm)
-      n="$(grep -E "[[:space:]][Tt][[:space:]]+_?${sym}$" "$SYM_OUT" | wc -l | tr -d ' ')"
-      if [[ "$n" == "0" ]]; then
-        n="$(grep -E "[[:space:]][TtAa][[:space:]]+_?${sym}(@[0-9]+)?$" "$SYM_OUT" | wc -l | tr -d ' ')"
-      fi
+      n="$(python3 - "$sym" "$SYM_OUT" <<'PY'
+import re, sys
+sym, path = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8", errors="replace").read()
+# BSD/llvm default: "00001234 T sqlite3_open_v2"
+#if posix/sysv: "sqlite3_open_v2 T 00001234" or "name | addr | T"
+patterns = [
+    rf"(?:^|\s)[TtAaDd]\s+_?{re.escape(sym)}(?:@[0-9]+)?\s*$",
+    rf"^_?{re.escape(sym)}(?:@[0-9]+)?\s+\|.*\|\s+[TtAaDd]\b",
+    rf"^_?{re.escape(sym)}(?:@[0-9]+)?\s+[TtAaDd]\s+",
+]
+n = 0
+for pat in patterns:
+    n = len(re.findall(pat, text, flags=re.M))
+    if n:
+        break
+if n == 0:
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        last = parts[-1].split("@")[0].lstrip("_")
+        kind = parts[-2] if len(parts) >= 2 else ""
+        if last == sym and kind not in {"U", "u"}:
+            n += 1
+print(n)
+PY
+)"
       ;;
     dumpbin)
       # MSVC dumpbin lists External | sqlite3_open_v2
@@ -202,6 +226,12 @@ echo "=== symbol owners ===" >&2
 for sym in sqlite3_open_v2 sqlite3_libversion sqlite3_key; do
   n="$(count_sym "$sym")"
   echo "$sym count=$n" >&2
+  if [[ "$n" == "0" && "$sym" != "sqlite3_key" ]]; then
+    echo "--- symbol lines containing $sym ---" >&2
+    grep -F "$sym" "$SYM_OUT" | head -n 40 >&2 || true
+    echo "--- symbol table head ---" >&2
+    head -n 25 "$SYM_OUT" >&2 || true
+  fi
   if [[ "$sym" == "sqlite3_key" ]]; then
     if [[ "$EXPECT_KEY" == "1" ]]; then
       [[ "$n" == "1" ]] || die "$sym expected exactly 1 owner in lab image, got $n"

@@ -308,8 +308,9 @@ jobs:
           if (-not (Test-Path $p)) { throw "missing $p" }
           # Parse-only: ensure script is well-formed PowerShell
           $errs = $null
+          $tokens = $null
           $null = [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path $p), [ref]$null, [ref]$errs)
+            (Resolve-Path $p), [ref]$tokens, [ref]$errs)
           if ($errs) { $errs | ForEach-Object { $_ }; throw "parse errors" }
           Write-Host "windows_service.ps1 OK"
       - name: bootstrap manual-peer smoke
