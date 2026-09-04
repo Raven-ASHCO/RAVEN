@@ -71,9 +71,19 @@ cargo clean -p libsqlite3-sys >/dev/null 2>&1 || true
 expect_fail "cargo: CFLAGS contains PBKDF2_ITER" \
   run_lab_build RAVEN_EXPECT_SQLCIPHER_4_17_0=1 CFLAGS='-DPBKDF2_ITER=1'
 
-cargo clean -p libsqlite3-sys >/dev/null 2>&1 || true
-expect_fail "cargo: CC=clang -DPBKDF2_ITER=1" \
-  run_lab_build RAVEN_EXPECT_SQLCIPHER_4_17_0=1 CC='clang -DPBKDF2_ITER=1'
+# Windows openssl-src/nmake consumes CC before libsqlite3-sys build.rs.
+# clang then dies on MSVC flags (/Zi, /MT) with no profile-guard diagnostic.
+# The env-guard case above already covers CC='clang -DPBKDF2_ITER=1'.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    pass "skip cargo: CC=clang -DPBKDF2_ITER=1 on Windows (openssl-src/nmake race)"
+    ;;
+  *)
+    cargo clean -p libsqlite3-sys >/dev/null 2>&1 || true
+    expect_fail "cargo: CC=clang -DPBKDF2_ITER=1" \
+      run_lab_build RAVEN_EXPECT_SQLCIPHER_4_17_0=1 CC='clang -DPBKDF2_ITER=1'
+    ;;
+esac
 
 # -include usually reaches libsqlite3-sys after openssl tolerates the flag.
 cargo clean -p libsqlite3-sys >/dev/null 2>&1 || true

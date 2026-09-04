@@ -966,11 +966,17 @@ fn linux_secret_service_is_session_bus_missing(err: &IdentityStoreError) -> bool
 /// Headless Linux has no Secret Service. Tests must not assume the default
 /// GNU/Linux backend works. Once set, the env stays set so parallel tests
 /// cannot race on process env (do not clear a CI job override).
+///
+/// macOS is a no-op: Keychain is available, and forcing locked-file here
+/// races migrate / binding-tamper / seed-conflict tests that assert Keychain.
 #[cfg(test)]
 pub(crate) fn test_enable_locked_file_identity_backend() {
     use std::sync::Once;
     static ENABLE: Once = Once::new();
     ENABLE.call_once(|| {
+        if cfg!(target_os = "macos") {
+            return;
+        }
         if locked_file_backend_requested() {
             return;
         }
@@ -1446,6 +1452,10 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         {
+            if locked_file_backend_requested() {
+                test_cleanup(dir);
+                return;
+            }
             assert!(
                 !path.exists(),
                 "plaintext identity.seed must be removed after Keychain migrate"
@@ -1596,6 +1606,10 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         {
+            if locked_file_backend_requested() {
+                test_cleanup(dir);
+                return;
+            }
             let seed = keychain_get(&account_for_data_dir(dir)).unwrap().unwrap();
             assert_eq!(Identity::from_seed(&seed).public_key_bytes(), original_pub);
         }
@@ -1694,6 +1708,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn secure_and_raw_seed_conflict_is_never_winner_picked() {
+        if locked_file_backend_requested() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let (id, _) = load_or_create_identity(dir).unwrap();
@@ -1745,6 +1762,9 @@ mod tests {
     #[test]
     fn locked_file_first_install_when_platform_store_unavailable() {
         test_enable_locked_file_identity_backend();
+        if !locked_file_backend_requested() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let (id, backend) = load_or_create_identity(dir).expect("locked-file first install");
