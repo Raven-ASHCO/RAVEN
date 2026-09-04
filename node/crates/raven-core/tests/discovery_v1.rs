@@ -861,8 +861,12 @@ fn contact_accept_and_intro_lane() {
 fn contact_inbox_accept_binds() {
     use raven_core::contact_request::ContactRequestInbox;
 
-    let requester = Identity::generate();
-    let accepter = Identity::generate();
+    // Fixed seeds so this is not a CSPRNG flake. The optional note must stay
+    // inside the sealed inner payload; a two-byte canary like "hi" can appear
+    // by chance in sender_pub / signature / ciphertext.
+    const OPTIONAL_NOTE: &str = "CONTACT_REQ_OPTIONAL_MSG_CANARY";
+    let requester = Identity::from_seed(&[0x11; 32]);
+    let accepter = Identity::from_seed(&[0x22; 32]);
     let req = make_contact_request(
         &requester,
         &accepter,
@@ -872,13 +876,20 @@ fn contact_inbox_accept_binds() {
             sender_display_name: "Ada".into(),
             sender_aliases: vec!["ada".into()],
             sender_profile_digest: [0u8; 32],
-            optional_message: "hi".into(),
+            optional_message: OPTIONAL_NOTE.into(),
             created_at: now(),
             expires_at: now() + 60_000,
         },
     );
     let wire = req.encode_wire().unwrap();
-    assert!(!String::from_utf8_lossy(&wire).contains("hi"));
+    assert!(
+        !String::from_utf8_lossy(&wire).contains(OPTIONAL_NOTE),
+        "optional contact-request note must not appear on the wire"
+    );
+    assert!(
+        !String::from_utf8_lossy(&req.ciphertext).contains(OPTIONAL_NOTE),
+        "optional contact-request note must not appear in ciphertext bytes"
+    );
     let decoded = RavenContactRequestV1::decode_wire(&wire).unwrap();
     assert_eq!(decoded.request_id, req.request_id);
 
