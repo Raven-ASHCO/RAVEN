@@ -22,7 +22,8 @@ Copy-Item "$Root\target\release\ash.exe" (Join-Path $BinDir "raven.exe") -Force
 Copy-Item "$Root\target\release\ash.exe" (Join-Path $BinDir "ash.exe") -Force
 
 $exe = Join-Path $BinDir "raven-node.exe"
-$args = "service --data-dir `"$DataDir`" --lan-listen 127.0.0.1:7420 --ble-listen 127.0.0.1:7421 --timeout-secs 0"
+# Do not use $args — automatic/read-only in pwsh 7.
+$serviceArgs = "service --data-dir `"$DataDir`" --lan-listen 127.0.0.1:7420 --ble-listen 127.0.0.1:7421 --timeout-secs 0"
 
 if ($SkipScheduledTask) {
     Write-Host "SkipScheduledTask: binaries copied; logon task not registered"
@@ -30,7 +31,7 @@ if ($SkipScheduledTask) {
     # Register a per-user logon task (survives reboot; no admin service required for V1 software path).
     $taskName = "RavenNodeBridge"
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    $action = New-ScheduledTaskAction -Execute $exe -Argument $args
+    $action = New-ScheduledTaskAction -Execute $exe -Argument $serviceArgs
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Description "RAVEN raven-node bridge (serverless)" | Out-Null

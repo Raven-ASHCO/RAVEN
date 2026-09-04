@@ -326,9 +326,10 @@ jobs:
           Get-Command Get-Content | Out-Null
           $p = "scripts/install/windows_service.ps1"
           if (-not (Test-Path $p)) { throw "missing $p" }
-          # Parse-only: ensure script is well-formed PowerShell
-          $errs = $null
+          # Parse-only: ensure script is well-formed PowerShell.
+          # pwsh 7 requires [ref] targets to exist before ParseFile.
           $tokens = $null
+          $errs = $null
           $null = [System.Management.Automation.Language.Parser]::ParseFile(
             (Resolve-Path $p), [ref]$tokens, [ref]$errs)
           if ($errs) { $errs | ForEach-Object { $_ }; throw "parse errors" }
