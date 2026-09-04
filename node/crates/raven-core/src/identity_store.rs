@@ -1587,7 +1587,7 @@ mod tests {
         assert_eq!(binding.len(), IDENTITY_BINDING_LEN);
         binding[44] ^= 0x80;
         std::fs::write(binding_path(dir), binding).unwrap();
-        let err = load_identity(dir).err().expect("tamper must fail");
+        let err = load_identity(dir).expect_err("tamper must fail");
         assert!(matches!(err, IdentityStoreError::Continuity(_)));
 
         #[cfg(target_os = "macos")]
@@ -1695,7 +1695,7 @@ mod tests {
         let mut other = Identity::generate().seed_bytes();
         write_locked_seed_file(&seed_path(dir), &other).unwrap();
         other.zeroize();
-        let err = load_identity(dir).err().expect("conflict must fail");
+        let err = load_identity(dir).expect_err("conflict must fail");
         assert!(matches!(err, IdentityStoreError::Continuity(_)));
         assert!(
             seed_path(dir).exists(),
