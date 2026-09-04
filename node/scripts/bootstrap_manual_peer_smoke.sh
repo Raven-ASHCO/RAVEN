@@ -69,7 +69,8 @@ plant_ci_seed() {
     chmod 600 "$dir/identity.seed"
   fi
 }
-# Headless Linux cannot prove Secret Service absence during first-install.
+# Headless Linux first-install allows only session-bus connect-fail as
+# "no store". Plant seeds so CI takes the unmarked load path.
 plant_ci_seed "$WORKDIR/a"
 plant_ci_seed "$WORKDIR/b"
 "$NODE" address --data-dir "$WORKDIR/a" | tee "$WORKDIR/a.out"

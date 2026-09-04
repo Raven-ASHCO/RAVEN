@@ -24,8 +24,10 @@ if [[ ! -x "$NODE" && -x "${NODE}.exe" ]]; then NODE="${NODE}.exe"; fi
 "$ASH" --help | grep -qi raven
 "$NODE" --help | grep -qi raven
 
-# Headless Linux cannot prove Secret Service absence, so plant a 32-byte
-# locked-file seed (load path tolerates a down session bus).
+# Headless Linux cannot prove Secret Service absence during first-install
+# unless the session bus is missing (`secret-service connect:`). Plant a
+# 32-byte locked-file seed so we take the load path. macOS still requires
+# proven-absent Keychain (Ok(None)); locked/denied is Continuity.
 plant_ci_seed() {
   local dir="$1"
   mkdir -p "$dir"
