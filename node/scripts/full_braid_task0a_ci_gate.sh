@@ -291,6 +291,11 @@ run_release_hold() {
 
 run_rust_lab_suite() {
   cd "$NODE"
+  # Headless Linux has no Secret Service. Debug locked-file is proven-absent
+  # / connect-fail only — same as rust-linux. Not a production Keychain claim.
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    export RAVEN_IDENTITY_BACKEND=locked-file
+  fi
   RAVEN_EXPECT_SQLCIPHER_4_17_0=1 \
     cargo test -p raven-core --features full-braid-durable-lab \
       --test full_braid_sqlcipher_profile -- --test-threads=1

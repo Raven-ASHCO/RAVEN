@@ -267,7 +267,7 @@ jobs:
       - name: test raven-core + ash
         run: |
           cargo test -p raven-core -p ash -p raven-node
-          cargo build -p raven-node -p raven-swarm -p ash
+          cargo build -p ash -p raven-node -p raven-swarm
           cargo build --release -p raven-core -p raven-node -p ash
       # Named reliability gates (Sprint 0 evidence bar). cargo, not bash.
       # reliability_10k on Windows is QUEUE DURABILITY ONLY — not a path proof.

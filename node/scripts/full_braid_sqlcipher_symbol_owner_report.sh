@@ -30,12 +30,14 @@ fi
 
 resolve_symbol_tool() {
   if [[ "$IS_WINDOWS" -eq 1 ]]; then
-    if command -v llvm-nm >/dev/null 2>&1; then
-      echo "llvm-nm"
-      return 0
-    fi
+    # Prefer dumpbin on MSVC: llvm-nm --defined-only often misses C symbols
+    # statically linked from rusqlite's bundled sqlite (count=0 false fail).
     if command -v dumpbin >/dev/null 2>&1; then
       echo "dumpbin"
+      return 0
+    fi
+    if command -v llvm-nm >/dev/null 2>&1; then
+      echo "llvm-nm"
       return 0
     fi
     die "Windows MSVC symbol probe requires llvm-nm or dumpbin on PATH"
@@ -177,6 +179,9 @@ count_sym() {
   case "$SYMBOL_TOOL" in
     nm|llvm-nm)
       n="$(grep -E "[[:space:]][Tt][[:space:]]+_?${sym}$" "$SYM_OUT" | wc -l | tr -d ' ')"
+      if [[ "$n" == "0" ]]; then
+        n="$(grep -E "[[:space:]][TtAa][[:space:]]+_?${sym}(@[0-9]+)?$" "$SYM_OUT" | wc -l | tr -d ' ')"
+      fi
       ;;
     dumpbin)
       # MSVC dumpbin lists External | sqlite3_open_v2
