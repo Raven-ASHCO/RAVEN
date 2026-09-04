@@ -377,11 +377,6 @@ jobs:
       CARGO_TARGET_DIR: target/full-braid-task0a-windows
       RAVEN_EXPECT_SQLCIPHER_4_17_0: "1"
     steps:
-      - name: Disable Git CRLF conversion
-        shell: bash
-        run: |
-          git config --global core.autocrlf false
-          git config --global core.eol lf
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -391,6 +386,19 @@ jobs:
       # Do not load vcvars here: VS 2026 env breaks rustc host build scripts
       # (proc-macro2). rustc finds MSVC itself; the gate prepends dumpbin/nmake
       # and Strawberry Perl for openssl-src.
+      - name: Verify SQLCipher sqlite3.c pin (LF bytes)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, sys
+          path = pathlib.Path("node/third_party/libsqlite3-sys-raven/sqlcipher/sqlite3.c")
+          got = hashlib.sha256(path.read_bytes()).hexdigest()
+          expect = "8adaff6b464052a74e7adaa3cfa2725400f48eca68f47856fa806eaf30bdf2c9"
+          if got != expect:
+              print(f"FAIL: {path} sha256={got} expected={expect}", file=sys.stderr)
+              sys.exit(1)
+          print(f"ok {path} {got}")
+          PY
       - name: Task 0A Windows CI gate
         working-directory: ${{ github.workspace }}
         run: bash ./node/scripts/full_braid_task0a_ci_gate.sh windows
