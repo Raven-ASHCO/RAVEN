@@ -29,7 +29,16 @@ assert_primary_hold_log() {
 import re, sys
 
 expected, path = sys.argv[1], sys.argv[2]
-text = open(path, "r", encoding="utf-8", errors="replace").read()
+raw = open(path, "r", encoding="utf-8", errors="replace").read()
+# GHA sets CARGO_TERM_COLOR=always; colored "error:" must not fail the hold.
+text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw)
+
+def fail(msg):
+    sys.stderr.write(msg + "\n")
+    sys.stderr.write("--- cargo release-hold log (tail) ---\n")
+    for line in text.splitlines()[-80:]:
+        sys.stderr.write(line + "\n")
+    sys.exit(1)
 
 # Cargo custom-build failures surface as this error before the script stderr.
 if not re.search(
@@ -37,11 +46,10 @@ if not re.search(
     text,
     re.M,
 ):
-    sys.stderr.write(
+    fail(
         "FULL_BRAID_0A5_HOLD_PRIMARY_MISSING: "
-        "missing raven-core custom build failure\n"
+        "missing raven-core custom build failure"
     )
-    sys.exit(1)
 
 # Bind hold to the build.rs panic message itself.
 # Real cargo shape (indented under Caused by / --- stderr):
@@ -52,11 +60,10 @@ panic_hold = re.compile(
     r"[ \t]*" + re.escape(expected) + r"[ \t]*(?:\n|$)"
 )
 if not panic_hold.search(text):
-    sys.stderr.write(
+    fail(
         "FULL_BRAID_0A5_HOLD_PRIMARY_MISSING: "
-        f"hold {expected!r} is not the raven-core/build.rs panic payload\n"
+        f"hold {expected!r} is not the raven-core/build.rs panic payload"
     )
-    sys.exit(1)
 
 # Reject any other build.rs panic payload in the same log.
 other_panics = []
@@ -83,6 +90,8 @@ for line in text.splitlines():
         continue
     if "failed to run custom build command for `raven-core" in line:
         continue
+    if "could not compile `raven-core" in line:
+        continue
     if expected in line:
         continue
     unrelated.append(line)
@@ -105,6 +114,7 @@ expect_release_hold_failure() {
   (
     cd "$NODE"
     env RAVEN_EXPECT_SQLCIPHER_4_17_0=1 \
+      CARGO_TERM_COLOR=never \
       cargo build --release -p raven-core --features full-braid-durable-lab
   ) >"$log" 2>&1
   local rc=$?
@@ -321,6 +331,35 @@ run_symbol_and_override() {
   bash "$SCRIPTS/full_braid_sqlcipher_profile_override_negatives.sh"
 }
 
+prefer_windows_openssl_perl() {
+  # Git Bash puts /usr/bin/perl first. openssl-src Configure needs Strawberry
+  # (Locale::Maketext::Simple). Not a system-OpenSSL bypass.
+  local cand win
+  for cand in \
+    "/c/Strawberry/perl/bin/perl.exe" \
+    "/c/Strawberry/perl/bin/perl" \
+    "/d/Strawberry/perl/bin/perl.exe"
+  do
+    if [[ -x "$cand" ]]; then
+      export PATH="$(dirname "$cand"):${PATH}"
+      if command -v cygpath >/dev/null 2>&1; then
+        win="$(cygpath -w "$cand")"
+      else
+        win="$cand"
+      fi
+      export PERL="$win"
+      export OPENSSL_SRC_PERL="$win"
+      echo "windows-openssl-perl=$cand" >&2
+      return 0
+    fi
+  done
+  if perl -e "use Locale::Maketext::Simple;" >/dev/null 2>&1; then
+    echo "windows-openssl-perl=$(command -v perl)" >&2
+    return 0
+  fi
+  die "Windows lab SQLCipher needs Strawberry Perl (Git Bash perl lacks Locale::Maketext::Simple)"
+}
+
 case "$MODE" in
   provenance)
     bash -n "$SCRIPTS/regenerate_sqlcipher_4_17.sh"
@@ -367,6 +406,7 @@ case "$MODE" in
     command -v cargo >/dev/null || die "cargo missing"
     # Symbol/import tools are mandatory on Windows (llvm-nm|dumpbin +
     # dumpbin|llvm-readobj); the symbol-owner script fails closed if absent.
+    prefer_windows_openssl_perl
     run_symbol_and_override
     run_rust_lab_suite
     run_release_hold

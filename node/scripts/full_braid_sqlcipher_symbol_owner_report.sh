@@ -124,10 +124,37 @@ locate_pdbutil() {
 DUMPBIN_BIN=""
 PDBUTIL_BIN=""
 
+prefer_windows_openssl_perl() {
+  # Git Bash shadows Strawberry with /usr/bin/perl. openssl-src needs modules
+  # from Strawberry. Does not set OPENSSL_DIR / OPENSSL_NO_VENDOR.
+  local cand win
+  for cand in \
+    "/c/Strawberry/perl/bin/perl.exe" \
+    "/c/Strawberry/perl/bin/perl" \
+    "/d/Strawberry/perl/bin/perl.exe"
+  do
+    if [[ -x "$cand" ]]; then
+      export PATH="$(dirname "$cand"):${PATH}"
+      if command -v cygpath >/dev/null 2>&1; then
+        win="$(cygpath -w "$cand")"
+      else
+        win="$cand"
+      fi
+      export PERL="$win"
+      export OPENSSL_SRC_PERL="$win"
+      echo "windows-openssl-perl=$cand" >&2
+      return 0
+    fi
+  done
+  if perl -e "use Locale::Maketext::Simple;" >/dev/null 2>&1; then
+    echo "windows-openssl-perl=$(command -v perl)" >&2
+    return 0
+  fi
+  echo "WARN: perl cannot load Locale::Maketext::Simple (lab openssl-src will fail)" >&2
+}
+
 resolve_symbol_tool() {
   if [[ "$IS_WINDOWS" -eq 1 ]]; then
-    DUMPBIN_BIN="$(locate_dumpbin || true)"
-    PDBUTIL_BIN="$(locate_pdbutil || true)"
     if [[ -n "$DUMPBIN_BIN" ]]; then
       echo "dumpbin"
       return 0
@@ -167,6 +194,12 @@ resolve_import_tool() {
   echo "ldd"
 }
 
+if [[ "$IS_WINDOWS" -eq 1 ]]; then
+  prefer_windows_openssl_perl
+  # Locate outside $(...) — assignments inside command substitution are lost.
+  DUMPBIN_BIN="$(locate_dumpbin || true)"
+  PDBUTIL_BIN="$(locate_pdbutil || true)"
+fi
 SYMBOL_TOOL="$(resolve_symbol_tool)"
 IMPORT_TOOL="$(resolve_import_tool)"
 echo "symbol_tool=$SYMBOL_TOOL import_tool=$IMPORT_TOOL dumpbin=${DUMPBIN_BIN:-none} pdbutil=${PDBUTIL_BIN:-none}" >&2
