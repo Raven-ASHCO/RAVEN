@@ -55,8 +55,9 @@ if not re.search(
 # Real cargo shape (indented under Caused by / --- stderr):
 #   thread 'main' (...) panicked at crates/raven-core/build.rs:17:9:
 #   FULL_BRAID_SQLCIPHER_NOT_APPROVED
+# Windows rustc prints backslashes: crates\raven-core\build.rs
 panic_hold = re.compile(
-    r"panicked at [^\n]*raven-core/build\.rs:\d+:\d+:\s*\n"
+    r"panicked at [^\n]*raven-core[/\\]build\.rs:\d+:\d+:\s*\n"
     r"[ \t]*" + re.escape(expected) + r"[ \t]*(?:\n|$)"
 )
 if not panic_hold.search(text):
@@ -68,7 +69,7 @@ if not panic_hold.search(text):
 # Reject any other build.rs panic payload in the same log.
 other_panics = []
 for match in re.finditer(
-    r"panicked at [^\n]*raven-core/build\.rs:\d+:\d+:\s*\n[ \t]*([^\n]+)",
+    r"panicked at [^\n]*raven-core[/\\]build\.rs:\d+:\d+:\s*\n[ \t]*([^\n]+)",
     text,
 ):
     payload = match.group(1).strip()
@@ -169,6 +170,21 @@ EOF
   rm -f "$log"
   [[ "$rc" -ne 0 ]] || die "hold gate false-passed unrelated build.rs panic + hold text"
   pass "hold gate rejects unrelated build.rs panic + hold text"
+
+  log="$(mktemp "${TMPDIR:-/tmp}/raven-0a5-hold-win-XXXXXX")"
+  cat >"$log" <<EOF
+error: failed to run custom build command for \`raven-core v0.1.0 (D:\\a\\RAVEN\\RAVEN\\node\\crates\\raven-core)\`
+
+Caused by:
+  process didn't exit successfully: \`build-script-build\` (exit status: 101)
+  --- stderr
+
+  thread 'main' (6580) panicked at crates\\raven-core\\build.rs:17:9:
+  $HOLD_TEXT
+EOF
+  assert_primary_hold_log "$HOLD_TEXT" "$log"
+  rm -f "$log"
+  pass "hold gate accepts Windows backslash build.rs path"
 }
 
 scoped_paths=(
