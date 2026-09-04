@@ -360,6 +360,19 @@ prefer_windows_openssl_perl() {
   die "Windows lab SQLCipher needs Strawberry Perl (Git Bash perl lacks Locale::Maketext::Simple)"
 }
 
+prepend_windows_msvc_bin() {
+  # Put nmake/cl/dumpbin on PATH without sourcing VS 2026 vcvars (breaks rustc).
+  local dumpbin
+  dumpbin="$(command -v dumpbin 2>/dev/null || true)"
+  if [[ -z "$dumpbin" ]]; then
+    dumpbin="$(ls /c/Program\ Files/Microsoft\ Visual\ Studio/*/Enterprise/VC/Tools/MSVC/*/bin/HostX64/x64/dumpbin.exe 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -n "$dumpbin" && -f "$dumpbin" ]]; then
+    export PATH="$(dirname "$dumpbin"):${PATH}"
+    echo "windows-msvc-bin=$(dirname "$dumpbin")" >&2
+  fi
+}
+
 case "$MODE" in
   provenance)
     bash -n "$SCRIPTS/regenerate_sqlcipher_4_17.sh"
@@ -407,6 +420,7 @@ case "$MODE" in
     # Symbol/import tools are mandatory on Windows (llvm-nm|dumpbin +
     # dumpbin|llvm-readobj); the symbol-owner script fails closed if absent.
     prefer_windows_openssl_perl
+    prepend_windows_msvc_bin
     run_symbol_and_override
     run_rust_lab_suite
     run_release_hold

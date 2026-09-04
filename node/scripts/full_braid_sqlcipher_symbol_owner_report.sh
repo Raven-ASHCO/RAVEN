@@ -199,6 +199,11 @@ if [[ "$IS_WINDOWS" -eq 1 ]]; then
   # Locate outside $(...) — assignments inside command substitution are lost.
   DUMPBIN_BIN="$(locate_dumpbin || true)"
   PDBUTIL_BIN="$(locate_pdbutil || true)"
+  # nmake/cl/lib live next to dumpbin; do not import full VS 2026 vcvars
+  # (that breaks rustc host build scripts on GHA windows-latest).
+  if [[ -n "$DUMPBIN_BIN" ]]; then
+    export PATH="$(dirname "$DUMPBIN_BIN"):${PATH}"
+  fi
 fi
 SYMBOL_TOOL="$(resolve_symbol_tool)"
 IMPORT_TOOL="$(resolve_import_tool)"
@@ -211,19 +216,55 @@ IMP_OUT="$(mktemp "${TMPDIR:-/tmp}/raven-0a2-imp-XXXXXX")"
 cleanup() { rm -f "$BUILD_JSON" "$SYM_OUT" "$IMP_OUT"; }
 trap cleanup EXIT
 
+dump_cargo_json_errors() {
+  python3 - "$BUILD_JSON" <<'PY' >&2 || true
+import json, sys
+path = sys.argv[1]
+print("--- cargo compiler-message errors ---")
+try:
+    fh = open(path, encoding="utf-8", errors="replace")
+except OSError as exc:
+    print(exc)
+    raise SystemExit(0)
+for line in fh:
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        msg = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if msg.get("reason") != "compiler-message":
+        continue
+    rendered = (msg.get("message") or {}).get("rendered") or ""
+    if rendered:
+        print(rendered.rstrip())
+PY
+}
+
 if [[ "$MODE" == "lab" ]]; then
   export RAVEN_EXPECT_SQLCIPHER_4_17_0=1
   EXPECT_KEY=1
   echo "=== build test binary (lab) ===" >&2
+  set +e
   cargo test -p raven-core --features full-braid-durable-lab \
     --test full_braid_sqlcipher_profile --no-run --message-format=json \
     >"$BUILD_JSON" 2> >(tee "${TMPDIR:-/tmp}/raven-0a2-sym-lab-stderr.txt" >&2)
+  cargo_rc=$?
+  set -e
 else
   unset RAVEN_EXPECT_SQLCIPHER_4_17_0 || true
   EXPECT_KEY=0
   echo "=== build test binary (default) ===" >&2
+  set +e
   cargo test -p raven-core --lib --no-run --message-format=json \
     >"$BUILD_JSON" 2> >(tee "${TMPDIR:-/tmp}/raven-0a2-sym-def-stderr.txt" >&2)
+  cargo_rc=$?
+  set -e
+fi
+if [[ "$cargo_rc" -ne 0 ]]; then
+  dump_cargo_json_errors
+  die "cargo test --no-run failed rc=$cargo_rc"
 fi
 
 BIN="$(

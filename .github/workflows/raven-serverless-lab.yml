@@ -383,7 +383,9 @@ jobs:
         with:
           workspaces: node
           prefix-key: full-braid-task0a-windows
-      - uses: ilammy/msvc-dev-cmd@v1
+      # Do not load vcvars here: VS 2026 env breaks rustc host build scripts
+      # (proc-macro2). rustc finds MSVC itself; the gate prepends dumpbin/nmake
+      # and Strawberry Perl for openssl-src.
       - name: Task 0A Windows CI gate
         working-directory: ${{ github.workspace }}
         run: bash ./node/scripts/full_braid_task0a_ci_gate.sh windows
