@@ -4,6 +4,7 @@
 set -euo pipefail
 # Ephemeral CI profile — Secret Service / Keychain ACL is not available to bots.
 export RAVEN_IDENTITY_BACKEND=locked-file
+export RAVEN_ALLOW_EPHEMERAL_DATA_DIR="${RAVEN_ALLOW_EPHEMERAL_DATA_DIR:-1}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORKDIR="${TMPDIR:-/tmp}/raven-term-$$"
 cleanup() { rm -rf "$WORKDIR"; }

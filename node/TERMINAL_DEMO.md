@@ -56,7 +56,7 @@ cd node
 ./scripts/ash_menu_smoke.sh
 ```
 
-CI (`rust-linux` / `rust-macos`) runs `ash_menu_smoke.sh` against **debug** `target/debug/ash` with `RAVEN_IDENTITY_BACKEND=locked-file`. That is **menu/CLI smoke only** — not Keychain, launchd, or Gatekeeper/notarize. Operators must not set `locked-file` for a normal Keychain install (Option A default). See [`docs/INSTALL_macOS.md`](../docs/INSTALL_macOS.md).
+CI (`rust-linux` / `rust-macos` / `rust-windows`) runs `ash_menu_smoke.sh` against **debug** `target/debug/ash` with `RAVEN_IDENTITY_BACKEND=locked-file`. That is **menu/CLI smoke only** — not Keychain, launchd, or Gatekeeper/notarize. Operators must not set `locked-file` for a normal Keychain install (Option A default). See [`docs/INSTALL_macOS.md`](../docs/INSTALL_macOS.md).
 
 ## Prerequisites
 

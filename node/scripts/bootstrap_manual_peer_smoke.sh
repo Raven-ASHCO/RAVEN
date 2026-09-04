@@ -7,6 +7,7 @@ set -euo pipefail
 set +m
 # Ephemeral CI profile — Secret Service / Keychain ACL is not available to bots.
 export RAVEN_IDENTITY_BACKEND=locked-file
+export RAVEN_ALLOW_EPHEMERAL_DATA_DIR="${RAVEN_ALLOW_EPHEMERAL_DATA_DIR:-1}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/debug"
 NODE="$BIN/raven-node"
@@ -28,6 +29,10 @@ dump_logs() {
 }
 
 cleanup() {
+  local rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    dump_logs
+  fi
   if [[ -n "${BPID}" ]]; then
     kill -TERM "$BPID" 2>/dev/null || true
     sleep 0.2
@@ -73,7 +78,6 @@ A_PUB=$(grep '^pub_hex=' "$WORKDIR/a.out" | cut -d= -f2)
 B_PUB=$(grep '^pub_hex=' "$WORKDIR/b.out" | cut -d= -f2)
 if [[ -z "$A_PUB" || -z "$B_PUB" ]]; then
   echo "init did not print pub_hex" >&2
-  dump_logs
   exit 1
 fi
 
@@ -94,20 +98,17 @@ for _ in $(seq 1 100); do
   fi
   if ! kill -0 "$BPID" 2>/dev/null; then
     echo "listener exited before writing b.addr" >&2
-    dump_logs
     exit 1
   fi
   sleep 0.1
 done
 if [[ ! -s "$WORKDIR/b.addr" ]]; then
   echo "timed out waiting for b.addr" >&2
-  dump_logs
   exit 1
 fi
 B_ADDR=$(tr -d '[:space:]' <"$WORKDIR/b.addr")
 if [[ -z "$B_ADDR" ]]; then
   echo "b.addr empty" >&2
-  dump_logs
   exit 1
 fi
 
@@ -132,7 +133,6 @@ SEND_RC=$?
 set -e
 if [[ "$SEND_RC" -ne 0 ]]; then
   echo "sender raven-node exited $SEND_RC" >&2
-  dump_logs
   exit 1
 fi
 
@@ -143,23 +143,19 @@ set -e
 BPID=""
 if [[ "$RECV_RC" -ne 0 ]]; then
   echo "listener raven-node exited $RECV_RC" >&2
-  dump_logs
   exit 1
 fi
 
 if ! grep -q 'ACK delivered' "$WORKDIR/a.log"; then
   echo "sender log missing ACK delivered" >&2
-  dump_logs
   exit 1
 fi
 if ! grep -q 'DELIVERED' "$WORKDIR/b.log"; then
   echo "listener log missing DELIVERED" >&2
-  dump_logs
   exit 1
 fi
 if grep -qiE 'fastapi|bootstrap\.raven|raven-owned' "$WORKDIR/a.log" "$WORKDIR/b.log"; then
   echo "forbidden central/bootstrap tokens in logs" >&2
-  dump_logs
   exit 1
 fi
 echo "=== MANUAL-PEER-ONLY BOOTSTRAP SMOKE OK ==="

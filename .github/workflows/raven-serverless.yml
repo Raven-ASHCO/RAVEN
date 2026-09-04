@@ -65,6 +65,11 @@ jobs:
   rust-linux:
     name: Rust + vectors (Linux)
     runs-on: ubuntu-latest
+    # GNU/Linux Secret Service *creation* is fail-closed before R1. Debug CI
+    # uses locked-file so cargo test / ash init can create ephemeral identities.
+    env:
+      RAVEN_IDENTITY_BACKEND: locked-file
+      RAVEN_ALLOW_EPHEMERAL_DATA_DIR: "1"
     defaults:
       run:
         working-directory: node
@@ -282,6 +287,19 @@ jobs:
           }
           & $script
           if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: ash / raven-node --help (terminal smoke)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "target\debug\ash.exe")) { throw "missing target/debug/ash.exe" }
+          if (-not (Test-Path "target\debug\raven-node.exe")) { throw "missing target/debug/raven-node.exe" }
+          & ".\target\debug\ash.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw "ash --help failed" }
+          & ".\target\debug\raven-node.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw "raven-node --help failed" }
+          Write-Host "Windows terminal --help OK"
+      - name: ash menu smoke
+        shell: bash
+        run: ./scripts/ash_menu_smoke.sh
       - name: PowerShell install script syntax check
         shell: pwsh
         run: |

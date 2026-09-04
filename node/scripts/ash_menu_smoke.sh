@@ -10,10 +10,17 @@ ASH="$BIN/ash"
 export PATH="${HOME}/.cargo/bin:${PATH}"
 export NO_COLOR=1
 
+if [[ ! -x "$ASH" && -x "${ASH}.exe" ]]; then
+  ASH="${ASH}.exe"
+fi
 if [[ ! -x "$ASH" ]]; then
   echo "Building ash…"
   (cd "$ROOT" && cargo build -p ash -p raven-node -q)
+  if [[ ! -x "$ASH" && -x "${BIN}/ash.exe" ]]; then
+    ASH="${BIN}/ash.exe"
+  fi
 fi
+[[ -x "$ASH" ]]
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/raven-ash-menu-XXXXXX")"
 cleanup() { rm -rf "$WORKDIR"; }

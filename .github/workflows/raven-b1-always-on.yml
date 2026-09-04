@@ -1,6 +1,8 @@
-# Thin always-on B1 gate. No path filters: docs-only PRs still get a required
+# Always-on B1 gate. No path filters: docs-only PRs still get a required
 # status. Runnable terminal smoke bots can re-trigger via workflow_dispatch.
-# Not Full Braid / ML-KEM lab. Cross-OS proof stays on Raven Serverless Node.
+# Secret scan + messaging boundary + rustfmt + ash/raven-node --help/whoami/
+# timed listen. Not Full Braid / ML-KEM lab. Cross-OS proof stays on
+# Raven Serverless Node (Linux/macOS/Windows).
 name: Raven B1 Always-On
 
 on:

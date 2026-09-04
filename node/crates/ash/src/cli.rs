@@ -3599,9 +3599,13 @@ fn wait_back() -> bool {
 
 fn stty(args: &[&str]) {
     #[cfg(unix)]
-    let _ = Command::new("stty").args(args).status();
+    {
+        let _ = Command::new("stty").args(args).status();
+    }
     #[cfg(not(unix))]
-    let _ = args;
+    {
+        let _ = args;
+    }
 }
 
 fn read_key_raw() -> MenuKey {
@@ -3921,6 +3925,50 @@ pub fn run() {
             ContactCommands::Block { request_id } => cmd_contact_block(&data_dir, &request_id),
         },
     }
+}
+
+fn cmd_send_cli(
+    data_dir: &Path,
+    peer: &str,
+    peer_pub_hex: &str,
+    listen: &str,
+    contact: &str,
+    stdin_text: bool,
+    chat: bool,
+) {
+    let id = require_identity(data_dir);
+    let (peer_dial, pub_hex, listen) =
+        match resolve_send_target(data_dir, contact, peer, peer_pub_hex, listen) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{}", sanitize_terminal_text(&e));
+                std::process::exit(1);
+            }
+        };
+    let (petname, tag) = load_contacts(data_dir)
+        .ok()
+        .and_then(|cs| {
+            cs.into_iter()
+                .find(|c| c.pub_hex.eq_ignore_ascii_case(&pub_hex))
+                .map(|c| (c.petname, c.public_tag))
+        })
+        .unwrap_or_default();
+    if chat {
+        ext::cmd_chat_session(data_dir, &id, &petname, &tag, &pub_hex, &peer_dial);
+        return;
+    }
+    if !stdin_text {
+        eprintln!("send requires a stdin body (never argv plaintext)");
+        std::process::exit(1);
+    }
+    let text = match ext::read_line_result() {
+        ext::LineResult::Line(s) if !s.is_empty() => s,
+        _ => {
+            eprintln!("empty send body on stdin");
+            std::process::exit(1);
+        }
+    };
+    run_send(data_dir, &peer_dial, &pub_hex, &listen, &text);
 }
 
 /// Guided walkthrough for newcomers. Every step prints what it does and why,
