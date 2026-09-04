@@ -377,6 +377,11 @@ jobs:
       CARGO_TARGET_DIR: target/full-braid-task0a-windows
       RAVEN_EXPECT_SQLCIPHER_4_17_0: "1"
     steps:
+      - name: Disable Git CRLF conversion
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

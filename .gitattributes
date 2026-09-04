@@ -1,0 +1,4 @@
+# Task 0A.1 / 0A.2 — byte-pinned SQLCipher amalgamation and provenance files.
+# SHA-256 must match on every host. Git must not convert CRLF on Windows.
+node/third_party/sqlcipher-4.17.0/** -text
+node/third_party/libsqlite3-sys-raven/sqlcipher/** -text
