@@ -5,8 +5,10 @@
 #   ./node/scripts/full_braid_sqlcipher_symbol_owner_report.sh default|lab
 #
 # Unix: nm + otool (Darwin) or ldd (Linux). Missing tools fail closed.
-# Windows MSVC: llvm-nm or dumpbin for symbols; dumpbin /imports or
-# llvm-readobj --coff-imports for DLL rejection. Missing tools fail closed.
+# Windows MSVC: PE symbol tables are often empty (C symbols live in the PDB).
+# Probe dumpbin (via vswhere if not on PATH), llvm-nm, then llvm-pdbutil on
+# the sibling PDB. Missing tools / empty tables fail closed. Not a Release
+# claim that llvm-nm --defined-only on the EXE is sufficient.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -28,11 +30,105 @@ if [[ "${OS:-}" == "Windows_NT" ]]; then
   IS_WINDOWS=1
 fi
 
+bash_path() {
+  local p="${1%$'\r'}"
+  [[ -n "$p" ]] || return 1
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$p"
+  else
+    printf '%s\n' "$p"
+  fi
+}
+
+first_existing() {
+  local cand converted
+  for cand in "$@"; do
+    [[ -z "$cand" ]] && continue
+    cand="${cand%$'\r'}"
+    if [[ -f "$cand" ]]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+    converted="$(bash_path "$cand" 2>/dev/null || true)"
+    if [[ -n "$converted" && -f "$converted" ]]; then
+      printf '%s\n' "$converted"
+      return 0
+    fi
+  done
+  return 1
+}
+
+locate_vswhere() {
+  local c
+  c="$(command -v vswhere 2>/dev/null || true)"
+  first_existing "$c" \
+    "/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" \
+    "/c/Program Files/Microsoft Visual Studio/Installer/vswhere.exe" \
+    "/d/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+}
+
+locate_dumpbin() {
+  local c vswhere found
+  c="$(command -v dumpbin 2>/dev/null || true)"
+  if [[ -n "$c" ]]; then
+    printf '%s\n' "$c"
+    return 0
+  fi
+  vswhere="$(locate_vswhere || true)"
+  if [[ -n "$vswhere" ]]; then
+    found="$("$vswhere" -latest -products '*' -find '**/Hostx64/x64/dumpbin.exe' 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+    if [[ -z "$found" ]]; then
+      found="$("$vswhere" -latest -products '*' -find '**/HostX64/x64/dumpbin.exe' 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+    fi
+    if [[ -z "$found" ]]; then
+      found="$("$vswhere" -latest -products '*' -find '**/dumpbin.exe' 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+    fi
+    if first_existing "$found" >/dev/null; then
+      first_existing "$found"
+      return 0
+    fi
+  fi
+  local g
+  for g in \
+    "/c/Program Files/Microsoft Visual Studio/"*/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe \
+    "/c/Program Files/Microsoft Visual Studio/"*/VC/Tools/MSVC/*/bin/HostX64/x64/dumpbin.exe \
+    "/d/Program Files/Microsoft Visual Studio/"*/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe
+  do
+    if [[ -f "$g" ]]; then
+      printf '%s\n' "$g"
+      return 0
+    fi
+  done
+  return 1
+}
+
+locate_pdbutil() {
+  local c nm_dir
+  c="$(command -v llvm-pdbutil 2>/dev/null || true)"
+  if [[ -n "$c" ]]; then
+    printf '%s\n' "$c"
+    return 0
+  fi
+  if command -v llvm-nm >/dev/null 2>&1; then
+    nm_dir="$(dirname "$(command -v llvm-nm)")"
+    if first_existing "$nm_dir/llvm-pdbutil" "$nm_dir/llvm-pdbutil.exe" >/dev/null; then
+      first_existing "$nm_dir/llvm-pdbutil" "$nm_dir/llvm-pdbutil.exe"
+      return 0
+    fi
+  fi
+  first_existing \
+    "/c/Program Files/LLVM/bin/llvm-pdbutil.exe" \
+    "/c/Program Files/LLVM/bin/llvm-pdbutil"
+}
+
+DUMPBIN_BIN=""
+PDBUTIL_BIN=""
+
 resolve_symbol_tool() {
   if [[ "$IS_WINDOWS" -eq 1 ]]; then
-    # Prefer dumpbin on MSVC: llvm-nm --defined-only often misses C symbols
-    # statically linked from rusqlite's bundled sqlite (count=0 false fail).
-    if command -v dumpbin >/dev/null 2>&1; then
+    DUMPBIN_BIN="$(locate_dumpbin || true)"
+    PDBUTIL_BIN="$(locate_pdbutil || true)"
+    if [[ -n "$DUMPBIN_BIN" ]]; then
       echo "dumpbin"
       return 0
     fi
@@ -40,7 +136,11 @@ resolve_symbol_tool() {
       echo "llvm-nm"
       return 0
     fi
-    die "Windows MSVC symbol probe requires llvm-nm or dumpbin on PATH"
+    if [[ -n "$PDBUTIL_BIN" ]]; then
+      echo "llvm-pdbutil"
+      return 0
+    fi
+    die "Windows MSVC symbol probe requires dumpbin, llvm-nm, or llvm-pdbutil"
   fi
   command -v nm >/dev/null 2>&1 || die "nm required on Unix"
   echo "nm"
@@ -48,7 +148,7 @@ resolve_symbol_tool() {
 
 resolve_import_tool() {
   if [[ "$IS_WINDOWS" -eq 1 ]]; then
-    if command -v dumpbin >/dev/null 2>&1; then
+    if [[ -n "$DUMPBIN_BIN" ]]; then
       echo "dumpbin"
       return 0
     fi
@@ -69,7 +169,7 @@ resolve_import_tool() {
 
 SYMBOL_TOOL="$(resolve_symbol_tool)"
 IMPORT_TOOL="$(resolve_import_tool)"
-echo "symbol_tool=$SYMBOL_TOOL import_tool=$IMPORT_TOOL" >&2
+echo "symbol_tool=$SYMBOL_TOOL import_tool=$IMPORT_TOOL dumpbin=${DUMPBIN_BIN:-none} pdbutil=${PDBUTIL_BIN:-none}" >&2
 
 cd "$ROOT/node"
 BUILD_JSON="$(mktemp "${TMPDIR:-/tmp}/raven-0a2-cargo-json-XXXXXX")"
@@ -150,44 +250,26 @@ if [[ ! -f "$BIN" ]]; then
 fi
 echo "binary=$BIN" >&2
 
-dump_symbols() {
-  case "$SYMBOL_TOOL" in
-    nm)
-      nm -gU "$BIN" >"$SYM_OUT" 2>/dev/null || nm -g "$BIN" >"$SYM_OUT" 2>/dev/null \
-        || die "nm failed on $BIN"
-      ;;
-    llvm-nm)
-      llvm-nm --defined-only "$BIN" >"$SYM_OUT" 2>/dev/null \
-        || llvm-nm "$BIN" >"$SYM_OUT" 2>/dev/null \
-        || die "llvm-nm failed on $BIN"
-      ;;
-    dumpbin)
-      dumpbin //SYMBOLS "$BIN" >"$SYM_OUT" 2>/dev/null \
-        || dumpbin /SYMBOLS "$BIN" >"$SYM_OUT" 2>/dev/null \
-        || die "dumpbin /SYMBOLS failed on $BIN"
-      ;;
-    *)
-      die "unsupported symbol tool $SYMBOL_TOOL"
-      ;;
-  esac
-}
-
 count_sym() {
   local sym="$1"
-  local n=0
-  set +e
-  case "$SYMBOL_TOOL" in
-    nm|llvm-nm)
-      n="$(python3 - "$sym" "$SYM_OUT" <<'PY'
+  local n
+  n="$(python3 - "$sym" "$SYM_OUT" <<'PY'
 import re, sys
 sym, path = sys.argv[1], sys.argv[2]
 text = open(path, encoding="utf-8", errors="replace").read()
-# BSD/llvm default: "00001234 T sqlite3_open_v2"
-#if posix/sysv: "sqlite3_open_v2 T 00001234" or "name | addr | T"
 patterns = [
+    # BSD/llvm: "00001234 T sqlite3_open_v2"
     rf"(?:^|\s)[TtAaDd]\s+_?{re.escape(sym)}(?:@[0-9]+)?\s*$",
+    # posix/sysv: "sqlite3_open_v2 T 00001234" or "name | addr | T"
     rf"^_?{re.escape(sym)}(?:@[0-9]+)?\s+\|.*\|\s+[TtAaDd]\b",
     rf"^_?{re.escape(sym)}(?:@[0-9]+)?\s+[TtAaDd]\s+",
+    # dumpbin: External | sqlite3_open_v2
+    rf"External\s+\|\s+_?{re.escape(sym)}(?:\s|$)",
+    # llvm-pdbutil dump -publics
+    rf"name\s*=\s*`_?{re.escape(sym)}`",
+    rf"\|\s+_?{re.escape(sym)}\s*$",
+    # llvm-pdbutil pretty -publics ("  sqlite3_open_v2 [32-bit function]")
+    rf"^\s+_?{re.escape(sym)}(?:\s|$)",
 ]
 n = 0
 for pat in patterns:
@@ -199,25 +281,210 @@ if n == 0:
         parts = line.split()
         if len(parts) < 2:
             continue
-        last = parts[-1].split("@")[0].lstrip("_")
+        last = parts[-1].split("@")[0].lstrip("_").strip("`")
         kind = parts[-2] if len(parts) >= 2 else ""
         if last == sym and kind not in {"U", "u"}:
             n += 1
 print(n)
 PY
 )"
-      ;;
-    dumpbin)
-      # MSVC dumpbin lists External | sqlite3_open_v2
-      n="$(grep -E "External[[:space:]]+\|[[:space:]]+_?${sym}([[:space:]]|$)" "$SYM_OUT" | wc -l | tr -d ' ')"
-      if [[ "$n" == "0" ]]; then
-        n="$(grep -E "[[:space:]]_?${sym}([[:space:]]|$)" "$SYM_OUT" | grep -ci 'External' | tr -d ' ' || true)"
-      fi
-      ;;
-  esac
-  set -e
   [[ -n "$n" ]] || n=0
   echo "$n"
+}
+
+# Run one symbol dumper. Empty success (MSVC PE has no COFF table) is not a hit.
+windows_try_source() {
+  local label="$1"
+  shift
+  set +e
+  "$@" >"$SYM_OUT" 2>/dev/null
+  local rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    echo "symbol source $label failed rc=$rc" >&2
+    : >"$SYM_OUT"
+    return 1
+  fi
+  if [[ ! -s "$SYM_OUT" ]]; then
+    echo "symbol source $label empty" >&2
+    return 1
+  fi
+  local n
+  n="$(count_sym sqlite3_open_v2)"
+  echo "symbol source $label sqlite3_open_v2 count=$n lines=$(wc -l <"$SYM_OUT" | tr -d ' ')" >&2
+  [[ "$n" != "0" ]]
+}
+
+resolve_pdb() {
+  local bin="$1"
+  local cand extracted sib
+  for cand in "${bin%.exe}.pdb" "${bin%.EXE}.pdb"; do
+    if [[ -f "$cand" ]]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  if command -v llvm-readobj >/dev/null 2>&1; then
+    extracted="$(
+      llvm-readobj --coff-debug-directory "$bin" 2>/dev/null | python3 - <<'PY'
+import re, sys
+text = sys.stdin.read()
+for pat in (
+    r"PdbFileName:\s+(\S+)",
+    r"Filename:\s+(\S+\.pdb)",
+    r"PDBFileName:\s+(\S+)",
+):
+    match = re.search(pat, text, flags=re.I)
+    if match:
+        print(match.group(1).strip().strip('"'))
+        break
+PY
+    )"
+    extracted="${extracted%$'\r'}"
+    if [[ -n "$extracted" ]]; then
+      if [[ -f "$extracted" ]]; then
+        printf '%s\n' "$extracted"
+        return 0
+      fi
+      sib="$(dirname "$bin")/$(basename "$extracted")"
+      if [[ -f "$sib" ]]; then
+        printf '%s\n' "$sib"
+        return 0
+      fi
+      converted="$(bash_path "$extracted" 2>/dev/null || true)"
+      if [[ -n "$converted" && -f "$converted" ]]; then
+        printf '%s\n' "$converted"
+        return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
+newest_native_sqlite_lib() {
+  local deps dir cand
+  deps="$(dirname "$BIN")"
+  dir="$(dirname "$deps")"
+  local found=""
+  set +e
+  found="$(ls -1t \
+    "$deps"/sqlite3.lib \
+    "$deps"/sqlcipher.lib \
+    "$deps"/libsqlite3.a \
+    "$dir"/build/libsqlite3-sys-*/out/sqlite3.lib \
+    "$dir"/build/libsqlite3-sys-*/out/sqlcipher.lib \
+    "$dir"/build/libsqlite3-sys-*/out/libsqlite3.a \
+    2>/dev/null | head -n 1)"
+  set -e
+  found="${found%$'\r'}"
+  [[ -n "$found" && -f "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+
+dump_symbols() {
+  if [[ "$IS_WINDOWS" -eq 0 ]]; then
+    case "$SYMBOL_TOOL" in
+      nm)
+        nm -gU "$BIN" >"$SYM_OUT" 2>/dev/null || nm -g "$BIN" >"$SYM_OUT" 2>/dev/null \
+          || die "nm failed on $BIN"
+        ;;
+      *)
+        die "unsupported Unix symbol tool $SYMBOL_TOOL"
+        ;;
+    esac
+    return 0
+  fi
+
+  # MSVC: llvm-nm --defined-only on the EXE often exits 0 with an empty table
+  # because bundled sqlite C symbols live in the PDB, not the PE.
+  if [[ -n "$DUMPBIN_BIN" ]]; then
+    windows_try_source "dumpbin-exe" "$DUMPBIN_BIN" //SYMBOLS "$BIN" \
+      || windows_try_source "dumpbin-exe" "$DUMPBIN_BIN" /SYMBOLS "$BIN" \
+      || true
+    if [[ "$(count_sym sqlite3_open_v2)" != "0" ]]; then
+      SYMBOL_TOOL="dumpbin"
+      echo "symbol_source=dumpbin exe" >&2
+      return 0
+    fi
+  fi
+
+  if command -v llvm-nm >/dev/null 2>&1; then
+    # Empty --defined-only is success; do not treat it as the only dump.
+    windows_try_source "llvm-nm-defined" llvm-nm --defined-only "$BIN" || true
+    if [[ "$(count_sym sqlite3_open_v2)" != "0" ]]; then
+      SYMBOL_TOOL="llvm-nm"
+      echo "symbol_source=llvm-nm --defined-only exe" >&2
+      return 0
+    fi
+    windows_try_source "llvm-nm" llvm-nm "$BIN" || true
+    if [[ "$(count_sym sqlite3_open_v2)" != "0" ]]; then
+      SYMBOL_TOOL="llvm-nm"
+      echo "symbol_source=llvm-nm exe" >&2
+      return 0
+    fi
+  fi
+
+  local pdb=""
+  pdb="$(resolve_pdb "$BIN" || true)"
+  if [[ -n "$pdb" ]]; then
+    echo "pdb=$pdb" >&2
+    if [[ -n "$PDBUTIL_BIN" ]]; then
+      windows_try_source "pdbutil-pretty" "$PDBUTIL_BIN" pretty -publics "$pdb" || true
+      if [[ "$(count_sym sqlite3_open_v2)" != "0" ]]; then
+        SYMBOL_TOOL="llvm-pdbutil"
+        echo "symbol_source=llvm-pdbutil pretty -publics" >&2
+        return 0
+      fi
+      windows_try_source "pdbutil-dump" "$PDBUTIL_BIN" dump -publics "$pdb" || true
+      if [[ "$(count_sym sqlite3_open_v2)" != "0" ]]; then
+        SYMBOL_TOOL="llvm-pdbutil"
+        echo "symbol_source=llvm-pdbutil dump -publics" >&2
+        return 0
+      fi
+    fi
+    if command -v llvm-nm >/dev/null 2>&1; then
+      windows_try_source "llvm-nm-pdb" llvm-nm "$pdb" || true
+      if [[ "$(count_sym sqlite3_open_v2)" != "0" ]]; then
+        SYMBOL_TOOL="llvm-nm"
+        echo "symbol_source=llvm-nm pdb" >&2
+        return 0
+      fi
+    fi
+  else
+    echo "pdb=missing (sibling of $BIN)" >&2
+  fi
+
+  # Last resort: newest libsqlite3-sys archive next to this artifact. Import
+  # rejection still proves the final image did not take sqlite3.dll.
+  local native=""
+  native="$(newest_native_sqlite_lib || true)"
+  if [[ -n "$native" ]]; then
+    echo "native_lib=$native" >&2
+    if command -v llvm-nm >/dev/null 2>&1; then
+      windows_try_source "native-lib-nm-defined" llvm-nm --defined-only "$native" \
+        || windows_try_source "native-lib-nm" llvm-nm "$native" \
+        || true
+      if [[ "$(count_sym sqlite3_open_v2)" != "0" ]]; then
+        SYMBOL_TOOL="llvm-nm"
+        echo "symbol_source=llvm-nm native lib" >&2
+        return 0
+      fi
+    fi
+    if [[ -n "$DUMPBIN_BIN" ]]; then
+      windows_try_source "native-lib-dumpbin" "$DUMPBIN_BIN" //SYMBOLS "$native" \
+        || windows_try_source "native-lib-dumpbin" "$DUMPBIN_BIN" /SYMBOLS "$native" \
+        || true
+      if [[ "$(count_sym sqlite3_open_v2)" != "0" ]]; then
+        SYMBOL_TOOL="dumpbin"
+        echo "symbol_source=dumpbin native lib" >&2
+        return 0
+      fi
+    fi
+  fi
+
+  echo "--- last symbol dump head ---" >&2
+  head -n 25 "$SYM_OUT" >&2 || true
+  die "Windows MSVC symbol table empty for $BIN (tried dumpbin/llvm-nm/PDB/native lib; C symbols are not in the PE)"
 }
 
 dump_symbols
@@ -260,8 +527,8 @@ dump_imports() {
       ldd "$BIN" >"$IMP_OUT"
       ;;
     dumpbin)
-      dumpbin //IMPORTS "$BIN" >"$IMP_OUT" 2>/dev/null \
-        || dumpbin /IMPORTS "$BIN" >"$IMP_OUT" 2>/dev/null \
+      "${DUMPBIN_BIN:-dumpbin}" //IMPORTS "$BIN" >"$IMP_OUT" 2>/dev/null \
+        || "${DUMPBIN_BIN:-dumpbin}" /IMPORTS "$BIN" >"$IMP_OUT" 2>/dev/null \
         || die "dumpbin /IMPORTS failed on $BIN"
       ;;
     llvm-readobj)

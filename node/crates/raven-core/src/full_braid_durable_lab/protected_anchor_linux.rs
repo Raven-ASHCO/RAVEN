@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn production_flag_stays_off() {
-        assert!(!PRODUCTION_ENABLED);
+        const { assert!(!PRODUCTION_ENABLED) };
         assert_eq!(RELEASE_HOLD, "FULL_BRAID_PROTECTED_ANCHOR_NOT_APPROVED");
     }
 
