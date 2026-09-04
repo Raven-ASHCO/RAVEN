@@ -963,26 +963,24 @@ fn linux_secret_service_is_session_bus_missing(err: &IdentityStoreError) -> bool
 
 /// Test/lab helper: request the debug locked-file identity backend.
 ///
-/// Headless Linux has no Secret Service. Tests must not assume the default
-/// GNU/Linux backend works. Once set, the env stays set so parallel tests
-/// cannot race on process env (do not clear a CI job override).
-///
-/// macOS is a no-op: Keychain is available, and forcing locked-file here
-/// races migrate / binding-tamper / seed-conflict tests that assert Keychain.
+/// **GNU/Linux only.** Headless Ubuntu has no Secret Service. Once set, the
+/// env stays set so parallel tests cannot race (do not clear a CI job
+/// override). macOS Keychain and Windows DPAPI tests stay on the platform
+/// store — forcing locked-file there regresses migrate / tamper / conflict.
 #[cfg(test)]
 pub(crate) fn test_enable_locked_file_identity_backend() {
-    use std::sync::Once;
-    static ENABLE: Once = Once::new();
-    ENABLE.call_once(|| {
-        if cfg!(target_os = "macos") {
-            return;
-        }
-        if locked_file_backend_requested() {
-            return;
-        }
-        // SAFETY: test-only process env for the documented lab/CI backend.
-        unsafe { std::env::set_var("RAVEN_IDENTITY_BACKEND", "locked-file") }
-    });
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::sync::Once;
+        static ENABLE: Once = Once::new();
+        ENABLE.call_once(|| {
+            if locked_file_backend_requested() {
+                return;
+            }
+            // SAFETY: test-only process env for the documented lab/CI backend.
+            unsafe { std::env::set_var("RAVEN_IDENTITY_BACKEND", "locked-file") }
+        });
+    }
 }
 
 /// Same unmarked locked-file probe as macOS, plus one lab-only exception:
