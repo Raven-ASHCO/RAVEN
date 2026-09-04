@@ -1,0 +1,42 @@
+# Thin always-on B1 gate. No path filters: docs-only PRs still get a required
+# status. Exercises the shipping terminal path, not Full Braid / ML-KEM lab.
+name: Raven B1 Always-On
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: raven-b1-always-on-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  b1-always-on:
+    name: B1 always-on gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secret history scan (CI mode)
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/secret_history_scan.sh --ci
+      - name: Messaging-only product boundary
+        working-directory: ${{ github.workspace }}
+        run: bash node/scripts/messaging_product_boundary_gate.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+          prefix-key: b1-always-on
+      - name: rustfmt (shipping crates)
+        run: cargo fmt --all -- --check
+      - name: Terminal messaging-path tests
+        run: cargo test -p raven-core --lib messaging_path

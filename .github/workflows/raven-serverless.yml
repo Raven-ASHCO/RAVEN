@@ -1,65 +1,15 @@
-# Raven serverless node CI — B1-required product gates.
+# Raven serverless node CI — B1-required product / terminal-path gates.
 # Lab / experimental jobs live in raven-serverless-lab.yml so a lab failure
 # cannot fail this workflow conclusion.
+# Thin always-on companion: raven-b1-always-on.yml (`B1 always-on gate`).
 name: Raven Serverless Node
 
 on:
+  # No path filters on the B1 product workflow. Docs-only PRs still get
+  # conclusions for Messaging / Secret / Rust job names after required-check
+  # pin. Lab stays path-filtered in raven-serverless-lab.yml.
   push:
-    paths:
-      - "node/**"
-      - "protocol/**"
-      - "shared-vectors/**"
-      - "ios-native/RAVEN/Libp2pBridge/**"
-      - "ios-native/RAVEN/RAVEN/Core/Config/FeatureFlags.swift"
-      - "ios-native/RAVEN/RAVEN/Core/Protocol/**"
-      - "ios-native/RAVEN/RAVEN/Core/Mesh/**"
-      - "ios-native/RAVEN/RAVEN/Core/Transport/**"
-      - "ios-native/RAVEN/RAVEN/Core/Messaging/**"
-      - "ios-native/RAVEN/RAVEN/Core/Security/ATSAM/**"
-      - "ios-native/RAVEN/RAVEN/Core/Security/LAN/**"
-      - "ios-native/RAVEN/RAVEN/Core/Security/MessageContentSealer.swift"
-      - "ios-native/RAVEN/RAVEN.xcodeproj/**"
-      - "ios-native/RAVEN/RAVEN/App/**"
-      - "ios-native/RAVEN/RAVEN/Features/Contacts/**"
-      - "ios-native/RAVEN/RAVEN/Features/QRCode/**"
-      - "ios-native/RAVEN/RAVEN/Features/Settings/RavenServerlessLanSettingsView.swift"
-      - "ios-native/RAVEN/RAVENTests/**"
-      - "ios-native/RAVEN/RAVEN/**/*.swift"
-      - "RAVEN-WatchApp/RAVEN-Watch/**/*.swift"
-      - "node/scripts/ios_lan_kat.sh"
-      - "node/scripts/ios_lan_lab_checklist.md"
-      - "scripts/secret_history_scan.sh"
-      - "docs/MIGRATION_SERVERLESS_V1.md"
-      - ".github/workflows/raven-serverless.yml"
-      - ".github/workflows/raven-serverless-lab.yml"
   pull_request:
-    paths:
-      - "node/**"
-      - "protocol/**"
-      - "shared-vectors/**"
-      - "ios-native/RAVEN/Libp2pBridge/**"
-      - "ios-native/RAVEN/RAVEN/Core/Config/FeatureFlags.swift"
-      - "ios-native/RAVEN/RAVEN/Core/Protocol/**"
-      - "ios-native/RAVEN/RAVEN/Core/Mesh/**"
-      - "ios-native/RAVEN/RAVEN/Core/Transport/**"
-      - "ios-native/RAVEN/RAVEN/Core/Messaging/**"
-      - "ios-native/RAVEN/RAVEN/Core/Security/ATSAM/**"
-      - "ios-native/RAVEN/RAVEN/Core/Security/LAN/**"
-      - "ios-native/RAVEN/RAVEN/Core/Security/MessageContentSealer.swift"
-      - "ios-native/RAVEN/RAVEN.xcodeproj/**"
-      - "ios-native/RAVEN/RAVEN/App/**"
-      - "ios-native/RAVEN/RAVEN/Features/Contacts/**"
-      - "ios-native/RAVEN/RAVEN/Features/QRCode/**"
-      - "ios-native/RAVEN/RAVEN/Features/Settings/RavenServerlessLanSettingsView.swift"
-      - "ios-native/RAVEN/RAVENTests/**"
-      - "ios-native/RAVEN/RAVEN/**/*.swift"
-      - "RAVEN-WatchApp/RAVEN-Watch/**/*.swift"
-      - "node/scripts/ios_lan_kat.sh"
-      - "node/scripts/ios_lan_lab_checklist.md"
-      - "scripts/secret_history_scan.sh"
-      - "docs/MIGRATION_SERVERLESS_V1.md"
-      - ".github/workflows/raven-serverless.yml"
-      - ".github/workflows/raven-serverless-lab.yml"
   workflow_dispatch:
 
 concurrency:
