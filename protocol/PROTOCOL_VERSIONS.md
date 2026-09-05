@@ -1,10 +1,10 @@
 # RAVEN Protocol Version Inventory
 
 **Status:** Living inventory (docs only). Not a wire change.
-**Updated:** 2026-09-04
+**Updated:** 2026-09-05
 **Audience:** protocol owners, ports, CI readers.
 
-This page lists which protocol families are frozen, which are draft / production-disabled, and which CI jobs in `.github/workflows/raven-serverless.yml` (workflow display name: **Raven Serverless Node**) can be cited as evidence on the current serverless `main` tree.
+This page lists which protocol families are frozen, which are draft / production-disabled, and which CI jobs in `.github/workflows/raven-serverless.yml` (workflow display name: **Raven Serverless Node**) and `.github/workflows/raven-b1-always-on.yml` (workflow display name: **Raven B1 Always-On**) can be cited as evidence on the current serverless `main` tree.
 
 Wire codecs, vectors, and workflow YAML are unchanged by this document.
 
@@ -61,33 +61,51 @@ Capability negotiation is layered on version negotiation. Reconciling legacy RUM
 
 Example green tips cited by DevSecOps: `148cdc9` (run [`33867613614`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol/actions/runs/33867613614)), `b7fca2a` (run [`33869790847`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol/actions/runs/33869790847)).
 
-**RAVEN Serverless Node B1 remains held / separate.** This inventory does **not** promote jobs in `.github/workflows/raven-serverless.yml` to required gates on this repo’s `main`. See **CI consumers on serverless `main`** below. Do not treat RDAP B1 as RAVEN `main` branch protection, and do not invent RAVEN green checks from this note.
+Do not treat RDAP B1 as RAVEN `main` branch protection. RAVEN Serverless names and status are in **RAVEN Serverless B1 (main-green verified, pin not enabled)** below. RDAP’s live-pin language does **not** apply to RAVEN.
+
+---
+
+## RAVEN Serverless B1 (main-green verified, pin not enabled)
+
+DevSecOps confirmed **main-green verified** on tip `e0a317aa` (`e0a317aa6d4873d13b674a8e62adc204950d7935`):
+
+- Workflow **Raven Serverless Node** run [`33989477053`](https://github.com/Raven-ASHCO/RAVEN/actions/runs/33989477053) → success (push)
+- Workflow **Raven B1 Always-On** run [`33989477009`](https://github.com/Raven-ASHCO/RAVEN/actions/runs/33989477009) → success (push); job `B1 always-on gate` success
+
+These six check names were SUCCESS on that tip. They are **PR-green candidates now recorded as main-green**. Pin / branch-protection is **NOT enabled** — pending **founder GO**. They are **not** “live required B1 pins.” That language is reserved for after founder GO. RDAP’s six A2A contexts above already use live-pin language; keep the distinction.
+
+1. `B1 always-on gate`
+2. `Messaging-only product boundary`
+3. `Secret pattern scan`
+4. `Rust + vectors (Linux)`
+5. `Rust (macOS)`
+6. `Rust (Windows)`
+
+This inventory does **not** enable branch protection and does **not** promote these names to required checks on this repo’s `main`.
 
 ---
 
 ## CI consumers on serverless `main` (honesty)
 
-This repo’s current `main` has **`node/`**, **`protocol/`**, and **`shared-vectors/`**. It has **0** `ios-native/` and **0** `RAVEN-WatchApp/` paths. The workflow file still names iOS / Watch / Libp2pBridge jobs. Those jobs are **blocked / N/A on serverless main until tree and workflow are aligned**. DevSecOps owns that CI fix. This inventory does **not** treat those jobs as healthy required gates.
+This repo’s current `main` has **`node/`**, **`protocol/`**, and **`shared-vectors/`**. It has **0** `ios-native/` and **0** `RAVEN-WatchApp/` paths. iOS / Go / Watch jobs remain **skip-when-absent / N/A** on this serverless tree (unchanged honesty from [PR #9](https://github.com/Raven-ASHCO/RAVEN/pull/9)). This inventory does **not** treat those jobs as healthy required gates.
 
-Cite present-tree evidence first:
+Cite present-tree evidence first. The six names in **RAVEN Serverless B1** above are **main-green verified** on `e0a317aa`; pin is **not** enabled.
 
 | Workflow job `name:` | Step `name:` (when relevant) | Present-tree status |
 |---|---|---|
-| **Rust + vectors (Linux)** | **protocol vectors (python)** | Intended `rvn1` vector regen/drift gate (`pytest` + `generate_rvn1.py` + `git diff --exit-code` on `shared-vectors/rvn1`). Job as a whole is **not-yet-green** on live PRs (`cargo fmt --check`). |
-| **Rust + vectors (Linux)** | **experimental mailbox/NAT tests (still production-disabled)** | Intended fail-closed hold: experimental binaries must refuse to run without explicit opt-in. Same job is **not-yet-green** (`fmt`). |
+| **Rust + vectors (Linux)** | **protocol vectors (python)** | Intended `rvn1` vector regen/drift gate (`pytest` + `generate_rvn1.py` + `git diff --exit-code` on `shared-vectors/rvn1`). Parent job is **main-green verified** on `e0a317aa` (pin not enabled). |
+| **Rust + vectors (Linux)** | **experimental mailbox/NAT tests (still production-disabled)** | Intended fail-closed hold: experimental binaries must refuse to run without explicit opt-in. Parent job is **main-green verified** on `e0a317aa` (pin not enabled). Profile remains production-disabled. |
 | **.NET / C# rvn1 shared-vector consumer** | — | **NOT YET.** No smoke gate in `raven-serverless.yml`. Do not invent a C# harness. |
 
-Jobs that exist in YAML but are **path-missing / red / not required gates** on this `main`:
+Jobs that remain **skip-when-absent / N/A** on this serverless `main` (not B1 candidates; not required gates):
 
 | Workflow job `name:` | Why it is not a healthy gate here |
 |---|---|
-| **Messaging-only product boundary** | Script requires `ios-native/RAVEN` and `RAVEN-WatchApp/RAVEN-Watch` sources. **Path-missing.** |
-| **Go libp2p bridge security** | `working-directory: ios-native/RAVEN/Libp2pBridge` (`go.mod` absent). **Path-missing.** |
-| **iOS protocol security tests** | `working-directory: ios-native/RAVEN`. **Path-missing.** |
-| **Full Braid Slice 2 lab (iOS)** | `ios_full_braid_lab_gate.sh` requires `ios-native/RAVEN`. **Path-missing / blocked.** |
-| **Full Braid Task 0A macOS + iOS (0A.2–0A.4)** | iOS half needs the same missing tree. **Blocked / N/A** until alignment. |
-| **Rust (macOS)** | Live PR failure: `adversarial_atsam` / `full-braid-lab` feature issue. **Red / not-yet-green.** Do not cite as green. |
+| **Go libp2p bridge security** | `working-directory: ios-native/RAVEN/Libp2pBridge` (`go.mod` absent). **Skip-when-absent / N/A.** |
+| **iOS protocol security tests** | `working-directory: ios-native/RAVEN`. **Skip-when-absent / N/A.** |
+| **Full Braid Slice 2 lab (iOS)** | Lab workflow; requires `ios-native/RAVEN`. **Skip-when-absent / N/A.** |
+| **Full Braid Task 0A macOS + iOS (0A.2–0A.4)** | Lab workflow; iOS half needs the same missing tree. **Skip-when-absent / N/A.** |
 
-Other job display names in the same workflow (not claimed green here): **Secret pattern scan**, **ML-KEM-768 incremental (portable)**, **ML-KEM-768 incremental (AVX2)**, **ML-KEM-768 incremental (NEON)**, **Full Braid Slice 2 lab**, **Full Braid Task 0A provenance (0A.1)**, **Full Braid Task 0A Linux (0A.2/0A.4/0A.5)**, **Full Braid Task 0A Windows MSVC (0A.2/0A.4)**, **Rust (Windows)**.
+Watch jobs remain **N/A** on this serverless tree (no `RAVEN-WatchApp/` paths). Other lab job display names (not claimed as RAVEN B1 here): **ML-KEM-768 incremental (portable)**, **ML-KEM-768 incremental (AVX2)**, **ML-KEM-768 incremental (NEON)**, **Full Braid Slice 2 lab**, **Full Braid Task 0A provenance (0A.1)**, **Full Braid Task 0A Linux (0A.2/0A.4/0A.5)**, **Full Braid Task 0A Windows MSVC (0A.2/0A.4)**.
 
 Platform vector consumers outside this workflow: see [`../shared-vectors/README.md`](../shared-vectors/README.md). **.NET / C# `rvn1` CI consumer is NOT YET.**
