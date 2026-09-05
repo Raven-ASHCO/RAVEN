@@ -5,6 +5,8 @@
 #
 # RAVEN_IDENTITY_BACKEND=locked-file — demo/CI file keystore so ash and
 # raven-node share the same data_dir without macOS Keychain ACL prompts.
+# RAVEN_CHAT_HISTORY_BACKEND=locked-file — same debug/lab SS connect-fail
+# path for send (headless rust-linux has no org.freedesktop.secrets).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,6 +16,7 @@ NODE="$BIN/raven-node"
 export PATH="${HOME}/.cargo/bin:${PATH}"
 export NO_COLOR=1
 export RAVEN_IDENTITY_BACKEND=locked-file
+export RAVEN_CHAT_HISTORY_BACKEND=locked-file
 
 source "${HOME}/.cargo/env" 2>/dev/null || true
 if [[ ! -x "$ASH" || ! -x "$NODE" ]]; then

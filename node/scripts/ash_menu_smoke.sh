@@ -23,6 +23,7 @@ trap cleanup EXIT
 # locked-file is debug-only. RAVEN_ALLOW_EPHEMERAL_DATA_DIR=1 keeps mktemp
 # --data-dir (ash otherwise remaps /tmp/raven-ash-* to ~/.raven for Mac whoami).
 export RAVEN_IDENTITY_BACKEND=locked-file
+export RAVEN_CHAT_HISTORY_BACKEND=locked-file
 export RAVEN_ALLOW_EPHEMERAL_DATA_DIR=1
 
 echo "=== ash menu smoke workdir=$WORKDIR ==="

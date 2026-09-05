@@ -4,6 +4,12 @@
 //! GNU/Linux its random encryption key lives in Keychain / Secret Service; on
 //! Windows the payload is protected directly with user-scoped DPAPI. There is
 //! deliberately no plaintext or mode-0600-key fallback.
+//!
+//! Headless GNU/Linux CI has no session bus. Debug lab/CI (and `cfg(test)`)
+//! may derive a per-`data_dir` key when Secret Service **connect** fails and
+//! an explicit locked-file override is set (`RAVEN_CHAT_HISTORY_BACKEND` or
+//! `RAVEN_IDENTITY_BACKEND`). Locked/search/get stay fail-closed. Release
+//! never takes this path.
 
 use crate::sanitize::sanitize_terminal_text;
 #[cfg(any(
@@ -898,7 +904,7 @@ fn platform_set_key(data_dir: &Path, key: &[u8; 32]) -> Result<(), ChatHistoryEr
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn linux_secret_service_connect_failed(err: &ChatHistoryError) -> bool {
     matches!(
         err,
@@ -908,11 +914,31 @@ fn linux_secret_service_connect_failed(err: &ChatHistoryError) -> bool {
     )
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn chat_history_lab_backend_requested() -> bool {
+    for key in ["RAVEN_CHAT_HISTORY_BACKEND", "RAVEN_IDENTITY_BACKEND"] {
+        if std::env::var_os(key).is_some_and(|v| v == "locked-file") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Same GNU/Linux SS connect-fail lab path as identity/prekey.
+///
+/// `cfg(test)` keeps `cargo test -p raven-core` green. Debug ash/raven-node
+/// (CI smokes) also take this path when an explicit locked-file env is set.
+/// Never Release; never a 0600-key fallback.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn chat_history_lab_key_allowed() -> bool {
+    cfg!(test) || (cfg!(debug_assertions) && chat_history_lab_backend_requested())
+}
+
 /// Headless rust-linux has no session bus. This is **not** a production
-/// 0600-key fallback — `cfg(test)` only, per-`data_dir` derived key so
+/// 0600-key fallback — lab/CI only, per-`data_dir` derived key so send and
 /// lan_dispatch can exercise history/stage without org.freedesktop.secrets.
-#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
-fn test_lab_history_key(data_dir: &Path) -> Zeroizing<[u8; 32]> {
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn lab_history_key(data_dir: &Path) -> Zeroizing<[u8; 32]> {
     let canonical = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let mut hasher = Sha256::new();
     hasher.update(b"raven/chat-history/test-lab-key/v1");
@@ -932,9 +958,9 @@ fn load_platform_key(
         Ok(Some(key)) => return Ok(key),
         Ok(None) => {}
         Err(e) => {
-            #[cfg(all(test, target_os = "linux", target_env = "gnu"))]
-            if linux_secret_service_connect_failed(&e) {
-                return Ok(test_lab_history_key(data_dir));
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            if linux_secret_service_connect_failed(&e) && chat_history_lab_key_allowed() {
+                return Ok(lab_history_key(data_dir));
             }
             return Err(e);
         }
@@ -1739,6 +1765,60 @@ impl BlockList {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn linux_ss_connect_fail_classifier_is_narrow() {
+        let connect = ChatHistoryError::ProtectedStoreUnavailable(
+            "secret-service connection failed: zbus error: I/O error: No such file or directory (os error 2)"
+                .into(),
+        );
+        let service_unknown = ChatHistoryError::ProtectedStoreUnavailable(
+            "secret-service connection failed: zbus error: org.freedesktop.DBus.Error.ServiceUnknown: \
+             The name org.freedesktop.secrets was not provided by any .service files"
+                .into(),
+        );
+        let locked =
+            ChatHistoryError::ProtectedStoreUnavailable("secret-service collection locked".into());
+        let search = ChatHistoryError::ProtectedStoreUnavailable(
+            "secret-service search failed: denied".into(),
+        );
+        let read = ChatHistoryError::ProtectedStoreUnavailable(
+            "secret-service read failed: denied".into(),
+        );
+        assert!(linux_secret_service_connect_failed(&connect));
+        assert!(linux_secret_service_connect_failed(&service_unknown));
+        assert!(!linux_secret_service_connect_failed(&locked));
+        assert!(!linux_secret_service_connect_failed(&search));
+        assert!(!linux_secret_service_connect_failed(&read));
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn linux_lab_history_key_is_stable_per_data_dir() {
+        let dir = tempdir().unwrap();
+        let a = lab_history_key(dir.path());
+        let b = lab_history_key(dir.path());
+        assert_eq!(*a, *b);
+        let other = tempdir().unwrap();
+        let c = lab_history_key(other.path());
+        assert_ne!(*a, *c);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn linux_platform_protector_roundtrips_without_secret_service() {
+        let dir = tempdir().unwrap();
+        let protector = PlatformChatHistoryProtector;
+        let plain = b"{\"entries\":[]}";
+        let ct = protector
+            .protect(dir.path(), plain)
+            .expect("lab or Secret Service protect");
+        let back = protector
+            .unprotect(dir.path(), &ct)
+            .expect("lab or Secret Service unprotect");
+        assert_eq!(back, plain);
+    }
 
     struct TestProtector {
         key: [u8; 32],
