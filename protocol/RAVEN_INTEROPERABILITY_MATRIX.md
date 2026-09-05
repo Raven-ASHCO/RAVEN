@@ -2,10 +2,10 @@
 
 **Version:** 1  
 **Status:** Living evidence table for Phase A/B freeze  
-**Updated:** 2026-09-04  
+**Updated:** 2026-09-05
 **Version inventory:** [`PROTOCOL_VERSIONS.md`](PROTOCOL_VERSIONS.md)
 
-CI names below are the `name:` strings from `.github/workflows/raven-serverless.yml` (workflow display name: **Raven Serverless Node**). This serverless `main` has **no** `ios-native/` or `RAVEN-WatchApp/` tree. Jobs that `cd` into those paths are **blocked / N/A until tree and workflow are aligned**. They are listed so the names stay accurate; they are **not** healthy required gates. **.NET / C# `rvn1` shared-vector CI consumer is NOT YET** (no smoke gate in that workflow).
+CI names below are the `name:` strings from `.github/workflows/raven-serverless.yml` (workflow display name: **Raven Serverless Node**) and, for the thin always-on companion, `.github/workflows/raven-b1-always-on.yml` (**Raven B1 Always-On**). This serverless `main` has **no** `ios-native/` or `RAVEN-WatchApp/` tree. iOS / Go / Watch jobs remain **skip-when-absent / N/A** on this tree (unchanged honesty from [PR #9](https://github.com/Raven-ASHCO/RAVEN/pull/9)); they are **not** healthy required gates. Six RAVEN B1 check names are **main-green verified** on `e0a317aa`; pin / branch-protection is **NOT enabled** — pending **founder GO**. They are **not** “live required B1 pins” (that language is reserved for after founder GO; RDAP’s six A2A contexts already use live-pin language). See [`PROTOCOL_VERSIONS.md`](PROTOCOL_VERSIONS.md) § RAVEN Serverless B1. **.NET / C# `rvn1` shared-vector CI consumer is NOT YET** (no smoke gate in `raven-serverless.yml`).
 
 ## 1. Wire object parity
 
@@ -28,7 +28,7 @@ CI names below are the `name:` strings from `.github/workflows/raven-serverless.
 | Bridge opaque forward | BRIDGE | — | `bridge` + demos | `RavenEnvelopeBridgeService` | |
 | Endpoint transaction | ENDPOINT_TRANSACTION | — | production-disabled Rust actor | production-disabled Swift actor | no new envelope bytes; **production disabled** — §5 |
 | Hybrid ratchet v2 / PairInit V2 | HYBRID_RATCHET_V2 | draft KATs | lab / Full Braid | lab FFI (tree absent here) | **REQUIRED / NOT YET APPROVED**; production disabled — §5 |
-| Full Braid lab | HYBRID_RATCHET_V2 lab | `test_full_braid.py` | `full-braid-lab` feature | iOS lab gate (path-missing) | lab-only vectors `production_enabled: false` — §5 |
+| Full Braid lab | HYBRID_RATCHET_V2 lab | `test_full_braid.py` | `full-braid-lab` feature | iOS lab gate (skip-when-absent / N/A) | lab-only vectors `production_enabled: false` — §5 |
 
 ## 2. Transport matrix
 
@@ -58,20 +58,20 @@ Add a row when a new platform claims parity; require shared-vector id or demo sc
 
 Every row below is **production disabled** (or lab-only / not-yet-approved). Vector column uses committed path and `id`/`name` when present; otherwise `—` / `none yet`.
 
-CI status labels: **present-tree evidence** (job can run against `node/` + `protocol/` + `shared-vectors/`, but the parent job may still be **not-yet-green**), **path-missing / blocked**, **red / not-yet-green**, **NOT YET**.
+CI status labels: **present-tree evidence** (job can run against `node/` + `protocol/` + `shared-vectors/`; parent **Rust + vectors (Linux)** is **main-green verified** on `e0a317aa`, pin not enabled), **skip-when-absent / N/A**, **NOT YET**.
 
 | Profile | Vectors / shared-vector ids | CI job `name:` / step `name:` | Status on serverless `main` |
 |---|---|---|---|
-| Indexed session / RVNA1 `0x03` | `shared-vectors/rvn1/atsam/indexed_session_v1_subkeys_001.json` (`atsam_indexed_session_v1_subkeys_001`); `indexed_session_v1_sealed_ack_001.json` (`atsam_indexed_session_v1_sealed_ack_001`) | **Rust + vectors (Linux)** → **protocol vectors (python)**; **iOS protocol security tests** (`ATSAMIndexedSessionProfileTests`) | Production disabled. Linux protocol-vector step is present-tree evidence; parent job **not-yet-green** (`fmt`). iOS job **path-missing / N/A**. |
+| Indexed session / RVNA1 `0x03` | `shared-vectors/rvn1/atsam/indexed_session_v1_subkeys_001.json` (`atsam_indexed_session_v1_subkeys_001`); `indexed_session_v1_sealed_ack_001.json` (`atsam_indexed_session_v1_sealed_ack_001`) | **Rust + vectors (Linux)** → **protocol vectors (python)**; **iOS protocol security tests** (`ATSAMIndexedSessionProfileTests`) | Production disabled. Linux protocol-vector step is present-tree evidence; parent job **main-green verified** on `e0a317aa` (pin not enabled). iOS job **skip-when-absent / N/A**. |
 | PairInit V1 | `shared-vectors/rvn1/atsam/pair_init_v1_001.json` (`atsam_pair_init_v1_001`) | **Rust + vectors (Linux)** → **protocol vectors (python)**; **iOS protocol security tests** (`ATSAMPairInitV1Tests`) | Production disabled. Same Linux vs iOS split as above. |
-| Prekey lifecycle | none yet (local state; no wire type) | **Rust + vectors (Linux)** → **test raven-core + ash** (`raven_core::prekey_lifecycle`) | Production disabled. Isolated Rust actor only. Parent job **not-yet-green** (`fmt`). |
+| Prekey lifecycle | none yet (local state; no wire type) | **Rust + vectors (Linux)** → **test raven-core + ash** (`raven_core::prekey_lifecycle`) | Production disabled. Isolated Rust actor only. Parent job **main-green verified** on `e0a317aa` (pin not enabled). |
 | Prekey bundle (activation held) | `shared-vectors/rvn1/prekey/bundle_structure_001.json` (`bundle_structure_001`); `negative/prekey_bad_sig.json` (`prekey_bad_sig`) | **Rust + vectors (Linux)** → **protocol vectors (python)** | Structural KATs exist; production activation held with PairInit gates. |
-| Endpoint transaction | none yet | **Rust + vectors (Linux)** → **test raven-core + ash**; **iOS protocol security tests** (`ATSAMEndpointTransactionV1Tests`) | Production disabled. No shared-vector id. iOS job **path-missing / N/A**. |
-| Mailbox transport | `shared-vectors/rvn1/store/mailbox_tag_001.json` (`mailbox_tag_001`) for tags; PUT/GET smokes are scripts, not KATs | **Rust + vectors (Linux)** → **experimental mailbox/NAT tests (still production-disabled)**; **mailbox opaque put/get smoke**; **libp2p offline mailbox restart smoke** | Production disabled. Fail-closed hold + smokes are present-tree evidence; parent job **not-yet-green** (`fmt`). |
-| NAT connectivity | — | **Rust + vectors (Linux)** → **experimental mailbox/NAT tests (still production-disabled)** | Production disabled. Fail-closed hold is present-tree evidence; parent job **not-yet-green** (`fmt`). |
-| Full Braid lab | `shared-vectors/rvn1/atsam/full_braid_sm_round_001.json`; `full_braid_full_exchange_2pq_2dh_001.json` (`production_enabled: false`, `lab_only: true`) | **Full Braid Slice 2 lab** → **Test Full Braid (Rust)**, **Python Full Braid reference**, **Production remains off (vectors + no app callsites)**; **Full Braid Slice 2 lab (iOS)** | Lab-only. Linux job is the named lab gate (not claimed green here). iOS lab job **path-missing / blocked**. |
+| Endpoint transaction | none yet | **Rust + vectors (Linux)** → **test raven-core + ash**; **iOS protocol security tests** (`ATSAMEndpointTransactionV1Tests`) | Production disabled. No shared-vector id. iOS job **skip-when-absent / N/A**. |
+| Mailbox transport | `shared-vectors/rvn1/store/mailbox_tag_001.json` (`mailbox_tag_001`) for tags; PUT/GET smokes are scripts, not KATs | **Rust + vectors (Linux)** → **experimental mailbox/NAT tests (still production-disabled)**; **mailbox opaque put/get smoke**; **libp2p offline mailbox restart smoke** | Production disabled. Fail-closed hold + smokes are present-tree evidence; parent job **main-green verified** on `e0a317aa` (pin not enabled). |
+| NAT connectivity | — | **Rust + vectors (Linux)** → **experimental mailbox/NAT tests (still production-disabled)** | Production disabled. Fail-closed hold is present-tree evidence; parent job **main-green verified** on `e0a317aa` (pin not enabled). |
+| Full Braid lab | `shared-vectors/rvn1/atsam/full_braid_sm_round_001.json`; `full_braid_full_exchange_2pq_2dh_001.json` (`production_enabled: false`, `lab_only: true`) | **Full Braid Slice 2 lab** → **Test Full Braid (Rust)**, **Python Full Braid reference**, **Production remains off (vectors + no app callsites)**; **Full Braid Slice 2 lab (iOS)** | Lab-only. Linux job is the named lab gate (not a RAVEN B1 name). iOS lab job **skip-when-absent / N/A**. |
 | Hybrid ratchet v2 / PairInit V2 | `shared-vectors/rvn1/atsam/pair_init_v2_001.json` (name: PairInit V2 / PairResponse V2 wire + pair-expand); `atsam/negative/pair_init_v1_as_v2_001.json`; `atsam/tr_*.json` | **Rust + vectors (Linux)** → **protocol vectors (python)**; **Full Braid Slice 2 lab** | Draft / `NOT YET APPROVED`; production disabled. Wire not a production profile. |
 | Identity Continuity V2 | none yet | — | Draft / production disabled. No CI consumer. |
 | .NET / C# `rvn1` vectors | (would consume `shared-vectors/rvn1/` when added) | — | **NOT YET.** No job or step in `raven-serverless.yml`. |
 
-YAML jobs that must **not** be cited as healthy required gates on this `main`: **Messaging-only product boundary** (missing iOS/Watch sources), **Go libp2p bridge security** (missing `ios-native/RAVEN/Libp2pBridge/go.mod`), **iOS protocol security tests** (missing `ios-native/RAVEN`), **Full Braid Slice 2 lab (iOS)**, **Full Braid Task 0A macOS + iOS (0A.2–0A.4)**, **Rust (macOS)** (live **red**: `adversarial_atsam` / `full-braid-lab` feature issue). See [`PROTOCOL_VERSIONS.md`](PROTOCOL_VERSIONS.md) § CI consumers.
+iOS / Go / Watch jobs (and iOS Full Braid / Task 0A macOS+iOS lab jobs) remain **skip-when-absent / N/A** on this serverless tree. Do not cite them as healthy required gates. The six RAVEN B1 names in [`PROTOCOL_VERSIONS.md`](PROTOCOL_VERSIONS.md) are **main-green verified** on `e0a317aa` only — pin **not** enabled, pending founder GO. They are **not** live required B1 pins. See [`PROTOCOL_VERSIONS.md`](PROTOCOL_VERSIONS.md) § CI consumers.
