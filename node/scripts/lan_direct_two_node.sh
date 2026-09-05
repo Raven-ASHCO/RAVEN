@@ -69,11 +69,18 @@ A_PID=$!
   >"$WORKDIR/b.node.log" 2>&1 &
 B_PID=$!
 
-for _ in $(seq 1 80); do
+# IPC can come up before LAN preflight (session/prekey/history) finishes bind.
+for _ in $(seq 1 150); do
   if [[ -S "$A/raven-node.sock" && -S "$B/raven-node.sock" ]] \
     && grep -q "lan_direct: listen" "$WORKDIR/a.node.log" \
     && grep -q "lan_direct: listen" "$WORKDIR/b.node.log"; then
     break
+  fi
+  if grep -Eqi 'lan_direct failed|service identity preflight failed' \
+    "$WORKDIR/a.node.log" "$WORKDIR/b.node.log" 2>/dev/null; then
+    echo "lan_direct bind/preflight failed" >&2
+    cat "$WORKDIR/a.node.log" "$WORKDIR/b.node.log" >&2 || true
+    exit 1
   fi
   sleep 0.1
 done

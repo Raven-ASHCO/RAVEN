@@ -71,9 +71,23 @@ cargo clean -p libsqlite3-sys >/dev/null 2>&1 || true
 expect_fail "cargo: CFLAGS contains PBKDF2_ITER" \
   run_lab_build RAVEN_EXPECT_SQLCIPHER_4_17_0=1 CFLAGS='-DPBKDF2_ITER=1'
 
-cargo clean -p libsqlite3-sys >/dev/null 2>&1 || true
-expect_fail "cargo: CC=clang -DPBKDF2_ITER=1" \
-  run_lab_build RAVEN_EXPECT_SQLCIPHER_4_17_0=1 CC='clang -DPBKDF2_ITER=1'
+# Windows openssl-src/nmake consumes CC before libsqlite3-sys build.rs.
+# clang then dies on MSVC flags (/Zi, /MT) with no profile-guard diagnostic.
+# The env-guard case above already covers CC='clang -DPBKDF2_ITER=1'.
+IS_WINDOWS=0
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*|Windows_NT) IS_WINDOWS=1 ;;
+esac
+if [[ "${OS:-}" == "Windows_NT" ]]; then
+  IS_WINDOWS=1
+fi
+if [[ "$IS_WINDOWS" -eq 1 ]]; then
+  pass "skip cargo: CC=clang -DPBKDF2_ITER=1 on Windows (openssl-src/nmake race)"
+else
+  cargo clean -p libsqlite3-sys >/dev/null 2>&1 || true
+  expect_fail "cargo: CC=clang -DPBKDF2_ITER=1" \
+    run_lab_build RAVEN_EXPECT_SQLCIPHER_4_17_0=1 CC='clang -DPBKDF2_ITER=1'
+fi
 
 # -include usually reaches libsqlite3-sys after openssl tolerates the flag.
 cargo clean -p libsqlite3-sys >/dev/null 2>&1 || true
@@ -87,8 +101,16 @@ expect_fail "guard: OPENSSL_NO_VENDOR=1" \
 expect_fail "guard: OPENSSL_DIR=/tmp/fake-openssl" \
   run_env_guard OPENSSL_DIR=/tmp/fake-openssl
 
-cargo clean -p openssl-sys -p libsqlite3-sys >/dev/null 2>&1 || true
-expect_fail "cargo: OPENSSL_NO_VENDOR=1" \
-  run_lab_build RAVEN_EXPECT_SQLCIPHER_4_17_0=1 OPENSSL_NO_VENDOR=1
+# OPENSSL_NO_VENDOR makes openssl-sys skip openssl-src and search for a
+# system install. That crate is a dep of libsqlite3-sys, so it fails first
+# on Windows (no OpenSSL) with "Could not find directory of OpenSSL" —
+# never reaching reject_openssl_provider_overrides(). Env-guard covers it.
+if [[ "$IS_WINDOWS" -eq 1 ]]; then
+  pass "skip cargo: OPENSSL_NO_VENDOR=1 on Windows (openssl-sys races before profile guard)"
+else
+  cargo clean -p openssl-sys -p libsqlite3-sys >/dev/null 2>&1 || true
+  expect_fail "cargo: OPENSSL_NO_VENDOR=1" \
+    run_lab_build RAVEN_EXPECT_SQLCIPHER_4_17_0=1 OPENSSL_NO_VENDOR=1
+fi
 
 echo "PASS: SQLCipher profile override negatives" >&2

@@ -963,20 +963,24 @@ fn linux_secret_service_is_session_bus_missing(err: &IdentityStoreError) -> bool
 
 /// Test/lab helper: request the debug locked-file identity backend.
 ///
-/// Headless Linux has no Secret Service. Tests must not assume the default
-/// GNU/Linux backend works. Once set, the env stays set so parallel tests
-/// cannot race on process env (do not clear a CI job override).
+/// **GNU/Linux only.** Headless Ubuntu has no Secret Service. Once set, the
+/// env stays set so parallel tests cannot race (do not clear a CI job
+/// override). macOS Keychain and Windows DPAPI tests stay on the platform
+/// store — forcing locked-file there regresses migrate / tamper / conflict.
 #[cfg(test)]
 pub(crate) fn test_enable_locked_file_identity_backend() {
-    use std::sync::Once;
-    static ENABLE: Once = Once::new();
-    ENABLE.call_once(|| {
-        if locked_file_backend_requested() {
-            return;
-        }
-        // SAFETY: test-only process env for the documented lab/CI backend.
-        unsafe { std::env::set_var("RAVEN_IDENTITY_BACKEND", "locked-file") }
-    });
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::sync::Once;
+        static ENABLE: Once = Once::new();
+        ENABLE.call_once(|| {
+            if locked_file_backend_requested() {
+                return;
+            }
+            // SAFETY: test-only process env for the documented lab/CI backend.
+            unsafe { std::env::set_var("RAVEN_IDENTITY_BACKEND", "locked-file") }
+        });
+    }
 }
 
 /// Same unmarked locked-file probe as macOS, plus one lab-only exception:
@@ -1446,6 +1450,10 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         {
+            if locked_file_backend_requested() {
+                test_cleanup(dir);
+                return;
+            }
             assert!(
                 !path.exists(),
                 "plaintext identity.seed must be removed after Keychain migrate"
@@ -1552,9 +1560,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         std::fs::write(marker_path(dir), b"macos-keychain\nextra\n").unwrap();
-        let err = load_or_create_identity(dir)
-            .err()
-            .expect("marker must fail");
+        let err = match load_or_create_identity(dir) {
+            Err(e) => e,
+            Ok(_) => panic!("marker must fail"),
+        };
         assert!(matches!(err, IdentityStoreError::Continuity(_)));
         assert!(!seed_path(dir).exists());
         assert!(!binding_path(dir).exists());
@@ -1584,11 +1593,18 @@ mod tests {
         assert_eq!(binding.len(), IDENTITY_BINDING_LEN);
         binding[44] ^= 0x80;
         std::fs::write(binding_path(dir), binding).unwrap();
-        let err = load_identity(dir).err().expect("tamper must fail");
+        let err = match load_identity(dir) {
+            Err(e) => e,
+            Ok(_) => panic!("tamper must fail"),
+        };
         assert!(matches!(err, IdentityStoreError::Continuity(_)));
 
         #[cfg(target_os = "macos")]
         {
+            if locked_file_backend_requested() {
+                test_cleanup(dir);
+                return;
+            }
             let seed = keychain_get(&account_for_data_dir(dir)).unwrap().unwrap();
             assert_eq!(Identity::from_seed(&seed).public_key_bytes(), original_pub);
         }
@@ -1674,9 +1690,10 @@ mod tests {
         let dir = tmp.path();
         test_cleanup(dir);
         write_marker(dir, IdentityStoreBackend::MacosKeychain).unwrap();
-        let err = load_or_create_identity(dir)
-            .err()
-            .expect("missing recorded Keychain item must fail");
+        let err = match load_or_create_identity(dir) {
+            Err(e) => e,
+            Ok(_) => panic!("missing recorded Keychain item must fail"),
+        };
         assert!(matches!(err, IdentityStoreError::Continuity(_)));
         assert!(keychain_get(&account_for_data_dir(dir)).unwrap().is_none());
         assert!(!binding_path(dir).exists());
@@ -1686,13 +1703,19 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn secure_and_raw_seed_conflict_is_never_winner_picked() {
+        if locked_file_backend_requested() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let (id, _) = load_or_create_identity(dir).unwrap();
         let mut other = Identity::generate().seed_bytes();
         write_locked_seed_file(&seed_path(dir), &other).unwrap();
         other.zeroize();
-        let err = load_identity(dir).err().expect("conflict must fail");
+        let err = match load_identity(dir) {
+            Err(e) => e,
+            Ok(_) => panic!("conflict must fail"),
+        };
         assert!(matches!(err, IdentityStoreError::Continuity(_)));
         assert!(
             seed_path(dir).exists(),
@@ -1734,6 +1757,9 @@ mod tests {
     #[test]
     fn locked_file_first_install_when_platform_store_unavailable() {
         test_enable_locked_file_identity_backend();
+        if !locked_file_backend_requested() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let (id, backend) = load_or_create_identity(dir).expect("locked-file first install");

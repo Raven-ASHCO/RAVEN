@@ -57,7 +57,7 @@ macOS stores the node seed in the **login Keychain** (service `app.raven.node.id
 
 ## CI menu smoke is not an install proof
 
-GitHub Actions `rust-linux` and `rust-macos` run `node/scripts/ash_menu_smoke.sh` against **debug** `target/debug/ash` only. That is **menu/CLI smoke** (init → doctor → contacts → send). It does **not** prove:
+GitHub Actions `rust-linux`, `rust-macos`, and `rust-windows` run `node/scripts/ash_menu_smoke.sh` against **debug** `target/debug/ash` only. That is **menu/CLI smoke** (init → doctor → contacts → send). It does **not** prove:
 
 - Keychain identity (Option A default above remains the login Keychain)
 - launchd service install (`scripts/install/macos_launchd.sh`)

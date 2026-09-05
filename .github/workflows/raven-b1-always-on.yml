@@ -1,0 +1,42 @@
+# Always-on B1 gate. No path filters: docs-only PRs still get a required
+# status. Runnable terminal smoke bots can re-trigger via workflow_dispatch.
+# Secret scan + messaging boundary + rustfmt + ash/raven-node --help/whoami/
+# timed listen. Not Full Braid / ML-KEM lab. Cross-OS proof stays on
+# Raven Serverless Node (Linux/macOS/Windows).
+name: Raven B1 Always-On
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: raven-b1-always-on-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  b1-always-on:
+    name: B1 always-on gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secret history scan (CI mode)
+        run: bash scripts/secret_history_scan.sh --ci
+      - name: Messaging-only product boundary
+        run: bash node/scripts/messaging_product_boundary_gate.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+          prefix-key: b1-always-on
+      - name: rustfmt (shipping crates)
+        working-directory: node
+        run: cargo fmt --all -- --check
+      - name: Terminal ash/raven-node smoke
+        working-directory: node
+        run: bash ./scripts/terminal_help_smoke.sh

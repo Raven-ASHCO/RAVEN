@@ -29,7 +29,16 @@ assert_primary_hold_log() {
 import re, sys
 
 expected, path = sys.argv[1], sys.argv[2]
-text = open(path, "r", encoding="utf-8", errors="replace").read()
+raw = open(path, "r", encoding="utf-8", errors="replace").read()
+# GHA sets CARGO_TERM_COLOR=always; colored "error:" must not fail the hold.
+text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw)
+
+def fail(msg):
+    sys.stderr.write(msg + "\n")
+    sys.stderr.write("--- cargo release-hold log (tail) ---\n")
+    for line in text.splitlines()[-80:]:
+        sys.stderr.write(line + "\n")
+    sys.exit(1)
 
 # Cargo custom-build failures surface as this error before the script stderr.
 if not re.search(
@@ -37,31 +46,30 @@ if not re.search(
     text,
     re.M,
 ):
-    sys.stderr.write(
+    fail(
         "FULL_BRAID_0A5_HOLD_PRIMARY_MISSING: "
-        "missing raven-core custom build failure\n"
+        "missing raven-core custom build failure"
     )
-    sys.exit(1)
 
 # Bind hold to the build.rs panic message itself.
 # Real cargo shape (indented under Caused by / --- stderr):
 #   thread 'main' (...) panicked at crates/raven-core/build.rs:17:9:
 #   FULL_BRAID_SQLCIPHER_NOT_APPROVED
+# Windows rustc prints backslashes: crates\raven-core\build.rs
 panic_hold = re.compile(
-    r"panicked at [^\n]*raven-core/build\.rs:\d+:\d+:\s*\n"
+    r"panicked at [^\n]*raven-core[/\\]build\.rs:\d+:\d+:\s*\n"
     r"[ \t]*" + re.escape(expected) + r"[ \t]*(?:\n|$)"
 )
 if not panic_hold.search(text):
-    sys.stderr.write(
+    fail(
         "FULL_BRAID_0A5_HOLD_PRIMARY_MISSING: "
-        f"hold {expected!r} is not the raven-core/build.rs panic payload\n"
+        f"hold {expected!r} is not the raven-core/build.rs panic payload"
     )
-    sys.exit(1)
 
 # Reject any other build.rs panic payload in the same log.
 other_panics = []
 for match in re.finditer(
-    r"panicked at [^\n]*raven-core/build\.rs:\d+:\d+:\s*\n[ \t]*([^\n]+)",
+    r"panicked at [^\n]*raven-core[/\\]build\.rs:\d+:\d+:\s*\n[ \t]*([^\n]+)",
     text,
 ):
     payload = match.group(1).strip()
@@ -82,6 +90,8 @@ for line in text.splitlines():
     if not line.startswith("error:"):
         continue
     if "failed to run custom build command for `raven-core" in line:
+        continue
+    if "could not compile `raven-core" in line:
         continue
     if expected in line:
         continue
@@ -105,6 +115,7 @@ expect_release_hold_failure() {
   (
     cd "$NODE"
     env RAVEN_EXPECT_SQLCIPHER_4_17_0=1 \
+      CARGO_TERM_COLOR=never \
       cargo build --release -p raven-core --features full-braid-durable-lab
   ) >"$log" 2>&1
   local rc=$?
@@ -159,6 +170,21 @@ EOF
   rm -f "$log"
   [[ "$rc" -ne 0 ]] || die "hold gate false-passed unrelated build.rs panic + hold text"
   pass "hold gate rejects unrelated build.rs panic + hold text"
+
+  log="$(mktemp "${TMPDIR:-/tmp}/raven-0a5-hold-win-XXXXXX")"
+  cat >"$log" <<EOF
+error: failed to run custom build command for \`raven-core v0.1.0 (D:\\a\\RAVEN\\RAVEN\\node\\crates\\raven-core)\`
+
+Caused by:
+  process didn't exit successfully: \`build-script-build\` (exit status: 101)
+  --- stderr
+
+  thread 'main' (6580) panicked at crates\\raven-core\\build.rs:17:9:
+  $HOLD_TEXT
+EOF
+  assert_primary_hold_log "$HOLD_TEXT" "$log"
+  rm -f "$log"
+  pass "hold gate accepts Windows backslash build.rs path"
 }
 
 scoped_paths=(
@@ -182,6 +208,7 @@ scoped_paths=(
   ios-native/RAVEN/RAVEN/Core/Security/ATSAM/Durable
   ios-native/RAVEN/RAVENTests/ATSAMFullBraidSQLCipherProfileV1Tests.swift
   .github/workflows/raven-serverless.yml
+  .github/workflows/raven-serverless-lab.yml
 )
 
 # Emulate `git diff --check` for a working-tree file (tracked or untracked).
@@ -290,6 +317,11 @@ run_release_hold() {
 
 run_rust_lab_suite() {
   cd "$NODE"
+  # Headless Linux has no Secret Service. Debug locked-file is proven-absent
+  # / connect-fail only — same as rust-linux. Not a production Keychain claim.
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    export RAVEN_IDENTITY_BACKEND=locked-file
+  fi
   RAVEN_EXPECT_SQLCIPHER_4_17_0=1 \
     cargo test -p raven-core --features full-braid-durable-lab \
       --test full_braid_sqlcipher_profile -- --test-threads=1
@@ -313,6 +345,48 @@ run_symbol_and_override() {
   bash "$SCRIPTS/full_braid_sqlcipher_symbol_owner_report.sh" default
   bash "$SCRIPTS/full_braid_sqlcipher_symbol_owner_report.sh" lab
   bash "$SCRIPTS/full_braid_sqlcipher_profile_override_negatives.sh"
+}
+
+prefer_windows_openssl_perl() {
+  # Git Bash puts /usr/bin/perl first. openssl-src Configure needs Strawberry
+  # (Locale::Maketext::Simple). Not a system-OpenSSL bypass.
+  local cand win
+  for cand in \
+    "/c/Strawberry/perl/bin/perl.exe" \
+    "/c/Strawberry/perl/bin/perl" \
+    "/d/Strawberry/perl/bin/perl.exe"
+  do
+    if [[ -x "$cand" ]]; then
+      export PATH="$(dirname "$cand"):${PATH}"
+      if command -v cygpath >/dev/null 2>&1; then
+        win="$(cygpath -w "$cand")"
+      else
+        win="$cand"
+      fi
+      export PERL="$win"
+      export OPENSSL_SRC_PERL="$win"
+      echo "windows-openssl-perl=$cand" >&2
+      return 0
+    fi
+  done
+  if perl -e "use Locale::Maketext::Simple;" >/dev/null 2>&1; then
+    echo "windows-openssl-perl=$(command -v perl)" >&2
+    return 0
+  fi
+  die "Windows lab SQLCipher needs Strawberry Perl (Git Bash perl lacks Locale::Maketext::Simple)"
+}
+
+prepend_windows_msvc_bin() {
+  # Put nmake/cl/dumpbin on PATH without sourcing VS 2026 vcvars (breaks rustc).
+  local dumpbin
+  dumpbin="$(command -v dumpbin 2>/dev/null || true)"
+  if [[ -z "$dumpbin" ]]; then
+    dumpbin="$(ls /c/Program\ Files/Microsoft\ Visual\ Studio/*/Enterprise/VC/Tools/MSVC/*/bin/HostX64/x64/dumpbin.exe 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -n "$dumpbin" && -f "$dumpbin" ]]; then
+    export PATH="$(dirname "$dumpbin"):${PATH}"
+    echo "windows-msvc-bin=$(dirname "$dumpbin")" >&2
+  fi
 }
 
 case "$MODE" in
@@ -361,6 +435,8 @@ case "$MODE" in
     command -v cargo >/dev/null || die "cargo missing"
     # Symbol/import tools are mandatory on Windows (llvm-nm|dumpbin +
     # dumpbin|llvm-readobj); the symbol-owner script fails closed if absent.
+    prefer_windows_openssl_perl
+    prepend_windows_msvc_bin
     run_symbol_and_override
     run_rust_lab_suite
     run_release_hold

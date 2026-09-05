@@ -44,13 +44,13 @@ fn dr_setup() -> (Identity, Identity, [u8; 32]) {
 #[cfg(feature = "full-braid-lab")]
 #[test]
 fn a1_replayed_consumed_message_is_rejected() {
-    let (_alice, bob, rk0) = dr_setup();
+    let (_alice, _bob, rk0) = dr_setup();
     let a_priv = [0x11; 32];
     let b_priv = [0x22; 32];
     let b_pub = PublicKey::from(&StaticSecret::from(b_priv)).to_bytes();
 
     let alice = ec_dr_init_alice(&rk0, &a_priv, &b_pub).unwrap();
-    let (alice, hdr0, _mk0) = ec_dr_encrypt(&alice).unwrap();
+    let (_alice, hdr0, _mk0) = ec_dr_encrypt(&alice).unwrap();
 
     let bob_st = ec_dr_init_bob(&rk0, &b_priv).unwrap();
     let b_ratchet_priv = [0x33; 32];
@@ -136,13 +136,12 @@ fn a4_max_skip_flood_leaves_state_usable() {
     let b_pub = PublicKey::from(&StaticSecret::from(b_priv)).to_bytes();
     let b_ratchet_priv = [0x33; 32];
 
-    let mut alice = ec_dr_init_alice(&rk0, &a_priv, &b_pub).unwrap();
+    let alice = ec_dr_init_alice(&rk0, &a_priv, &b_pub).unwrap();
     let (alice, hdr0, _) = ec_dr_encrypt(&alice).unwrap();
-    let (mut alice, hdr1) = {
+    let (_alice, hdr1) = {
         let (st, h, _) = ec_dr_encrypt(&alice).unwrap();
         (st, h)
     };
-    let _ = hdr1;
 
     let bob = ec_dr_init_bob(&rk0, &b_priv).unwrap();
     let (bob, _) = ec_dr_decrypt(&bob, &hdr0, 100, Some(&b_ratchet_priv), 2000).unwrap();
@@ -169,13 +168,12 @@ fn a5_skipped_store_exhaustion_is_bounded_and_recovers() {
     let b_pub = PublicKey::from(&StaticSecret::from(b_priv)).to_bytes();
     let b_ratchet_priv = [0x33; 32];
 
-    let mut alice = ec_dr_init_alice(&rk0, &a_priv, &b_pub).unwrap();
+    let alice = ec_dr_init_alice(&rk0, &a_priv, &b_pub).unwrap();
     let (alice, hdr0, _) = ec_dr_encrypt(&alice).unwrap();
-    let (alice, hdr1) = {
+    let (_alice, hdr1) = {
         let (st, h, _) = ec_dr_encrypt(&alice).unwrap();
         (st, h)
     };
-    let _ = hdr1;
 
     let bob = ec_dr_init_bob(&rk0, &b_priv).unwrap();
     let (bob, _) = ec_dr_decrypt(&bob, &hdr0, 100, Some(&b_ratchet_priv), 2000).unwrap();
