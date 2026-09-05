@@ -24,7 +24,7 @@ jobs:
       libp2p_bridge: ${{ steps.detect.outputs.libp2p_bridge }}
       ios_app: ${{ steps.detect.outputs.ios_app }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: detect
         name: Record whether iOS / Libp2pBridge trees exist
         run: |
@@ -48,7 +48,7 @@ jobs:
     name: Messaging-only product boundary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Refuse public-social product regressions
         run: bash node/scripts/messaging_product_boundary_gate.sh
 
@@ -56,7 +56,7 @@ jobs:
     name: Secret pattern scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Run secret history scan (CI mode)
@@ -74,7 +74,7 @@ jobs:
       run:
         working-directory: node
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -219,7 +219,7 @@ jobs:
       run:
         working-directory: node
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -259,7 +259,7 @@ jobs:
       run:
         working-directory: node
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -326,7 +326,7 @@ jobs:
       run:
         working-directory: ios-native/RAVEN/Libp2pBridge
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: ios-native/RAVEN/Libp2pBridge/go.mod
@@ -345,7 +345,7 @@ jobs:
       run:
         working-directory: ios-native/RAVEN
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Select an available iOS simulator
         id: simulator
         run: |

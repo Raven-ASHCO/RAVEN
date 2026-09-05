@@ -73,7 +73,7 @@ jobs:
     outputs:
       ios_app: ${{ steps.detect.outputs.ios_app }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: detect
         name: Record whether ios-native/RAVEN exists
         run: |
@@ -97,7 +97,7 @@ jobs:
       LIBCRUX_DISABLE_SIMD128: "1"
       LIBCRUX_DISABLE_SIMD256: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Test portable incremental ML-KEM-768
         run: cargo test -p raven-core --features mlkem768-incremental-lab --lib mlkem768_incremental
@@ -164,7 +164,7 @@ jobs:
       LIBCRUX_DISABLE_SIMD128: "1"
       LIBCRUX_DISABLE_SIMD256: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -275,7 +275,7 @@ jobs:
       LIBCRUX_DISABLE_SIMD256: "1"
       IPHONEOS_DEPLOYMENT_TARGET: "17.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
@@ -306,7 +306,7 @@ jobs:
       run:
         working-directory: node
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Hermetic SQLCipher regen/verify selftest
@@ -325,7 +325,7 @@ jobs:
       CARGO_TARGET_DIR: target/full-braid-task0a
       RAVEN_EXPECT_SQLCIPHER_4_17_0: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
@@ -350,7 +350,7 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/node/target/full-braid-task0a-macos
       RAVEN_EXPECT_SQLCIPHER_4_17_0: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
@@ -377,7 +377,7 @@ jobs:
       CARGO_TARGET_DIR: target/full-braid-task0a-windows
       RAVEN_EXPECT_SQLCIPHER_4_17_0: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -413,7 +413,7 @@ jobs:
     env:
       CARGO_TARGET_DIR: target/libcrux-avx2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Confirm AVX2 available
         run: |
@@ -464,7 +464,7 @@ jobs:
     env:
       CARGO_TARGET_DIR: target/libcrux-neon
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Confirm arm64 runner
         run: test "$(uname -m)" = arm64
