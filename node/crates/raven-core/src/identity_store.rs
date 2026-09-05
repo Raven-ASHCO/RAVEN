@@ -1611,10 +1611,6 @@ mod tests {
             let seed = keychain_get(&account_for_data_dir(dir)).unwrap().unwrap();
             assert_eq!(Identity::from_seed(&seed).public_key_bytes(), original_pub);
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = original_pub;
-        }
         test_cleanup(dir);
     }
 
