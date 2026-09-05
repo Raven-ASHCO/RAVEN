@@ -1462,6 +1462,7 @@ mod tests {
     }
 
     fn publish_and_install(data_dir: &Path, id: &Identity) {
+        crate::identity_store::test_enable_locked_file_identity_backend();
         let mut rng = rand::thread_rng();
         let mut kp = HybridKeypair::generate(&mut rng);
         let t = now();

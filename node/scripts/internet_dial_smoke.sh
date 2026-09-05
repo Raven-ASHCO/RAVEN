@@ -6,6 +6,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/debug"
 NODE="$BIN/raven-node"
+# Same debug/lab identity override as lan_direct / ash menu (refused in Release).
+export RAVEN_IDENTITY_BACKEND=locked-file
+export RAVEN_CHAT_HISTORY_BACKEND=locked-file
 WORKDIR="${TMPDIR:-/tmp}/raven-inet-$$"
 mkdir -p "$WORKDIR/a" "$WORKDIR/b"
 cleanup() {

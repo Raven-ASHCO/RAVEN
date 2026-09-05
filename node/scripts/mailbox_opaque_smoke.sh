@@ -3,6 +3,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+# Same debug/lab identity override as lan_direct / ash menu (refused in Release).
+export RAVEN_IDENTITY_BACKEND=locked-file
+export RAVEN_CHAT_HISTORY_BACKEND=locked-file
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

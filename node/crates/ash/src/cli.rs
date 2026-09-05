@@ -8,13 +8,13 @@ mod ipc_client;
 mod pair_init_lab;
 mod trace_delivery;
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::{Parser, Subcommand};
 use raven_core::address::{decode_address, encode_address};
-use raven_core::alias_record::{AliasClaimStore, AliasRecord};
+use raven_core::alias_record::{normalize_alias, AliasClaimStore, AliasRecord};
 use raven_core::chat_history::BlockList;
 use raven_core::contact_request::{
     ContactRequestInbox, ContactRequestInner, RavenContactRequestV1,
@@ -94,7 +94,6 @@ fn c() -> Colors {
             green: "\x1b[1m",
             yellow: "\x1b[2m",
             red: "\x1b[1m",
-            white_on_purple: "\x1b[7m",
         }
     } else {
         Colors {
@@ -106,7 +105,6 @@ fn c() -> Colors {
             green: "",
             yellow: "",
             red: "",
-            white_on_purple: "",
         }
     }
 }
@@ -120,7 +118,6 @@ struct Colors {
     green: &'static str,
     yellow: &'static str,
     red: &'static str,
-    white_on_purple: &'static str,
 }
 
 fn default_ash_data_dir() -> PathBuf {
@@ -1418,6 +1415,46 @@ fn save_alias_claim(data_dir: &Path, rec: &AliasRecord) -> Result<(), String> {
     std::fs::write(path, raw).map_err(|e| e.to_string())
 }
 
+fn cmd_alias_publish(data_dir: &Path, alias: &str, sequence: u64, expires_at: Option<u64>) {
+    let id = require_identity(data_dir);
+    let alias = match normalize_alias(alias) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let now = now_ms();
+    let expires_at = expires_at.unwrap_or(now.saturating_add(30 * 24 * 60 * 60 * 1000));
+    let rec = AliasRecord {
+        alias: alias.clone(),
+        identity_address: id.address(),
+        sequence,
+        expires_at,
+        signature: [0u8; 64],
+        ed25519_pub: id.public_key_bytes(),
+    };
+    let signed = match rec.sign(&id) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("alias sign: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = signed.verify(now) {
+        eprintln!("alias verify: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = save_alias_claim(data_dir, &signed) {
+        eprintln!("alias store: {e}");
+        std::process::exit(1);
+    }
+    println!("{C_GREEN}alias published{C_RESET} @{alias}");
+    println!("{C_DIM}sequence{C_RESET}    {sequence}");
+    println!("{C_DIM}expires_ms{C_RESET}  {expires_at}");
+    println!("{C_DIM}address{C_RESET}     {}", signed.identity_address);
+}
+
 fn load_profile_store(_data_dir: &Path, _now: u64) -> ProfileStore {
     ProfileStore::default()
 }
@@ -2209,13 +2246,7 @@ fn cmd_contact_list(data_dir: &Path) {
             tag = tag,
             tw = w_tag
         );
-        println!(
-            "     {d}fp {fp}{r}{dial_extra}",
-            d = c.dim,
-            r = c.reset,
-            fp = fp,
-            dial_extra = ""
-        );
+        println!("     {d}fp {fp}{r}", d = c.dim, r = c.reset, fp = fp);
     }
 }
 
@@ -2346,7 +2377,7 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
                 public_tag: String::new(),
                 alias: String::new(),
                 address: addr,
-                pub_hex: pub_hex,
+                pub_hex,
                 pinned,
                 lan_dial: String::new(),
             }
@@ -3242,7 +3273,7 @@ fn resolve_send_target(
 ) -> Result<(String, String, String), String> {
     if !contact.trim().is_empty() {
         let contacts = load_contacts(data_dir)?;
-        let hits = resolve_tag_contacts(&contacts, contact);
+        let hits = resolve_alias_contacts(&contacts, contact);
         if hits.is_empty() {
             return Err(format!(
                 "no contact for {} — ash contact add … --tag … --lan-dial host:port",
@@ -3257,13 +3288,13 @@ fn resolve_send_target(
             ));
         }
         let c = hits[0];
-        if !looks_like_lan_dial(&c.lan_dial) {
-            return Err(format!(
-                "contact {} has no valid lan_dial — set host:port (not LocalListenQueue)",
+        return match resolve_or_reuse_lan_dial(data_dir, c) {
+            Some(ResolvedLanPeer::Dial(dial)) => Ok((dial, c.pub_hex.clone(), listen.to_string())),
+            None => Err(format!(
+                "contact {} has no reachable lan_dial — set host:port (not LocalListenQueue)",
                 c.primary_label()
-            ));
-        }
-        return Ok((c.lan_dial.clone(), c.pub_hex.clone(), listen.to_string()));
+            )),
+        };
     }
     if peer_pub_hex.trim().is_empty() || !looks_like_lan_dial(peer) {
         return Err("send requires --contact @tag or --peer host:port plus --peer-pub-hex".into());
@@ -3309,6 +3340,101 @@ fn run_send(data_dir: &Path, peer: &str, peer_pub_hex: &str, listen: &str, text:
     {
         eprintln!("send refused: {error}");
         std::process::exit(1);
+    }
+}
+
+fn cmd_send_cli(
+    data_dir: &Path,
+    peer: &str,
+    peer_pub_hex: &str,
+    listen: &str,
+    contact: &str,
+    stdin_text: bool,
+    chat: bool,
+) {
+    let no_target = contact.trim().is_empty() && peer.trim().is_empty();
+    if chat {
+        if no_target {
+            eprintln!(
+                "ash send --chat requires --contact @tag or --peer host:port plus --peer-pub-hex"
+            );
+            std::process::exit(1);
+        }
+        let id = require_identity(data_dir);
+        if !contact.trim().is_empty() {
+            let contacts = match load_contacts(data_dir) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+            let hits = resolve_alias_contacts(&contacts, contact);
+            if hits.is_empty() {
+                eprintln!(
+                    "no contact for {} — ash contact add … --tag … --lan-dial host:port",
+                    sanitize_terminal_text(contact)
+                );
+                std::process::exit(1);
+            }
+            if hits.len() > 1 {
+                eprintln!(
+                    "contact tag {} is ambiguous ({} matches)",
+                    sanitize_terminal_text(contact),
+                    hits.len()
+                );
+                std::process::exit(1);
+            }
+            let c = hits[0];
+            let Some(ResolvedLanPeer::Dial(dial)) = resolve_or_reuse_lan_dial(data_dir, c) else {
+                eprintln!(
+                    "contact {} has no reachable lan_dial — set host:port",
+                    c.primary_label()
+                );
+                std::process::exit(1);
+            };
+            ext::cmd_chat_session(
+                data_dir,
+                &id,
+                &c.petname,
+                &normalize_tag(&c.public_tag),
+                &c.pub_hex,
+                &dial,
+            );
+            return;
+        }
+        if peer_pub_hex.trim().is_empty() || !looks_like_lan_dial(peer) {
+            eprintln!(
+                "ash send --chat requires --contact @tag or --peer host:port plus --peer-pub-hex"
+            );
+            std::process::exit(1);
+        }
+        ext::cmd_chat_session(data_dir, &id, "", "", peer_pub_hex, peer);
+        return;
+    }
+    if no_target && stdin_is_tty() {
+        cmd_send_interactive(data_dir);
+        return;
+    }
+    if !stdin_text {
+        ext::refuse_argv_plaintext();
+    }
+    let mut text = String::new();
+    if io::stdin().read_to_string(&mut text).is_err() {
+        eprintln!("failed to read message from stdin");
+        std::process::exit(1);
+    }
+    let text = text.trim_end_matches(['\r', '\n']);
+    if text.is_empty() {
+        eprintln!("empty message");
+        std::process::exit(1);
+    }
+    match resolve_send_target(data_dir, contact, peer, peer_pub_hex, listen) {
+        Ok((peer, pub_hex, listen)) => run_send(data_dir, &peer, &pub_hex, &listen, text),
+        Err(e) => {
+            eprintln!("{}", sanitize_terminal_text(&e));
+            std::process::exit(1);
+        }
     }
 }
 
@@ -3374,9 +3500,8 @@ fn line_menu_loop(data_dir: &Path) {
     loop {
         print_menu();
         let mut choice = String::new();
-        match io::stdin().read_line(&mut choice) {
-            Ok(0) => break, // stdin closed — stop instead of spinning
-            _ => {}
+        if let Ok(0) = io::stdin().read_line(&mut choice) {
+            break; // stdin closed — stop instead of spinning
         }
         let choice = choice.trim().to_string();
         if !run_menu_choice(data_dir, &choice) {
@@ -3419,7 +3544,7 @@ fn screen_header(title: &str) {
     let c = c();
     let label = format!(" ── {} ", title);
     let fill_len = 56usize.saturating_sub(label.chars().count());
-    let fill: String = std::iter::repeat('─').take(fill_len).collect();
+    let fill = "─".repeat(fill_len);
     println!("\n{}{}{}{}", c.dim, label, fill, c.reset);
 }
 
@@ -3520,7 +3645,7 @@ fn read_key_raw_inner() -> MenuKey {
 fn render_arrow_menu(sel: usize, first: bool) {
     let items = MENU_ITEMS;
     let cc = c();
-    let (purple, bold, dim, reset, marker) = (cc.purple, cc.bold, cc.dim, cc.reset, "\u{25b8}");
+    let (purple, _bold, dim, reset, marker) = (cc.purple, cc.bold, cc.dim, cc.reset, "\u{25b8}");
 
     let mut lines: Vec<String> = Vec::new();
     let section = |v: &mut Vec<String>, label: &str| {
@@ -3585,9 +3710,6 @@ fn render_arrow_menu(sel: usize, first: bool) {
     let _ = io::stdout().flush();
 }
 
-/// Guided walkthrough for newcomers. Every step prints what it does and why,
-/// then runs the safe ones inline. No private material is ever displayed.
-
 pub fn run() {
     let path = resolve_terminal_messaging_path();
     if let Err(e) = assert_no_silent_fastapi(path) {
@@ -3628,6 +3750,112 @@ pub fn run() {
         Some(Commands::Doctor { require_ready }) => cmd_doctor(&data_dir, require_ready),
         Some(Commands::IpcPing) => cmd_ipc_ping(&data_dir),
         Some(Commands::Inbox) => cmd_endpoint_inbox(&data_dir),
+        Some(Commands::Send {
+            peer,
+            peer_pub_hex,
+            listen,
+            contact,
+            stdin_text,
+            chat,
+        }) => cmd_send_cli(
+            &data_dir,
+            &peer,
+            &peer_pub_hex,
+            &listen,
+            &contact,
+            stdin_text,
+            chat,
+        ),
+        Some(Commands::Find {
+            query,
+            local,
+            exact_id,
+            exact_alias,
+            all,
+        }) => cmd_find(&data_dir, &query, local, exact_id, exact_alias, all),
+        Some(Commands::Nearby) => cmd_nearby(&data_dir),
+        Some(Commands::Node { cmd }) => match cmd {
+            NodeCommands::Bridge { state } => {
+                set_node_flag(&data_dir, "bridge", matches!(state, OnOff::On))
+            }
+            NodeCommands::Store { state } => {
+                set_node_flag(&data_dir, "store", matches!(state, OnOff::On))
+            }
+            NodeCommands::Relay { state } => {
+                set_node_flag(&data_dir, "relay", matches!(state, OnOff::On))
+            }
+            NodeCommands::AddBootstrap { multiaddr, manual } => {
+                ext::cmd_bootstrap_add(&data_dir, &multiaddr, manual)
+            }
+            NodeCommands::DisableRavenDefaults => ext::cmd_bootstrap_disable_raven(&data_dir),
+            NodeCommands::ShowBootstrap => ext::cmd_bootstrap_show(&data_dir),
+            NodeCommands::InitBootstrap { no_raven_defaults } => {
+                ext::cmd_bootstrap_init(&data_dir, no_raven_defaults)
+            }
+        },
+        Some(Commands::Alias { cmd }) => match cmd {
+            AliasCommands::Publish {
+                alias,
+                sequence,
+                expires_at,
+            } => cmd_alias_publish(&data_dir, &alias, sequence, expires_at),
+        },
+        Some(Commands::Prekey { cmd }) => match cmd {
+            PrekeyCommands::Publish { device_id, out } => {
+                cmd_prekey_publish(&data_dir, &device_id, out.as_deref())
+            }
+            PrekeyCommands::Fetch { pub_hex, file } => {
+                cmd_prekey_fetch(&data_dir, &pub_hex, file.as_deref())
+            }
+        },
+        Some(Commands::Device { cmd }) => {
+            let id = require_identity(&data_dir);
+            match cmd {
+                DeviceCommands::SyncExport { device_id, out } => {
+                    ext::cmd_device_sync_export(&data_dir, &id, &device_id, &out)
+                }
+                DeviceCommands::SyncImport { file } => {
+                    ext::cmd_device_sync_import(&data_dir, &id, &file)
+                }
+                DeviceCommands::Revoke { device_id, epoch } => {
+                    ext::cmd_device_revoke(&data_dir, &id, &device_id, epoch)
+                }
+            }
+        }
+        Some(Commands::Mailbox { cmd }) => match cmd {
+            MailboxCommands::Put {
+                k_route_hex,
+                epoch,
+                slot,
+                envelope_hex,
+            } => ext::cmd_mailbox_put(&data_dir, &k_route_hex, epoch, slot, &envelope_hex),
+            MailboxCommands::Get {
+                k_route_hex,
+                epoch,
+                slot,
+            } => ext::cmd_mailbox_get(&data_dir, &k_route_hex, epoch, slot),
+        },
+        Some(Commands::Lab { cmd }) => match cmd {
+            LabCommands::ExportCert => {
+                let id = require_identity(&data_dir);
+                if let Err(e) = pair_init_lab::export_lab_device_cert(&data_dir, &id) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            LabCommands::ImportPeerCert { peer_pub_hex, file } => {
+                if let Err(e) =
+                    pair_init_lab::import_peer_device_cert(&data_dir, &peer_pub_hex, &file)
+                {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            LabCommands::ImportPeerPrekey { peer_pub_hex, file } => {
+                cmd_prekey_fetch(&data_dir, &peer_pub_hex, Some(&file))
+            }
+            LabCommands::Status => print_production_gate_matrix(),
+        },
         Some(Commands::Contact { cmd }) => match cmd {
             ContactCommands::Add {
                 address,
@@ -3636,7 +3864,7 @@ pub fn run() {
                 tag,
                 alias,
                 verify_fp,
-                prekey_file: _,
+                prekey_file,
                 lan_dial,
             } => {
                 let public_tag = if !tag.trim().is_empty() { tag } else { alias };
@@ -3651,6 +3879,13 @@ pub fn run() {
                 ) {
                     eprintln!("{}", sanitize_terminal_text(&e));
                     std::process::exit(1);
+                }
+                if let Some(path) = prekey_file {
+                    if let Err(e) = ext::contact_add_fetch_prekey(&data_dir, &pub_hex, Some(&path))
+                    {
+                        eprintln!("{}", sanitize_terminal_text(&e));
+                        std::process::exit(1);
+                    }
                 }
             }
             ContactCommands::List => cmd_contact_list(&data_dir),
@@ -3681,10 +3916,11 @@ pub fn run() {
             ContactCommands::Decline { request_id } => cmd_contact_decline(&data_dir, &request_id),
             ContactCommands::Block { request_id } => cmd_contact_block(&data_dir, &request_id),
         },
-        _ => {} // other subcommands handled by their own dispatch
     }
 }
 
+/// Guided walkthrough for newcomers. Every step prints what it does and why,
+/// then runs the safe ones inline. No private material is ever displayed.
 fn cmd_tutorial(data_dir: &Path) {
     let c = c();
     let _ = offer_first_run_identity(data_dir);
@@ -3823,7 +4059,7 @@ fn arrow_menu_loop(data_dir: &Path) {
 }
 
 /// Minimal header shown on every screen refresh (not the full banner).
-fn print_welcome_minimal(data_dir: &Path) {
+fn print_welcome_minimal(_data_dir: &Path) {
     let c = c();
     let (b, d, r) = (c.bold, c.dim, c.reset);
     println!("{b}R A V E N{r}  {d}\u{00b7}  serverless \u{00b7} P2P{r}");
@@ -3913,6 +4149,9 @@ fn probe_ipc_status(data_dir: &Path) -> Result<IpcResponse, String> {
     ipc_client::ipc_request(data_dir, &IpcRequest::Status { v: IPC_VERSION })
 }
 
+/// Thin wrapper used by doctor unit tests. Production doctor uses
+/// `probe_doctor_identity` (same `raven_core::identity_usable` backend).
+#[cfg_attr(not(test), allow(dead_code))]
 fn identity_usable(data_dir: &Path) -> bool {
     match raven_core::identity_usable(data_dir) {
         Ok(u) => u.usable,

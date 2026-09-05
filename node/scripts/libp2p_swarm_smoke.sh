@@ -7,6 +7,10 @@ BIN="$ROOT/target/debug"
 SWARM="$BIN/raven-swarm"
 WORKDIR="${TMPDIR:-/tmp}/raven-libp2p-$$"
 mkdir -p "$WORKDIR/a" "$WORKDIR/b"
+# Headless rust-linux has no org.freedesktop.secrets. serve/dial create an
+# ephemeral identity; locked-file is debug/lab only (refused in Release).
+export RAVEN_IDENTITY_BACKEND=locked-file
+export RAVEN_CHAT_HISTORY_BACKEND=locked-file
 cleanup() {
   [[ -n "${SPID:-}" ]] && kill "$SPID" 2>/dev/null || true
   rm -rf "$WORKDIR"
@@ -37,7 +41,11 @@ for _ in $(seq 1 120); do
   [[ -f "$WORKDIR/a.addr" && -f "$WORKDIR/a.peer" ]] && grep -q 'kad_put_ok' "$WORKDIR/a.log" 2>/dev/null && break
   sleep 0.1
 done
-[[ -f "$WORKDIR/a.addr" ]]
+if [[ ! -f "$WORKDIR/a.addr" ]]; then
+  echo "serve failed to publish listen addr" >&2
+  cat "$WORKDIR/a.log" >&2 || true
+  exit 1
+fi
 A_ADDR=$(cat "$WORKDIR/a.addr")
 A_PEER=$(cat "$WORKDIR/a.peer")
 A_PUB=$(grep '^raven_pub_hex=' "$WORKDIR/a.log" | head -1 | cut -d= -f2)

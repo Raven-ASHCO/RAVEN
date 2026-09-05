@@ -117,6 +117,10 @@ jobs:
         run: ./scripts/ash_menu_smoke.sh
       - name: LAN handshake KAT (shared vectors, no live network)
         run: cargo test -p raven-core --lib lan_
+      # Must stay on script-default target/debug — locked-file is refused in Release.
+      # Script uses RAVEN_IDENTITY_BACKEND=locked-file and
+      # RAVEN_CHAT_HISTORY_BACKEND=locked-file so GNU/Linux SS connect-fail
+      # can persist chat-history (not a production 0600-key fallback).
       - name: LAN direct two-node smoke
         run: ./scripts/lan_direct_two_node.sh
       - name: bridge + fuzz smoke

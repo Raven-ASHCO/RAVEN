@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use raven_core::ack::Ack;
 use raven_core::atsam_aead::{seal_rvna1_v2, unseal_rvna1_v2};
 use raven_core::atsam_indexed_session::{
-    ack_key_at_index, derive_route_tag, encode_signed_ack, message_key_at_index, open_ack,
+    derive_route_tag, encode_signed_ack, message_key_at_index, open_ack,
     open_indexed_message_with_key, route_coordinates, seal_ack, seal_indexed_message_with_key,
     Direction, SignedAck,
 };

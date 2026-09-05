@@ -267,6 +267,7 @@ async fn read_frame_with_limits<R: AsyncRead + Unpin>(
     Ok(buf)
 }
 
+#[cfg(feature = "unsafe-demo-crypto")]
 fn fingerprint_of(pub_bytes: &[u8]) -> String {
     let mut k = [0u8; 32];
     let n = pub_bytes.len().min(32);

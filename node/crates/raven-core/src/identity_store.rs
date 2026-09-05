@@ -5,7 +5,11 @@
 //! - Windows: DPAPI-protected `identity.seed` file
 //! - Linux: Secret Service (glibc) — *loading only*; creation stays fail-closed
 //!   until R1 authorizes an add-only prompt-free backend
-//! - locked-file mode is an explicit lab/CI override only
+//! - locked-file mode is an explicit lab/CI override only (debug builds).
+//!   First-install and unmarked-seed load require proven platform absence
+//!   (`Ok(None)`). macOS `SecureStore` (locked/denied Keychain) is Continuity.
+//!   Linux debug/lab may treat `secret-service connect:` / `ServiceUnknown`
+//!   (no session bus or no `org.freedesktop.secrets`) as no store.
 //!
 //! Legacy plaintext `identity.seed` (exactly 32 raw bytes) is migrated on first load.
 
@@ -908,6 +912,99 @@ fn bytes_to_seed(bytes: &[u8]) -> Result<[u8; 32], IdentityStoreError> {
     Ok(seed)
 }
 
+/// Locked-file lab/CI (debug only) may proceed only when Keychain is
+/// **proven absent** (`Ok(None)` / `errSecItemNotFound`).
+///
+/// Used for first-install *and* unmarked planted/legacy seed load. It is
+/// **not Release-safe** to treat `SecureStore` as absence: a locked
+/// Keychain *with* an existing item often surfaces as `SecureStore`
+/// (search hits, then `get_generic_password` fails), which would fork a
+/// locked-file identity beside the Keychain root.
+#[cfg(target_os = "macos")]
+fn locked_file_after_keychain_probe(
+    result: Result<Option<[u8; 32]>, IdentityStoreError>,
+) -> Result<(), IdentityStoreError> {
+    match result {
+        Ok(Some(_)) => Err(IdentityStoreError::Continuity(
+            "locked-file override conflicts with existing Keychain identity",
+        )),
+        Ok(None) => Ok(()),
+        Err(IdentityStoreError::SecureStore(_)) => Err(IdentityStoreError::Continuity(
+            "locked-file path requires proven-absent Keychain; unavailable or locked is not absence",
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn refuse_locked_file_if_keychain_not_proven_absent(
+    account: &str,
+) -> Result<(), IdentityStoreError> {
+    locked_file_after_keychain_probe(keychain_get(account))
+}
+
+/// Headless Linux CI has no session bus and no `org.freedesktop.secrets`.
+/// `secret-service connect:` (including zbus `ServiceUnknown`) is the
+/// documented lab-only exception ("no provider"), not "item exists but
+/// locked". This soft path is debug only. Locked/search/get stay Continuity.
+///
+/// Creating or loading a locked-file identity still requires explicit
+/// `RAVEN_IDENTITY_BACKEND=locked-file`. It is **not Release-safe** to treat
+/// other `SecureStore` errors as absence.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn linux_secret_service_is_session_bus_missing(err: &IdentityStoreError) -> bool {
+    matches!(
+        err,
+        IdentityStoreError::SecureStore(msg)
+            if msg.starts_with("secret-service connect:")
+                || msg.contains("ServiceUnknown")
+    )
+}
+
+/// Test/lab helper: request the debug locked-file identity backend.
+///
+/// Headless Linux has no Secret Service. Tests must not assume the default
+/// GNU/Linux backend works. Once set, the env stays set so parallel tests
+/// cannot race on process env (do not clear a CI job override).
+#[cfg(test)]
+pub(crate) fn test_enable_locked_file_identity_backend() {
+    use std::sync::Once;
+    static ENABLE: Once = Once::new();
+    ENABLE.call_once(|| {
+        if locked_file_backend_requested() {
+            return;
+        }
+        // SAFETY: test-only process env for the documented lab/CI backend.
+        unsafe { std::env::set_var("RAVEN_IDENTITY_BACKEND", "locked-file") }
+    });
+}
+
+/// Same unmarked locked-file probe as macOS, plus one lab-only exception:
+/// session-bus connect-fail. Never Release; never without locked-file env.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn locked_file_after_secret_service_probe(
+    result: Result<Option<[u8; 32]>, IdentityStoreError>,
+) -> Result<(), IdentityStoreError> {
+    match result {
+        Ok(Some(_)) => Err(IdentityStoreError::Continuity(
+            "locked-file override conflicts with existing Secret Service identity",
+        )),
+        Ok(None) => Ok(()),
+        Err(e) if linux_secret_service_is_session_bus_missing(&e) => Ok(()),
+        Err(IdentityStoreError::SecureStore(_)) => Err(IdentityStoreError::Continuity(
+            "locked-file path requires proven-absent Secret Service or a missing session bus; a locked item is not absence",
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn refuse_locked_file_if_secret_service_not_proven_absent(
+    account: &str,
+) -> Result<(), IdentityStoreError> {
+    locked_file_after_secret_service_probe(secret_service_get(account))
+}
+
 /// Load from platform store or locked file; migrate legacy plaintext when needed.
 #[allow(clippy::needless_return)]
 fn load_seed_with_migrate(
@@ -929,30 +1026,15 @@ fn load_seed_with_migrate(
         }
         return match read_raw_seed_file(&path)? {
             Some(mut bytes) if is_legacy_plaintext(&bytes) => {
-                // Established headless Debug/CI profile: loading may tolerate a
-                // temporarily unavailable platform store, but any *visible*
-                // protected identity is a hard conflict — never generate twice.
+                // Planted CI / leftover plaintext seed. Same proven-absent
+                // rule as first-install: macOS only Ok(None); Linux only
+                // Ok(None) or session-bus connect-fail. SecureStore is not
+                // absence (locked item with a file seed would fork).
                 if marker.is_none() {
                     #[cfg(target_os = "macos")]
-                    match keychain_get(&account) {
-                        Ok(Some(_)) => {
-                            return Err(IdentityStoreError::Continuity(
-                                "locked-file override conflicts with existing Keychain identity",
-                            ));
-                        }
-                        Ok(None) | Err(IdentityStoreError::SecureStore(_)) => {}
-                        Err(e) => return Err(e),
-                    }
+                    refuse_locked_file_if_keychain_not_proven_absent(&account)?;
                     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-                    match secret_service_get(&account) {
-                        Ok(Some(_)) => {
-                            return Err(IdentityStoreError::Continuity(
-                                "locked-file override conflicts with existing Secret Service identity",
-                            ));
-                        }
-                        Ok(None) | Err(IdentityStoreError::SecureStore(_)) => {}
-                        Err(e) => return Err(e),
-                    }
+                    refuse_locked_file_if_secret_service_not_proven_absent(&account)?;
                 }
                 let seed = bytes_to_seed(&bytes)?;
                 bytes.zeroize();
@@ -963,31 +1045,17 @@ fn load_seed_with_migrate(
                 Err(IdentityStoreError::Corrupt)
             }
             None => {
-                // Explicit locked-file first install (CI/lab). A *visible*
-                // protected identity is a hard conflict. SecureStore-unavailable
-                // is not visible — same rule as the legacy-plaintext branch.
+                // Locked-file first-install (debug CI/lab only). Unavailable ≠
+                // proven absent. macOS: only Ok(None)/errSecItemNotFound.
+                // A locked or denied Keychain (SecureStore) must not mint a
+                // second root beside an existing item. Linux: only a session-bus
+                // *connect* failure is treated as no store (headless ubuntu).
                 // require_proven_first_install still refuses non-empty profiles.
                 if marker.is_none() {
                     #[cfg(target_os = "macos")]
-                    match keychain_get(&account) {
-                        Ok(Some(_)) => {
-                            return Err(IdentityStoreError::Continuity(
-                                "locked-file override conflicts with existing Keychain identity",
-                            ));
-                        }
-                        Ok(None) | Err(IdentityStoreError::SecureStore(_)) => {}
-                        Err(e) => return Err(e),
-                    }
+                    refuse_locked_file_if_keychain_not_proven_absent(&account)?;
                     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-                    match secret_service_get(&account) {
-                        Ok(Some(_)) => {
-                            return Err(IdentityStoreError::Continuity(
-                                "locked-file override conflicts with existing Secret Service identity",
-                            ));
-                        }
-                        Ok(None) | Err(IdentityStoreError::SecureStore(_)) => {}
-                        Err(e) => return Err(e),
-                    }
+                    refuse_locked_file_if_secret_service_not_proven_absent(&account)?;
                 }
                 require_proven_first_install(data_dir, marker)?;
                 Ok(None)
@@ -1080,7 +1148,17 @@ fn load_seed_with_migrate(
                 "identity backend marker is not valid on GNU/Linux",
             ));
         }
-        if let Some(seed) = secret_service_get(&account)? {
+        // Debug/lab only: no session bus / ServiceUnknown is "no store", not
+        // Continuity. Release still fail-closes on connect. Locked/search/get
+        // stay hard errors. Locked-file create/load still needs the explicit env.
+        let existing = match secret_service_get(&account) {
+            Ok(seed) => seed,
+            Err(e) if cfg!(debug_assertions) && linux_secret_service_is_session_bus_missing(&e) => {
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(seed) = existing {
             reconcile_secure_and_raw_seed(&path, &seed)?;
             return Ok(Some((seed, IdentityStoreBackend::LinuxSecretService)));
         }
@@ -1318,6 +1396,7 @@ mod tests {
 
     #[test]
     fn create_load_round_trip() {
+        test_enable_locked_file_identity_backend();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let (id, backend) = load_or_create_identity(dir).expect("create");
@@ -1338,6 +1417,7 @@ mod tests {
 
     #[test]
     fn migrates_legacy_plaintext_seed_file() {
+        test_enable_locked_file_identity_backend();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         std::fs::create_dir_all(dir).unwrap();
@@ -1454,6 +1534,7 @@ mod tests {
 
     #[test]
     fn store_status_reports_backend_without_secrets() {
+        test_enable_locked_file_identity_backend();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let _ = load_or_create_identity(dir).unwrap();
@@ -1494,6 +1575,7 @@ mod tests {
 
     #[test]
     fn binding_tamper_refuses_the_original_protected_seed() {
+        test_enable_locked_file_identity_backend();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let (id, _) = load_or_create_identity(dir).unwrap();
@@ -1510,6 +1592,10 @@ mod tests {
             let seed = keychain_get(&account_for_data_dir(dir)).unwrap().unwrap();
             assert_eq!(Identity::from_seed(&seed).public_key_bytes(), original_pub);
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = original_pub;
+        }
         test_cleanup(dir);
     }
 
@@ -1520,6 +1606,65 @@ mod tests {
         assert!(keychain_status_is_proven_absent(errSecItemNotFound));
         assert!(!keychain_status_is_proven_absent(-25_293));
         assert!(!keychain_status_is_proven_absent(-25_308));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn locked_file_maps_keychain_securestore_to_continuity() {
+        // Locked/denied (`SecureStore`) must not soft-succeed as first-install
+        // *or* as unmarked planted-seed load. Search-hit + get fail is the
+        // locked-with-item case Core flagged.
+        for msg in [
+            "keychain get status -25308",
+            "keychain read status -25293",
+            "keychain get status -25393",
+        ] {
+            let err =
+                locked_file_after_keychain_probe(Err(IdentityStoreError::SecureStore(msg.into())))
+                    .expect_err("locked Keychain is not proven absent");
+            assert!(matches!(err, IdentityStoreError::Continuity(_)), "{msg}");
+        }
+        locked_file_after_keychain_probe(Ok(None)).expect("item-not-found is absence");
+        let visible = locked_file_after_keychain_probe(Ok(Some([0x11; 32])))
+            .expect_err("visible Keychain identity conflicts");
+        assert!(matches!(visible, IdentityStoreError::Continuity(_)));
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn linux_ss_connect_fail_is_lab_absent_but_locked_item_is_not() {
+        let connect = IdentityStoreError::SecureStore(
+            "secret-service connect: zbus error: I/O error: No such file or directory (os error 2)"
+                .into(),
+        );
+        let service_unknown = IdentityStoreError::SecureStore(
+            "secret-service connect: zbus error: org.freedesktop.DBus.Error.ServiceUnknown: \
+             The name org.freedesktop.secrets was not provided by any .service files"
+                .into(),
+        );
+        let locked = IdentityStoreError::SecureStore("secret-service identity item locked".into());
+        let search = IdentityStoreError::SecureStore("secret-service search: denied".into());
+        let get = IdentityStoreError::SecureStore("secret-service get: denied".into());
+        assert!(linux_secret_service_is_session_bus_missing(&connect));
+        assert!(linux_secret_service_is_session_bus_missing(
+            &service_unknown
+        ));
+        assert!(!linux_secret_service_is_session_bus_missing(&locked));
+        assert!(!linux_secret_service_is_session_bus_missing(&search));
+        assert!(!linux_secret_service_is_session_bus_missing(&get));
+        locked_file_after_secret_service_probe(Ok(None)).expect("empty collection is absence");
+        locked_file_after_secret_service_probe(Err(connect))
+            .expect("session-bus connect-fail is the lab-only exception");
+        locked_file_after_secret_service_probe(Err(service_unknown))
+            .expect("ServiceUnknown is the same no-provider exception");
+        for err in [locked, search, get] {
+            let mapped = locked_file_after_secret_service_probe(Err(err))
+                .expect_err("locked/search/get is not absence");
+            assert!(matches!(mapped, IdentityStoreError::Continuity(_)));
+        }
+        let visible = locked_file_after_secret_service_probe(Ok(Some([0x22; 32])))
+            .expect_err("visible Secret Service identity conflicts");
+        assert!(matches!(visible, IdentityStoreError::Continuity(_)));
     }
 
     #[cfg(target_os = "macos")]
@@ -1586,22 +1731,9 @@ mod tests {
         test_cleanup(&dir);
     }
 
-    static LOCKED_FILE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct LockedFileEnvGuard;
-    impl Drop for LockedFileEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: test-only, held under LOCKED_FILE_ENV.
-            unsafe { std::env::remove_var("RAVEN_IDENTITY_BACKEND") }
-        }
-    }
-
     #[test]
     fn locked_file_first_install_when_platform_store_unavailable() {
-        let _lock = LOCKED_FILE_ENV.lock().expect("env lock");
-        // SAFETY: test-only, serialized by LOCKED_FILE_ENV.
-        unsafe { std::env::set_var("RAVEN_IDENTITY_BACKEND", "locked-file") }
-        let _clear = LockedFileEnvGuard;
+        test_enable_locked_file_identity_backend();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let (id, backend) = load_or_create_identity(dir).expect("locked-file first install");
@@ -1614,6 +1746,7 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn locked_file_permissions_are_0600_when_used() {
+        test_enable_locked_file_identity_backend();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let id = Identity::generate();
@@ -1721,9 +1854,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         std::fs::write(marker_path(dir), b"macos-keychain\nextra\n").unwrap();
-        let err = backend_consistency_with(dir, false)
-            .err()
-            .expect("malformed marker");
+        let err = backend_consistency_with(dir, false).expect_err("malformed marker");
         assert!(matches!(err, IdentityStoreError::Continuity(_)));
         assert!(!err.redacted_display().contains("seed"));
         test_cleanup(dir);

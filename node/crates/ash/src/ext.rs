@@ -1337,7 +1337,17 @@ mod prekey_private_store_tests {
     fn publish_does_not_write_plaintext_hybrid_secret() {
         let dir = tempdir().expect("tempdir");
         let identity = Identity::from_seed(&[0x77; 32]);
-        cmd_prekey_publish_real(dir.path(), &identity, PRIMARY_DEVICE_ID, None).expect("publish");
+        // rust-linux has no Secret Service. The explicit lab locked-file
+        // backend lets publish succeed so we can assert it still never writes
+        // a plaintext hybrid secret.
+        let previous = std::env::var_os("RAVEN_PREKEY_BACKEND");
+        unsafe { std::env::set_var("RAVEN_PREKEY_BACKEND", "locked-file") };
+        let published = cmd_prekey_publish_real(dir.path(), &identity, PRIMARY_DEVICE_ID, None);
+        match previous {
+            Some(value) => unsafe { std::env::set_var("RAVEN_PREKEY_BACKEND", value) },
+            None => unsafe { std::env::remove_var("RAVEN_PREKEY_BACKEND") },
+        }
+        published.expect("publish");
         assert!(!dir.path().join("prekey_hybrid.secret").exists());
         assert!(dir.path().join("prekey_store.json").exists());
     }

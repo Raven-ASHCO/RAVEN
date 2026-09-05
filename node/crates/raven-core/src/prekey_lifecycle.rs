@@ -434,6 +434,26 @@ fn force_locked_file_prekey_backend() -> bool {
     false
 }
 
+/// Test/lab helper: request the debug locked-file prekey backend.
+///
+/// Headless Linux CI has no Secret Service. `PrekeyLifecycleActor::open`
+/// requires the explicit lab override. Once set, the env stays set so
+/// parallel tests cannot race on process env (do not clear a CI job override).
+/// Uses `RAVEN_PREKEY_BACKEND` only — identity doctor tests read
+/// `RAVEN_IDENTITY_BACKEND` and must stay independent.
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+pub(crate) fn test_enable_locked_file_prekey_backend() {
+    use std::sync::Once;
+    static ENABLE: Once = Once::new();
+    ENABLE.call_once(|| {
+        if force_locked_file_prekey_backend() {
+            return;
+        }
+        // SAFETY: test-only process env for the documented lab/CI backend.
+        unsafe { std::env::set_var("RAVEN_PREKEY_BACKEND", "locked-file") }
+    });
+}
+
 fn locked_file_get(path: &Path) -> Result<Option<Vec<u8>>, PrekeyLifecycleError> {
     if !path.exists() {
         return Ok(None);
@@ -799,6 +819,10 @@ impl PrekeyLifecycleActor {
     /// GNU/Linux uses Secret Service, Windows uses an atomically replaced
     /// DPAPI blob, and every other target fails closed.
     pub fn open(data_dir: &Path) -> Result<Self, PrekeyLifecycleError> {
+        // rust-linux has no org.freedesktop.secrets. Production `open` is
+        // unchanged: this hook is test-only and GNU/Linux-only.
+        #[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+        test_enable_locked_file_prekey_backend();
         let backend = Arc::new(PlatformProtectedPrekeyBackend::new(data_dir)?);
         Self::open_with_backend(data_dir, backend)
     }

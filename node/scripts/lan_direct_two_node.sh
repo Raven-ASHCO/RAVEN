@@ -6,7 +6,11 @@ set -euo pipefail
 set +m
 
 # Shared 0600 seed file so ash and raven-node read the same identity (no Keychain ACL).
+# Chat-history uses the same debug/lab GNU/Linux SS connect-fail path as identity
+# and prekey (derived per-data_dir key). Not a production 0600-key fallback;
+# locked-file is refused in Release.
 export RAVEN_IDENTITY_BACKEND=locked-file
+export RAVEN_CHAT_HISTORY_BACKEND=locked-file
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/debug"
@@ -66,7 +70,9 @@ A_PID=$!
 B_PID=$!
 
 for _ in $(seq 1 80); do
-  if [[ -S "$A/raven-node.sock" && -S "$B/raven-node.sock" ]]; then
+  if [[ -S "$A/raven-node.sock" && -S "$B/raven-node.sock" ]] \
+    && grep -q "lan_direct: listen" "$WORKDIR/a.node.log" \
+    && grep -q "lan_direct: listen" "$WORKDIR/b.node.log"; then
     break
   fi
   sleep 0.1
