@@ -70,7 +70,9 @@ A_PID=$!
 B_PID=$!
 
 for _ in $(seq 1 80); do
-  if [[ -S "$A/raven-node.sock" && -S "$B/raven-node.sock" ]]; then
+  if [[ -S "$A/raven-node.sock" && -S "$B/raven-node.sock" ]] \
+    && grep -q "lan_direct: listen" "$WORKDIR/a.node.log" \
+    && grep -q "lan_direct: listen" "$WORKDIR/b.node.log"; then
     break
   fi
   sleep 0.1
