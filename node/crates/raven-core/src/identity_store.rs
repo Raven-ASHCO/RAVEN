@@ -1588,10 +1588,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let (id, _) = load_or_create_identity(dir).unwrap();
-        #[cfg(target_os = "macos")]
         let original_pub = id.public_key_bytes();
-        #[cfg(not(target_os = "macos"))]
-        let _ = id;
         let mut binding = std::fs::read(binding_path(dir)).unwrap();
         assert_eq!(binding.len(), IDENTITY_BINDING_LEN);
         binding[44] ^= 0x80;
@@ -1610,6 +1607,10 @@ mod tests {
             }
             let seed = keychain_get(&account_for_data_dir(dir)).unwrap().unwrap();
             assert_eq!(Identity::from_seed(&seed).public_key_bytes(), original_pub);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = original_pub;
         }
         test_cleanup(dir);
     }
