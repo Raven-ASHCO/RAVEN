@@ -37,6 +37,14 @@ pub enum IpcRequest {
         expected_pub_hex: String,
         frames_b64: Vec<String>,
     },
+    /// Direct-dial an InternetTransport peer (RIH1 hello + framed envelopes).
+    /// Lab-only until INTERNET_DIRECT_PRODUCTION_ENABLED. Not a WAN claim.
+    InternetDial {
+        v: u16,
+        internet_dial: String,
+        expected_pub_hex: String,
+        frames_b64: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +65,10 @@ pub enum IpcResponse {
         v: u16,
     },
     LanDialResult {
+        v: u16,
+        frames_b64: Vec<String>,
+    },
+    InternetDialResult {
         v: u16,
         frames_b64: Vec<String>,
     },
@@ -92,7 +104,8 @@ pub fn decode_request(frame: &[u8]) -> Result<IpcRequest, String> {
         | IpcRequest::Status { v }
         | IpcRequest::SetPolicy { v, .. }
         | IpcRequest::EnqueueSealed { v, .. }
-        | IpcRequest::LanDial { v, .. } => {
+        | IpcRequest::LanDial { v, .. }
+        | IpcRequest::InternetDial { v, .. } => {
             if *v != IPC_VERSION {
                 return Err("ipc version".into());
             }
@@ -234,6 +247,28 @@ mod tests {
         frame.extend_from_slice(&(huge.len() as u32).to_be_bytes());
         frame.extend_from_slice(&huge);
         assert!(decode_request(&frame).is_err());
+    }
+
+    #[test]
+    fn roundtrip_internet_dial() {
+        let req = IpcRequest::InternetDial {
+            v: IPC_VERSION,
+            internet_dial: "127.0.0.1:7421".into(),
+            expected_pub_hex: "ab".repeat(32),
+            frames_b64: vec!["QUJD".into()],
+        };
+        let f = encode_request(&req).unwrap();
+        assert_eq!(decode_request(&f).unwrap(), req);
+        let resp = IpcResponse::InternetDialResult {
+            v: IPC_VERSION,
+            frames_b64: vec!["ZGVm".into()],
+        };
+        let rf = encode_response(&resp).unwrap();
+        assert_eq!(decode_response(&rf).unwrap(), resp);
+        let raw = std::str::from_utf8(&f[4..]).unwrap().to_ascii_lowercase();
+        for bad in ["seed", "private_key", "plaintext", "recovery"] {
+            assert!(!raw.contains(bad), "{bad} leaked into InternetDial JSON");
+        }
     }
 
     #[test]

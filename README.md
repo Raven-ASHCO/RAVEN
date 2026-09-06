@@ -194,7 +194,7 @@ bash scripts/final_serverless_proof.sh
 # fail-closed origination · secret scrub → AUTOMATED_PROOF_GREEN
 ```
 
-Single-path smokes: `node/scripts/{lan_path_smoke,two_node_demo,internet_dial_smoke,bootstrap_manual_peer_smoke,bridge_abc_demo}.sh`
+Single-path smokes: `node/scripts/{lan_path_smoke,two_node_demo,internet_dial_smoke,internet_indexed_two_node,bootstrap_manual_peer_smoke,bridge_abc_demo}.sh`
 
 ---
 

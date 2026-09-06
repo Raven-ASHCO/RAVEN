@@ -24,7 +24,7 @@ Companion to `docs/MASTER_CHECKLIST_STATUS.md`. This is **not** Final DoD §60.
 
 | Item | Status | Evidence |
 |------|--------|----------|
-| InternetTransport endpoint delivery | ❌ PRODUCTION HOLD | `internet_dial_smoke.sh` proves exact ATSAM refusal |
+| InternetTransport endpoint delivery | 🟡 lab localhost-only (not WAN) | Positive: `internet_indexed_two_node.sh` (RIH1 + indexed ACK on `127.0.0.1`). Negative: `internet_dial_smoke.sh` fail-closed. `INTERNET_DIRECT_PRODUCTION_ENABLED=false`. **dial≠WAN.** multi-NAT **BLOCKED_HARDWARE**. |
 | Full libp2p QUIC/DHT/DCUtR public | ❌ BLOCKED_HARDWARE | local swarm smoke green |
 | Capability advertisement | 🟡 bounded | Internet only; default swarm no longer falsely advertises Relay |
 | Always-on node scripts | ✅ | launchd / systemd / Windows |

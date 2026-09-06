@@ -1,7 +1,8 @@
-//! LAN-direct send: Noise-backed LanDial + PairInit + indexed message/ACK.
+//! Indexed send: LanDial (Noise XX) or InternetDial (RIH1) + PairInit + ACK.
 //!
 //! Never uses `unsafe-demo-crypto` / public-key-derived `seal_message`.
 //! Lab import files are optional leftovers; the live path uses RLB1 on the socket.
+//! InternetDial is lab-gated and is not a WAN claim.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,22 @@ const C_BOLD: &str = "\x1b[1m";
 
 const DEVICE_ID: &str = PRIMARY_DEVICE_ID;
 const PEER_CERT_CACHE: &str = "peer_device_certs.json";
+
+/// Carrier for one indexed send. `Internet` is lab-only (not WAN Proven).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialCarrier {
+    Lan,
+    Internet,
+}
+
+impl DialCarrier {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lan => "lan_dial",
+            Self::Internet => "internet_dial",
+        }
+    }
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -90,9 +107,10 @@ fn cache_peer_cert(
     raven_core::atomic_write_private(&path, out.as_bytes())
 }
 
-fn ipc_lan_dial(
+fn ipc_carrier_dial(
     data_dir: &Path,
-    lan_dial: &str,
+    carrier: DialCarrier,
+    dial: &str,
     expected_pub_hex: &str,
     frames: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, String> {
@@ -101,32 +119,62 @@ fn ipc_lan_dial(
     if !ep.transport_available() {
         return Err("ipc_transport_missing".into());
     }
-    if lan_dial.trim().is_empty()
-        || lan_dial.eq_ignore_ascii_case("local-listen")
-        || lan_dial.eq_ignore_ascii_case("local")
+    if dial.trim().is_empty()
+        || dial.eq_ignore_ascii_case("local-listen")
+        || dial.eq_ignore_ascii_case("local")
     {
-        return Err("valid lan_dial host:port required (LocalListenQueue is disabled)".into());
+        return Err(format!(
+            "valid {} host:port required (LocalListenQueue is disabled)",
+            carrier.label()
+        ));
     }
     let frames_b64 = frames
         .iter()
         .map(|f| base64::engine::general_purpose::STANDARD.encode(f))
         .collect();
-    let req = IpcRequest::LanDial {
-        v: IPC_VERSION,
-        lan_dial: lan_dial.to_string(),
-        expected_pub_hex: expected_pub_hex.to_string(),
-        frames_b64,
+    let req = match carrier {
+        DialCarrier::Lan => IpcRequest::LanDial {
+            v: IPC_VERSION,
+            lan_dial: dial.to_string(),
+            expected_pub_hex: expected_pub_hex.to_string(),
+            frames_b64,
+        },
+        DialCarrier::Internet => IpcRequest::InternetDial {
+            v: IPC_VERSION,
+            internet_dial: dial.to_string(),
+            expected_pub_hex: expected_pub_hex.to_string(),
+            frames_b64,
+        },
     };
     match super::ipc_client::ipc_request_timeout(data_dir, &req, Duration::from_secs(50)) {
-        Ok(IpcResponse::LanDialResult { frames_b64, .. }) => frames_b64
-            .iter()
-            .map(|s| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(s.trim())
-                    .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim()))
-                    .map_err(|e| e.to_string())
-            })
-            .collect(),
+        Ok(IpcResponse::LanDialResult { frames_b64, .. }) if carrier == DialCarrier::Lan => {
+            frames_b64
+                .iter()
+                .map(|s| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(s.trim())
+                        .or_else(|_| {
+                            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim())
+                        })
+                        .map_err(|e| e.to_string())
+                })
+                .collect()
+        }
+        Ok(IpcResponse::InternetDialResult { frames_b64, .. })
+            if carrier == DialCarrier::Internet =>
+        {
+            frames_b64
+                .iter()
+                .map(|s| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(s.trim())
+                        .or_else(|_| {
+                            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim())
+                        })
+                        .map_err(|e| e.to_string())
+                })
+                .collect()
+        }
         Ok(IpcResponse::Error { code, message, .. }) => Err(format!("ipc {code}: {message}")),
         Ok(other) => Err(format!("unexpected ipc: {other:?}")),
         Err(e) => Err(e),
@@ -165,7 +213,7 @@ pub fn ensure_lab_local_material(data_dir: &Path, id: &Identity) -> Result<(), S
     raven_core::ensure_local_prekey(data_dir, id)
 }
 
-/// PairInit + indexed send over one-connection LanDial. No lab import files.
+/// PairInit + indexed send over one-connection LanDial or InternetDial.
 pub fn run_pair_init_and_send(
     data_dir: &Path,
     id: &Identity,
@@ -173,22 +221,43 @@ pub fn run_pair_init_and_send(
     peer_pub_hex: &str,
     text: &str,
 ) -> Result<(), String> {
+    run_pair_init_and_send_on(data_dir, id, peer, peer_pub_hex, text, DialCarrier::Lan)
+}
+
+/// PairInit + indexed send on a named carrier. Internet is lab-only (not WAN).
+pub fn run_pair_init_and_send_on(
+    data_dir: &Path,
+    id: &Identity,
+    peer: &str,
+    peer_pub_hex: &str,
+    text: &str,
+    carrier: DialCarrier,
+) -> Result<(), String> {
     if !trace_delivery::live_pair_init_outbound_ready() {
         return Err(trace_delivery::production_gate_status().into());
+    }
+    if carrier == DialCarrier::Internet && !raven_core::internet_direct_live_enabled() {
+        return Err(
+            "INTERNET_DIRECT_HOLD: indexed InternetTransport is lab-only \
+             (debug RAVEN_LAB_TEST_A=1); INTERNET_DIRECT_PRODUCTION_ENABLED=false; \
+             localhost ≠ WAN Proven"
+                .into(),
+        );
     }
     if !peer.contains(':')
         || peer.eq_ignore_ascii_case("local-listen")
         || peer.eq_ignore_ascii_case("local")
     {
-        return Err(
-            "valid lan_dial host:port required — refusing LocalListenQueue fallback".into(),
-        );
+        return Err(format!(
+            "valid {} host:port required — refusing LocalListenQueue fallback",
+            carrier.label()
+        ));
     }
     ensure_lab_local_material(data_dir, id)?;
     let peer_pub = parse_pub_hex(peer_pub_hex)?;
     let (local_cert, registry) = ensure_local_device_cert(data_dir, id)?;
 
-    let rlb1_replies = ipc_lan_dial(data_dir, peer, peer_pub_hex, &[])?;
+    let rlb1_replies = ipc_carrier_dial(data_dir, carrier, peer, peer_pub_hex, &[])?;
     let peer_bundle = rlb1_replies
         .iter()
         .find_map(|f| parse_peer_offer(f).ok())
@@ -205,7 +274,7 @@ pub fn run_pair_init_and_send(
     } else {
         let (init, key) = create_initiator_pair_init(data_dir, id, &peer_bundle)?;
         let init_frame = wrap_pair_init(id, &init)?;
-        let replies = ipc_lan_dial(data_dir, peer, peer_pub_hex, &[init_frame])?;
+        let replies = ipc_carrier_dial(data_dir, carrier, peer, peer_pub_hex, &[init_frame])?;
         let response = first_pair_response(&replies).ok_or_else(|| {
             let kinds: Vec<String> = replies
                 .iter()
@@ -232,7 +301,7 @@ pub fn run_pair_init_and_send(
             "TRACE_PAIR_RESPONSE_CONFIRMED",
             "SESSION_CONFIRMED",
             Some(&hex::encode(&init.init_id[..4])),
-            Some("lan_dial"),
+            Some(carrier.label()),
         );
         println!("{C_GREEN}PairResponse confirmed{C_RESET} — sending indexed message");
         key
@@ -248,6 +317,7 @@ pub fn run_pair_init_and_send(
         peer,
         peer_pub_hex,
         &peer_bundle.cert,
+        carrier,
     )
 }
 
@@ -262,11 +332,17 @@ fn send_indexed_text(
     lan_dial: &str,
     peer_pub_hex: &str,
     peer_cert: &DeviceCertificate,
+    carrier: DialCarrier,
 ) -> Result<(), String> {
-    if text.len() > raven_core::lan_noise::MAX_LAN_ENDPOINT_TEXT {
+    let max_text = match carrier {
+        DialCarrier::Lan => raven_core::lan_noise::MAX_LAN_ENDPOINT_TEXT,
+        DialCarrier::Internet => raven_core::MAX_ENDPOINT_TEXT_BYTES.min(64 * 1024),
+    };
+    if text.len() > max_text {
         return Err(format!(
-            "message too large for LAN Noise (max {} bytes)",
-            raven_core::lan_noise::MAX_LAN_ENDPOINT_TEXT
+            "message too large for {} (max {} bytes)",
+            carrier.label(),
+            max_text
         ));
     }
     let now = now_ms();
@@ -298,8 +374,15 @@ fn send_indexed_text(
     // Exact binding observed in the dial callback when handoff fails.
     let failed_binding = std::cell::RefCell::new(None::<([u8; 32], [u8; 32], [u8; 16])>);
     let mut dial = |digest: &[u8; 32], bytes: &[u8]| {
-        if bytes.len() > raven_core::lan_noise::MAX_TRANSPORT_PLAINTEXT {
-            *dial_err.borrow_mut() = Some("packed envelope exceeds Noise transport limit".into());
+        let oversize = match carrier {
+            DialCarrier::Lan => bytes.len() > raven_core::lan_noise::MAX_TRANSPORT_PLAINTEXT,
+            DialCarrier::Internet => bytes.len() > raven_core::MAX_FRAME_BYTES,
+        };
+        if oversize {
+            *dial_err.borrow_mut() = Some(format!(
+                "packed envelope exceeds {} transport limit",
+                carrier.label()
+            ));
             return Err(());
         }
         if let Some(expected) = *dial_expected_digest.borrow() {
@@ -337,11 +420,11 @@ fn send_indexed_text(
                     *dial_err.borrow_mut() = Some(e);
                     return Err(());
                 }
-                // Never hold BEGIN EXCLUSIVE across ipc_lan_dial (up to ~45s).
+                // Never hold BEGIN EXCLUSIVE across carrier dial (up to ~45s).
                 let _ = stage_guard.borrow_mut().take();
             }
         }
-        match ipc_lan_dial(data_dir, lan_dial, peer_pub_hex, &[bytes.to_vec()]) {
+        match ipc_carrier_dial(data_dir, carrier, lan_dial, peer_pub_hex, &[bytes.to_vec()]) {
             Ok(frames) => {
                 *replies.borrow_mut() = frames;
                 Ok(*digest)
@@ -567,11 +650,12 @@ fn send_indexed_text(
         "TRACE_INDEXED_MESSAGE_DIALED",
         "WAITING_FOR_ENDPOINT_ACK",
         Some(&mid),
-        Some("lan_dial"),
+        Some(carrier.label()),
     );
     println!(
-        "{C_GREEN}indexed message queued after dial{C_RESET} mid={mid}… peer={}",
-        sanitize_terminal_text(lan_dial)
+        "{C_GREEN}indexed message queued after dial{C_RESET} mid={mid}… peer={} carrier={}",
+        sanitize_terminal_text(lan_dial),
+        carrier.label()
     );
     if let Some(ack) = first_ack_frame(&replies.borrow()) {
         finish_outbound_delivered(

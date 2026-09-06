@@ -52,7 +52,7 @@ Signed peer record (`raven_core::discovery`):
 
 Ed25519-signed. MAY be published into a Kademlia DHT when `rust-libp2p` integration is enabled. V1 shipping path dials explicit `host:port` / multiaddr without requiring live DHT.
 
-**NAT / CGNAT / DCUtR:** multi-NAT live matrix is **BLOCKED_HARDWARE**. Software substitutes: localhost + LAN dial smokes (`internet_dial_smoke`, `lan_path_smoke`); AutoNAT/DCUtR not claimed complete.
+**NAT / CGNAT / DCUtR:** multi-NAT live matrix is **BLOCKED_HARDWARE**. Software substitutes: localhost + LAN dial smokes (`internet_dial_smoke` fail-closed; `internet_indexed_two_node` localhost/lab indexed delivery — **dial≠WAN**; `lan_path_smoke`); AutoNAT/DCUtR not claimed complete.
 
 ## 6. Target libp2p (ADR-0002)
 
@@ -65,4 +65,4 @@ Ed25519-signed. MAY be published into a Kademlia DHT when `rust-libp2p` integrat
 
 ## 7. Tests
 
-`internet` unit tests, `internet_dial_smoke.sh`, `lan_path_smoke.sh`, `libp2p_swarm_smoke.sh`, `bootstrap_manual_peer_smoke.sh`, bridge demos.
+`internet` unit tests, `internet_dial_smoke.sh` (fail-closed), `internet_indexed_two_node.sh` (localhost lab; **dial≠WAN**), `lan_path_smoke.sh`, `libp2p_swarm_smoke.sh`, `bootstrap_manual_peer_smoke.sh`, bridge demos.

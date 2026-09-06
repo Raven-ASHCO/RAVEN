@@ -61,7 +61,8 @@ Companion: [`blockers-ownership-board.md`](blockers-ownership-board.md) · evide
 |------|------|
 | LAN / localhost | **Proven** (localhost/LAN software path) |
 | WAN | **blocked / untested** — **NOT** a WAN reliability claim |
-| Internet dial | **fail-closed proven** — **NOT** a WAN reliability claim |
+| Internet dial | **fail-closed proven** (legacy `raven-node run`) — **NOT** a WAN reliability claim |
+| InternetTransport indexed (lab) | **localhost-only software Proven (lab)** — RIH1 + PairInit + sealed ACK via `internet_indexed_two_node.sh` on `127.0.0.1`. **dial≠WAN.** multi-NAT **BLOCKED_HARDWARE**. Production flag stays false. Named-pipe ≠ WAN. |
 | `ash_menu_smoke` | CLI DX [RAVEN#16](https://github.com/Raven-ASHCO/RAVEN/pull/16) |
 | Windows | **honest fail-closed** until named-pipe (B10 #1) |
 
@@ -106,7 +107,7 @@ Terminal Win / macOS / Linux reliability **and** this three-path matrix sit **ab
 |------|---------------|--------------------------|---------------------------|
 | **mesh** (Path A) | **Not Proven** — **locked** | **Path A lock:** localhost reservation only. Two-client circuit / WAN / auto-fallback / DCUtR **NOT proven**. Hop server **missing**. Multi-NAT **BLOCKED_HARDWARE**. NAT hold **intact**. Policy/sim (`network_sim_1000`) + `mock_ble` hygiene ≠ live mesh. **Do not call mesh relay reliable.** | Executed green/red only (linked CI or agent smoke) on a **named** mesh path after the lock lifts. CI ≠ hardware. |
 | **bridge** (Path B) | **Locked** — opaque custody + `ENDPOINT_ACK_ONLY` **proven (software)** | **Path B lock:** hop/repl **cooperative-only**; prod mailbox **held**; iOS **blocked on B8**. Claim language locked — **not flood-proof / not Byzantine-safe**. Prefer executed green/red citations (`bridge_v1` / named smokes — do not invent run IDs here). | Broader Proven (flood / Byzantine / prod mailbox / iOS) is **out of claim**. |
-| **direct** (Path C) | **Locked** — LAN/localhost **proven**; WAN **blocked/untested** | **Path C lock:** internet dial **fail-closed proven** — **NOT** a WAN reliability claim. `ash_menu_smoke` → CLI DX [RAVEN#16](https://github.com/Raven-ASHCO/RAVEN/pull/16). Windows **honest fail-closed** until named-pipe. Named-pipe/UDS work **does not unblock WAN**. See connectivity matrix §0. | WAN Proven would need executed green/red on a **non-loopback / non-RFC1918** peer. `127.0.0.1` (B12) is **not** WAN Proven. |
+| **direct** (Path C) | **Locked** — LAN/localhost **proven**; InternetTransport indexed **lab localhost-only proven**; WAN **blocked/untested** | **Path C lock:** legacy internet dial **fail-closed proven** — **NOT** a WAN reliability claim. Lab smoke: `internet_indexed_two_node.sh` = RIH1 + indexed ACK on `127.0.0.1` only (**dial≠WAN**; localhost ≠ public WAN). multi-NAT **BLOCKED_HARDWARE**. `ash_menu_smoke` → CLI DX [RAVEN#16](https://github.com/Raven-ASHCO/RAVEN/pull/16). Windows **honest fail-closed** until named-pipe. Named-pipe/UDS work **does not unblock WAN**. | WAN Proven would need executed green/red on a **distinct non-loopback / non-RFC1918 public peer**. `127.0.0.1` (B12) is **not** WAN Proven. |
 
 ---
 

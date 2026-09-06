@@ -355,6 +355,8 @@ step_begin "14_lan_smoke_internet_hold"
   set -e
   bash "$NODE_ROOT/scripts/lan_path_smoke.sh" | tee "$ART/logs/lan.log"
   bash "$NODE_ROOT/scripts/internet_dial_smoke.sh" | tee "$ART/logs/internet.log"
+  bash "$NODE_ROOT/scripts/internet_indexed_two_node.sh" | tee "$ART/logs/internet_indexed.log"
+  grep -q 'INTERNET_INDEXED_TWO_NODE_PASS' "$ART/logs/internet_indexed.log"
   bash "$NODE_ROOT/scripts/two_node_demo.sh" | tee "$ART/logs/two_node.log"
 ) >"$STEP_LOG" 2>&1 && step_ok || step_fail "lan/internet/two-node"
 
