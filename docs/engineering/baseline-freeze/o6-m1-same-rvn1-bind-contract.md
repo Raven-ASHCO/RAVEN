@@ -34,7 +34,7 @@ ash --data-dir "$DATA" whoami --json # public card only
 {"address":"rvn1…","fingerprint":"XXXX-XXXX-XXXX","pub_hex":"<64 hex>"}
 ```
 
-`address` MUST equal Identity V1 encode of `pub_hex` (`SHA-256(ed_pub)[:20]` + bech32m `rvn`). Fingerprint MUST equal `device_fingerprint_v1(ed_pub)` (same function ash already prints).
+`address` MUST equal Identity V1 encode of `pub_hex` (`SHA-256(ed_pub)[:20]` + bech32m `rvn`). That `ed_pub` is the **user identity** key that derives the RVN1 — **not** a device-only key and **not** `device_ed_pub`. Fingerprint MUST equal `device_fingerprint_v1` of that same identity pub (ash-style contact pin). **Pin ≢ `device_ed_pub`** (G5 SoT / ADR 0004 Appendix G5).
 
 ---
 
@@ -73,6 +73,8 @@ The helper **never** writes `device_ed25519.seed` or copies `identity.seed`.
 - No daemon-seal / `EnqueueSealed` / `LanDial` as O6 confidentiality.
 - No Python ATSAM / no `atsam_rvn1` send claim.
 - No distinct `USER_AGENT_DEVICE` (documented follow-on after M2).
+- No second pin namespace / soft parallel trust root beside the node contact plane.
+- No soft-load P0 (OPEN-ID-P0 stays held; out of this PR).
 - No HOLD lift / Release / production enablement.
 
 ---
