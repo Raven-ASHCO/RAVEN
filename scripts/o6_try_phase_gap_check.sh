@@ -97,13 +97,13 @@ echo
 echo "gates:"
 echo "  G-HOLD=ACTIVE"
 echo "  G-TERM=NOT_PROVEN (named-pipe code landed #43; Proven still needs executed green/red)"
-echo "  G-M1=MISSING (same-RVN1 bridge)"
+  echo "  G-M1=IN_PROGRESS (RAVEN public whoami + pin-file bind; RDAP seed still parallel; NON-RELEASE)"
 echo "  G-M2-IPC=MISSING (no daemon-seal op)"
 echo "  G-M2-PY=MISSING (no RDAP IPC client in this repo)"
 echo "  G-M3=MISSING (no two-device RDAP harness)"
 echo "  G-CI=MISSING (no Raven↔RDAP interop job)"
 echo
-echo "next_authorized_code_pr=M1 identity bridge only, after terminal board green (or CEO override)"
+echo "next_authorized_code_pr=M1 RDAP companion pin consume (RAVEN-side public bind in progress); then M2 daemon-seal"
 echo "forbidden=python ATSAM seal; Noise-only confidentiality claim; HOLD lift via this script"
 echo
 red "O6_TRY_PHASE=RED"

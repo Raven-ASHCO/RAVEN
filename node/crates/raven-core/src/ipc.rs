@@ -325,6 +325,103 @@ mod tests {
         assert!(!matches!(ep, IpcEndpoint::Unsupported));
     }
 
+    fn assert_json_has_no_secret_tokens(raw: &str) {
+        let lower = raw.to_ascii_lowercase();
+        for bad in ["seed", "private_key", "plaintext", "recovery"] {
+            assert!(!lower.contains(bad), "{bad} leaked into IPC JSON: {raw}");
+        }
+    }
+
+    #[test]
+    fn status_json_has_no_private_key_material() {
+        let req = IpcRequest::Status { v: IPC_VERSION };
+        let resp = IpcResponse::Status {
+            v: IPC_VERSION,
+            bridge: false,
+            store: false,
+            relay: false,
+            forward_pending: 0,
+            capabilities: vec!["ipc".into()],
+        };
+        let rf = encode_request(&req).unwrap();
+        let sf = encode_response(&resp).unwrap();
+        let req_json = std::str::from_utf8(&rf[4..]).unwrap();
+        let resp_json = std::str::from_utf8(&sf[4..]).unwrap();
+        assert_json_has_no_secret_tokens(req_json);
+        assert_json_has_no_secret_tokens(resp_json);
+        assert!(resp_json.contains("\"ok\":\"status\""));
+        assert!(
+            !resp_json.contains("rvn1"),
+            "Status stays policy-only; whoami is ash CLI"
+        );
+    }
+
+    /// Serialize existing ops to prove no secret field names.
+    /// Does **not** exercise LanDial/EnqueueSealed as a send path (M2 still closed).
+    #[test]
+    fn all_ipc_variants_json_have_no_private_key_material() {
+        let reqs = [
+            IpcRequest::Ping { v: IPC_VERSION },
+            IpcRequest::Status { v: IPC_VERSION },
+            IpcRequest::SetPolicy {
+                v: IPC_VERSION,
+                bridge: Some(false),
+                store: None,
+                relay: None,
+            },
+            IpcRequest::EnqueueSealed {
+                v: IPC_VERSION,
+                envelope_b64: "QUJD".into(),
+                peer_hint: Some("peer".into()),
+            },
+            IpcRequest::LanDial {
+                v: IPC_VERSION,
+                lan_dial: "127.0.0.1:1".into(),
+                expected_pub_hex: "ab".repeat(32),
+                frames_b64: vec!["QUJD".into()],
+            },
+            IpcRequest::InternetDial {
+                v: IPC_VERSION,
+                internet_dial: "127.0.0.1:1".into(),
+                expected_pub_hex: "ab".repeat(32),
+                frames_b64: vec!["QUJD".into()],
+            },
+        ];
+        let resps = [
+            IpcResponse::Pong { v: IPC_VERSION },
+            IpcResponse::Status {
+                v: IPC_VERSION,
+                bridge: false,
+                store: false,
+                relay: false,
+                forward_pending: 0,
+                capabilities: vec!["ipc".into()],
+            },
+            IpcResponse::Accepted { v: IPC_VERSION },
+            IpcResponse::LanDialResult {
+                v: IPC_VERSION,
+                frames_b64: vec!["QUJD".into()],
+            },
+            IpcResponse::InternetDialResult {
+                v: IPC_VERSION,
+                frames_b64: vec!["QUJD".into()],
+            },
+            IpcResponse::Error {
+                v: IPC_VERSION,
+                code: "X".into(),
+                message: "no".into(),
+            },
+        ];
+        for req in &reqs {
+            let f = encode_request(req).unwrap();
+            assert_json_has_no_secret_tokens(std::str::from_utf8(&f[4..]).unwrap());
+        }
+        for resp in &resps {
+            let f = encode_response(resp).unwrap();
+            assert_json_has_no_secret_tokens(std::str::from_utf8(&f[4..]).unwrap());
+        }
+    }
+
     #[test]
     fn enqueue_sealed_roundtrip_has_no_secret_fields() {
         let req = IpcRequest::EnqueueSealed {
