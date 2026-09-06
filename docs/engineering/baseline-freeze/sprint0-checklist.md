@@ -13,7 +13,7 @@ Status legend: `NOT STARTED` · `IN PROGRESS` · `BLOCKED` · `DONE` · `WAIVED`
 | CI required checks | #20 | NOT STARTED | Workflows exist (`raven-serverless.yml`, `selftest.yml`); not required on `main` |
 | Current protocol versions | #2, #3, #14 | IN PROGRESS | Inventory: `protocol/PROTOCOL_VERSIONS.md` (linked from `protocol/SPEC.md`); production-disabled evidence in `protocol/RAVEN_INTEROPERABILITY_MATRIX.md` §5. Docs only; CI YAML alignment is DevSecOps. |
 | Experimental-only features | #2, #14, #10 | NOT STARTED | |
-| Known security / interop / Raven↔RDAP gaps | #4, #17, #18 | NOT STARTED | |
+| Known security / interop / Raven↔RDAP gaps | #4, #17, #18 | IN PROGRESS | **Inventory landed** (2026-09-06, tip `7ccf180`): [`o6-raven-rdap-try-phase-gap-board.md`](o6-raven-rdap-try-phase-gap-board.md) + fail-closed [`scripts/o6_try_phase_gap_check.sh`](../../../scripts/o6_try_phase_gap_check.sh) (expected RED). ADR 0004 + G5 ACK’d (RAVEN#3). **Not** O6 harness green. Interop tests in CI still **not started** (blocked on terminal + HOLD + M1–M3). |
 | Performance baseline | #19 SRE Perf | IN PROGRESS | Harvest landed [RAVEN#26](https://github.com/Raven-ASHCO/RAVEN/pull/26): [`perf-baseline-2026-09-04.md`](perf-baseline-2026-09-04.md) + [`reliability-evidence-bar.md`](reliability-evidence-bar.md). Soft budgets stay draft. Docs-only ≠ Proven. |
 | 90-day roadmap | #1, Eng Mgmt | IN PROGRESS | Outcomes O1–O7 in `07-ninety-day-outcomes.md` |
 

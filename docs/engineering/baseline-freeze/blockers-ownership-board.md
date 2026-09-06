@@ -184,6 +184,10 @@ Default catch-all on both repos: `@Raven-ASHCO/architecture` + `@Raven-ASHCO/rel
 
 ---
 
+## O6 try-phase gap board (2026-09-06)
+
+**Non-release inventory** at tip `7ccf180`: [`o6-raven-rdap-try-phase-gap-board.md`](o6-raven-rdap-try-phase-gap-board.md). Fail-closed check [`scripts/o6_try_phase_gap_check.sh`](../../../scripts/o6_try_phase_gap_check.sh) is **expected RED**. M0 remains closed; **M1–M3 production code still gated** (terminal + HOLD). This 2026-09-04 board’s B10 “named-pipe = #1 blocker” sentence is **stale vs [RAVEN#43](https://github.com/Raven-ASHCO/RAVEN/pull/43)** (pipe **code** landed; **not** terminal Proven). Do not treat a docs refresh as O6 harness green.
+
 ## O6 milestone gate (M0 / RAVEN#3)
 
 **M0 docs done ✅ CLOSED / MERGED.** [RAVEN#3](https://github.com/Raven-ASHCO/RAVEN/pull/3) ADR 0004 is on `main` at `ce087c7d9cfb`.
