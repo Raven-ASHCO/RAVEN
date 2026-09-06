@@ -172,7 +172,7 @@ ATSAM_SESSION_REQUIRED: no persisted peer material for hint
 
 IPC refuse token: `ATSAM_SESSION_REQUIRED`. `rc=1`. stdout empty. No `ATSAM_LINEAGE_REVOKED`.
 
-Daemon ([`red/node.log`](artifacts/o6-m2-seal-under-session/red/node.log)): `raven-node ipc: listening …/raven-node.sock` + `lan_direct: listen`.
+Daemon ([`red/node.listen.txt`](artifacts/o6-m2-seal-under-session/red/node.listen.txt)): `raven-node ipc: listening …/raven-node.sock` + `lan_direct: listen`.
 
 ### GREEN excerpt
 
