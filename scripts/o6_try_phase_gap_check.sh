@@ -41,8 +41,8 @@ grep -q 'Release status | \*\*HOLD\*\*' "$TM" \
   || fail_reg "$TM missing Release status HOLD row"
 grep -qi 'not approved for production' "$ERRATA" \
   || fail_reg "$ERRATA missing production-hold language"
-grep -q 'Daemon never seals from plaintext here' "$IPC" \
-  || fail_reg "$IPC missing sealed-frame-only invariant"
+grep -q 'Daemon never seals here' "$IPC" \
+  || fail_reg "$IPC missing EnqueueSealed sealed-frame-only invariant"
 grep -q 'EnqueueSealed' "$IPC" && grep -q 'LanDial' "$IPC" \
   || fail_reg "$IPC missing EnqueueSealed / LanDial"
 if grep -Eq 'enum IpcRequest' -A 40 "$IPC" | grep -Eqi 'SealPlaintext|SealPayload|EnqueuePlain'; then
@@ -98,12 +98,12 @@ echo "gates:"
 echo "  G-HOLD=ACTIVE"
 echo "  G-TERM=NOT_PROVEN (named-pipe code landed #43; Proven still needs executed green/red)"
   echo "  G-M1=IN_PROGRESS (RAVEN public whoami + pin-file bind; RDAP seed still parallel; NON-RELEASE)"
-echo "  G-M2-IPC=MISSING (no daemon-seal op)"
-echo "  G-M2-PY=MISSING (no RDAP IPC client in this repo)"
+echo "  G-M2-IPC=LANDED_LAB_ONLY (SealUnderSession on main; not O6 E2E / not HOLD lift)"
+echo "  G-M2-PY=LANDED_LAB_ONLY (RDAP companion client; not in this repo; not confidential)"
 echo "  G-M3=MISSING (no two-device RDAP harness)"
 echo "  G-CI=MISSING (no Raven↔RDAP interop job)"
 echo
-echo "next_authorized_code_pr=M1 RDAP companion pin consume (RAVEN-side public bind in progress); then M2 daemon-seal"
+echo "next_authorized_code_pr=M3 two-device RDAP ask harness (still NON-RELEASE / HOLD); no HOLD lift"
 echo "forbidden=python ATSAM seal; Noise-only confidentiality claim; HOLD lift via this script"
 echo
 red "O6_TRY_PHASE=RED"
