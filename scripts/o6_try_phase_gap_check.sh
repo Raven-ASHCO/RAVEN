@@ -8,9 +8,12 @@
 # production ATSAM, or a HOLD lift. Harness green ≠ HOLD lifted.
 # Python ATSAM seal is forbidden; this script does not send, dial, or seal.
 #
-# Exit 0 is reserved for a future HOLD-aware M3 harness and is refused today.
-# Exit 1 = expected RED (gates still closed).
-# Exit 2 = inventory/invariant regression (board or HOLD citations missing).
+# Exit 0 is reserved for a future HOLD-aware M3 harness (O6 E2E Proven) and
+# is refused today. M2 SealUnderSession landed ≠ Exit 0.
+# Exit 1 = expected RED: inventory/containment checks passed, but the O6
+#          two-device harness is NOT green (HOLD intact; M2 IPC ≠ O6 E2E).
+# Exit 2 = inventory/invariant regression (board, HOLD, EnqueueSealed
+#          sealed-frame-only, or SealUnderSession citations missing).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -41,13 +44,24 @@ grep -q 'Release status | \*\*HOLD\*\*' "$TM" \
   || fail_reg "$TM missing Release status HOLD row"
 grep -qi 'not approved for production' "$ERRATA" \
   || fail_reg "$ERRATA missing production-hold language"
-grep -q 'Daemon never seals from plaintext here' "$IPC" \
-  || fail_reg "$IPC missing sealed-frame-only invariant"
+# EnqueueSealed stays sealed-frame-only. Tip wording is "Daemon never seals
+# here." Accept the pre-M2 citation too so this check does not false-fail.
+if grep -q 'Daemon never seals here' "$IPC" \
+  || grep -q 'Daemon never seals from plaintext here' "$IPC"; then
+  :
+else
+  fail_reg "$IPC missing EnqueueSealed sealed-frame-only invariant"
+fi
 grep -q 'EnqueueSealed' "$IPC" && grep -q 'LanDial' "$IPC" \
   || fail_reg "$IPC missing EnqueueSealed / LanDial"
-if grep -Eq 'enum IpcRequest' -A 40 "$IPC" | grep -Eqi 'SealPlaintext|SealPayload|EnqueuePlain'; then
-  fail_reg "$IPC grew a plaintext-seal op; do not treat as O6 green — Crypto must own M2"
+# M2 Crypto-owned daemon seal landed. Required; not a regression; not O6 green.
+grep -q 'SealUnderSession' "$IPC" && grep -q 'SealUnderSessionResult' "$IPC" \
+  || fail_reg "$IPC missing SealUnderSession / SealUnderSessionResult (M2 landed)"
+if grep -Eqi 'SealPlaintext|SealPayload|EnqueuePlain' "$IPC"; then
+  fail_reg "$IPC grew a plaintext-named seal op; Crypto-owned name is SealUnderSession"
 fi
+echo "m2_ipc=SealUnderSession landed (NON-RELEASE)"
+echo "honesty=M2 IPC ≠ O6 E2E Proven; HOLD intact"
 if grep -qi 'python MUST NOT construct' "$ADR"; then
   :
 elif grep -q 'Python / RDAP MUST NOT' "$ADR"; then
@@ -59,6 +73,15 @@ grep -q 'non-release' "$BOARD" || fail_reg "$BOARD missing non-release label"
 grep -q 'Harness green ≠ HOLD lifted' "$BOARD" \
   || grep -q 'harness green ≠ hold lifted' "$BOARD" \
   || fail_reg "$BOARD missing harness-green ≠ HOLD-lifted rule"
+grep -q 'SealUnderSession' "$BOARD" \
+  || fail_reg "$BOARD missing SealUnderSession (G-M2-IPC honesty)"
+grep -q 'Daemon never seals here' "$BOARD" \
+  || fail_reg "$BOARD missing current EnqueueSealed sealed-frame-only citation"
+if grep -q '3207e8ea' "$BOARD" || grep -q 'raven_ipc' "$BOARD"; then
+  :
+else
+  fail_reg "$BOARD missing RDAP companion client citation (G-M2-PY)"
+fi
 
 # This repo must not grow a Python ATSAM / RDAP IPC client by accident.
 if [[ -d "$ROOT/team_agents" ]]; then
@@ -83,11 +106,11 @@ if [[ -n "${RDAP_ROOT:-}" ]]; then
     fi
   fi
   rdap_hits="$(find "$RDAP_ROOT" -name '*.py' ! -path '*/.git/*' -print0 2>/dev/null \
-    | xargs -0 -r grep -l 'EnqueueSealed' 2>/dev/null || true)"
+    | xargs -0 -r grep -l -E 'EnqueueSealed|SealUnderSession' 2>/dev/null || true)"
   if [[ -n "$rdap_hits" ]]; then
-    echo "rdap_enqueue_sealed=present — still not O6 green without M1/M2/HOLD labeling"
+    echo "rdap_seal_client=present — M2 companion landed; still not O6 E2E Proven / HOLD intact"
   else
-    echo "rdap_enqueue_sealed=absent"
+    echo "rdap_seal_client=absent"
   fi
 else
   echo "rdap_root=unset (RAVEN-only check; companion gap cited from live README in the board)"
@@ -97,19 +120,21 @@ echo
 echo "gates:"
 echo "  G-HOLD=ACTIVE"
 echo "  G-TERM=NOT_PROVEN (named-pipe code landed #43; Proven still needs executed green/red)"
-  echo "  G-M1=IN_PROGRESS (RAVEN public whoami + pin-file bind; RDAP seed still parallel; NON-RELEASE)"
-echo "  G-M2-IPC=MISSING (no daemon-seal op)"
-echo "  G-M2-PY=MISSING (no RDAP IPC client in this repo)"
-echo "  G-M3=MISSING (no two-device RDAP harness)"
+echo "  G-M1=IN_PROGRESS (RAVEN public whoami + pin-file bind; RDAP seed still parallel; NON-RELEASE)"
+echo "  G-M2-IPC=LANDED (SealUnderSession; NON-RELEASE; M2 IPC ≠ O6 E2E Proven)"
+echo "  G-M2-PY=LANDED_COMPANION (RDAP 3207e8ea raven_ipc; not in this repo; not O6 E2E Proven)"
+echo "  G-M3=MISSING (no two-device RDAP harness / execute evidence)"
 echo "  G-CI=MISSING (no Raven↔RDAP interop job)"
 echo
-echo "next_authorized_code_pr=M1 RDAP companion pin consume (RAVEN-side public bind in progress); then M2 daemon-seal"
-echo "forbidden=python ATSAM seal; Noise-only confidentiality claim; HOLD lift via this script"
+echo "next_authorized_code_pr=M3 two-device execute evidence (HOLD-labeled); M2 IPC + RDAP companion already on main"
+echo "forbidden=python ATSAM seal; Noise-only confidentiality claim; HOLD lift via this script; O6 Proven claim"
 echo
 red "O6_TRY_PHASE=RED"
 red "O6_HARNESS=NOT_GREEN"
 red "O6_INVENTORY=PRESENT"
+red "M2_IPC=LANDED"
+red "M2_IPC_NE_O6_E2E=1"
 red "HOLD=ACTIVE"
 red "LABEL=$LABEL"
-echo "exit=1 (expected while gated)"
+echo "exit=1 (inventory/containment passed; O6 try-phase not green)"
 exit 1
