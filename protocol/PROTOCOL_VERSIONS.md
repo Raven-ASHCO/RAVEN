@@ -50,7 +50,7 @@ Capability negotiation is layered on version negotiation. Reconciling legacy RUM
 
 [`Raven-ASHCO/raven-distributed-agent-protocol`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol) package **1.1.0** is an experimental A2A companion. It vendors `protocol/reference/raven_protocol`. It is **not** the `raven-node` identity store. Those package / companion facts are unchanged.
 
-**RDAP B1 (main-green streak reset; required checks OFF / pin not enabled).** The six A2A selftest job names are unchanged. They are **not** “live B1 required pins” and are **not** “verified live required checks.” Branch-protection **required checks are OFF** (`required_status_checks: null`); the pin is **not** enabled. Manager GO asked to re-enable; that GO is **not applied yet**. Job display names are from workflow **RDAP selftest** (`.github/workflows/selftest.yml` in the RDAP repo):
+**RDAP B1 (main-green streak reset; required checks OFF / pin not enabled).** The six A2A selftest job names are unchanged. They are **not** “live B1 required pins” and are **not** “verified live required checks.” Branch-protection **required checks are OFF** (`required_status_checks: null`); the pin is **not** enabled — pending **founder GO**. Do not claim live pins until founder GO. Job display names are from workflow **RDAP selftest** (`.github/workflows/selftest.yml` in the RDAP repo):
 
 1. `A2A selftest (ubuntu-latest, Python 3.10)`
 2. `A2A selftest (ubuntu-latest, Python 3.12)`
@@ -61,7 +61,7 @@ Capability negotiation is layered on version negotiation. Reconciling legacy RUM
 
 Streak reset; ≥2 consecutive greens on tip `4307b86e` (`4307b86e69144f20480c24d6d6ce9f1e68a596e7`). DevSecOps reports the main-green streak reset after an intervening RDAP selftest failure on `3c5a0cb` (run [`34033634481`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol/actions/runs/34033634481)), then greens on `4d58dd46` (run [`34035297812`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol/actions/runs/34035297812)) and tip `4307b86e` (run [`34035600187`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol/actions/runs/34035600187)).
 
-Do not treat RDAP B1 as RAVEN `main` branch protection. RAVEN Serverless names and status are in **RAVEN Serverless B1 (main-green verified, pin not enabled)** below (pending **founder GO**, not Manager GO). Do not use live-pin language for either repo until the matching GO is applied.
+Do not treat RDAP B1 as RAVEN `main` branch protection. RAVEN Serverless names and status are in **RAVEN Serverless B1 (main-green verified, pin not enabled)** below (also pending **founder GO**). Do not use live-pin language for either repo until founder GO.
 
 ---
 
@@ -72,7 +72,7 @@ DevSecOps confirmed **main-green verified** on tip `e0a317aa` (`e0a317aa6d4873d1
 - Workflow **Raven Serverless Node** run [`33989477053`](https://github.com/Raven-ASHCO/RAVEN/actions/runs/33989477053) → success (push)
 - Workflow **Raven B1 Always-On** run [`33989477009`](https://github.com/Raven-ASHCO/RAVEN/actions/runs/33989477009) → success (push); job `B1 always-on gate` success
 
-These six check names were SUCCESS on that tip. They are **PR-green candidates now recorded as main-green**. Pin / branch-protection is **NOT enabled** — pending **founder GO**. They are **not** “live required B1 pins.” That language is reserved for after founder GO. RDAP B1 above is a separate-repo note: streak reset (≥2) on tip `4307b86e`, required checks **OFF**, pending **Manager GO**. Keep the distinction.
+These six check names were SUCCESS on that tip. They are **PR-green candidates now recorded as main-green**. Pin / branch-protection is **NOT enabled** — pending **founder GO**. They are **not** “live required B1 pins.” That language is reserved for after founder GO. RDAP B1 above is a separate-repo note: streak reset (≥2) on tip `4307b86e`, required checks **OFF**, also pending **founder GO**. Keep the distinction.
 
 1. `B1 always-on gate`
 2. `Messaging-only product boundary`
