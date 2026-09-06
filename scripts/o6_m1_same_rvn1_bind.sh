@@ -140,10 +140,12 @@ umask 022
 cat >"$pin" <<EOF
 # ADR 0004 D3 same-RVN1 public pin (NON-RELEASE)
 # Public pin only — not a keypair and not private-key material.
+# principal=user_identity  pin ≢ device_ed_pub (G5)
 address=$ADDRESS
 pub_hex=$PUB_HEX
 fingerprint=$FINGERPRINT
 source=raven-node-whoami
+principal=user_identity
 label=$LABEL
 hold=ACTIVE
 claim=none
@@ -159,6 +161,8 @@ obj = {
     "pub_hex": pub_hex,
     "fingerprint": fingerprint,
     "source": "raven-node-whoami",
+    "principal": "user_identity",
+    "g5_pin_ne_device_ed_pub": True,
     "label": "NON-RELEASE",
     "hold": "ACTIVE",
     "claim": "none",

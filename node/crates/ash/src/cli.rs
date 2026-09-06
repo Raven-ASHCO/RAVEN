@@ -4791,6 +4791,42 @@ mod tests {
     }
 
     #[test]
+    fn public_whoami_card_is_user_identity_pin_not_device_ed_pub() {
+        let user = Identity::from_seed(&[0x11; 32]);
+        let device = Identity::from_seed(&[0x22; 32]);
+        let card = public_whoami_card(&user);
+        let obj = card.as_object().expect("object");
+        assert_eq!(card["address"].as_str().unwrap(), user.address());
+        assert_eq!(
+            card["address"].as_str().unwrap(),
+            encode_address(&user.public_key_bytes())
+        );
+        assert_ne!(
+            card["address"].as_str().unwrap(),
+            encode_address(&device.public_key_bytes()),
+            "pin RVN1 must be user identity, not a parallel device key"
+        );
+        assert_ne!(
+            card["pub_hex"].as_str().unwrap(),
+            hex::encode(device.public_key_bytes())
+        );
+        assert_eq!(
+            card["fingerprint"].as_str().unwrap(),
+            device_fingerprint_v1(&user.public_key_bytes())
+        );
+        assert_ne!(
+            card["fingerprint"].as_str().unwrap(),
+            device_fingerprint_v1(&device.public_key_bytes())
+        );
+        assert!(
+            !obj.contains_key("device_ed_pub"),
+            "G5: pin ≢ device_ed_pub — field must not appear"
+        );
+        assert!(!obj.contains_key("seed"));
+        assert!(!obj.contains_key("private_key"));
+    }
+
+    #[test]
     fn whoami_blob_extracts_address_and_pub_hex() {
         let blob = "\
 address     rvn1qexampleaddressonlyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

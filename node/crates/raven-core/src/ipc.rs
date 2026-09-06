@@ -357,6 +357,70 @@ mod tests {
     }
 
     #[test]
+    fn all_ipc_variants_json_have_no_private_key_material() {
+        let reqs = [
+            IpcRequest::Ping { v: IPC_VERSION },
+            IpcRequest::Status { v: IPC_VERSION },
+            IpcRequest::SetPolicy {
+                v: IPC_VERSION,
+                bridge: Some(false),
+                store: None,
+                relay: None,
+            },
+            IpcRequest::EnqueueSealed {
+                v: IPC_VERSION,
+                envelope_b64: "QUJD".into(),
+                peer_hint: Some("peer".into()),
+            },
+            IpcRequest::LanDial {
+                v: IPC_VERSION,
+                lan_dial: "127.0.0.1:1".into(),
+                expected_pub_hex: "ab".repeat(32),
+                frames_b64: vec!["QUJD".into()],
+            },
+            IpcRequest::InternetDial {
+                v: IPC_VERSION,
+                internet_dial: "127.0.0.1:1".into(),
+                expected_pub_hex: "ab".repeat(32),
+                frames_b64: vec!["QUJD".into()],
+            },
+        ];
+        let resps = [
+            IpcResponse::Pong { v: IPC_VERSION },
+            IpcResponse::Status {
+                v: IPC_VERSION,
+                bridge: false,
+                store: false,
+                relay: false,
+                forward_pending: 0,
+                capabilities: vec!["ipc".into()],
+            },
+            IpcResponse::Accepted { v: IPC_VERSION },
+            IpcResponse::LanDialResult {
+                v: IPC_VERSION,
+                frames_b64: vec!["QUJD".into()],
+            },
+            IpcResponse::InternetDialResult {
+                v: IPC_VERSION,
+                frames_b64: vec!["QUJD".into()],
+            },
+            IpcResponse::Error {
+                v: IPC_VERSION,
+                code: "X".into(),
+                message: "no".into(),
+            },
+        ];
+        for req in &reqs {
+            let f = encode_request(req).unwrap();
+            assert_json_has_no_secret_tokens(std::str::from_utf8(&f[4..]).unwrap());
+        }
+        for resp in &resps {
+            let f = encode_response(resp).unwrap();
+            assert_json_has_no_secret_tokens(std::str::from_utf8(&f[4..]).unwrap());
+        }
+    }
+
+    #[test]
     fn enqueue_sealed_roundtrip_has_no_secret_fields() {
         let req = IpcRequest::EnqueueSealed {
             v: IPC_VERSION,

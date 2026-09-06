@@ -123,7 +123,7 @@ import json, sys
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 assert isinstance(obj, dict)
 assert set(obj) == {"address", "fingerprint", "pub_hex"}
-forbidden = {"seed", "private_key", "plaintext", "recovery"}
+forbidden = {"seed", "private_key", "plaintext", "recovery", "device_ed_pub"}
 assert not ({k.lower() for k in obj} & forbidden)
 PY
 
@@ -151,11 +151,41 @@ fi
 if grep -E '^(seed|private_key|plaintext|recovery)=' "$PIN" >/dev/null; then
   fail_green "pin grew a forbidden field"
 fi
-python3 - "$CARD" <<'PY' || fail_green "card leaked a forbidden key"
+python3 - "$CARD" <<'PY' || fail_green "card leaked a forbidden key or failed G5 pin rule"
 import json, sys
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
-forbidden = {"seed", "private_key", "plaintext", "recovery"}
+forbidden = {"seed", "private_key", "plaintext", "recovery", "device_ed_pub"}
 assert not ({str(k).lower() for k in obj} & forbidden)
+assert obj.get("principal") == "user_identity"
+assert obj.get("g5_pin_ne_device_ed_pub") is True
+assert obj.get("address", "").startswith("rvn1")
+PY
+
+# Ash-style contact pin of that same RVN1 (public bits only).
+"$ASH" --data-dir "$DATA" contact add \
+  --address "$WHO_ADDR" \
+  --pub-hex "$WHO_PUB" \
+  --petname "O6M1" \
+  --tag o6m1 \
+  --verify-fp "$WHO_FP" >"$WORKDIR/contact.out"
+grep -q 'contact saved' "$WORKDIR/contact.out" || fail_green "ash contact add rejected same-RVN1 public pin"
+python3 - "$DATA/contacts.json" "$WHO_ADDR" <<'PY' || fail_green "contacts.json pin is not the same RVN1"
+import json, sys
+book = json.load(open(sys.argv[1], encoding="utf-8"))
+addr = sys.argv[2]
+rows = book if isinstance(book, list) else book.get("contacts", book.get("entries", []))
+if isinstance(book, dict) and not rows:
+    rows = [book]
+found = False
+for row in rows if isinstance(rows, list) else []:
+    if not isinstance(row, dict):
+        continue
+    if row.get("address") == addr or row.get("identity_address") == addr:
+        assert "device_ed_pub" not in row
+        found = True
+if not found:
+    raw = open(sys.argv[1], encoding="utf-8").read()
+    assert addr in raw
 PY
 
 echo "node_rvn1=$WHO_ADDR"
@@ -205,6 +235,30 @@ else
     RED_FIRED=1
   else
     fail_reg "parallel-seed refuse did not print O6_M1_BIND=RED + reason"
+  fi
+fi
+
+# RED-2b: refuse a second pin namespace (existing pin, different RVN1)
+NS="$WORKDIR/namespace-home"
+mkdir -p "$NS/.team/keys"
+cat >"$NS/.team/keys/o6_m1_same_rvn1.pin" <<'EOF'
+address=rvn1qysluvwl5922yctzd0u9gpr06gn3k7ldfvecule0
+pub_hex=d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+fingerprint=If4x-36FU-omFi
+EOF
+if "$BIND" --rdap-home "$NS" --whoami-json "$WORKDIR/whoami.json" \
+  >"$WORKDIR/ns.out" 2>"$WORKDIR/ns.err"; then
+  echo "unexpected: bind overwrote a different existing RVN1 pin" >&2
+else
+  if grep -q 'O6_M1_BIND=RED' "$WORKDIR/ns.out" "$WORKDIR/ns.err" \
+    && grep -q 'second pin namespace' "$WORKDIR/ns.out" "$WORKDIR/ns.err"; then
+    echo "O6_M1_BIND=RED"
+    echo "reason=refuse-parallel-pin (existing pin address differs)"
+    echo "LABEL=$LABEL"
+    echo "HOLD=ACTIVE"
+    RED_FIRED=1
+  else
+    fail_reg "second-pin-namespace refuse did not print O6_M1_BIND=RED + reason"
   fi
 fi
 

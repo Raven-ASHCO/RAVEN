@@ -100,11 +100,6 @@ jobs:
       # Script uses RAVEN_IDENTITY_BACKEND=locked-file and ephemeral mktemp dirs.
       - name: ash menu smoke
         run: ./scripts/ash_menu_smoke.sh
-      # O6 M1 same-RVN1 public bind (NON-RELEASE). Not a HOLD lift. Not O6 E2E.
-      # Uses debug ash + locked-file + ephemeral mktemp dirs. No WAN.
-      - name: O6 M1 same-RVN1 bind check (NON-RELEASE)
-        working-directory: .
-        run: bash scripts/o6_m1_same_rvn1_bind_check.sh
       - name: LAN handshake KAT (shared vectors, no live network)
         run: cargo test -p raven-core --lib lan_
       # Must stay on script-default target/debug — locked-file is refused in Release.

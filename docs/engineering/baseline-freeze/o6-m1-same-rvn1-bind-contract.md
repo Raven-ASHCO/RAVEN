@@ -19,6 +19,8 @@ Private keys stay in the node identity store (ADR 0003 / `ipc.rs`). **Private ke
 
 Status IPC remains policy/capabilities only. Public whoami is the existing `ash whoami` surface (optional `--json`). No new `IpcRequest::Whoami`. No seal IPC.
 
+**CI (not in this PR):** do **not** wire `scripts/o6_m1_same_rvn1_bind_check.sh` into `.github/workflows/raven-serverless.yml` here — that file collides with RAVEN #51 / OAuth (same trap as #50). Follow-up for DevSecOps **after #51 merges**. The script stays locally / agent-executable (linux, no WAN).
+
 ---
 
 ## Export (this repo)
