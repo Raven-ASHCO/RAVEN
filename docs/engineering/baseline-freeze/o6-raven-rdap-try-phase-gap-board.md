@@ -1,6 +1,6 @@
 # O6 try-phase gap board — Raven↔RDAP encrypted two-device path
 
-**As of:** 2026-09-06 · snapshot SHA `7ccf1809b318a111e745d311dd9bcfbc870efd28` (`main` tip when written)  
+**As of:** 2026-09-06 · board snapshot SHA `7ccf1809b318a111e745d311dd9bcfbc870efd28`; G-M1 row updated for M1-in-progress public bind (NON-RELEASE; not O6 E2E)  
 **Owner:** Eng Program (#2) · consult Raven↔RDAP Integration Lead (`@Raven-ASHCO/architecture`, `@Raven-ASHCO/rdap`), Protocol Spec (#4), Adversarial QA (#18), Python Runtime (#14)  
 **Risk class:** **R0** (docs + fail-closed checklist). **Not** M1–M3 production code.  
 **Label:** **non-release** / **fail-closed containment**. This board does **not** claim confidential Raven messaging, production ATSAM, or a HOLD lift.
@@ -25,7 +25,7 @@ Citations: [`docs/THREAT_MODEL.md`](../../THREAT_MODEL.md) (executable posture; 
 | Question | Honest answer |
 |----------|---------------|
 | Is O6 **inventory** closer to green? | **Yes (docs).** ADR 0004 + Appendix G5 are ACK’d on `main`. This board + the fail-closed check close the Sprint 0 “Known security / interop / Raven↔RDAP gaps” row as **inventory landed**. |
-| Is O6 **two-device encrypted E2E harness** green? | **No.** Still **blocked** on (1) Founder Priority #1 terminal board green, (2) RVN1 HOLD / no production enablement, (3) missing M1 identity bridge, (4) missing M2 daemon-seal IPC, (5) no RDAP `EnqueueSealed` / `LanDial` client. |
+| Is O6 **two-device encrypted E2E harness** green? | **No.** Still **blocked** on (1) Founder Priority #1 terminal board green, (2) RVN1 HOLD / no production enablement, (3) M1 identity bridge **in progress** (RAVEN-side public whoami + pin-file only; RDAP still mints `.team/keys` seed), (4) missing M2 daemon-seal IPC, (5) no RDAP `EnqueueSealed` / `LanDial` client. |
 | May M1–M3 **production** code land now? | **No.** ADR 0004 header: no M1–M3 production code until terminal-path board green + HOLD lift process. CEO override only for scheduling M1 eng before the terminal board is green. |
 | May a **non-release** harness scaffold land? | **Not yet as a working encrypted path.** Current IPC is sealed-frame-only; there is no Crypto-owned daemon-seal op. A working two-device encrypted RDAP path would be M2/M3 code. Authorized now: this inventory + fail-closed RED check. |
 
@@ -62,7 +62,7 @@ These are **green as stated**. None of them is the O6 encrypted harness.
 |----|-----|--------------------------|-------------------|
 | **G-HOLD** | RVN1 production HOLD | Even a perfect lab harness is **non-release**. Cannot claim confidential production delivery. | Security / Crypto process — **not** this PR |
 | **G-TERM** | Terminal L/M/W board not Proven | Founder Priority #1 sits **above** O6 M1+. Named-pipe **code** landed (#43); Proven still needs executed green/red (linked CI or agent smoke) per [`terminal-path-reliability.md`](terminal-path-reliability.md). Living boards at [`blockers-ownership-board.md`](blockers-ownership-board.md) / [`three-path-verification-board.md`](three-path-verification-board.md) are **stale (2026-09-04)** and still narrate pipe-as-blocker. | SRE Perf (#19), Windows (#11), Node IPC (#8), CLI DX (#12) |
-| **G-M1** | Same-RVN1 identity bridge missing | RDAP uses `.team/keys`; `raven-node` uses `~/.raven` / `--data-dir`. ADR 0004 D3: no parallel pin namespace. Private keys MUST NOT appear in IPC JSON. | Identity (#15) + Node IPC (#8) + Python Runtime (#14) |
+| **G-M1** | Same-RVN1 identity bridge **M1-in-progress (NON-RELEASE)** | RAVEN-side public export: `ash whoami --json` (no new IPC op). Pin-file bind stub + executed green/red: [`scripts/o6_m1_same_rvn1_bind_check.sh`](../../../scripts/o6_m1_same_rvn1_bind_check.sh). Contract: [`o6-m1-same-rvn1-bind-contract.md`](o6-m1-same-rvn1-bind-contract.md). RDAP companion still `load_or_create`s `.team/keys/device_ed25519.seed` — follow-up, not this PR. **Not** O6 E2E. **Not** HOLD lift. Harness green ≠ HOLD lift. Private keys MUST NOT appear in IPC JSON. | Identity (#15) + Node IPC (#8) + Python Runtime (#14) |
 | **G-M2-IPC** | No daemon-seal IPC | `IpcRequest` is sealed-frame-only (`EnqueueSealed` / `LanDial`). Comment in [`ipc.rs`](../../../node/crates/raven-core/src/ipc.rs): “Daemon never seals from plaintext here.” M2 must add a Crypto-owned **in-daemon** seal. | Node IPC + Crypto (#3) + RDAP Protocol (#13) + Python Runtime |
 | **G-M2-PY** | No RDAP IPC client | This repo has **zero** `team_agents` / Python `EnqueueSealed` / `LanDial` caller. Companion RDAP README still states the integration gap (live `main` 2026-09-04). | Python Runtime (#14) + Raven↔RDAP Integration Lead |
 | **G-M3** | No two-device RDAP harness | ADR 0004 D5: two devices, mutual pin of the **same** RVN1, Alice `ask` → Bob complete, ATSAM-sealed frames, carrier enum `atsam_rvn1`, HOLD/non-Release labeled. None of that exists as an executable RDAP path. | Adversarial QA (#18) + SRE + Eng Program + CLI DX |
@@ -96,13 +96,12 @@ Carriers on that README: signed HTTP (not Raven E2EE), Git relay (not Raven E2EE
 
 **Now (authorized, this class of work):**
 
-1. **This PR** — inventory + fail-closed RED check + Sprint 0 row flip. R0. No HOLD lift.
+1. **Landed (#49)** — inventory + fail-closed RED check + Sprint 0 row flip. R0. No HOLD lift.
 2. **Optional sibling (already open):** [RAVEN#25](https://github.com/Raven-ASHCO/RAVEN/pull/25) Crypto `RDAP_ATSAM_BOUNDARY_V1.md` — do not duplicate; do not merge as if it were M1.
 3. **Optional RDAP docs-only:** pointer-only README sentence (“see RAVEN ADR 0004; gap still open; HOLD”) — **keep** “Important integration gap” until M3. Must not claim the carrier exists.
+4. **M1 (in progress, NON-RELEASE):** read-only public whoami + pin-file bind of the local `raven-node` RVN1 (D3). `ash whoami --json` / [`o6-m1-same-rvn1-bind-contract.md`](o6-m1-same-rvn1-bind-contract.md). **No** private keys on IPC. **No** seal. **No** `atsam_rvn1` send claim. RDAP companion still needs to consume the pin (do not `load_or_create` a parallel seed). RDAP remains HTTP control plane. **Not** O6 E2E. Harness green ≠ HOLD lift.
 
-**After terminal board is honestly green** (executed green/red on the named terminal path; CEO override only to start sooner) **and** Eng Program unblocks M1 scheduling — still **non-release / HOLD-labeled**:
-
-4. **Next code PR = M1 only:** read-only / IPC-mediated bind of RDAP to the local `raven-node` RVN1 (D3). Public whoami / pin import. **No** private keys on IPC. **No** seal. **No** `atsam_rvn1` send claim. RDAP remains HTTP control plane.
+**After terminal board is honestly green** (executed green/red on the named terminal path) — still **non-release / HOLD-labeled**:
 5. **Then M2:** Crypto-owned daemon-seal IPC (new op or documented extension) + RDAP submits **plaintext application bytes only** to that op (or receives already-sealed frames for `LanDial`). Peer-cred / named-pipe ACL mandatory. Fail-closed if session missing / revoked.
 6. **Then M3:** two-device (physical or VM) harness: mutual pin → Alice `ask` → Bob echo → assert ATSAM-sealed data plane → carrier enum `atsam_rvn1` → docs still say HOLD / non-Release. Negative: drop session → refuse; RDAP MUST NOT report task success.
 7. **M4 parallel with M3:** RDAP README replaces “Important integration gap” with ADR 0004 pointer; plaintext carriers stay explicitly non-confidential.
@@ -130,6 +129,7 @@ Two devices (physical or VM), each with `raven-node` + RDAP:
 |------|-------------------------|
 | This board / ADR 0004 / G5 | Inventory only |
 | `scripts/o6_try_phase_gap_check.sh` exit ≠ 0 | **Executed RED** (honest). Not a pass. |
+| `scripts/o6_m1_same_rvn1_bind_check.sh` | **Executed green+red for G-M1 public bind only.** Still **NON-RELEASE**. Not O6 E2E. Not HOLD lift. |
 | `lan_direct_two_node.sh` | Raven-only precursor. Cite as precursor, never as O6 green. |
 | RDAP A2A selftest | Control-plane only. |
 | Future M3 job labeled `atsam_rvn1` with HOLD banner | Harness claim only; still not Release. |

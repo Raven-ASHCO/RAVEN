@@ -325,6 +325,37 @@ mod tests {
         assert!(!matches!(ep, IpcEndpoint::Unsupported));
     }
 
+    fn assert_json_has_no_secret_tokens(raw: &str) {
+        let lower = raw.to_ascii_lowercase();
+        for bad in ["seed", "private_key", "plaintext", "recovery"] {
+            assert!(!lower.contains(bad), "{bad} leaked into IPC JSON: {raw}");
+        }
+    }
+
+    #[test]
+    fn status_json_has_no_private_key_material() {
+        let req = IpcRequest::Status { v: IPC_VERSION };
+        let resp = IpcResponse::Status {
+            v: IPC_VERSION,
+            bridge: false,
+            store: false,
+            relay: false,
+            forward_pending: 0,
+            capabilities: vec!["ipc".into()],
+        };
+        let rf = encode_request(&req).unwrap();
+        let sf = encode_response(&resp).unwrap();
+        let req_json = std::str::from_utf8(&rf[4..]).unwrap();
+        let resp_json = std::str::from_utf8(&sf[4..]).unwrap();
+        assert_json_has_no_secret_tokens(req_json);
+        assert_json_has_no_secret_tokens(resp_json);
+        assert!(resp_json.contains("\"ok\":\"status\""));
+        assert!(
+            !resp_json.contains("rvn1"),
+            "Status stays policy-only; whoami is ash CLI"
+        );
+    }
+
     #[test]
     fn enqueue_sealed_roundtrip_has_no_secret_fields() {
         let req = IpcRequest::EnqueueSealed {

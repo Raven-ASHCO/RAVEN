@@ -216,8 +216,13 @@ struct Cli {
 enum Commands {
     /// Create local identity (prints address + pub hex + fingerprint only).
     Init,
-    /// Show public identity bits for data dir.
-    Whoami,
+    /// Show public identity bits for data dir (never a seed).
+    Whoami {
+        /// Machine-readable public card only (`address` / `fingerprint` / `pub_hex`).
+        /// NON-RELEASE O6 M1 bind helper. No private key fields.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Forward send to raven-node. Plaintext ONLY via stdin (never argv).
     Send {
         #[arg(long, default_value = "")]
@@ -717,6 +722,16 @@ fn print_public_identity(id: &Identity) {
         hex::encode(id.public_key_bytes()),
         c().reset
     );
+}
+
+/// Public whoami card for O6 M1 same-RVN1 bind (ADR 0004 D3).
+/// Public material only — MUST NOT include seed / private_key / plaintext.
+fn public_whoami_card(id: &Identity) -> serde_json::Value {
+    serde_json::json!({
+        "address": id.address(),
+        "fingerprint": device_fingerprint_v1(&id.public_key_bytes()),
+        "pub_hex": hex::encode(id.public_key_bytes()),
+    })
 }
 
 /// Raven Node welcome banner — monochrome.
@@ -3795,10 +3810,27 @@ pub fn run() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Whoami) => match try_load_identity(&data_dir) {
-            Ok(Some(id)) => print_public_identity(&id),
-            Ok(None) => println!("no identity — run init"),
-            Err(e) => eprintln!("identity store: {}", sanitize_terminal_text(&e)),
+        Some(Commands::Whoami { json }) => match try_load_identity(&data_dir) {
+            Ok(Some(id)) => {
+                if json {
+                    println!("{}", public_whoami_card(&id));
+                } else {
+                    print_public_identity(&id);
+                }
+            }
+            Ok(None) => {
+                if json {
+                    eprintln!("{{\"error\":\"no_identity\"}}");
+                    std::process::exit(1);
+                }
+                println!("no identity — run init");
+            }
+            Err(e) => {
+                eprintln!("identity store: {}", sanitize_terminal_text(&e));
+                if json {
+                    std::process::exit(1);
+                }
+            }
         },
         Some(Commands::Status) => {
             if let Err(e) = cmd_status(&data_dir) {
@@ -4734,6 +4766,28 @@ mod tests {
         let ed = parse_pub_hex(hex).unwrap();
         let addr = encode_address(&ed);
         assert!(addr.starts_with("rvn1"));
+    }
+
+    #[test]
+    fn public_whoami_card_has_no_private_key_material() {
+        let id = Identity::from_seed(&[0x11; 32]);
+        let card = public_whoami_card(&id);
+        let raw = card.to_string();
+        let lower = raw.to_ascii_lowercase();
+        for bad in ["seed", "private_key", "plaintext", "recovery"] {
+            assert!(!lower.contains(bad), "{bad} leaked into whoami JSON");
+        }
+        assert_eq!(card["address"].as_str().unwrap(), id.address());
+        assert_eq!(
+            card["pub_hex"].as_str().unwrap(),
+            hex::encode(id.public_key_bytes())
+        );
+        assert_eq!(
+            card["fingerprint"].as_str().unwrap(),
+            device_fingerprint_v1(&id.public_key_bytes())
+        );
+        assert!(id.address().starts_with("rvn1"));
+        assert_eq!(card.as_object().map(|o| o.len()), Some(3));
     }
 
     #[test]
