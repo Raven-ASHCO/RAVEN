@@ -24,7 +24,7 @@ This gate is binding for the whole ADR:
 
 RDAP today exchanges recipient-bound, Ed25519-signed A2A tasks primarily over **cleartext HTTP** on a trusted LAN, with an optional **experimental plaintext** libp2p mailbox (`raven-swarm-mailbox-experimental`, env `RDAP_ENABLE_EXPERIMENTAL_PLAINTEXT_MAILBOX` / `--experimental-plaintext-mailbox`). Task JSON may sit in an RVN1 field named `message_ciphertext` without being confidential.
 
-Production-shaped Raven messaging is fail-closed: without a persisted authenticated **ATSAM** session, `raven-node` refuses origination with `ATSAM_SESSION_REQUIRED`. Local clients talk to the daemon over UDS IPC and may only **`EnqueueSealed`** / **`LanDial`** already-sealed frames — the daemon does not seal plaintext for callers. IPC auth is peer-cred (UDS) / pipe ACL (Windows) per ADR 0003.
+Production-shaped Raven messaging is fail-closed: without a persisted authenticated **ATSAM** session, `raven-node` refuses origination with `ATSAM_SESSION_REQUIRED`. Local clients talk to the daemon over UDS IPC. **`EnqueueSealed`** / **`LanDial`** / **`InternetDial`** remain already-sealed-frame-only. **`SealUnderSession`** (M2, NON-RELEASE) seals application payload bytes *inside* the daemon under a persisted ATSAM session; it does not lift RVN1 HOLD and is not O6 E2E / confidential-delivery Proven. IPC auth is peer-cred (UDS) / pipe ACL (Windows) per ADR 0003.
 
 RDAP also keeps a separate identity under `.team/keys`, while `raven-node` uses `~/.raven`. Closing the documented integration gap for an honest encrypted carrier is the O6 KPI: a **two-device encrypted E2E harness** (still under the RVN1 HOLD above).
 
@@ -96,11 +96,12 @@ Status output MUST NOT leak confidential metadata (no plaintext task bodies, no 
 ### D4 — Sealing ownership (M2)
 
 - Sealing and session ratchet state live in **Raven** (`raven-core` / `raven-node`).
-- **Current IPC** (`EnqueueSealed` / `LanDial`) is **sealed-frame-only** — the daemon does **not** seal plaintext today (`ipc.rs`). Python MUST NOT construct RVNA1/ATSAM ciphertext.
-- **M2 MUST add a Crypto-owned `raven-node` path** that seals application payloads *inside* the daemon under the persisted ATSAM session (new IPC op or documented extension). Until that exists, RDAP MUST NOT invent a seal path and MUST NOT claim confidential send.
-- After M2: Python RDAP submits plaintext application payloads only to that daemon seal IPC (or receives already-sealed frames for dial), never sealing locally.
+- **`EnqueueSealed` / `LanDial` / `InternetDial` remain sealed-frame-only** — those ops still never seal (`ipc.rs`). Python MUST NOT construct RVNA1/ATSAM ciphertext.
+- **M2 daemon-seal IPC exists** as `IpcRequest::SealUnderSession`: the daemon seals application payload bytes under a persisted ATSAM session (indexed-session path already used by LAN / pair_init_lab). **NON-RELEASE.** Does **not** lift RVN1 HOLD / SECURITY_ERRATA. **Not** O6 E2E Proven, WAN Proven, or confidential RDAP delivery Proven. Python RDAP client is a separate follow-up.
+- After this slice: Python RDAP must submit application payload bytes only to that daemon seal IPC (or receive already-sealed frames for dial), never sealing locally.
+- Identity lineage/deny runs **before** seal crypto. Covered lineage (`device_id` / `device_ed_pub` / `device_x_pub` / `device_cert_hash` via existing Identity `RevocationStore` / `DeviceRegistry` loaders) refuses with frozen **`ATSAM_LINEAGE_REVOKED`**. Missing/unusable session remains **`ATSAM_SESSION_REQUIRED`**. Soft-load empty-denylist (`unwrap_or_default`) is out of scope on this path.
 - **FFI (if ever):** Crypto-owned, **R3**, Architect + Protocol Spec (#4) ack, shared-vectors KATs before RDAP may consume it.
-- Forbidden: stuffing plaintext into `message_ciphertext`; Python-side ATSAM; client-triggered seal without a local authenticated session; treating Noise-only dial as confidential.
+- Forbidden: stuffing application bytes into `message_ciphertext`; Python-side ATSAM; client-triggered seal without a local authenticated session; treating Noise-only dial as confidential.
 - **IPC trust (repeat for M2):** Confidential seal/dial IPC MUST enforce ADR 0003 peer-cred (UDS) / equivalent pipe ACL; unsigned or unattributed local callers MUST NOT invoke seal, `EnqueueSealed`, or `LanDial`.
 
 ### D5 — Harness acceptance (M3)
@@ -170,7 +171,7 @@ See `docs/adr/0004-appendix-g5-raven-rdap-revoke.md` (Architecture SoT = Identit
 
 - `docs/THREAT_MODEL.md`
 - `protocol/SECURITY_ERRATA_RVN1_2026-08-13.md`
-- `node/crates/raven-core/src/ipc.rs` — `EnqueueSealed`, `LanDial`
+- `node/crates/raven-core/src/ipc.rs` — `EnqueueSealed`, `LanDial`, `SealUnderSession` (M2 NON-RELEASE; HOLD unchanged)
 - ADR 0003 — IPC peer-cred / services
 - RDAP `team_agents/mesh.py` — experimental plaintext carrier
 - RDAP README — Important integration gap
