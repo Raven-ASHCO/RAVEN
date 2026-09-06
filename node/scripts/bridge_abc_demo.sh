@@ -3,7 +3,18 @@
 # Topology: A (LAN only) → B (bridge LAN+mock_ble) → C (BLE only).
 # Opaque RavenEnvelopeV1 preserved; B never decrypts; ACK only from C.
 # Safe: ephemeral dirs only. No secrets. No GitHub.
+# Lab body path uses unsafe-demo-crypto (debug only). Always rebuild so a prior
+# default-feature `cargo build -p raven-node` cannot leave a binary that refuses
+# --body-mode unsafe-interim.
+# Software mock_ble / store-carry only — not Byzantine, not flood-proof.
 set -euo pipefail
+
+# Headless CI / Linux agents: Secret Service is absent. Debug locked-file is
+# refused in Release and does not change production fail-closed identity.
+export RAVEN_IDENTITY_BACKEND=locked-file
+export RAVEN_CHAT_HISTORY_BACKEND=locked-file
+export RAVEN_ALLOW_EPHEMERAL_DATA_DIR="${RAVEN_ALLOW_EPHEMERAL_DATA_DIR:-1}"
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/debug"
 NODE="$BIN/raven-node"
@@ -18,10 +29,12 @@ cleanup() {
 trap cleanup EXIT
 
 source "${HOME}/.cargo/env" 2>/dev/null || true
-if [[ ! -x "$NODE" ]]; then
-  echo "Building…"
-  (cd "$ROOT" && cargo build -p raven-node -p ash --features raven-node/unsafe-demo-crypto -q)
-fi
+echo "=== building raven-node + ash with unsafe-demo-crypto (debug) ==="
+(cd "$ROOT" && cargo build -p raven-node -p ash --features raven-node/unsafe-demo-crypto -q)
+[[ -x "$NODE" || -x "${NODE}.exe" ]]
+[[ -x "$ASH" || -x "${ASH}.exe" ]]
+if [[ ! -x "$NODE" && -x "${NODE}.exe" ]]; then NODE="${NODE}.exe"; fi
+if [[ ! -x "$ASH" && -x "${ASH}.exe" ]]; then ASH="${ASH}.exe"; fi
 
 echo "=== Bridge A-B-C workdir=$WORKDIR ==="
 "$NODE" init --data-dir "$WORKDIR/a" | tee "$WORKDIR/a.out"

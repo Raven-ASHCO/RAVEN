@@ -176,6 +176,12 @@ jobs:
         run: ./scripts/libp2p_swarm_smoke.sh
       - name: bootstrap manual-peer smoke
         run: ./scripts/bootstrap_manual_peer_smoke.sh
+      # Software A–B–C mock_ble (TCP stand-in). Debug locked-file only —
+      # not a production Secret Service claim; not Byzantine / flood-proof.
+      # Must stay on script-default target/debug — locked-file is refused in Release.
+      # Script always rebuilds with unsafe-demo-crypto for --body-mode unsafe-interim.
+      - name: bridge A-B-C demo (mock_ble)
+        run: ./scripts/bridge_abc_demo.sh
       - name: mailbox opaque put/get smoke
         run: ./scripts/mailbox_opaque_smoke.sh
       - name: libp2p offline mailbox restart smoke
