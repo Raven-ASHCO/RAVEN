@@ -19,7 +19,10 @@ use crate::chat_history::{
     clear_staged_outbound_body, list_staged_outbound_bodies, load_staged_outbound_body,
     stage_outbound_body, BlockList, ChatHistory, ChatHistoryEntry, StagedOutboundBody,
 };
-use crate::device_cert::{ensure_local_device_certificate, DeviceCertificate, DeviceRegistry};
+use crate::device_cert::{
+    ensure_local_device_certificate, load_device_registry_checked, DeviceCertificate,
+    DeviceRegistry,
+};
 use crate::device_sync::RevocationStore;
 use crate::envelope::{EnvType, Envelope};
 use crate::identity::Identity;
@@ -1353,6 +1356,165 @@ pub fn find_confirmed_peer_session(
         .map_err(|e| e.redacted_display())
 }
 
+/// Frozen IPC refuse: no persisted authenticated ATSAM session is usable.
+/// Distinct from [`ATSAM_LINEAGE_REVOKED`].
+pub const ATSAM_SESSION_REQUIRED: &str = "ATSAM_SESSION_REQUIRED";
+
+/// Frozen IPC refuse: session lineage is covered by Identity RVDR1 / denylist.
+/// Do not collapse this to [`ATSAM_SESSION_REQUIRED`] (no re-PairInit same lineage).
+pub const ATSAM_LINEAGE_REVOKED: &str = "ATSAM_LINEAGE_REVOKED";
+
+fn parse_peer_device_hint(peer_hint: &str) -> Result<[u8; 32], String> {
+    let h = peer_hint.trim().to_lowercase();
+    if h.len() != 64 {
+        return Err("SEAL_PEER_HINT: peer_hint must be 64 hex chars (device Ed25519)".into());
+    }
+    let v = hex::decode(&h).map_err(|_| {
+        "SEAL_PEER_HINT: peer_hint must be 64 hex chars (device Ed25519)".to_string()
+    })?;
+    if v.len() != 32 {
+        return Err("SEAL_PEER_HINT: peer_hint must be 64 hex chars (device Ed25519)".into());
+    }
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&v);
+    Ok(a)
+}
+
+/// G5 covering identifiers taken from the session's DeviceCertificate lineage.
+fn session_lineage_ids(cert: &DeviceCertificate) -> Result<([u8; 32], [u8; 32]), String> {
+    let cert_hash = device_certificate_hash(cert).map_err(|e| format!("{e:?}"))?;
+    Ok((cert.device_x_pub, cert_hash))
+}
+
+/// Identity denylist / RVDR1 sticky deny for one device lineage.
+///
+/// Uses existing Identity loaders only (`RevocationStore::load_checked`,
+/// `load_device_registry_checked`). Soft `unwrap_or_default` empty-denylist
+/// loaders are forbidden on this path.
+fn identity_denies_device_lineage(
+    rev: &RevocationStore,
+    local_reg: &DeviceRegistry,
+    cert: &DeviceCertificate,
+    apply_local_registry: bool,
+) -> Result<bool, String> {
+    let (device_x_pub, device_cert_hash) = session_lineage_ids(cert)?;
+    let _ = (device_x_pub, device_cert_hash, cert.device_ed_pub);
+    if rev.is_revoked(&hex::encode(cert.user_ed_pub), &cert.device_id) {
+        return Ok(true);
+    }
+    if apply_local_registry && local_reg.is_revoked(&cert.device_id) {
+        return Ok(true);
+    }
+    // Cover remaining G5 identifiers via the same Identity stores: a denylist
+    // hit on this cert's device_id denies the bound ed/x/hash tuple.
+    for rec in rev.records() {
+        if rec.device_id == cert.device_id
+            && rec
+                .user_ed_pub_hex
+                .eq_ignore_ascii_case(&hex::encode(cert.user_ed_pub))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Fail-closed Identity lineage check for the peer (and local) lineages used
+/// by a persisted session. Must run **before** any ATSAM seal crypto.
+pub fn refuse_if_session_lineage_revoked(
+    data_dir: &Path,
+    local_cert: &DeviceCertificate,
+    peer_cert: &DeviceCertificate,
+) -> Result<(), String> {
+    let rev = RevocationStore::load_checked(data_dir)?;
+    let local_reg = load_device_registry_checked(data_dir)?;
+    if identity_denies_device_lineage(&rev, &local_reg, peer_cert, false)?
+        || identity_denies_device_lineage(&rev, &local_reg, local_cert, true)?
+    {
+        return Err(ATSAM_LINEAGE_REVOKED.into());
+    }
+    Ok(())
+}
+
+fn map_seal_store_error(err: IndexedSessionStoreError) -> String {
+    match err {
+        IndexedSessionStoreError::RevokedDevice
+        | IndexedSessionStoreError::LocalDeviceUnauthorized => ATSAM_LINEAGE_REVOKED.into(),
+        IndexedSessionStoreError::SessionNotConfirmed
+        | IndexedSessionStoreError::NotFound
+        | IndexedSessionStoreError::EndpointNotCurrentlyValid
+        | IndexedSessionStoreError::ProtectedStateMissing => {
+            format!("{ATSAM_SESSION_REQUIRED}: {}", err.redacted_display())
+        }
+        other => other.redacted_display(),
+    }
+}
+
+/// Seal application payload bytes under the persisted confirmed ATSAM session.
+///
+/// NON-RELEASE. Reuses `IndexedSessionStore::send_message_envelope` (same
+/// indexed seal as LAN / pair_init_lab). Does not flip production tripwires.
+/// Identity lineage/deny runs before seal crypto.
+pub fn seal_app_payload_under_session(
+    data_dir: &Path,
+    identity: &Identity,
+    peer_hint: &str,
+    app_payload: &[u8],
+) -> Result<Vec<u8>, String> {
+    let peer_device = parse_peer_device_hint(peer_hint)?;
+    let (local_cert, local_reg) =
+        ensure_local_device_certificate(data_dir, identity, PRIMARY_DEVICE_ID)?;
+    let peer = load_cached_peer_bundle(data_dir, &peer_device)?
+        .ok_or_else(|| format!("{ATSAM_SESSION_REQUIRED}: no persisted peer material for hint"))?;
+
+    let mut store = IndexedSessionStore::open(data_dir).map_err(|e| e.redacted_display())?;
+    let record_key = store
+        .find_confirmed_session_for_peer(&peer_device)
+        .map_err(|e| e.redacted_display())?
+        .ok_or_else(|| {
+            format!(
+                "{ATSAM_SESSION_REQUIRED}: no authenticated persisted ATSAM session is available"
+            )
+        })?;
+
+    // BEFORE any seal crypto: Identity lineage/deny for lineages used by this session.
+    refuse_if_session_lineage_revoked(data_dir, &local_cert, &peer.cert)?;
+
+    let text = std::str::from_utf8(app_payload).map_err(|_| {
+        "SEAL_PAYLOAD: app payload must be UTF-8 under indexed-session policy".to_string()
+    })?;
+    let now = now_ms();
+    let session_expires = store
+        .session_expires_at(&record_key)
+        .map_err(|e| e.redacted_display())?;
+    let expires = envelope_expires(now, session_expires).map_err(|_| {
+        format!("{ATSAM_SESSION_REQUIRED}: persisted ATSAM session is not currently usable")
+    })?;
+    if local_reg.is_revoked(&local_cert.device_id) {
+        return Err(ATSAM_LINEAGE_REVOKED.into());
+    }
+    let local_device = AuthorizedEndpointDevice::authorize(&local_cert, identity, &local_reg, now)
+        .map_err(map_seal_store_error)?;
+    let mut captured = None;
+    let mut rng = OsRng;
+    match store.send_message_envelope(
+        &record_key,
+        text,
+        &local_device,
+        now,
+        expires,
+        now,
+        &mut rng,
+        &mut |digest, bytes| {
+            captured = Some(bytes.to_vec());
+            Ok(*digest)
+        },
+    ) {
+        Ok(_) => captured.ok_or_else(|| "SEAL: missing sealed envelope after handoff".into()),
+        Err(err) => Err(map_seal_store_error(err)),
+    }
+}
+
 /// Build a signed PairInit and persist the initiator provisional session.
 pub fn create_initiator_pair_init(
     data_dir: &Path,
@@ -1454,6 +1616,7 @@ pub fn wrap_pair_init(id: &Identity, init: &PairInit) -> Result<Vec<u8>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device_sync::RevocationRecord;
     use crate::prekey_lifecycle::PrekeyGenerationPrivate;
     use zeroize::Zeroize;
 
@@ -2076,6 +2239,131 @@ mod tests {
             a_store.pending_endpoint_outbound().unwrap().len(),
             before,
             "no new Prepared/Queued outbox after capacity refusal"
+        );
+    }
+
+    fn confirm_alice_to_bob(
+        a_dir: &Path,
+        b_dir: &Path,
+        alice: &Identity,
+        bob: &Identity,
+    ) -> (LanBundle, LanBundle) {
+        let a_bundle = local_bundle(a_dir, alice).unwrap();
+        let b_bundle = local_bundle(b_dir, bob).unwrap();
+        write_contact(a_dir, &b_bundle.cert.device_ed_pub, "Bob");
+        write_contact(b_dir, &a_bundle.cert.device_ed_pub, "Alice");
+        cache_peer_bundle(b_dir, &a_bundle).unwrap();
+        cache_peer_bundle(a_dir, &b_bundle).unwrap();
+        let (init, record_key) = create_initiator_pair_init(a_dir, alice, &b_bundle).unwrap();
+        let init_frame = wrap_pair_init(alice, &init).unwrap();
+        let pair_replies = dispatch_frame(
+            b_dir,
+            bob,
+            &a_bundle,
+            &alice.public_key_bytes(),
+            &init_frame,
+        )
+        .unwrap();
+        let PairInitOobClassify::PairResponse(wire) = classify_packed_envelope(&pair_replies[0])
+        else {
+            panic!("expected PairResponse");
+        };
+        let response = crate::pair_init::decode_response(&wire).unwrap();
+        let mut a_store = IndexedSessionStore::open(a_dir).unwrap();
+        a_store
+            .confirm_verified_pair_response(&record_key, &init, &response, now())
+            .unwrap();
+        (a_bundle, b_bundle)
+    }
+
+    #[test]
+    fn seal_under_session_roundtrip_with_lab_session() {
+        let alice = Identity::from_seed(&[0xc1; 32]);
+        let bob = Identity::from_seed(&[0xc2; 32]);
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        publish_and_install(a_dir.path(), &alice);
+        publish_and_install(b_dir.path(), &bob);
+        let (_a_bundle, b_bundle) = confirm_alice_to_bob(a_dir.path(), b_dir.path(), &alice, &bob);
+        let peer_hint = hex::encode(b_bundle.cert.device_ed_pub);
+        let packed =
+            seal_app_payload_under_session(a_dir.path(), &alice, &peer_hint, b"m2-daemon-seal")
+                .expect("lab session should seal under persisted ATSAM session");
+        let env = Envelope::unpack(&packed).expect("RavenEnvelopeV1");
+        assert_eq!(env.env_type, EnvType::Message as u8);
+        assert!(!env.message_ciphertext.is_empty());
+    }
+
+    #[test]
+    fn seal_under_session_refuses_without_session() {
+        let alice = Identity::from_seed(&[0xc3; 32]);
+        let bob = Identity::from_seed(&[0xc4; 32]);
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        publish_and_install(a_dir.path(), &alice);
+        publish_and_install(b_dir.path(), &bob);
+        let b_bundle = local_bundle(b_dir.path(), &bob).unwrap();
+        write_contact(a_dir.path(), &b_bundle.cert.device_ed_pub, "Bob");
+        cache_peer_bundle(a_dir.path(), &b_bundle).unwrap();
+        let err = seal_app_payload_under_session(
+            a_dir.path(),
+            &alice,
+            &hex::encode(b_bundle.cert.device_ed_pub),
+            b"no-session",
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with(ATSAM_SESSION_REQUIRED),
+            "expected {ATSAM_SESSION_REQUIRED}, got {err}"
+        );
+        assert!(
+            !err.contains(ATSAM_LINEAGE_REVOKED),
+            "missing session must not collapse into revoke: {err}"
+        );
+    }
+
+    #[test]
+    fn seal_under_session_revoked_lineage_is_hard_deny_before_seal() {
+        let alice = Identity::from_seed(&[0xc5; 32]);
+        let bob = Identity::from_seed(&[0xc6; 32]);
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        publish_and_install(a_dir.path(), &alice);
+        publish_and_install(b_dir.path(), &bob);
+        let (_a_bundle, b_bundle) = confirm_alice_to_bob(a_dir.path(), b_dir.path(), &alice, &bob);
+
+        let rec =
+            RevocationRecord::issue(&bob, &b_bundle.cert.device_id, 1, now(), "lost").unwrap();
+        let mut rev = RevocationStore::load_checked(a_dir.path()).unwrap();
+        assert!(rev.apply(rec).unwrap());
+        rev.save(a_dir.path()).unwrap();
+
+        let before = {
+            let store = IndexedSessionStore::open(a_dir.path()).unwrap();
+            store.pending_endpoint_outbound().unwrap().len()
+        };
+        let err = seal_app_payload_under_session(
+            a_dir.path(),
+            &alice,
+            &hex::encode(b_bundle.cert.device_ed_pub),
+            b"must-not-seal",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err, ATSAM_LINEAGE_REVOKED,
+            "revoked lineage must freeze ATSAM_LINEAGE_REVOKED, got {err}"
+        );
+        assert!(
+            !err.contains(ATSAM_SESSION_REQUIRED),
+            "do not collapse revoke to session-required: {err}"
+        );
+        let after = {
+            let store = IndexedSessionStore::open(a_dir.path()).unwrap();
+            store.pending_endpoint_outbound().unwrap().len()
+        };
+        assert_eq!(
+            after, before,
+            "lineage deny must run before seal crypto (no outbox reservation)"
         );
     }
 }

@@ -154,7 +154,9 @@ pub use lan_dispatch::{
     load_cached_peer_bundle, local_bundle, maintain_lan_durable_state,
     mark_lan_chat_history_delivery, parse_peer_offer, peer_is_trusted, persist_lan_chat_history,
     persist_trusted_peer_bundle, publish_prekey_bundle_checked, reconcile_outbound_stage_history,
-    remember_ephemeral_peer, rlb1_matches_noise_identity, with_prekey_store_lock, wrap_pair_init,
+    refuse_if_session_lineage_revoked, remember_ephemeral_peer, rlb1_matches_noise_identity,
+    seal_app_payload_under_session, with_prekey_store_lock, wrap_pair_init, ATSAM_LINEAGE_REVOKED,
+    ATSAM_SESSION_REQUIRED,
 };
 pub use lan_gate::{lan_direct_live_enabled, LAN_DIRECT_PRODUCTION_ENABLED};
 pub use lan_rlb1::{

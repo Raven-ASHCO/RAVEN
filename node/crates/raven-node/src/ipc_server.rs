@@ -5,6 +5,7 @@
 //! Unix uses a `0600` socket plus peer-cred UID check; Windows binds
 //! `WINDOWS_NAMED_PIPE` with a current-user DACL (fail-closed).
 //! Requests still refuse secret field names (`raven_core::ipc`).
+//! `SealUnderSession` is served only after the same peer-cred / pipe-ACL gate.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +16,8 @@ use raven_core::forward_queue::{ForwardItem, ForwardQueue, ForwardState};
 #[cfg(unix)]
 use raven_core::ipc::default_socket_path;
 use raven_core::ipc::{decode_request, encode_response, IpcRequest, IpcResponse, IPC_VERSION};
+use raven_core::load_identity_required;
+use raven_core::{seal_app_payload_under_session, ATSAM_LINEAGE_REVOKED, ATSAM_SESSION_REQUIRED};
 use tokio::time::Duration;
 
 use crate::internet_direct;
@@ -282,6 +285,65 @@ fn handle_req(req: IpcRequest, data_dir: &Path, forward: &Option<ForwardQueue>) 
             }
             IpcResponse::Accepted { v }
         }
+        IpcRequest::SealUnderSession {
+            v,
+            peer_hint,
+            app_payload_b64,
+        } => {
+            if app_payload_b64.len() > 512 * 1024 {
+                return IpcResponse::Error {
+                    v,
+                    code: "IPC_FRAME".into(),
+                    message: "app payload too large".into(),
+                };
+            }
+            let payload = match base64_decode(&app_payload_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    return IpcResponse::Error {
+                        v,
+                        code: "IPC_BAD_B64".into(),
+                        message: e,
+                    };
+                }
+            };
+            let identity = match load_identity_required(data_dir) {
+                Ok(id) => id,
+                Err(_) => {
+                    return IpcResponse::Error {
+                        v,
+                        code: ATSAM_SESSION_REQUIRED.into(),
+                        message: format!(
+                            "{ATSAM_SESSION_REQUIRED}: local identity missing; session plane unusable"
+                        ),
+                    };
+                }
+            };
+            match seal_app_payload_under_session(data_dir, &identity, &peer_hint, &payload) {
+                Ok(packed) => IpcResponse::SealUnderSessionResult {
+                    v,
+                    envelope_b64: b64_encode(&packed),
+                },
+                Err(e) => {
+                    let code = if e.starts_with(ATSAM_LINEAGE_REVOKED) {
+                        ATSAM_LINEAGE_REVOKED
+                    } else if e.starts_with(ATSAM_SESSION_REQUIRED) {
+                        ATSAM_SESSION_REQUIRED
+                    } else if e.starts_with("SEAL_PEER_HINT") {
+                        "SEAL_PEER_HINT"
+                    } else if e.starts_with("SEAL_PAYLOAD") {
+                        "SEAL_PAYLOAD"
+                    } else {
+                        "SEAL"
+                    };
+                    IpcResponse::Error {
+                        v,
+                        code: code.into(),
+                        message: e,
+                    }
+                }
+            }
+        }
         IpcRequest::LanDial { v, .. } => IpcResponse::Error {
             v,
             code: "INTERNAL".into(),
@@ -519,6 +581,9 @@ pub async fn client_ping(sock: &Path) -> Result<IpcResponse, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use raven_core::ipc::{IpcRequest, IpcResponse, IPC_VERSION};
+
     #[test]
     fn pipe_name_constant_is_exact() {
         assert_eq!(raven_core::WINDOWS_NAMED_PIPE, r"\\.\pipe\raven-node");
@@ -526,5 +591,49 @@ mod tests {
             raven_core::default_pipe_name(),
             raven_core::WINDOWS_NAMED_PIPE
         );
+    }
+
+    #[test]
+    fn enqueue_sealed_never_seals_app_payload() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let req = IpcRequest::EnqueueSealed {
+            v: IPC_VERSION,
+            envelope_b64: base64::engine::general_purpose::STANDARD.encode(b"not-a-raven-envelope"),
+            peer_hint: Some("peer".into()),
+        };
+        let resp = handle_req(req, dir.path(), &None);
+        match resp {
+            IpcResponse::Error { code, .. } => {
+                assert_eq!(code, "IPC_BAD_ENVELOPE");
+            }
+            other => panic!("EnqueueSealed must not seal app bytes: {other:?}"),
+        }
+        assert!(
+            !dir.path().join("queue.sqlite").exists(),
+            "EnqueueSealed must not create an outbox from unsealed bytes"
+        );
+    }
+
+    #[test]
+    fn seal_under_session_refuses_without_session() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let req = IpcRequest::SealUnderSession {
+            v: IPC_VERSION,
+            peer_hint: "ab".repeat(32),
+            app_payload_b64: base64::engine::general_purpose::STANDARD.encode(b"hello"),
+        };
+        let resp = handle_req(req, dir.path(), &None);
+        match resp {
+            IpcResponse::Error { code, message, .. } => {
+                assert_eq!(code, ATSAM_SESSION_REQUIRED);
+                assert!(
+                    !message.contains(ATSAM_LINEAGE_REVOKED),
+                    "missing session must not report revoke: {message}"
+                );
+            }
+            other => panic!("expected ATSAM_SESSION_REQUIRED, got {other:?}"),
+        }
     }
 }

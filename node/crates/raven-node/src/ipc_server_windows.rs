@@ -2,7 +2,8 @@
 //!
 //! Binds the canonical `WINDOWS_NAMED_PIPE` endpoint with a current-user-only
 //! DACL. Fail closed: if DACL setup fails, do not bind (NULL DACL is world-writable).
-//! Framing and request handling are shared with the Unix UDS server.
+//! Framing and request handling are shared with the Unix UDS server
+//! (including `SealUnderSession`; unsigned callers never reach handle_req).
 
 use std::path::PathBuf;
 use std::sync::Arc;

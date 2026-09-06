@@ -24,11 +24,23 @@ pub enum IpcRequest {
         store: Option<bool>,
         relay: Option<bool>,
     },
-    /// Enqueue already-sealed RavenEnvelopeV1 (base64). Daemon never seals from plaintext here.
+    /// Enqueue already-sealed RavenEnvelopeV1 (base64). Daemon never seals here.
     EnqueueSealed {
         v: u16,
         envelope_b64: String,
         peer_hint: Option<String>,
+    },
+    /// Seal application payload bytes inside the daemon under a persisted ATSAM
+    /// session (ADR 0004 D4 / M2). NON-RELEASE: does not lift RVN1 HOLD, and is
+    /// not O6 E2E / confidential-delivery Proven. Field names must not include
+    /// the substring `plaintext` (decode denylist).
+    SealUnderSession {
+        v: u16,
+        /// Peer device Ed25519 as 64 hex chars (same plane as LanDial expected_pub_hex).
+        peer_hint: String,
+        /// Application payload bytes (standard or URL-safe base64). Not a field
+        /// named with substring `plaintext`.
+        app_payload_b64: String,
     },
     /// Direct-dial a LAN peer over Noise XX and exchange already-sealed frames.
     LanDial {
@@ -72,6 +84,11 @@ pub enum IpcResponse {
         v: u16,
         frames_b64: Vec<String>,
     },
+    /// Packed RavenEnvelopeV1 produced by in-daemon ATSAM seal (base64).
+    SealUnderSessionResult {
+        v: u16,
+        envelope_b64: String,
+    },
     Error {
         v: u16,
         code: String,
@@ -104,6 +121,7 @@ pub fn decode_request(frame: &[u8]) -> Result<IpcRequest, String> {
         | IpcRequest::Status { v }
         | IpcRequest::SetPolicy { v, .. }
         | IpcRequest::EnqueueSealed { v, .. }
+        | IpcRequest::SealUnderSession { v, .. }
         | IpcRequest::LanDial { v, .. }
         | IpcRequest::InternetDial { v, .. } => {
             if *v != IPC_VERSION {
@@ -357,7 +375,7 @@ mod tests {
     }
 
     /// Serialize existing ops to prove no secret field names.
-    /// Does **not** exercise LanDial/EnqueueSealed as a send path (M2 still closed).
+    /// Encode/decode only — not an O6 E2E / HOLD-lift claim.
     #[test]
     fn all_ipc_variants_json_have_no_private_key_material() {
         let reqs = [
@@ -373,6 +391,11 @@ mod tests {
                 v: IPC_VERSION,
                 envelope_b64: "QUJD".into(),
                 peer_hint: Some("peer".into()),
+            },
+            IpcRequest::SealUnderSession {
+                v: IPC_VERSION,
+                peer_hint: "ab".repeat(32),
+                app_payload_b64: "aGVsbG8=".into(),
             },
             IpcRequest::LanDial {
                 v: IPC_VERSION,
@@ -406,6 +429,10 @@ mod tests {
                 v: IPC_VERSION,
                 frames_b64: vec!["QUJD".into()],
             },
+            IpcResponse::SealUnderSessionResult {
+                v: IPC_VERSION,
+                envelope_b64: "QUJD".into(),
+            },
             IpcResponse::Error {
                 v: IPC_VERSION,
                 code: "X".into(),
@@ -420,6 +447,29 @@ mod tests {
             let f = encode_response(resp).unwrap();
             assert_json_has_no_secret_tokens(std::str::from_utf8(&f[4..]).unwrap());
         }
+    }
+
+    #[test]
+    fn seal_under_session_roundtrip_has_no_secret_fields() {
+        let req = IpcRequest::SealUnderSession {
+            v: IPC_VERSION,
+            peer_hint: "cd".repeat(32),
+            app_payload_b64: "aGVsbG8=".into(),
+        };
+        let f = encode_request(&req).unwrap();
+        assert_eq!(decode_request(&f).unwrap(), req);
+        let raw = std::str::from_utf8(&f[4..]).unwrap();
+        assert_json_has_no_secret_tokens(raw);
+        assert!(raw.contains("\"op\":\"seal_under_session\""));
+        assert!(raw.contains("app_payload_b64"));
+        assert!(!raw.to_ascii_lowercase().contains("plaintext"));
+        let resp = IpcResponse::SealUnderSessionResult {
+            v: IPC_VERSION,
+            envelope_b64: "QkFTRTY0".into(),
+        };
+        let rf = encode_response(&resp).unwrap();
+        assert_eq!(decode_response(&rf).unwrap(), resp);
+        assert_json_has_no_secret_tokens(std::str::from_utf8(&rf[4..]).unwrap());
     }
 
     #[test]
