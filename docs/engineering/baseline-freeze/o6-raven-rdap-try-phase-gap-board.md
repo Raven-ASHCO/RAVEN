@@ -1,7 +1,7 @@
 # O6 try-phase gap board — Raven↔RDAP encrypted two-device path
 
 **As of:** 2026-09-06 · snapshot SHA `7ccf1809b318a111e745d311dd9bcfbc870efd28` (`main` tip when written)  
-**Owner:** Eng Program (#2) · consult Raven↔RDAP (#17), Protocol Spec (#4), Adversarial QA (#18), Python Runtime (#14)  
+**Owner:** Eng Program (#2) · consult Raven↔RDAP Integration Lead (`@Raven-ASHCO/architecture`, `@Raven-ASHCO/rdap`), Protocol Spec (#4), Adversarial QA (#18), Python Runtime (#14)  
 **Risk class:** **R0** (docs + fail-closed checklist). **Not** M1–M3 production code.  
 **Label:** **non-release** / **fail-closed containment**. This board does **not** claim confidential Raven messaging, production ATSAM, or a HOLD lift.
 
@@ -64,7 +64,7 @@ These are **green as stated**. None of them is the O6 encrypted harness.
 | **G-TERM** | Terminal L/M/W board not Proven | Founder Priority #1 sits **above** O6 M1+. Named-pipe **code** landed (#43); Proven still needs executed green/red (linked CI or agent smoke) per [`terminal-path-reliability.md`](terminal-path-reliability.md). Living boards at [`blockers-ownership-board.md`](blockers-ownership-board.md) / [`three-path-verification-board.md`](three-path-verification-board.md) are **stale (2026-09-04)** and still narrate pipe-as-blocker. | SRE Perf (#19), Windows (#11), Node IPC (#8), CLI DX (#12) |
 | **G-M1** | Same-RVN1 identity bridge missing | RDAP uses `.team/keys`; `raven-node` uses `~/.raven` / `--data-dir`. ADR 0004 D3: no parallel pin namespace. Private keys MUST NOT appear in IPC JSON. | Identity (#15) + Node IPC (#8) + Python Runtime (#14) |
 | **G-M2-IPC** | No daemon-seal IPC | `IpcRequest` is sealed-frame-only (`EnqueueSealed` / `LanDial`). Comment in [`ipc.rs`](../../../node/crates/raven-core/src/ipc.rs): “Daemon never seals from plaintext here.” M2 must add a Crypto-owned **in-daemon** seal. | Node IPC + Crypto (#3) + RDAP Protocol (#13) + Python Runtime |
-| **G-M2-PY** | No RDAP IPC client | This repo has **zero** `team_agents` / Python `EnqueueSealed` / `LanDial` caller. Companion RDAP README still states the integration gap (live `main` 2026-09-04). | Python Runtime (#14) + Raven↔RDAP (#17) |
+| **G-M2-PY** | No RDAP IPC client | This repo has **zero** `team_agents` / Python `EnqueueSealed` / `LanDial` caller. Companion RDAP README still states the integration gap (live `main` 2026-09-04). | Python Runtime (#14) + Raven↔RDAP Integration Lead |
 | **G-M3** | No two-device RDAP harness | ADR 0004 D5: two devices, mutual pin of the **same** RVN1, Alice `ask` → Bob complete, ATSAM-sealed frames, carrier enum `atsam_rvn1`, HOLD/non-Release labeled. None of that exists as an executable RDAP path. | Adversarial QA (#18) + SRE + Eng Program + CLI DX |
 | **G-M4** | RDAP “Important integration gap” still live | Honest today. D5.5 says replace it with a pointer to ADR 0004 **when** the encrypted path exists — **not before**. | RDAP Protocol + Assurance |
 | **G-CI** | No Raven↔RDAP interop job | O6 KPI “interop tests in CI” is empty. Do **not** pin a greenwashed job that talks HTTP A2A or experimental mailbox and calls it `atsam_rvn1`. | DevSecOps (#20) after M3 |
