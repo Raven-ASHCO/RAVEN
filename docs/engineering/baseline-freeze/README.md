@@ -45,6 +45,7 @@ Feature PRs that touch R2/R3 surfaces **must not** land until the Sprint 0 check
 | [`tickets/cross-os-bridge-matrix.md`](tickets/cross-os-bridge-matrix.md) | Design-only ticket: minimal cross-OS Bridge CI matrix (`bridge_v1` + `bridge_abc`/smoke) — no implementation in that file |
 | [`blockers-ownership-board.md`](blockers-ownership-board.md) | Living Sprint 0 blockers / ownership board (Eng Program) |
 | [`three-path-verification-board.md`](three-path-verification-board.md) | Manager SoT A/B/C + founder Proven rule; mesh \| bridge \| direct |
+| [`o6-raven-rdap-try-phase-gap-board.md`](o6-raven-rdap-try-phase-gap-board.md) | O6 try-phase honesty: what’s green vs gated toward the two-device encrypted harness; **non-release**; inventory ≠ Proven |
 | Live CODEOWNERS | [`.github/CODEOWNERS`](../../../.github/CODEOWNERS) (RAVEN); RDAP repo `.github/CODEOWNERS` |
 
 ### Sprint 0 architecture drafts (#1)

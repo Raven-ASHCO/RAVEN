@@ -160,7 +160,7 @@ For each boundary:
 | G21 | `store_tag = SHA-256("rdap-task:" ‖ address)[:16]` | Stable, address-derived, not `K_route` rotating mailbox (`RAVEN_STORE_OBJECT_V1.md`). Linkable and not a Raven polling capability. |
 | G22 | Runtime spec vs RDAP implementation | Spec forbids treating model output as authority; RDAP still sends task text to an LLM/tools. Enforcement is signature+pin+path policy, not the AR1–AR12 capability machine. |
 | G23 | `--allow-shell` / `--open` | Documented foot-guns; default off. Any default-on change is R3. |
-| G24 | Joint Raven↔RDAP revoke / confidential-path docs vs live code | O6 checklist row still NOT STARTED. ADR 0004 + Appendix G5 and Identity G5 are the docs SoT (PR#3 / PR#5); **code held**. Applied device-lineage revoke ⇒ lineage-scoped data-plane fail-closed, not automatic address-deny. |
+| G24 | Joint Raven↔RDAP revoke / confidential-path docs vs live code | O6 **inventory** landed 2026-09-06: [`o6-raven-rdap-try-phase-gap-board.md`](o6-raven-rdap-try-phase-gap-board.md) (Sprint 0 row IN PROGRESS). ADR 0004 + Appendix G5 and Identity G5 remain the docs SoT (PR#3 / PR#5); **code held**. Applied device-lineage revoke ⇒ lineage-scoped data-plane fail-closed, not automatic address-deny. Harness / interop CI still RED. |
 
 ---
 

@@ -22,6 +22,8 @@ O5 (protocol) + O6 (interop) can proceed in parallel once O3 draft exists.
 O7 needs O3 + initial CI from O2.
 ```
 
+**O6 honesty (2026-09-06):** inventory board [`o6-raven-rdap-try-phase-gap-board.md`](o6-raven-rdap-try-phase-gap-board.md). ADR 0004 two-device encrypted harness remains **RED / gated** (terminal + HOLD + M1–M3). Inventory ≠ harness green ≠ HOLD lift.
+
 ## Explicit non-outcome
 
 Staffing every role #1–#20 with a named human is **not** required to claim O1–O7 if teams and boards cover the approval matrix; vacant roles must still have an acting owner recorded by Eng Management.
