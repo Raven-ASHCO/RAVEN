@@ -26,12 +26,11 @@ non-localhost endpoint path remains an acceptance requirement.
 | Gate | Claim |
 |------|--------|
 | `scripts/internet_dial_smoke.sh` | Negative: legacy `raven-node run` without a persisted ATSAM session still refuses with `ATSAM_SESSION_REQUIRED`. **Not** delivery. **Not** WAN. |
-| `scripts/internet_indexed_two_node.sh` | Positive **lab** proof: RIH1 + indexed PairInit + sealed ACK on `127.0.0.1` **and** a same-host non-loopback IPv4 (often RFC1918). **dial≠WAN.** multi-NAT stays **BLOCKED_HARDWARE**. |
+| `scripts/internet_indexed_two_node.sh` | Positive **lab** proof: RIH1 + indexed PairInit + sealed ACK on `127.0.0.1` only. **localhost-only.** **dial≠WAN.** multi-NAT stays **BLOCKED_HARDWARE**. |
 | `INTERNET_DIRECT_PRODUCTION_ENABLED` | Stays **false** until founder GO after green lab evidence. |
 
 **Do not claim WAN / multi-NAT / public-Internet Proven from either smoke.**
-`127.0.0.1` is not WAN. Same-host non-loopback / RFC1918 is not public WAN.
-Named-pipe work is not WAN.
+`127.0.0.1` is not WAN. Named-pipe work is not WAN.
 
 ## Invariants
 

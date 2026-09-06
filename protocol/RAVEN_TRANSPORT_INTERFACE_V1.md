@@ -65,4 +65,4 @@ Ed25519-signed. MAY be published into a Kademlia DHT when `rust-libp2p` integrat
 
 ## 7. Tests
 
-`internet` unit tests, `internet_dial_smoke.sh`, `lan_path_smoke.sh`, `libp2p_swarm_smoke.sh`, `bootstrap_manual_peer_smoke.sh`, bridge demos.
+`internet` unit tests, `internet_dial_smoke.sh` (fail-closed), `internet_indexed_two_node.sh` (localhost lab; **dial≠WAN**), `lan_path_smoke.sh`, `libp2p_swarm_smoke.sh`, `bootstrap_manual_peer_smoke.sh`, bridge demos.
