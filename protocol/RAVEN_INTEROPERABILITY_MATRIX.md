@@ -2,10 +2,10 @@
 
 **Version:** 1  
 **Status:** Living evidence table for Phase A/B freeze  
-**Updated:** 2026-09-05
+**Updated:** 2026-09-06
 **Version inventory:** [`PROTOCOL_VERSIONS.md`](PROTOCOL_VERSIONS.md)
 
-CI names below are the `name:` strings from `.github/workflows/raven-serverless.yml` (workflow display name: **Raven Serverless Node**) and, for the thin always-on companion, `.github/workflows/raven-b1-always-on.yml` (**Raven B1 Always-On**). This serverless `main` has **no** `ios-native/` or `RAVEN-WatchApp/` tree. iOS / Go / Watch jobs remain **skip-when-absent / N/A** on this tree (unchanged honesty from [PR #9](https://github.com/Raven-ASHCO/RAVEN/pull/9)); they are **not** healthy required gates. Six RAVEN B1 check names are **main-green verified** on `e0a317aa`; pin / branch-protection is **NOT enabled** — pending **founder GO**. They are **not** “live required B1 pins” (that language is reserved for after founder GO; RDAP’s six A2A contexts already use live-pin language). See [`PROTOCOL_VERSIONS.md`](PROTOCOL_VERSIONS.md) § RAVEN Serverless B1. **.NET / C# `rvn1` shared-vector CI consumer is NOT YET** (no smoke gate in `raven-serverless.yml`).
+CI names below are the `name:` strings from `.github/workflows/raven-serverless.yml` (workflow display name: **Raven Serverless Node**) and, for the thin always-on companion, `.github/workflows/raven-b1-always-on.yml` (**Raven B1 Always-On**). This serverless `main` has **no** `ios-native/` or `RAVEN-WatchApp/` tree. iOS / Go / Watch jobs remain **skip-when-absent / N/A** on this tree (unchanged honesty from [PR #9](https://github.com/Raven-ASHCO/RAVEN/pull/9)); they are **not** healthy required gates. Six RAVEN B1 check names are **main-green verified** on `e0a317aa`; pin / branch-protection is **NOT enabled** — pending **founder GO**. They are **not** “live required B1 pins” (that language is reserved for after founder GO; RDAP’s six A2A contexts are also not live required pins — required checks OFF, pending Manager GO). See [`PROTOCOL_VERSIONS.md`](PROTOCOL_VERSIONS.md) § RAVEN Serverless B1. **.NET / C# `rvn1` shared-vector CI consumer is NOT YET** (no smoke gate in `raven-serverless.yml`).
 
 ## 1. Wire object parity
 
