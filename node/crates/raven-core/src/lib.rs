@@ -42,6 +42,7 @@ pub mod identity;
 pub mod identity_store;
 pub mod indexed_session_store;
 pub mod internet;
+pub mod internet_gate;
 pub mod introduction;
 pub mod ipc;
 pub mod lan_dispatch;
@@ -136,9 +137,10 @@ pub use indexed_session_store::{
 };
 pub use internet::{
     bits_to_caps, caps_to_bits, deframe_prefix, frame, opaque_store_tag, pack_hello,
-    unpack_verify_hello, CAP_BLE, CAP_BRIDGE, CAP_INTERNET, CAP_RELAY, CAP_STORE,
+    unpack_verify_hello, CAP_BLE, CAP_BRIDGE, CAP_INTERNET, CAP_RELAY, CAP_STORE, HELLO_WIRE_LEN,
     INTERNET_PROTO_ID, MAX_FRAME_BYTES,
 };
+pub use internet_gate::{internet_direct_live_enabled, INTERNET_DIRECT_PRODUCTION_ENABLED};
 pub use introduction::{IntroductionInbox, RavenIntroductionV1};
 pub use ipc::{
     decode_request, decode_response, default_ipc_endpoint, default_pipe_name, default_socket_path,

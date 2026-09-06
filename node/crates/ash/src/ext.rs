@@ -543,6 +543,45 @@ pub fn run_send_secure(
     super::pair_init_lab::run_pair_init_and_send(data_dir, id, dial, peer_pub_hex, text)
 }
 
+/// Same as [`run_send_secure`] on a named carrier (`lan` or lab `internet`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_send_secure_on(
+    data_dir: &Path,
+    id: &Identity,
+    peer: &str,
+    peer_pub_hex: &str,
+    listen: &str,
+    text: &str,
+    petname: &str,
+    tag: &str,
+    carrier: super::pair_init_lab::DialCarrier,
+) -> Result<(), String> {
+    if carrier == super::pair_init_lab::DialCarrier::Lan {
+        return run_send_secure(data_dir, id, peer, peer_pub_hex, listen, text, petname, tag);
+    }
+    let path = resolve_terminal_messaging_path();
+    assert_no_silent_fastapi(path)?;
+    let blocks = BlockList::load_checked(data_dir)?;
+    if blocks.is_blocked(peer_pub_hex) {
+        return Err("peer is on the local block list".into());
+    }
+    let _peer_pub = parse_pub_hex(peer_pub_hex)?;
+    let _ = (petname, tag, listen);
+    let dial = if looks_like_host_port(peer) {
+        peer
+    } else {
+        return Err(
+            "valid internet_dial host:port required — refusing LocalListenQueue / 127.0.0.1:0 fallback"
+                .into(),
+        );
+    };
+    if !super::trace_delivery::live_pair_init_outbound_ready() {
+        return Err(super::trace_delivery::production_gate_status().into());
+    }
+    let _ = ensure_mac_lan_daemon(data_dir);
+    super::pair_init_lab::run_pair_init_and_send_on(data_dir, id, dial, peer_pub_hex, text, carrier)
+}
+
 fn looks_like_host_port(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() || t.contains(' ') || t.starts_with("rvn1") {

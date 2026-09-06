@@ -235,6 +235,10 @@ enum Commands {
         /// Interactive chat session with /back /info /verify /block.
         #[arg(long, default_value_t = false)]
         chat: bool,
+        /// `lan` (default, Noise XX) or `internet` (RIH1 lab path).
+        /// `internet` is localhost/indexed lab only — not WAN Proven.
+        #[arg(long, default_value = "lan")]
+        carrier: String,
     },
     /// Show committed endpoint inbox (PairInit/LAN messages).
     Inbox,
@@ -2823,6 +2827,14 @@ fn print_production_gate_matrix() {
         on(raven_core::lan_direct_live_enabled())
     );
     println!(
+        "  {C_DIM}INTERNET_DIRECT_PRODUCTION_ENABLED{C_RESET}        {}",
+        on(raven_core::INTERNET_DIRECT_PRODUCTION_ENABLED)
+    );
+    println!(
+        "  {C_DIM}internet_direct_live_enabled{C_RESET}              {}",
+        on(raven_core::internet_direct_live_enabled())
+    );
+    println!(
         "  {C_DIM}unsafe-demo-crypto feature{C_RESET}                {}",
         on(cfg!(feature = "unsafe-demo-crypto"))
     );
@@ -3333,16 +3345,48 @@ fn cmd_endpoint_inbox(data_dir: &Path) {
     }
 }
 
-fn run_send(data_dir: &Path, peer: &str, peer_pub_hex: &str, listen: &str, text: &str) {
+fn parse_send_carrier(s: &str) -> Result<pair_init_lab::DialCarrier, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "lan" | "" => Ok(pair_init_lab::DialCarrier::Lan),
+        "internet" => Ok(pair_init_lab::DialCarrier::Internet),
+        other => Err(format!(
+            "unknown --carrier {other} (lan | internet). internet is localhost/indexed lab only — not WAN Proven"
+        )),
+    }
+}
+
+fn run_send(
+    data_dir: &Path,
+    peer: &str,
+    peer_pub_hex: &str,
+    listen: &str,
+    text: &str,
+    carrier: pair_init_lab::DialCarrier,
+) {
     let id = require_identity(data_dir);
-    if let Err(error) =
-        ext::run_send_secure(data_dir, &id, peer, peer_pub_hex, listen, text, "", "")
-    {
+    let result = match carrier {
+        pair_init_lab::DialCarrier::Lan => {
+            ext::run_send_secure(data_dir, &id, peer, peer_pub_hex, listen, text, "", "")
+        }
+        pair_init_lab::DialCarrier::Internet => ext::run_send_secure_on(
+            data_dir,
+            &id,
+            peer,
+            peer_pub_hex,
+            listen,
+            text,
+            "",
+            "",
+            carrier,
+        ),
+    };
+    if let Err(error) = result {
         eprintln!("send refused: {error}");
         std::process::exit(1);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_send_cli(
     data_dir: &Path,
     peer: &str,
@@ -3351,9 +3395,24 @@ fn cmd_send_cli(
     contact: &str,
     stdin_text: bool,
     chat: bool,
+    carrier: &str,
 ) {
+    let carrier = match parse_send_carrier(carrier) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}", sanitize_terminal_text(&e));
+            std::process::exit(1);
+        }
+    };
     let no_target = contact.trim().is_empty() && peer.trim().is_empty();
     if chat {
+        if carrier == pair_init_lab::DialCarrier::Internet {
+            eprintln!(
+                "ash send --chat --carrier internet is not in this slice \
+                 (localhost indexed send-only; not WAN Proven)"
+            );
+            std::process::exit(1);
+        }
         if no_target {
             eprintln!(
                 "ash send --chat requires --contact @tag or --peer host:port plus --peer-pub-hex"
@@ -3430,7 +3489,7 @@ fn cmd_send_cli(
         std::process::exit(1);
     }
     match resolve_send_target(data_dir, contact, peer, peer_pub_hex, listen) {
-        Ok((peer, pub_hex, listen)) => run_send(data_dir, &peer, &pub_hex, &listen, text),
+        Ok((peer, pub_hex, listen)) => run_send(data_dir, &peer, &pub_hex, &listen, text, carrier),
         Err(e) => {
             eprintln!("{}", sanitize_terminal_text(&e));
             std::process::exit(1);
@@ -3757,6 +3816,7 @@ pub fn run() {
             contact,
             stdin_text,
             chat,
+            carrier,
         }) => cmd_send_cli(
             &data_dir,
             &peer,
@@ -3765,6 +3825,7 @@ pub fn run() {
             &contact,
             stdin_text,
             chat,
+            &carrier,
         ),
         Some(Commands::Find {
             query,
@@ -4694,6 +4755,19 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
         assert!(looks_like_lan_dial("192.168.1.20:9000"));
         assert!(!looks_like_lan_dial("rvn1qabc"));
         assert!(!looks_like_lan_dial("not-a-dial"));
+    }
+
+    #[test]
+    fn send_carrier_parses_lan_and_internet_refuses_wan() {
+        assert_eq!(
+            parse_send_carrier("lan").unwrap(),
+            pair_init_lab::DialCarrier::Lan
+        );
+        assert_eq!(
+            parse_send_carrier("internet").unwrap(),
+            pair_init_lab::DialCarrier::Internet
+        );
+        assert!(parse_send_carrier("wan").is_err());
     }
 
     #[test]

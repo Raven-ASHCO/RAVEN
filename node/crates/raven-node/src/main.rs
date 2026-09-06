@@ -5,6 +5,7 @@
 mod bridge_run;
 #[cfg(feature = "corebluetooth")]
 mod corebluetooth_exp;
+mod internet_direct;
 #[cfg(any(unix, windows))]
 mod ipc_server;
 mod lan_direct;
@@ -184,6 +185,10 @@ enum Commands {
         lan_listen: String,
         #[arg(long, default_value = raven_core::DEFAULT_BLE_LISTEN)]
         ble_listen: String,
+        /// Optional InternetTransport (RIH1) listen. Empty = disabled.
+        /// Lab-only until INTERNET_DIRECT_PRODUCTION_ENABLED. localhost ≠ WAN.
+        #[arg(long, default_value = "")]
+        internet_listen: String,
         #[arg(long, default_value_t = 0)]
         timeout_secs: u64,
     },
@@ -1304,6 +1309,7 @@ async fn main() {
             data_dir,
             lan_listen,
             ble_listen,
+            internet_listen,
             timeout_secs,
         } => {
             // Identity preflight MUST run before any profile-state creation:
@@ -1331,6 +1337,15 @@ async fn main() {
             let data_lan = data_dir.clone();
             let mut lan_task =
                 tokio::spawn(async move { lan_direct::run_listener(data_lan, lan_listen).await });
+            let want_internet = !internet_listen.trim().is_empty();
+            let mut inet_task = if want_internet {
+                let data_inet = data_dir.clone();
+                tokio::spawn(async move {
+                    internet_direct::run_listener(data_inet, internet_listen).await
+                })
+            } else {
+                tokio::spawn(async { std::future::pending::<Result<(), String>>().await })
+            };
             for _ in 0..50 {
                 if lan_direct::listener_is_up() {
                     break;
@@ -1348,7 +1363,30 @@ async fn main() {
                     Err(e) => eprintln!("lan_direct join: {e}"),
                 }
                 ipc_task.abort();
+                inet_task.abort();
                 std::process::exit(1);
+            }
+            if want_internet {
+                for _ in 0..50 {
+                    if internet_direct::listener_is_up() {
+                        break;
+                    }
+                    if inet_task.is_finished() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                if !internet_direct::listener_is_up() {
+                    eprintln!("internet_direct failed to bind");
+                    match inet_task.await {
+                        Ok(Err(e)) => eprintln!("internet_direct failed: {e}"),
+                        Ok(Ok(())) => {}
+                        Err(e) => eprintln!("internet_direct join: {e}"),
+                    }
+                    ipc_task.abort();
+                    lan_task.abort();
+                    std::process::exit(1);
+                }
             }
             // Mock BLE stays on ble_listen. Do not fanout the production LAN port.
             tokio::select! {
@@ -1359,6 +1397,17 @@ async fn main() {
                         Err(e) => eprintln!("lan_direct join: {e}"),
                     }
                     ipc_task.abort();
+                    inet_task.abort();
+                    std::process::exit(1);
+                }
+                r = &mut inet_task => {
+                    match r {
+                        Ok(Err(e)) => eprintln!("internet_direct failed: {e}"),
+                        Ok(Ok(())) => eprintln!("internet_direct listener exited"),
+                        Err(e) => eprintln!("internet_direct join: {e}"),
+                    }
+                    ipc_task.abort();
+                    lan_task.abort();
                     std::process::exit(1);
                 }
                 r = &mut ipc_task => {
@@ -1366,6 +1415,7 @@ async fn main() {
                         eprintln!("ipc join: {e}");
                     }
                     lan_task.abort();
+                    inet_task.abort();
                     std::process::exit(1);
                 }
                 bridge_result = bridge_run::run_bridge_daemon(
@@ -1379,6 +1429,7 @@ async fn main() {
                 ) => {
                     ipc_task.abort();
                     lan_task.abort();
+                    inet_task.abort();
                     if let Err(e) = bridge_result {
                         eprintln!("service bridge failed: {e}");
                         std::process::exit(1);

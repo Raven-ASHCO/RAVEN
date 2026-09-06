@@ -1,13 +1,12 @@
-//! InternetTransport — dialable TCP carrier for opaque RavenEnvelopeV1.
+//! InternetTransport codec — RIH1 hello + length-prefixed opaque frames.
 //!
-//! Not a fake path selector: peers open real sockets, exchange a short
-//! Ed25519-authenticated hello + capability bits, then framed envelopes.
+//! Live sockets live in `raven-node` `internet_direct` (hello, then framed
+//! envelopes). This module is pack/unpack only. Localhost indexed delivery is
+//! a software substitute; it is **not** public-Internet / WAN Proven.
 //!
-//! ADR-0002 target: rust-libp2p QUIC/TCP + DHT. This module ships the V1
-//! serverless Internet proof path. Signed discovery records live in
-//! `crate::discovery` (DHT-ready values + in-process store). Live Kademlia /
-//! DCUtR / multi-NAT CGNAT: see `discovery::NAT_STATUS` (BLOCKED_HARDWARE;
-//! software substitutes: dial/LAN smokes + DiscoveryStore).
+//! ADR-0002 target: rust-libp2p QUIC/TCP + DHT. Signed discovery records live
+//! in `crate::discovery`. Live Kademlia / DCUtR / multi-NAT CGNAT: see
+//! `discovery::NAT_STATUS` (BLOCKED_HARDWARE).
 
 use crate::identity::Identity;
 use crate::transport::NodeCapability;
@@ -75,6 +74,9 @@ pub fn hello_signing_bytes(caps: u32, nonce12: &[u8; 12], pub_key: &[u8; 32]) ->
     out
 }
 
+/// Packed hello wire length: magic(4) || caps_u32_be || nonce(12) || pub(32) || sig(64).
+pub const HELLO_WIRE_LEN: usize = 4 + 4 + 12 + 32 + 64;
+
 /// Packed hello: magic(4) || caps_u32_be || nonce(12) || pub(32) || sig(64)
 pub fn pack_hello(id: &Identity, caps: u32, nonce12: [u8; 12]) -> Vec<u8> {
     let pk = id.public_key_bytes();
@@ -90,7 +92,7 @@ pub fn pack_hello(id: &Identity, caps: u32, nonce12: [u8; 12]) -> Vec<u8> {
 }
 
 pub fn unpack_verify_hello(raw: &[u8]) -> Result<(u32, [u8; 32]), String> {
-    if raw.len() != 4 + 4 + 12 + 32 + 64 {
+    if raw.len() != HELLO_WIRE_LEN {
         return Err("hello length".into());
     }
     if &raw[0..4] != HELLO_MAGIC {
@@ -160,6 +162,7 @@ mod tests {
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
         let packed = pack_hello(&id, CAP_INTERNET | CAP_RELAY, nonce);
+        assert_eq!(packed.len(), HELLO_WIRE_LEN);
         let (caps, pk) = unpack_verify_hello(&packed).unwrap();
         assert_eq!(caps, CAP_INTERNET | CAP_RELAY);
         assert_eq!(pk, id.public_key_bytes());

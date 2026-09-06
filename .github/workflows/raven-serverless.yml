@@ -188,6 +188,14 @@ jobs:
         run: ./scripts/swarm_mailbox_smoke.sh
       - name: legacy Internet path remains fail-closed
         run: ./scripts/internet_dial_smoke.sh
+      # Positive lab path: RIH1 + indexed PairInit/ACK on 127.0.0.1.
+      # CLAIM: localhost/lab ≠ WAN / multi-NAT Proven. Production flag stays false.
+      - name: InternetTransport localhost indexed two-node (lab; not WAN)
+        run: ./scripts/internet_indexed_two_node.sh
+        env:
+          RAVEN_IDENTITY_BACKEND: locked-file
+          RAVEN_ALLOW_EPHEMERAL_DATA_DIR: "1"
+          RAVEN_LAB_TEST_A: "1"
       - name: protocol vectors (python)
         working-directory: protocol/reference
         run: |
@@ -257,6 +265,12 @@ jobs:
         run: ./scripts/libp2p_swarm_smoke.sh
       - name: bootstrap manual-peer smoke
         run: ./scripts/bootstrap_manual_peer_smoke.sh
+      - name: InternetTransport localhost indexed two-node (lab; not WAN)
+        run: ./scripts/internet_indexed_two_node.sh
+        env:
+          RAVEN_IDENTITY_BACKEND: locked-file
+          RAVEN_ALLOW_EPHEMERAL_DATA_DIR: "1"
+          RAVEN_LAB_TEST_A: "1"
 
   rust-windows:
     name: Rust (Windows)

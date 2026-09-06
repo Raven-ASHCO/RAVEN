@@ -17,10 +17,12 @@ use raven_core::ipc::default_socket_path;
 use raven_core::ipc::{decode_request, encode_response, IpcRequest, IpcResponse, IPC_VERSION};
 use tokio::time::Duration;
 
+use crate::internet_direct;
 use crate::lan_direct;
 
 const IPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const LAN_DIAL_TIMEOUT: Duration = Duration::from_secs(45);
+const INTERNET_DIAL_TIMEOUT: Duration = Duration::from_secs(45);
 use raven_core::node_policy::{load_policy, save_policy};
 use raven_core::queue::{DeliveryState, OutgoingQueue, QueueItem};
 use raven_core::transport::TransportKind;
@@ -136,6 +138,9 @@ fn handle_req(req: IpcRequest, data_dir: &Path, forward: &Option<ForwardQueue>) 
                     let mut c = vec!["ipc".into()];
                     if crate::lan_direct::listener_is_up() {
                         c.push("lan_direct".into());
+                    }
+                    if crate::internet_direct::listener_is_up() {
+                        c.push("internet_direct".into());
                     }
                     if policy.bridge {
                         c.push("bridge".into());
@@ -282,6 +287,11 @@ fn handle_req(req: IpcRequest, data_dir: &Path, forward: &Option<ForwardQueue>) 
             code: "INTERNAL".into(),
             message: "LanDial must be handled asynchronously".into(),
         },
+        IpcRequest::InternetDial { v, .. } => IpcResponse::Error {
+            v,
+            code: "INTERNAL".into(),
+            message: "InternetDial must be handled asynchronously".into(),
+        },
     }
 }
 
@@ -336,6 +346,52 @@ async fn handle_lan_dial(data_dir: &Path, req: IpcRequest) -> IpcResponse {
     }
 }
 
+async fn handle_internet_dial(data_dir: &Path, req: IpcRequest) -> IpcResponse {
+    let IpcRequest::InternetDial {
+        v,
+        internet_dial,
+        expected_pub_hex,
+        frames_b64,
+    } = req
+    else {
+        return IpcResponse::Error {
+            v: IPC_VERSION,
+            code: "INTERNAL".into(),
+            message: "not InternetDial".into(),
+        };
+    };
+    let mut frames = Vec::new();
+    for item in frames_b64 {
+        match base64_decode(&item) {
+            Ok(b) => frames.push(b),
+            Err(e) => {
+                return IpcResponse::Error {
+                    v,
+                    code: "IPC_BAD_B64".into(),
+                    message: e,
+                };
+            }
+        }
+    }
+    let work = internet_direct::dial(data_dir, &internet_dial, &expected_pub_hex, &frames);
+    match tokio::time::timeout(INTERNET_DIAL_TIMEOUT, work).await {
+        Ok(Ok(replies)) => IpcResponse::InternetDialResult {
+            v,
+            frames_b64: replies.iter().map(|f| b64_encode(f)).collect(),
+        },
+        Ok(Err(e)) => IpcResponse::Error {
+            v,
+            code: "INTERNET_DIAL".into(),
+            message: e,
+        },
+        Err(_) => IpcResponse::Error {
+            v,
+            code: "INTERNET_DIAL_TIMEOUT".into(),
+            message: "internet dial exceeded 45s".into(),
+        },
+    }
+}
+
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD
@@ -357,6 +413,7 @@ async fn serve_one<S>(
     };
     let resp = match decode_request(&frame) {
         Ok(req @ IpcRequest::LanDial { .. }) => handle_lan_dial(&data_dir, req).await,
+        Ok(req @ IpcRequest::InternetDial { .. }) => handle_internet_dial(&data_dir, req).await,
         Ok(req) => {
             let fwd = forward.lock().await;
             handle_req(req, &data_dir, &fwd)
