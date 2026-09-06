@@ -1,0 +1,5 @@
+{
+  "envelope_b64": "UlZOMQEBAACD99tnAGolm3C0f8OYldgbMPbYvfaA0TGRcNo3+nn/8SyFkinHduc1AAABoHi0yzsAAAGgeOu5uwgCefz53dOfkiRX2sKIAAAAAAAvAEBSVk5BMQAAAAMBAAAAAZpxgwV66Rb2wxEp1tXkdyEekaCqioj0+bP+SEumurk6I3GQBsJ6ZFZzrM7J1wrktb9eSgie117zfnFBH/Ju6w4ED0XbqhA1tueP0uqjOEfPiwSFRcwyMfLJD2w6WfE3Lgo="
+}
+NON-RELEASE / HOLD active. plaintext-to-daemon SealUnderSession only. Not O6 E2E Proven. No HOLD lift. Soft-load P0 held. Seal still requires a raven-node ATSAM session.
+NON-RELEASE / HOLD. Not O6 Proven. envelope_b64 is daemon-sealed; RDAP did not construct ATSAM/RVNA1 ciphertext.

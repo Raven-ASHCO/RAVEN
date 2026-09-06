@@ -64,8 +64,8 @@ grep -q 'Harness green ≠ HOLD lift' "$BOARD" \
   || grep -q 'harness green ≠ HOLD lift' "$BOARD" \
   || grep -q 'Harness green ≠ HOLD lifted' "$BOARD" \
   || fail_reg "$BOARD missing harness-green ≠ HOLD-lifted rule"
-grep -q 'Daemon never seals from plaintext here' "$IPC" \
-  || fail_reg "$IPC missing sealed-frame-only invariant"
+grep -q 'Daemon never seals here' "$IPC" \
+  || fail_reg "$IPC missing EnqueueSealed sealed-frame-only invariant"
 if grep -Eq 'enum IpcRequest' -A 50 "$IPC" | grep -Eqi 'SealPlaintext|SealPayload|EnqueuePlain'; then
   fail_reg "$IPC grew a plaintext-seal op; Crypto owns M2 — out of this PR"
 fi

@@ -1,0 +1,8 @@
+raven-node ipc: listening /tmp/raven-o6-m2-seal-9848/green/b/raven-node.sock
+raven-node lan_direct: listen 127.0.0.1:18848
+raven-node: BRIDGE lan listen 127.0.0.1:44067
+raven-node: BRIDGE mock_ble listen 127.0.0.1:33687
+raven-node: BRIDGE enabled=true store=true pending=0
+lan_direct inbound read: early eof
+lan_direct inbound read: early eof
+lan_direct inbound read: early eof
