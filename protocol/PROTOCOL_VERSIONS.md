@@ -1,7 +1,7 @@
 # RAVEN Protocol Version Inventory
 
 **Status:** Living inventory (docs only). Not a wire change.
-**Updated:** 2026-09-05
+**Updated:** 2026-09-06
 **Audience:** protocol owners, ports, CI readers.
 
 This page lists which protocol families are frozen, which are draft / production-disabled, and which CI jobs in `.github/workflows/raven-serverless.yml` (workflow display name: **Raven Serverless Node**) and `.github/workflows/raven-b1-always-on.yml` (workflow display name: **Raven B1 Always-On**) can be cited as evidence on the current serverless `main` tree.
@@ -50,7 +50,7 @@ Capability negotiation is layered on version negotiation. Reconciling legacy RUM
 
 [`Raven-ASHCO/raven-distributed-agent-protocol`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol) package **1.1.0** is an experimental A2A companion. It vendors `protocol/reference/raven_protocol`. It is **not** the `raven-node` identity store. Those package / companion facts are unchanged.
 
-**Live B1 required pins (RDAP `main`).** Manager GO applied GitHub branch protection on RDAP `main` requiring these six check contexts. They are **verified live required checks**, not provisional names. Job display names are from workflow **RDAP selftest** (`.github/workflows/selftest.yml` in the RDAP repo):
+**RDAP B1 (main-green streak reset; required checks OFF / pin not enabled).** The six A2A selftest job names are unchanged. They are **not** “live B1 required pins” and are **not** “verified live required checks.” Branch-protection **required checks are OFF** (`required_status_checks: null`); the pin is **not** enabled. Founder **declined** pin-GO on 2026-09-06 (skipped the pin-GO widget; treat as **NO**). Pins remain **OFF** until an **explicit** founder GO. Do not re-ask this week. Job display names are from workflow **RDAP selftest** (`.github/workflows/selftest.yml` in the RDAP repo):
 
 1. `A2A selftest (ubuntu-latest, Python 3.10)`
 2. `A2A selftest (ubuntu-latest, Python 3.12)`
@@ -59,9 +59,9 @@ Capability negotiation is layered on version negotiation. Reconciling legacy RUM
 5. `A2A selftest (windows-latest, Python 3.10)`
 6. `A2A selftest (windows-latest, Python 3.12)`
 
-Example green tips cited by DevSecOps: `148cdc9` (run [`33867613614`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol/actions/runs/33867613614)), `b7fca2a` (run [`33869790847`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol/actions/runs/33869790847)).
+Streak reset; ≥2 consecutive greens on tip `4307b86e` (`4307b86e69144f20480c24d6d6ce9f1e68a596e7`). DevSecOps reports the main-green streak reset after an intervening RDAP selftest failure on `3c5a0cb` (run [`34033634481`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol/actions/runs/34033634481)), then greens on `4d58dd46` (run [`34035297812`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol/actions/runs/34035297812)) and tip `4307b86e` (run [`34035600187`](https://github.com/Raven-ASHCO/raven-distributed-agent-protocol/actions/runs/34035600187)).
 
-Do not treat RDAP B1 as RAVEN `main` branch protection. RAVEN Serverless names and status are in **RAVEN Serverless B1 (main-green verified, pin not enabled)** below. RDAP’s live-pin language does **not** apply to RAVEN.
+Do not treat RDAP B1 as RAVEN `main` branch protection. RAVEN Serverless names and status are in **RAVEN Serverless B1 (main-green verified, pin not enabled)** below (also **OFF**; founder declined 2026-09-06). Do not use live-pin language for either repo until an explicit founder GO.
 
 ---
 
@@ -72,7 +72,7 @@ DevSecOps confirmed **main-green verified** on tip `e0a317aa` (`e0a317aa6d4873d1
 - Workflow **Raven Serverless Node** run [`33989477053`](https://github.com/Raven-ASHCO/RAVEN/actions/runs/33989477053) → success (push)
 - Workflow **Raven B1 Always-On** run [`33989477009`](https://github.com/Raven-ASHCO/RAVEN/actions/runs/33989477009) → success (push); job `B1 always-on gate` success
 
-These six check names were SUCCESS on that tip. They are **PR-green candidates now recorded as main-green**. Pin / branch-protection is **NOT enabled** — pending **founder GO**. They are **not** “live required B1 pins.” That language is reserved for after founder GO. RDAP’s six A2A contexts above already use live-pin language; keep the distinction.
+These six check names were SUCCESS on that tip. They are **PR-green candidates now recorded as main-green**. Pin / branch-protection is **NOT enabled**. Founder **declined** pin-GO on 2026-09-06 (skipped the pin-GO widget; treat as **NO**). Pins remain **OFF** until an **explicit** founder GO. Do not re-ask this week. They are **not** “live required B1 pins.” That language is reserved for after an explicit founder GO. RDAP B1 above is a separate-repo note: streak reset (≥2) on tip `4307b86e`, required checks **OFF**, founder declined the same day. Keep the distinction.
 
 1. `B1 always-on gate`
 2. `Messaging-only product boundary`
