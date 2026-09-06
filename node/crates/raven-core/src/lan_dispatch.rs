@@ -2339,7 +2339,7 @@ mod tests {
         rev.save(a_dir.path()).unwrap();
 
         let before = {
-            let mut store = IndexedSessionStore::open(a_dir.path()).unwrap();
+            let store = IndexedSessionStore::open(a_dir.path()).unwrap();
             store.pending_endpoint_outbound().unwrap().len()
         };
         let err = seal_app_payload_under_session(
@@ -2358,7 +2358,7 @@ mod tests {
             "do not collapse revoke to session-required: {err}"
         );
         let after = {
-            let mut store = IndexedSessionStore::open(a_dir.path()).unwrap();
+            let store = IndexedSessionStore::open(a_dir.path()).unwrap();
             store.pending_endpoint_outbound().unwrap().len()
         };
         assert_eq!(
