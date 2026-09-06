@@ -48,13 +48,26 @@ refuse() {
 [[ -n "$RDAP_HOME" ]] || refuse "rdap-home required"
 if [[ -n "$WHOAMI_JSON" ]]; then
   [[ -f "$WHOAMI_JSON" ]] || refuse "whoami-json missing: $WHOAMI_JSON"
-  raw="$(cat "$WHOAMI_JSON")"
-  lower="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
-  for bad in seed private_key plaintext recovery; do
-    if printf '%s' "$lower" | grep -Fq "$bad"; then
-      refuse "whoami JSON contains forbidden token: $bad"
+  if python3 - "$WHOAMI_JSON" <<'PY'
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+if not isinstance(obj, dict):
+    sys.exit(2)
+forbidden = {"seed", "private_key", "plaintext", "recovery"}
+keys = {str(k).lower() for k in obj}
+if keys & forbidden:
+    sys.exit(3)
+sys.exit(0)
+PY
+  then
+    :
+  else
+    code=$?
+    if [[ "$code" -eq 3 ]]; then
+      refuse "whoami JSON contains forbidden key (seed/private_key/plaintext/recovery)"
     fi
-  done
+    refuse "whoami JSON is not a public card object"
+  fi
   ADDRESS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["address"])' "$WHOAMI_JSON")"
   PUB_HEX="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pub_hex"])' "$WHOAMI_JSON")"
   FINGERPRINT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fingerprint"])' "$WHOAMI_JSON")"
@@ -62,13 +75,7 @@ fi
 
 [[ -n "$ADDRESS" && -n "$PUB_HEX" && -n "$FINGERPRINT" ]] || refuse "address, pub_hex, fingerprint required"
 
-blob="$(printf '%s\n%s\n%s\n' "$ADDRESS" "$PUB_HEX" "$FINGERPRINT")"
-lower="$(printf '%s' "$blob" | tr '[:upper:]' '[:lower:]')"
-for bad in seed private_key plaintext recovery; do
-  if printf '%s' "$lower" | grep -Fq "$bad"; then
-    refuse "bind input contains forbidden token: $bad"
-  fi
-done
+# Public values may coincidentally contain those letter sequences; refuse keys only.
 
 # Derive address + fingerprint from pub_hex (Identity V1 / same pin plane).
 derived="$(
@@ -132,7 +139,7 @@ fi
 umask 022
 cat >"$pin" <<EOF
 # ADR 0004 D3 same-RVN1 public pin (NON-RELEASE)
-# NOT a keypair. NOT a seed. Trust/invite MUST use this RVN1.
+# Public pin only — not a keypair and not private-key material.
 address=$ADDRESS
 pub_hex=$PUB_HEX
 fingerprint=$FINGERPRINT

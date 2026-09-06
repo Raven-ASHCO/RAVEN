@@ -118,13 +118,14 @@ INIT_FP="$(grep '^fingerprint=' "$WORKDIR/init.out" | cut -d= -f2)"
   || fail_green "ash init did not print public address/pub_hex/fingerprint"
 
 "$ASH" --data-dir "$DATA" whoami --json >"$WORKDIR/whoami.json"
-WHOAMI_RAW="$(cat "$WORKDIR/whoami.json")"
-WHOAMI_LOWER="$(printf '%s' "$WHOAMI_RAW" | tr '[:upper:]' '[:lower:]')"
-for bad in seed private_key plaintext recovery; do
-  if printf '%s' "$WHOAMI_LOWER" | grep -Fq "$bad"; then
-    fail_green "whoami --json leaked forbidden token: $bad"
-  fi
-done
+python3 - "$WORKDIR/whoami.json" <<'PY' || fail_green "whoami --json leaked a forbidden key"
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+assert isinstance(obj, dict)
+assert set(obj) == {"address", "fingerprint", "pub_hex"}
+forbidden = {"seed", "private_key", "plaintext", "recovery"}
+assert not ({k.lower() for k in obj} & forbidden)
+PY
 
 WHO_ADDR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["address"])' "$WORKDIR/whoami.json")"
 WHO_PUB="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pub_hex"])' "$WORKDIR/whoami.json")"
@@ -147,9 +148,15 @@ CARD_ADDR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ad
 if [[ -e "$RDAP_HOME/.team/keys/device_ed25519.seed" || -e "$RDAP_HOME/.team/keys/identity.seed" ]]; then
   fail_green "bind wrote a seed file (forbidden)"
 fi
-if grep -Ei 'seed|private_key|plaintext|recovery' "$PIN" "$CARD" >/dev/null; then
-  fail_green "pin/card contains forbidden token"
+if grep -E '^(seed|private_key|plaintext|recovery)=' "$PIN" >/dev/null; then
+  fail_green "pin grew a forbidden field"
 fi
+python3 - "$CARD" <<'PY' || fail_green "card leaked a forbidden key"
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+forbidden = {"seed", "private_key", "plaintext", "recovery"}
+assert not ({str(k).lower() for k in obj} & forbidden)
+PY
 
 echo "node_rvn1=$WHO_ADDR"
 echo "rdap_pin_rvn1=$PIN_ADDR"
@@ -204,15 +211,14 @@ fi
 # RED-3: IPC / whoami JSON dump contains no private key material
 STATUS_JSON='{"ok":"status","v":1,"bridge":false,"store":false,"relay":false,"forward_pending":0,"capabilities":["ipc"]}'
 printf '%s\n' "$STATUS_JSON" >"$WORKDIR/status.json"
-WHOAMI_DUMP="$(cat "$WORKDIR/whoami.json")"
-for dump in "$STATUS_JSON" "$WHOAMI_DUMP"; do
-  lower="$(printf '%s' "$dump" | tr '[:upper:]' '[:lower:]')"
-  for bad in seed private_key plaintext recovery; do
-    if printf '%s' "$lower" | grep -Fq "$bad"; then
-      fail_green "public dump leaked $bad"
-    fi
-  done
-done
+python3 - "$WORKDIR/status.json" "$WORKDIR/whoami.json" <<'PY' || fail_green "public dump leaked a forbidden key"
+import json, sys
+forbidden = {"seed", "private_key", "plaintext", "recovery"}
+for path in sys.argv[1:]:
+    obj = json.load(open(path, encoding="utf-8"))
+    keys = {str(k).lower() for k in obj}
+    assert not (keys & forbidden), path
+PY
 # Executable negative: a dump that *does* include a private-key field is RED.
 BAD_DUMP='{"ok":"status","v":1,"private_key":"nope"}'
 printf '%s\n' "$BAD_DUMP" >"$WORKDIR/bad-ipc.json"
