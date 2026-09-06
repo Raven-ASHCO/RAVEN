@@ -1,0 +1,13 @@
+O6_M2_SEAL_LAB=PASS
+HOLD=ACTIVE
+LABEL=NON-RELEASE
+RAVEN_TIP=1b662b4d0c6a59a8c73c36409ad769f652b73f4e
+RDAP_TIP=3207e8ea56002ff0efe0909ec9b6ec233b920c05
+UNIT_BASELINE=PASS rc=0 162 passed RDAP_TRY_OK
+RED_NO_SESSION=PASS rc=1 ATSAM_SESSION_REQUIRED
+GREEN_LAB_SEAL=PASS rc=0
+RED_REVOKE=BLOCKED
+RDAP_NO_LOCAL_ATSAM=PASS
+CLAIM=lab localhost IPC seal under HOLD
+NOT_PROVEN=O6 E2E; HOLD lift; WAN; confidential RDAP delivery
+NON-RELEASE / HOLD active. plaintext-to-daemon SealUnderSession only. Not O6 E2E Proven. No HOLD lift. Soft-load P0 held. Seal still requires a raven-node ATSAM session.

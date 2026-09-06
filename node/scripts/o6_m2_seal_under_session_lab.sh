@@ -71,7 +71,14 @@ cleanup() {
   wait 2>/dev/null || true
   if [[ -n "${EVIDENCE_OUT}" && -d "$WORKDIR" ]]; then
     mkdir -p "$EVIDENCE_OUT"
-    cp -a "$WORKDIR"/. "$EVIDENCE_OUT/" 2>/dev/null || true
+    # Public logs only — never copy identity.seed / session secrets / sqlite.
+    find "$WORKDIR" -type f \( \
+        -name '*.log' -o -name '*.out' -o -name '*.err' -o -name '*.stdout' \
+        -o -name '*.stderr' -o -name '*.combined' -o -name '*.status' \
+        -o -name 'SUMMARY.txt' -o -name 'lab.status' -o -name '*.init' \
+        -o -name '*.help' \
+      \) ! -path '*/.venv/*' ! -name 'identity.seed' \
+      -exec bash -c 'dest="$1"; src="$2"; rel="${src#"$3"/}"; mkdir -p "$dest/$(dirname "$rel")"; cp -a "$src" "$dest/$rel"' _ "$EVIDENCE_OUT" {} "$WORKDIR" \;
   fi
   if [[ "${RAVEN_KEEP_M2:-}" == "1" ]]; then
     echo "keeping $WORKDIR" >&2
@@ -97,13 +104,16 @@ echo "=== build ash + raven-node (debug; no unsafe-demo-crypto) ==="
 [[ -x "$ASH" ]] || fail "ash binary missing"
 [[ -x "$NODE" ]] || fail "raven-node binary missing"
 
-echo "=== production tripwires stay false ==="
+echo "=== production tripwires stay false (HOLD) ==="
 "$ASH" lab status >"$WORKDIR/lab.status" 2>&1 || true
-if grep -E 'PRODUCTION_ENABLED' "$WORKDIR/lab.status" | grep -E 'true' | grep -v live_enabled >/dev/null; then
+# LAN_DIRECT_PRODUCTION_ENABLED is already true on main (existing LAN slice).
+# This pack must not flip the remaining HOLD tripwires.
+if grep -E 'pair_init::PRODUCTION_ENABLED|atsam_indexed_session::PRODUCTION_ENABLED|INDEXED_SESSION_STORE_PRODUCTION_ENABLED|PREKEY_LIFECYCLE_PRODUCTION_ENABLED|INTERNET_DIRECT_PRODUCTION_ENABLED' \
+     "$WORKDIR/lab.status" | grep -E 'true' >/dev/null; then
   cat "$WORKDIR/lab.status" >&2 || true
-  fail "a PRODUCTION_ENABLED tripwire is true"
+  fail "a HOLD PRODUCTION_ENABLED tripwire is true (this pack must not flip them)"
 fi
-echo "LAB_STATUS_OK (PRODUCTION_ENABLED remain false)"
+echo "LAB_STATUS_OK (HOLD tripwires remain false; LAN_DIRECT_PRODUCTION_ENABLED is pre-existing on main)"
 
 # ── RDAP companion ────────────────────────────────────────────────────────
 if [[ -n "${RDAP_HOME:-}" && -x "${RDAP_HOME}/rdap" ]]; then
@@ -144,13 +154,17 @@ UNIT_PASSED="$(grep -Eo '[0-9]+ passed' "$WORKDIR/unit/selftest.combined" | tail
 echo "UNIT_BASELINE=PASS rc=$UNIT_RC ${UNIT_PASSED:-} RDAP_TRY_OK"
 
 # Assert caller-only request shape (RDAP does not construct ATSAM locally).
-python3 - <<'PY' "$RDAP_DIR/team_agents/raven_ipc.py" || fail "RDAP raven_ipc.py request-shape assert"
-import pathlib, sys, ast
-src = pathlib.Path(sys.argv[1]).read_text()
-if "message_ciphertext" in src or "RVNA1" in src or "seal_message" in src:
-    raise SystemExit("raven_ipc.py must not construct ATSAM/RVNA1 ciphertext")
-if "app_payload_b64" not in src or "seal_under_session" not in src:
-    raise SystemExit("raven_ipc.py missing plaintext-to-daemon fields")
+PYTHONPATH="$RDAP_DIR${PYTHONPATH:+:$PYTHONPATH}" "$RDAP_DIR/.venv/bin/python" - <<'PY' || fail "RDAP raven_ipc.py request-shape assert"
+from team_agents.raven_ipc import seal_under_session_request
+req = seal_under_session_request("ab" * 32, b"hello")
+allowed = {"op", "v", "peer_hint", "app_payload_b64"}
+if set(req) != allowed:
+    raise SystemExit(f"unexpected SealUnderSession keys: {sorted(req)}")
+if req["op"] != "seal_under_session":
+    raise SystemExit(f"op={req['op']!r}")
+for bad in ("message_ciphertext", "plaintext", "seed", "private_key", "recovery"):
+    if any(bad in str(k).lower() for k in req):
+        raise SystemExit(f"forbidden field {bad}")
 print("RDAP_NO_LOCAL_ATSAM=PASS (caller submits app_payload_b64 only)")
 PY
 
