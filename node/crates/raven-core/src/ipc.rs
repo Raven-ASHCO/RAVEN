@@ -356,6 +356,8 @@ mod tests {
         );
     }
 
+    /// Serialize existing ops to prove no secret field names.
+    /// Does **not** exercise LanDial/EnqueueSealed as a send path (M2 still closed).
     #[test]
     fn all_ipc_variants_json_have_no_private_key_material() {
         let reqs = [
