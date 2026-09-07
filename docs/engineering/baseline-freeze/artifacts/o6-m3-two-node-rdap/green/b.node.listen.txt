@@ -1,0 +1,2 @@
+raven-node ipc: listening /tmp/raven-o6-m3-lab-11570/green/b/raven-node.sock
+raven-node lan_direct: listen 127.0.0.1:18570

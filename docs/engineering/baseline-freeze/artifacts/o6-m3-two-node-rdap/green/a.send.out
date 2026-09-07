@@ -1,0 +1,4 @@
+LAN dial 127.0.0.1:18570 (saved · Bob)
+[38;2;34;197;94mPairResponse confirmed[0m — sending indexed message
+[38;2;34;197;94mindexed message queued after dial[0m mid=dcfeaaed… peer=127.0.0.1:18570 carrier=lan_dial
+[38;2;34;197;94mstatus[0m delivered

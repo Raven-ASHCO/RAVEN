@@ -833,6 +833,42 @@ pub fn export_lab_device_cert(data_dir: &Path, id: &Identity) -> Result<(), Stri
     Ok(())
 }
 
+/// Decode an already-sealed RavenEnvelopeV1. Does not seal (O6 M3 lab).
+pub fn decode_already_sealed_envelope_b64(envelope_b64: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let raw = envelope_b64.trim();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw))
+        .map_err(|e| format!("envelope_b64: {e}"))?;
+    if Envelope::unpack(&bytes).is_none() {
+        return Err("not a packed RavenEnvelopeV1 (already-sealed LanDial only)".into());
+    }
+    if bytes.len() < 4 || &bytes[..4] != b"RVN1" {
+        return Err("envelope magic is not RVN1 (already-sealed LanDial only)".into());
+    }
+    Ok(bytes)
+}
+
+/// Forward an already-sealed RavenEnvelopeV1 over LanDial. Lab-only. Not WAN.
+pub fn lan_dial_already_sealed(
+    data_dir: &Path,
+    lan_dial: &str,
+    expected_pub_hex: &str,
+    envelope: &[u8],
+) -> Result<Vec<Vec<u8>>, String> {
+    if Envelope::unpack(envelope).is_none() || envelope.len() < 4 || &envelope[..4] != b"RVN1" {
+        return Err("not a packed RavenEnvelopeV1 (already-sealed LanDial only)".into());
+    }
+    ipc_carrier_dial(
+        data_dir,
+        DialCarrier::Lan,
+        lan_dial,
+        expected_pub_hex,
+        &[envelope.to_vec()],
+    )
+}
+
 pub fn import_peer_device_cert(
     data_dir: &Path,
     peer_pub_hex: &str,
@@ -871,4 +907,31 @@ pub fn ingest_pair_response_packed(data_dir: &Path, packed: &[u8]) -> Result<(),
 #[allow(dead_code)]
 fn _path_marker() -> PathBuf {
     PathBuf::from(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn already_sealed_decode_refuses_raw_payload() {
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::STANDARD.encode(b"hello");
+        let err = decode_already_sealed_envelope_b64(&raw).unwrap_err();
+        assert!(
+            err.contains("already-sealed") || err.contains("RavenEnvelopeV1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn already_sealed_dial_refuses_unpacked_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = lan_dial_already_sealed(dir.path(), "127.0.0.1:9", &"ab".repeat(32), b"hello")
+            .unwrap_err();
+        assert!(
+            err.contains("already-sealed") || err.contains("RavenEnvelopeV1"),
+            "{err}"
+        );
+    }
 }

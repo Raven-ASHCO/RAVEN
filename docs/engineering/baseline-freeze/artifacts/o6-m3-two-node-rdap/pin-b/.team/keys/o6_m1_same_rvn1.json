@@ -1,0 +1,12 @@
+{
+  "schema": "o6_m1_same_rvn1_pin_v1",
+  "address": "rvn1qy2enctalyy2t8cy2jregh4hgmmunjph5sfy98w3",
+  "pub_hex": "101557af1f847c7e155e57c79d6c203cc3b94664e0ed7ca1a17bbdd73e1d6c07",
+  "fingerprint": "FZnh-ffkI-pZ8E",
+  "source": "raven-node-whoami",
+  "principal": "user_identity",
+  "g5_pin_ne_device_ed_pub": true,
+  "label": "NON-RELEASE",
+  "hold": "ACTIVE",
+  "claim": "none"
+}

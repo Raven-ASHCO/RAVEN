@@ -1,0 +1,5 @@
+O6_M3_LAN_DIAL_SEALED=OK replies=2
+HOLD=ACTIVE
+LABEL=NON-RELEASE
+CLAIM=lab localhost already-sealed LanDial under HOLD
+NOT_PROVEN=O6 E2E; HOLD lift; WAN; confidential RDAP delivery

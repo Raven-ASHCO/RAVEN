@@ -1,0 +1,16 @@
+[1mproduction gates (Test A PairInit path)[0m
+  [2mpair_init::PRODUCTION_ENABLED[0m              [2mfalse[0m
+  [2mpair_init::live_enabled[0m                   [2mfalse[0m
+  [2mRAVEN_LAB_TEST_A[0m                           [2mfalse[0m
+  [2matsam_indexed_session::PRODUCTION_ENABLED[0m  [2mfalse[0m
+  [2mINDEXED_SESSION_STORE_PRODUCTION_ENABLED[0m   [2mfalse[0m
+  [2mPREKEY_LIFECYCLE_PRODUCTION_ENABLED[0m        [2mfalse[0m
+  [2mLAN_DIRECT_PRODUCTION_ENABLED[0m             [1;32mtrue[0m
+  [2mlan_direct_live_enabled[0m                   [1;32mtrue[0m
+  [2mINTERNET_DIRECT_PRODUCTION_ENABLED[0m        [2mfalse[0m
+  [2minternet_direct_live_enabled[0m              [2mfalse[0m
+  [2munsafe-demo-crypto feature[0m                [2mfalse[0m
+  [2mcontact_session_transport_ready[0m           [2mfalse[0m
+  [2mlive_outbound_status[0m                      LIVE_PAIR_INIT_READY
+[2mnote[0m: Lab unlock = debug build + RAVEN_LAB_TEST_A=1 (Release stays fail-closed).
+[2mnote[0m: LAN PairInit rides RVN1 OOB wrap (RVPI1/RVPR1 as message ciphertext).

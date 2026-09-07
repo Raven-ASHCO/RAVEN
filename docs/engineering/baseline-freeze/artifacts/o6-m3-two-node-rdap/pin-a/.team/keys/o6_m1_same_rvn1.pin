@@ -1,0 +1,11 @@
+# ADR 0004 D3 same-RVN1 public pin (NON-RELEASE)
+# Public pin only — not a keypair and not private-key material.
+# principal=user_identity  pin ≢ device_ed_pub (G5)
+address=rvn1qxlalzz3epwskvsaqvzatjxk0eqk2caklch26jmh
+pub_hex=02346c45a48a5c9e50af1b4c2d6ff8dcd42fbafa0fd2647a854a44985e1ee62d
+fingerprint=v9IU-chdC-zId
+source=raven-node-whoami
+principal=user_identity
+label=NON-RELEASE
+hold=ACTIVE
+claim=none
