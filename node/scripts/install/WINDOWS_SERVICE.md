@@ -7,9 +7,13 @@
 ```powershell
 # From repo:
 #   powershell -ExecutionPolicy Bypass -File node/scripts/install/windows_service.ps1
+# CI / layout-only (no RavenNodeBridge logon task):
+#   powershell -ExecutionPolicy Bypass -File node/scripts/install/windows_service.ps1 -SkipScheduledTask
 ```
 
 See `windows_service.ps1` for build + Task Scheduler registration. This is a **per-user Task Scheduler** task (not an SCM service flip).
+
+CI (`rust-windows` in `raven-serverless.yml`) exercises this helper beyond parse-only: it runs the script with `-DataDir` / `-BinDir` under `$env:RUNNER_TEMP` and `-SkipScheduledTask` so release binaries are built and copied (`raven-node.exe`, `raven.exe`, `ash.exe`) without registering a persistent per-user logon task on the runner. Leave `-SkipScheduledTask` off for a real local install. LAN bind stays `127.0.0.1:7420` (B12 hold).
 
 ## Per-user background process (V1)
 
