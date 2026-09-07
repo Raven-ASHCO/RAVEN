@@ -47,6 +47,7 @@ Feature PRs that touch R2/R3 surfaces **must not** land until the Sprint 0 check
 | [`three-path-verification-board.md`](three-path-verification-board.md) | Manager SoT A/B/C + founder Proven rule; mesh \| bridge \| direct |
 | [`o6-raven-rdap-try-phase-gap-board.md`](o6-raven-rdap-try-phase-gap-board.md) | O6 try-phase honesty: what’s green vs gated toward the two-device encrypted harness; **non-release**; inventory ≠ Proven |
 | [`o6-m1-same-rvn1-bind-contract.md`](o6-m1-same-rvn1-bind-contract.md) | O6 M1 D3 public whoami → RDAP pin-file bind (NON-RELEASE; not O6 E2E; not HOLD lift) |
+| [`o6-m3-two-node-rdap-lab-evidence.md`](o6-m3-two-node-rdap-lab-evidence.md) | O6 M3 localhost two-process Raven↔RDAP lab (NON-RELEASE; not O6 E2E; `BLOCKED_HARDWARE` for WAN) |
 | Live CODEOWNERS | [`.github/CODEOWNERS`](../../../.github/CODEOWNERS) (RAVEN); RDAP repo `.github/CODEOWNERS` |
 
 ### Sprint 0 architecture drafts (#1)

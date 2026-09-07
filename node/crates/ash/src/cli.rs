@@ -337,6 +337,21 @@ enum LabCommands {
     },
     /// Print lab unlock status.
     Status,
+    /// Forward an already-sealed RavenEnvelopeV1 over LanDial (O6 M3 lab).
+    ///
+    /// Does **not** seal. Requires debug + `RAVEN_LAB_TEST_A=1`.
+    /// NON-RELEASE: not O6 E2E Proven, not a HOLD lift, dial≠WAN.
+    LanDialSealed {
+        /// Peer LAN listen host:port (localhost lab).
+        #[arg(long)]
+        dial: String,
+        /// Peer identity or device Ed25519 (64 hex) — same plane as ash send.
+        #[arg(long)]
+        expected_pub_hex: String,
+        /// Daemon-sealed envelope from SealUnderSession / RDAP (standard or URL-safe b64).
+        #[arg(long)]
+        envelope_b64: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2800,6 +2815,47 @@ fn print_messaging_path_diag() -> Result<(), String> {
     }
 }
 
+const M3_LAN_DIAL_SEALED_BANNER: &str = "NON-RELEASE / HOLD active. already-sealed LanDial only. Not O6 E2E Proven. No HOLD lift. dial≠WAN. Soft-load P0 held.";
+
+fn cmd_lab_lan_dial_sealed(
+    data_dir: &Path,
+    dial: &str,
+    expected_pub_hex: &str,
+    envelope_b64: &str,
+) {
+    eprintln!("{M3_LAN_DIAL_SEALED_BANNER}");
+    if !raven_core::pair_init::lab_test_a_enabled() {
+        eprintln!("O6_M3_LAN_DIAL_SEALED=RED");
+        eprintln!("reason=RAVEN_LAB_TEST_A required (debug lab only; not a production path)");
+        eprintln!("HOLD=ACTIVE");
+        std::process::exit(1);
+    }
+    let envelope = match pair_init_lab::decode_already_sealed_envelope_b64(envelope_b64) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("O6_M3_LAN_DIAL_SEALED=RED");
+            eprintln!("{}", sanitize_terminal_text(&e));
+            eprintln!("HOLD=ACTIVE");
+            std::process::exit(1);
+        }
+    };
+    match pair_init_lab::lan_dial_already_sealed(data_dir, dial, expected_pub_hex, &envelope) {
+        Ok(replies) => {
+            println!("O6_M3_LAN_DIAL_SEALED=OK replies={}", replies.len());
+            println!("HOLD=ACTIVE");
+            println!("LABEL=NON-RELEASE");
+            println!("CLAIM=lab localhost already-sealed LanDial under HOLD");
+            println!("NOT_PROVEN=O6 E2E; HOLD lift; WAN; confidential RDAP delivery");
+        }
+        Err(e) => {
+            eprintln!("O6_M3_LAN_DIAL_SEALED=RED");
+            eprintln!("{}", sanitize_terminal_text(&e));
+            eprintln!("HOLD=ACTIVE");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn print_production_gate_matrix() {
     let on = |b: bool| {
         if b {
@@ -3948,6 +4004,11 @@ pub fn run() {
                 cmd_prekey_fetch(&data_dir, &peer_pub_hex, Some(&file))
             }
             LabCommands::Status => print_production_gate_matrix(),
+            LabCommands::LanDialSealed {
+                dial,
+                expected_pub_hex,
+                envelope_b64,
+            } => cmd_lab_lan_dial_sealed(&data_dir, &dial, &expected_pub_hex, &envelope_b64),
         },
         Some(Commands::Contact { cmd }) => match cmd {
             ContactCommands::Add {
@@ -5112,6 +5173,17 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
                 reason: "identity_unusable".into()
             }
         );
+    }
+
+    #[test]
+    fn m3_lan_dial_sealed_banner_is_honest() {
+        let b = M3_LAN_DIAL_SEALED_BANNER;
+        assert!(b.contains("NON-RELEASE"));
+        assert!(b.contains("HOLD"));
+        assert!(b.contains("already-sealed"));
+        assert!(b.contains("Not O6 E2E Proven"));
+        assert!(b.contains("dial≠WAN") || b.contains("dial!=WAN"));
+        assert!(!b.contains("confidential Proven"));
     }
 
     #[test]

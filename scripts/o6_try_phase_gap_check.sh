@@ -8,8 +8,10 @@
 # production ATSAM, or a HOLD lift. Harness green ≠ HOLD lifted.
 # Python ATSAM seal is forbidden; this script does not send, dial, or seal.
 #
-# Exit 0 is reserved for a future HOLD-aware M3 harness and is refused today.
-# Exit 1 = expected RED (gates still closed).
+# Exit 0 is reserved for a future HOLD-aware O6 E2E Proven harness and is
+# refused today. The M3 localhost two-process lab (o6_m3_two_node_rdap_lab.sh)
+# may be green as a *lab* claim; that is NOT this script and NOT a HOLD lift.
+# Exit 1 = expected RED (O6 E2E / HOLD still closed).
 # Exit 2 = inventory/invariant regression (board or HOLD citations missing).
 set -euo pipefail
 
@@ -59,6 +61,16 @@ grep -q 'non-release' "$BOARD" || fail_reg "$BOARD missing non-release label"
 grep -q 'Harness green ≠ HOLD lifted' "$BOARD" \
   || grep -q 'harness green ≠ hold lifted' "$BOARD" \
   || fail_reg "$BOARD missing harness-green ≠ HOLD-lifted rule"
+M3_SCRIPT="node/scripts/o6_m3_two_node_rdap_lab.sh"
+M3_EVIDENCE="docs/engineering/baseline-freeze/o6-m3-two-node-rdap-lab-evidence.md"
+[[ -f "$M3_SCRIPT" ]] || fail_reg "missing $M3_SCRIPT"
+[[ -f "$M3_EVIDENCE" ]] || fail_reg "missing $M3_EVIDENCE"
+grep -q 'BLOCKED_HARDWARE' "$M3_SCRIPT" || fail_reg "$M3_SCRIPT missing BLOCKED_HARDWARE"
+grep -q 'Not O6 E2E Proven' "$M3_SCRIPT" || fail_reg "$M3_SCRIPT missing Not O6 E2E Proven"
+grep -q 'BLOCKED_HARDWARE' "$M3_EVIDENCE" || fail_reg "$M3_EVIDENCE missing BLOCKED_HARDWARE"
+grep -q 'Not Proven' "$BOARD" || grep -q 'not Proven' "$BOARD" \
+  || fail_reg "$BOARD missing Not Proven language"
+grep -q 'G-M3' "$BOARD" || fail_reg "$BOARD missing G-M3 row"
 
 # This repo must not grow a Python ATSAM / RDAP IPC client by accident.
 if [[ -d "$ROOT/team_agents" ]]; then
@@ -100,10 +112,10 @@ echo "  G-TERM=NOT_PROVEN (named-pipe code landed #43; Proven still needs execut
   echo "  G-M1=IN_PROGRESS (RAVEN public whoami + pin-file bind; RDAP seed still parallel; NON-RELEASE)"
 echo "  G-M2-IPC=LANDED_LAB_ONLY (SealUnderSession on main; not O6 E2E / not HOLD lift)"
 echo "  G-M2-PY=LANDED_LAB_ONLY (RDAP companion client; not in this repo; not confidential)"
-echo "  G-M3=MISSING (no two-device RDAP harness)"
+echo "  G-M3=LANDED_LAB_ONLY (two-process localhost; not O6 E2E / not HOLD lift / BLOCKED_HARDWARE)"
 echo "  G-CI=MISSING (no Raven↔RDAP interop job)"
 echo
-echo "next_authorized_code_pr=M3 two-device RDAP ask harness (still NON-RELEASE / HOLD); no HOLD lift"
+echo "next_authorized_code_pr=RDAP ask-over-atsam_rvn1 and/or physical two-device WAN (still NON-RELEASE / HOLD); no HOLD lift"
 echo "forbidden=python ATSAM seal; Noise-only confidentiality claim; HOLD lift via this script"
 echo
 red "O6_TRY_PHASE=RED"
