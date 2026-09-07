@@ -4,9 +4,10 @@
 **ADR:** [0004 D5](../../adr/0004-raven-rdap-atsam-transport.md) — harness acceptance (M3). This pack is the **smallest honest lab substitute** (two logical devices on `127.0.0.1`).  
 **Label:** **NON-RELEASE**. Harness green ≠ HOLD lift. HOLD still active.  
 **Topology:** localhost two-process (`raven-node` Alice + Bob). **dial≠WAN.**  
-**Hardware:** `TWO_DEVICE_WAN=BLOCKED_HARDWARE` (no second physical device / WAN peer on this runner).
+**Hardware:** `TWO_DEVICE_WAN=BLOCKED_HARDWARE` (no second physical device / WAN peer on this runner).  
+**Owners:** Raven↔RDAP Integration Lead (#17) + SRE Perf (#19). **Sole M3 vehicle:** [RAVEN#57](https://github.com/Raven-ASHCO/RAVEN/pull/57) — no duplicate harness PRs.
 
-Companion client invocation against RDAP tip `3207e8ea56002ff0efe0909ec9b6ec233b920c05` (`./rdap seal-under-session` / `team_agents.raven_ipc`). **No RDAP code change** in this pack — the tip still has no `ask` over `atsam_rvn1`.
+Companion client invocation against RDAP tip `3207e8ea56002ff0efe0909ec9b6ec233b920c05` (`./rdap seal-under-session` / `team_agents.raven_ipc`). **No RDAP code change** in this pack — the tip still has no `EnqueueSealed` / `LanDial` in `raven_ipc.py` and no `ask` over `atsam_rvn1`. Dial uses existing Raven IPC (`ash lab lan-dial-sealed`). Python ATSAM is forbidden.
 
 ---
 
@@ -14,10 +15,12 @@ Companion client invocation against RDAP tip `3207e8ea56002ff0efe0909ec9b6ec233b
 
 | Claim | Status |
 |-------|--------|
-| Proven | **lab localhost two-process encrypted Raven↔RDAP path under HOLD** |
-| Not Proven | **O6 E2E**, **HOLD lift**, **WAN**, **confidential RDAP delivery**, **RDAP ask-over-atsam_rvn1**, **physical two-device** |
+| Proven (lab under HOLD) | **Only markers that PASS with artifacts** (see table below) |
+| Not Proven | **O6 E2E** · **HOLD lift** · **WAN** · **confidential production** · **PRODUCTION_ENABLED** · **HTTP A2A as O6 green** · **RDAP ask-over-atsam_rvn1** · **physical two-device** |
+| HOLD | **ACTIVE** |
+| Harness green ≠ HOLD lift | **true** |
 
-Do **not** flip `PRODUCTION_ENABLED` tripwires. Do **not** describe this as confidential Raven messaging or production ATSAM. `mock_ble` remains the mesh claim on `main` (this pack does not touch BLE).
+Do **not** flip `PRODUCTION_ENABLED` tripwires. Do **not** describe this as confidential Raven messaging or production ATSAM. `mock_ble` remains the mesh claim on `main` (this pack does not touch BLE). Docs-only ≠ Proven.
 
 Stderr banner (harness):
 
@@ -33,8 +36,8 @@ NON-RELEASE / HOLD active. two-process localhost Raven↔RDAP lab only. Not O6 E
 |--------------------|-----------|
 | Two devices (physical or VM), each with `raven-node` + RDAP | **Lab substitute:** two `raven-node` processes + RDAP seal CLI on Alice. Physical / WAN = `BLOCKED_HARDWARE`. |
 | Mutual pin of the same RVN1 / device bindings (D3) | **PASS (lab):** mutual `ash contact add` + M1 public pin files via `scripts/o6_m1_same_rvn1_bind.sh`. |
-| Alice `ask` → Bob completes (`RAVEN_A2A_OK_*`) | **Partial / not Proven:** marker `RAVEN_A2A_OK_M3_LAB` is sealed by RDAP and opened in Bob's ash inbox. RDAP `ask` at this tip remains **signed HTTP** (`http_signed`). `RDAP_ASK_ATSAM=BLOCKED`. |
-| Data-plane frames ATSAM-sealed + drop-session refuse | **PASS (lab):** daemon `RavenEnvelopeV1` + RED `ATSAM_SESSION_REQUIRED` on missing session / never-paired hint. |
+| Alice `ask` → Bob completes (`RAVEN_A2A_OK_*`) | **Lab substitute / not Proven:** marker `RAVEN_A2A_OK_M3_LAB` is sealed by RDAP and opened in Bob's ash inbox (`GREEN_DIAL_OR_INBOX`). `BLOCKED_ASK_ATSAM` — `./rdap ask` at this tip remains **signed HTTP**. Do not treat HTTP A2A as O6 green. |
+| Data-plane frames ATSAM-sealed + drop-session refuse | **PASS (lab) for seal/no-session:** daemon `RavenEnvelopeV1` + `RED_NO_SESSION` / `RED_MISSING_SESSION` (`ATSAM_SESSION_REQUIRED`; RDAP reports no task success). `RED_DROP_SESSION=BLOCKED` — no public session-drop IPC; Soft-load P0 held; do not invent revoke plumbing. |
 | Carrier enum `atsam_rvn1` | **BLOCKED** — RDAP status at this tip does not report `atsam_rvn1`. |
 | Replace RDAP “Important integration gap” | **Not done.** Gap paragraph stays (honest). D5.5 is for when the encrypted `ask` path exists. |
 | Experimental mailbox opt-in / non-confidential | Unchanged. This pack does not enable it. |
@@ -65,16 +68,18 @@ EVIDENCE_OUT=docs/engineering/baseline-freeze/artifacts/o6-m3-two-node-rdap \
 
 **Not wired** into `.github/workflows/raven-serverless.yml` here (same OAuth / required-check collision as M1/M2). Agent / local executable only.
 
-Expected codes:
+Expected codes (Role #17 / #19 marker names; GREEN/RED/BLOCKED only — no invent):
 
 | Marker | Expect |
 |--------|--------|
-| `O6_M3_TWO_NODE_LAB` | `PASS` (lab only) and process exit **0** |
-| `RED_NO_SESSION` | nonzero RDAP CLI + `ATSAM_SESSION_REQUIRED` |
-| `GREEN_LAB_SEAL` / `GREEN_LAN_DIAL` / `GREEN_INBOX` | `PASS` |
-| `TWO_DEVICE_WAN` | `BLOCKED_HARDWARE` |
-| `RDAP_ASK_ATSAM` | `BLOCKED` |
+| `UNIT_OR_PIN` | `PASS` — unit selftest + M1 same-RVN1 public pin |
+| `RED_NO_SESSION` | nonzero RDAP CLI + `ATSAM_SESSION_REQUIRED`; RDAP must **not** report task success |
+| `GREEN_SEAL` | `PASS` — `./rdap seal-under-session` → daemon `envelope_b64` |
+| `GREEN_DIAL_OR_INBOX` | `PASS` — `ash lab lan-dial-sealed` + Bob inbox `RAVEN_A2A_OK_M3_LAB` (**lab substitute**, not full `ask`) |
+| `BLOCKED_ASK_ATSAM` | `BLOCKED` — `./rdap ask` over `atsam_rvn1` missing at tip `3207e8ea` |
+| `RED_DROP_SESSION` | `BLOCKED` this execute (no session-drop IPC; Soft-load P0 held). Negative refuse covered by `RED_MISSING_SESSION`. |
 | `HOLD` | `ACTIVE` |
+| `O6_M3_TWO_NODE_LAB` | `PASS` (lab only) and process exit **0** |
 | Fail / regression | `O6_M3_TWO_NODE_LAB=FAIL` and exit **1** |
 
 ---
@@ -131,9 +136,13 @@ Public logs only (no `identity.seed` / session secrets): [`artifacts/o6-m3-two-n
 | `GREEN_LAB_SEAL` | **PASS** — `rc=0` + `envelope_b64` unpacks `RVN1` v1 `Message` `ct_len=61` `packed_len=211` |
 | `GREEN_LAN_DIAL` | **PASS** — `O6_M3_LAN_DIAL_SEALED=OK replies=2` |
 | `GREEN_INBOX` | **PASS** — Bob inbox contains `RAVEN_A2A_OK_M3_LAB` |
-| `RED_MISSING_SESSION` | **PASS** — never-paired hint → `rc=1` + `ATSAM_SESSION_REQUIRED` |
+| `RED_MISSING_SESSION` | **PASS** — never-paired hint → `rc=1` + `ATSAM_SESSION_REQUIRED`; RDAP task success = none |
+| `RED_DROP_SESSION` | **BLOCKED** — no public drop of the established Alice↔Bob session; Soft-load P0 held |
+| `UNIT_OR_PIN` | **PASS** — alias of `UNIT_BASELINE` + `PIN_M1` |
+| `GREEN_SEAL` | **PASS** — alias of `GREEN_LAB_SEAL` |
+| `GREEN_DIAL_OR_INBOX` | **PASS** — alias of `GREEN_LAN_DIAL` + `GREEN_INBOX` (lab substitute) |
 | `RDAP_NO_LOCAL_ATSAM` | **PASS** — request keys `{op, v, peer_hint, app_payload_b64}` only |
-| `RDAP_ASK_ATSAM` | **BLOCKED** — companion tip is `seal-under-session` only; `ask` remains `http_signed` |
+| `BLOCKED_ASK_ATSAM` / `RDAP_ASK_ATSAM` | **BLOCKED** — companion tip is `seal-under-session` only; `ask` remains `http_signed` |
 | `CARRIER_ENUM_ATSAM_RVN1` | **BLOCKED** |
 | `TWO_DEVICE_WAN` | **BLOCKED_HARDWARE** |
 | `O6_M3_TWO_NODE_LAB` | **PASS** (lab localhost two-process path under HOLD) |

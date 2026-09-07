@@ -449,7 +449,18 @@ fi
 echo "TWO_DEVICE_WAN=BLOCKED_HARDWARE"
 echo "PHYSICAL_DEVICES=UNAVAILABLE"
 echo "RDAP_ASK_ATSAM=BLOCKED (companion tip $RDAP_TIP: seal-under-session only; ask is http_signed)"
+echo "BLOCKED_ASK_ATSAM=BLOCKED"
 echo "CARRIER_ENUM_ATSAM_RVN1=BLOCKED (RDAP status does not report atsam_rvn1)"
+echo "RDAP_TASK_SUCCESS=none (no ./rdap ask over atsam_rvn1; RED paths refused seal)"
+# Mid-path drop of the *established* Alice↔Bob session is not a public IPC.
+# Soft-load P0 held — do not invent revoke/session-wipe plumbing.
+# Never-paired hint after GREEN is RED_MISSING_SESSION, not a drop of that session.
+echo "RED_DROP_SESSION=BLOCKED (no session-drop IPC; Soft-load P0 held; see RED_MISSING_SESSION)"
+echo "UNIT_OR_PIN=PASS"
+echo "GREEN_SEAL=PASS"
+echo "GREEN_DIAL_OR_INBOX=PASS (lab substitute; not full RDAP ask)"
+echo "HOLD=ACTIVE"
+echo "harness green ≠ HOLD lift"
 
 # Public listen lines only (no identity material).
 grep -E 'raven-node ipc: listening|lan_direct: listen' "$WORKDIR/red/node.log" \
@@ -474,13 +485,20 @@ GREEN_LAB_SEAL=PASS rc=$GREEN_SEAL_RC
 GREEN_LAN_DIAL=PASS rc=$GREEN_DIAL_RC
 GREEN_INBOX=PASS marker=$MARKER
 RED_MISSING_SESSION=$RED_SESSION_STATUS
+RED_DROP_SESSION=BLOCKED
 RDAP_NO_LOCAL_ATSAM=PASS
 RDAP_ASK_ATSAM=BLOCKED
+BLOCKED_ASK_ATSAM=BLOCKED
 CARRIER_ENUM_ATSAM_RVN1=BLOCKED
+RDAP_TASK_SUCCESS=none
 TWO_DEVICE_WAN=BLOCKED_HARDWARE
 PHYSICAL_DEVICES=UNAVAILABLE
+UNIT_OR_PIN=PASS
+GREEN_SEAL=PASS
+GREEN_DIAL_OR_INBOX=PASS
 CLAIM=lab localhost two-process encrypted Raven↔RDAP path under HOLD
-NOT_PROVEN=O6 E2E; HOLD lift; WAN; confidential RDAP delivery; RDAP ask-over-atsam_rvn1; physical two-device
+NOT_PROVEN=O6 E2E; HOLD lift; WAN; confidential production; PRODUCTION_ENABLED; HTTP A2A as O6; RDAP ask-over-atsam_rvn1; physical two-device
+HARNESS_GREEN_NE_HOLD_LIFT=true
 $BANNER
 EOF
 cat "$WORKDIR/SUMMARY.txt"
