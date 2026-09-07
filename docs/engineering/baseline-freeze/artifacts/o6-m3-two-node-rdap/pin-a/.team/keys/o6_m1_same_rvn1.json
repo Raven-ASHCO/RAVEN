@@ -1,8 +1,8 @@
 {
   "schema": "o6_m1_same_rvn1_pin_v1",
-  "address": "rvn1qycu269d9hssckgtllkzvpflc9qxdx7m8cf253w7",
-  "pub_hex": "862aedba48e5a78de427a338fcb1dba8f86b0251ab55a685839b09955d58b09d",
-  "fingerprint": "McVo-rS3h-DFkL",
+  "address": "rvn1qxlalzz3epwskvsaqvzatjxk0eqk2caklch26jmh",
+  "pub_hex": "02346c45a48a5c9e50af1b4c2d6ff8dcd42fbafa0fd2647a854a44985e1ee62d",
+  "fingerprint": "v9IU-chdC-zId",
   "source": "raven-node-whoami",
   "principal": "user_identity",
   "g5_pin_ne_device_ed_pub": true,

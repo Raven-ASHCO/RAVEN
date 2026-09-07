@@ -165,8 +165,8 @@ SRE bar markers first (GREEN / RED / BLOCKED only — no invent). Proven = **onl
 | `RED_DROP_SESSION` | **BLOCKED** — no public drop of the established Alice↔Bob session; Soft-load P0 held |
 | `HOLD` | **ACTIVE** |
 | `O6_M3_TWO_NODE_LAB` | **PASS** (lab localhost two-process path under HOLD) |
-| `WALL_CLOCK_SEC` | recorded by harness on execute (host wall time; not a budget). Soft p50/p95 = **not recorded** (no real snapshot). |
-| `BRING_UP_RETRY_COUNT` | recorded by harness (one listen/bind retry max; still-red → FAIL) |
+| `WALL_CLOCK_SEC` | **20** (host wall time; not a budget). Soft p50/p95 = **not recorded** (no real snapshot). |
+| `BRING_UP_RETRY_COUNT` | **0** (one listen/bind retry max; still-red → FAIL) |
 
 Detail aliases (same execute; not extra claims):
 
@@ -184,7 +184,7 @@ Detail aliases (same execute; not extra claims):
 
 | Repo | `git rev-parse HEAD` |
 |------|----------------------|
-| RAVEN (this branch) | `ddbd391f2f6b3458c96388b7b18e0e9616f7b3b0` |
+| RAVEN (this branch, execute tip) | `bc2fa6c4b63fd8f0019e7256b19bc85eee694269` |
 | RDAP | `3207e8ea56002ff0efe0909ec9b6ec233b920c05` |
 
 ### UNIT excerpt
@@ -213,7 +213,7 @@ IPC refuse token: `ATSAM_SESSION_REQUIRED`. `rc=1`. stdout empty. No `ATSAM_LINE
 
 Session-ensure is Raven, not RDAP: `RAVEN_LAB_TEST_A=1` + two-node `ash send --contact @bob` → `status delivered` / `carrier=lan_dial` ([`green/a.send.out`](artifacts/o6-m3-two-node-rdap/green/a.send.out)).
 
-Topology: `localhost_two_process` Alice `127.0.0.1:18237` / Bob `127.0.0.1:18737`.
+Topology: `localhost_two_process` Alice `127.0.0.1:18070` / Bob `127.0.0.1:18570`.
 
 RDAP Alice sealed marker `RAVEN_A2A_OK_M3_LAB`. Decode assert: `ENVELOPE=RVN1 v1 Message ct_len=61 packed_len=211`.
 
@@ -231,8 +231,8 @@ Bob inbox ([`green/b.inbox.out`](artifacts/o6-m3-two-node-rdap/green/b.inbox.out
 
 ```
 inbox (2)
-  e39cdbae hello from a (lab pair_init / session-ensure)
-  9a9e4a00 RAVEN_A2A_OK_M3_LAB
+  dcfeaaed hello from a (lab pair_init / session-ensure)
+  37a71f66 RAVEN_A2A_OK_M3_LAB
 ```
 
 ### RED missing-session excerpt
@@ -241,21 +241,23 @@ Same Alice node, never-paired dummy hint → `rc=1` + `ATSAM_SESSION_REQUIRED` (
 
 ### `SUMMARY.txt`
 
-SRE bar keys (excerpt). `WALL_CLOCK_SEC` / `BRING_UP_RETRY_COUNT` land on the next execute after the reliability lock; do not invent them from the prior capture.
+SRE bar keys from this execute ([`SUMMARY.txt`](artifacts/o6-m3-two-node-rdap/SUMMARY.txt)). `scripts/o6_try_phase_gap_check.sh` stayed **RED** (`O6_TRY_PHASE=RED`, exit 1) — expected.
 
 ```
 O6_M3_TWO_NODE_LAB=PASS
 HOLD=ACTIVE
 UNIT_OR_PIN=PASS
 RED_NO_SESSION=PASS rc=1 ATSAM_SESSION_REQUIRED
-GREEN_SEAL=PASS
-GREEN_DIAL_OR_INBOX=PASS
+GREEN_SEAL=PASS rc=0
+GREEN_DIAL_OR_INBOX=PASS rc=0 marker=RAVEN_A2A_OK_M3_LAB
 BLOCKED_ASK_ATSAM=BLOCKED
 RED_DROP_SESSION=BLOCKED
 RDAP_TASK_SUCCESS=none
-TWO_DEVICE_WAN=BLOCKED_HARDWARE
+WALL_CLOCK_SEC=20
+BRING_UP_RETRY_COUNT=0
 P50_MS=not_recorded
 P95_MS=not_recorded
+TWO_DEVICE_WAN=BLOCKED_HARDWARE
 CLAIM=lab localhost two-process encrypted Raven↔RDAP path under HOLD
 NOT_PROVEN=O6 E2E; HOLD lift; WAN; confidential production; PRODUCTION_ENABLED; HTTP A2A as O6; RDAP ask-over-atsam_rvn1; physical two-device
 HARNESS_GREEN_NE_HOLD_LIFT=true
