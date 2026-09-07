@@ -74,8 +74,9 @@ cleanup() {
     mkdir -p "$EVIDENCE_OUT"
     # Public logs only — never copy identity.seed / session secrets / sqlite.
     find "$WORKDIR" -type f \( \
-        -name '*.log' -o -name '*.out' -o -name '*.err' -o -name '*.stdout' \
+        -name '*.out' -o -name '*.err' -o -name '*.stdout' \
         -o -name '*.stderr' -o -name '*.combined' -o -name '*.status' \
+        -o -name '*.listen.txt' \
         -o -name 'SUMMARY.txt' -o -name 'lab.status' -o -name '*.init' \
         -o -name '*.help' -o -name '*.whoami.json' -o -name '*.pin' \
         -o -name 'o6_m1_same_rvn1.json' -o -name '*.inbox.out' \
@@ -135,6 +136,19 @@ RDAP="$RDAP_DIR/rdap"
 [[ -x "$RDAP" ]] || fail "RDAP launcher missing"
 
 echo "=== bootstrap RDAP venv (./rdap --help) ==="
+# Some lab images ship python3 without ensurepip (python3-venv package absent).
+# Prefer the RDAP launcher; fall back to virtualenv so the pack stays executable.
+if [[ ! -x "$RDAP_DIR/.venv/bin/python" ]] \
+  || ! "$RDAP_DIR/.venv/bin/python" -m pip --version >/dev/null 2>&1; then
+  if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+    echo "ensurepip=missing; bootstrapping .venv via python3 -m virtualenv (lab fallback)"
+    python3 -m pip install --user virtualenv >/dev/null
+    python3 -m virtualenv "$RDAP_DIR/.venv" \
+      || fail "virtualenv bootstrap failed (install python3-venv or virtualenv)"
+    (cd "$RDAP_DIR" && .venv/bin/python -m pip install --require-hashes -r requirements.lock.txt) \
+      || fail "RDAP requirements.lock.txt install failed"
+  fi
+fi
 (cd "$RDAP_DIR" && ./rdap --help >"$WORKDIR/unit/rdap.help" 2>&1) \
   || fail "RDAP launcher failed (see $WORKDIR/unit/rdap.help)"
 [[ -x "$RDAP_DIR/.venv/bin/python" ]] || fail "RDAP .venv/bin/python missing after launcher"
@@ -160,8 +174,8 @@ if grep -q 'Important integration gap' "$RDAP_DIR/README.md"; then
 else
   echo "RDAP_README_GAP=missing — do not assume M3 closed the gap paragraph"
 fi
-if grep -qi 'atsam_rvn1' "$WORKDIR/unit/rdap.help"; then
-  echo "RDAP_ASK_ATSAM=help-mentions-atsam (still not Proven without execute)"
+if (cd "$RDAP_DIR" && ./rdap ask --help 2>/dev/null | grep -qi 'atsam_rvn1'); then
+  echo "RDAP_ASK_ATSAM=help-mentions-atsam_rvn1 (still not Proven without execute)"
 else
   echo "RDAP_ASK_ATSAM=BLOCKED (tip has seal-under-session only; ask remains http_signed)"
 fi

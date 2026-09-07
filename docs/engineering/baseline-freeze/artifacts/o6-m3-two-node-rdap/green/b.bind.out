@@ -1,0 +1,7 @@
+pin=/tmp/raven-o6-m3-lab-6737/pin-b/.team/keys/o6_m1_same_rvn1.pin
+card=/tmp/raven-o6-m3-lab-6737/pin-b/.team/keys/o6_m1_same_rvn1.json
+address=rvn1q952m5tlauk4e2ug7ckuspw0lqqha04n6yqhdks4
+bind=same_rvn1
+LABEL=NON-RELEASE
+HOLD=ACTIVE
+CLAIM=none (not confidential; not atsam_rvn1 send)

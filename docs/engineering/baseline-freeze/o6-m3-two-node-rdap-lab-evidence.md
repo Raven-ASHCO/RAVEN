@@ -110,9 +110,116 @@ RDAP submits `app_payload_b64` only. It does **not** construct ATSAM / RVNA1 cip
 
 ## Captured run
 
-See [`artifacts/o6-m3-two-node-rdap/`](artifacts/o6-m3-two-node-rdap/) after execute. Public logs only (no `identity.seed` / session secrets).
+Executed 2026-09-07 on this branch via:
 
-Until that directory is filled, treat the pack as **code + contract only** — docs-only ≠ Proven.
+```bash
+EVIDENCE_OUT=docs/engineering/baseline-freeze/artifacts/o6-m3-two-node-rdap \
+  RDAP_HOME=/tmp/rdap-inspect/rdap \
+  bash node/scripts/o6_m3_two_node_rdap_lab.sh
+```
+
+Toolchain: rustc/cargo **1.98.1** (1.83.0 cannot parse current `Cargo.lock` / `edition2024` crates). RDAP venv: `python3 -m virtualenv` fallback because this image has no `ensurepip` / `python3-venv`.
+
+Public logs only (no `identity.seed` / session secrets): [`artifacts/o6-m3-two-node-rdap/`](artifacts/o6-m3-two-node-rdap/).
+
+| Marker | Result |
+|--------|--------|
+| `UNIT_BASELINE` | **PASS** — `162 passed, 0 failed` + `RDAP_TRY_OK` (`rc=0`) |
+| `PIN_M1` | **PASS** — Alice + Bob same-RVN1 public pin files (`bind=same_rvn1`; no seed copy) |
+| `PIN_CONTACT` | **PASS** — mutual `ash contact add` of each node's RVN1 |
+| `RED_NO_SESSION` | **PASS** — `rc=1` + `ATSAM_SESSION_REQUIRED` (not `ATSAM_LINEAGE_REVOKED`) |
+| `GREEN_LAB_SEAL` | **PASS** — `rc=0` + `envelope_b64` unpacks `RVN1` v1 `Message` `ct_len=61` `packed_len=211` |
+| `GREEN_LAN_DIAL` | **PASS** — `O6_M3_LAN_DIAL_SEALED=OK replies=2` |
+| `GREEN_INBOX` | **PASS** — Bob inbox contains `RAVEN_A2A_OK_M3_LAB` |
+| `RED_MISSING_SESSION` | **PASS** — never-paired hint → `rc=1` + `ATSAM_SESSION_REQUIRED` |
+| `RDAP_NO_LOCAL_ATSAM` | **PASS** — request keys `{op, v, peer_hint, app_payload_b64}` only |
+| `RDAP_ASK_ATSAM` | **BLOCKED** — companion tip is `seal-under-session` only; `ask` remains `http_signed` |
+| `CARRIER_ENUM_ATSAM_RVN1` | **BLOCKED** |
+| `TWO_DEVICE_WAN` | **BLOCKED_HARDWARE** |
+| `O6_M3_TWO_NODE_LAB` | **PASS** (lab localhost two-process path under HOLD) |
+| `HOLD` | **ACTIVE** (unchanged) |
+| HOLD `PRODUCTION_ENABLED` tripwires | **false** (unchanged). `LAN_DIRECT_PRODUCTION_ENABLED=true` is pre-existing on `main`. |
+
+### Pins actually executed
+
+| Repo | `git rev-parse HEAD` |
+|------|----------------------|
+| RAVEN (this branch) | `ddbd391f2f6b3458c96388b7b18e0e9616f7b3b0` |
+| RDAP | `3207e8ea56002ff0efe0909ec9b6ec233b920c05` |
+
+### UNIT excerpt
+
+From [`artifacts/o6-m3-two-node-rdap/unit/selftest.stdout`](artifacts/o6-m3-two-node-rdap/unit/selftest.stdout):
+
+```
+162 passed, 0 failed
+RDAP_TRY_OK
+```
+
+### RED no-session excerpt
+
+Env: `RAVEN_IDENTITY_BACKEND=locked-file`; `ash init`; `raven-node service` (IPC UDS up); **no** PairInit / no indexed session.
+
+stderr ([`red/cli.stderr`](artifacts/o6-m3-two-node-rdap/red/cli.stderr)):
+
+```
+NON-RELEASE / HOLD active. plaintext-to-daemon SealUnderSession only. Not O6 E2E Proven. No HOLD lift. Soft-load P0 held. Seal still requires a raven-node ATSAM session.
+ATSAM_SESSION_REQUIRED: no persisted peer material for hint
+```
+
+IPC refuse token: `ATSAM_SESSION_REQUIRED`. `rc=1`. stdout empty. No `ATSAM_LINEAGE_REVOKED`.
+
+### GREEN excerpt
+
+Session-ensure is Raven, not RDAP: `RAVEN_LAB_TEST_A=1` + two-node `ash send --contact @bob` → `status delivered` / `carrier=lan_dial` ([`green/a.send.out`](artifacts/o6-m3-two-node-rdap/green/a.send.out)).
+
+Topology: `localhost_two_process` Alice `127.0.0.1:18237` / Bob `127.0.0.1:18737`.
+
+RDAP Alice sealed marker `RAVEN_A2A_OK_M3_LAB`. Decode assert: `ENVELOPE=RVN1 v1 Message ct_len=61 packed_len=211`.
+
+Then `ash lab lan-dial-sealed` ([`green/dial.stdout`](artifacts/o6-m3-two-node-rdap/green/dial.stdout)):
+
+```
+O6_M3_LAN_DIAL_SEALED=OK replies=2
+HOLD=ACTIVE
+LABEL=NON-RELEASE
+CLAIM=lab localhost already-sealed LanDial under HOLD
+NOT_PROVEN=O6 E2E; HOLD lift; WAN; confidential RDAP delivery
+```
+
+Bob inbox ([`green/b.inbox.out`](artifacts/o6-m3-two-node-rdap/green/b.inbox.out)):
+
+```
+inbox (2)
+  e39cdbae hello from a (lab pair_init / session-ensure)
+  9a9e4a00 RAVEN_A2A_OK_M3_LAB
+```
+
+### RED missing-session excerpt
+
+Same Alice node, never-paired dummy hint → `rc=1` + `ATSAM_SESSION_REQUIRED` (not `ATSAM_LINEAGE_REVOKED`) ([`green/red-hint.stderr`](artifacts/o6-m3-two-node-rdap/green/red-hint.stderr)).
+
+### `SUMMARY.txt`
+
+```
+O6_M3_TWO_NODE_LAB=PASS
+HOLD=ACTIVE
+LABEL=NON-RELEASE
+UNIT_BASELINE=PASS rc=0 162 passed RDAP_TRY_OK
+PIN_M1=PASS
+PIN_CONTACT=PASS
+RED_NO_SESSION=PASS rc=1 ATSAM_SESSION_REQUIRED
+GREEN_LAB_SEAL=PASS rc=0
+GREEN_LAN_DIAL=PASS rc=0
+GREEN_INBOX=PASS marker=RAVEN_A2A_OK_M3_LAB
+RED_MISSING_SESSION=PASS
+RDAP_NO_LOCAL_ATSAM=PASS
+RDAP_ASK_ATSAM=BLOCKED
+CARRIER_ENUM_ATSAM_RVN1=BLOCKED
+TWO_DEVICE_WAN=BLOCKED_HARDWARE
+CLAIM=lab localhost two-process encrypted Raven↔RDAP path under HOLD
+NOT_PROVEN=O6 E2E; HOLD lift; WAN; confidential RDAP delivery; RDAP ask-over-atsam_rvn1; physical two-device
+```
 
 ---
 

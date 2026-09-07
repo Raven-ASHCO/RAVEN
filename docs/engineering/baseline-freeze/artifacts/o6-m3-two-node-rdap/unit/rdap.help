@@ -1,0 +1,52 @@
+usage: rdap [-h]
+            {try,doctor,health,selftest,init,raven-bind,identity,seal-under-session,relay-setup,trust,start,model,ask,ping,invite,discover,replies,goal,say,chat,status,watch,do,ls,board,mesh-build}
+            ...
+
+RDAP — signed agent-to-agent tasks. Newcomer path: `./rdap try` then `./rdap
+init --name you --no-internet`. NON-RELEASE / HOLD active.
+
+positional arguments:
+  {try,doctor,health,selftest,init,raven-bind,identity,seal-under-session,relay-setup,trust,start,model,ask,ping,invite,discover,replies,goal,say,chat,status,watch,do,ls,board,mesh-build}
+    try                 newcomer path: doctor + signed localhost selftest
+                        (same as CI)
+    doctor              check Python, Git, deps, signed-by-default, port, and
+                        /health
+    health              GET /health on a running node
+    selftest            run the signed localhost A2A selftest (same suite as
+                        CI)
+    init                first-time setup of this agent
+    raven-bind          M1 bind public same-RVN1 from raven-node whoami (NON-
+                        RELEASE / HOLD; not confidential)
+    identity            public RVN1 identity (NON-RELEASE / HOLD; bind is M1
+                        public import)
+    seal-under-session  M2 submit app payload to raven-node SealUnderSession
+                        IPC (plaintext-to-daemon only; NON-RELEASE / HOLD; not
+                        O6 Proven)
+    relay-setup         configure the shared Git remote used by offline relay
+    trust               register a teammate's invite
+    start               serve this agent
+    model               choose this agent's brain (LLM)
+    ask                 delegate a task to a teammate
+    ping                check whether a teammate node is reachable
+    invite              print your invite line (add --port for url)
+    discover            find nearby agents on this LAN (mDNS)
+    replies             collect offline answers from git relay
+    goal                set THE unified mission for all agents
+    say                 group chat: @agent task | @all broadcast
+    chat                show the shared team thread
+    status              one-glance dashboard
+    watch               live dashboard of all agents (no input)
+    do                  short delegation: do WORKER "text" | do all "text"
+    ls                  list teammates + last activity
+    board               show the shared task board
+    mesh-build          build EXPERIMENTAL PLAINTEXT mailbox binary (disabled
+                        by default)
+
+options:
+  -h, --help            show this help message and exit
+
+OPEN MODE (--open / TEAM_REQUIRE_SIGNED=0) is never the default. Do not add
+those flags for a first run. NON-RELEASE / HOLD active: raven-bind / identity
+bind import public RVN1 only and do not claim confidential / atsam_rvn1 send.
+seal-under-session is plaintext-to-daemon only; not O6 Proven; no HOLD lift;
+seal still requires a raven-node session.

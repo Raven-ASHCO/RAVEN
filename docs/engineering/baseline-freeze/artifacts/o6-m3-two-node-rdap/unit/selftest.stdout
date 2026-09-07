@@ -1,0 +1,239 @@
+== unit ==
+✓ address/public-key binding validates
+✓ mismatched identity binding rejected
+✓ after bind, RDAP principal RVN1 matches imported whoami
+✓ private key in import rejected
+✓ JWK private d in import rejected
+✓ refuse claiming confidential
+✓ whoami confidential claim rejected
+✓ whoami atsam_rvn1 carrier claim rejected
+✓ device_ed_pub is not accepted as the pin
+✓ device_ed_pub rejected even when public_key is also present
+✓ ash contact pin is the user-identity RVN1
+✓ ash pin with mismatched device-like key rejected
+✓ M1 bind ships no EnqueueSealed/LanDial client
+✓ SealUnderSession JSON shape matches RAVEN #54 — {'op': 'seal_under_session', 'v': 1, 'peer_hint': 'abababababababababababababababababababababababababababababababab', 'app_payload_b64': 'cmRhcC1tMi1hcHAtcGF5bG9hZA=='}
+✓ SealUnderSession IPC frame is 4-byte BE length + JSON
+✓ client returns daemon envelope_b64 without local seal
+✓ maps ATSAM_SESSION_REQUIRED
+✓ maps ATSAM_LINEAGE_REVOKED distinctly
+✓ LINEAGE_REVOKED is not collapsed to SESSION_REQUIRED
+✓ map_seal_response SESSION_REQUIRED
+✓ M2 honesty banner is NON-RELEASE / not Proven / no HOLD lift
+✓ no local ATSAM/RVNA1 crypto seal module introduced
+✓ M2 client field is app_payload_b64 not plaintext*
+✓ mocked UDS SealUnderSession returns daemon envelope_b64
+✓ mocked UDS maps ATSAM_LINEAGE_REVOKED
+✓ Unix IPC endpoint is data-dir raven-node.sock
+✓ request builder refuses plaintext field name
+✓ decode_response_frame reads length-prefixed JSON
+✓ named-pipe transact does not drop the timeout parameter
+✓ named-pipe I/O honors timeout — elapsed=0.200s code=IPC_FRAME msg='ipc read timeout'
+✓ named-pipe transact still succeeds when timeout is set
+✓ trusted peer loader validates binding
+✓ bad trust file fails closed
+✓ recipient/task-bound delegation verifies — verified rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv
+✓ replay rejection after cache restart is mutation-free — replayed delegation
+✓ HTTP request auth binds Raven owner, method/target/body and replay — HTTP authorization verified; HTTP authorization replay; HTTP signature invalid
+✓ replay cache enforces active-row and database-byte ceilings — ([True, True, False], 2, 12288)
+✓ task-id substitution rejected — delegation task id mismatch
+✓ recipient forwarding rejected — delegation recipient mismatch
+✓ payload tamper rejected — signature invalid
+✓ missing nonce rejected — missing or malformed nonce
+✓ six-minute offline task accepted before explicit expiry — verified rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv
+✓ expired task rejected — delegation expired
+✓ delegation and HTTP expiry are exclusive at exact boundary — delegation expired; HTTP authorization expired
+✓ revoked sender rejected — revoked peer: rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv
+✓ broken revocation policy fails closed
+✓ OPEN MODE is not the NodeConfig default (shared/prod demos must not default open)
+✓ node names are bounded and cross-platform path-safe
+✓ fresh init is independent of global Git identity — rc=0 identity='RDAP Agent <rdap@localhost.invalid>' author='RDAP Agent <rdap@localhost.invalid>' stderr=''
+✓ fresh init commits only its explicit bootstrap allowlist — .gitignore
+✓ init refuses an occupied unmanaged directory without Git mutation — RDAP initialization refused: team-repo already contains unmanaged files: user-notes.txt
+* generating raven identity…
+
+✓ init preserves existing history, ignore rules, and untracked files — rc=0 stderr=''
+✓ re-running init repairs legacy local Git identity without a commit
+✓ model CLI validates and persists a provider configuration — rc=0 state={'provider': 'ollama', 'model': 'llama3.2', 'base_url': 'http://localhost:11434/v1'} stderr=''
+✓ newcomer CLI advertises try, doctor, health, and selftest — usage: rdap [-h]
+            {try,doctor,health,selftest,init,raven-bind,identity,seal-under-session,relay-setup,trust,start,model,ask,ping,invite,discover,replies,goal,say,chat,status,watch,do,ls,board,mesh-build}
+            ...
+
+RDAP — signed agent-to-agent tasks. Newcomer path: `./rdap try` then `./rdap
+init --name you --no-internet`. NON-RELEASE / HOLD active.
+
+positional arguments:
+  {try,doctor,health,selftest,init,raven-bind,identity,seal-under-session,relay-setup,trust,start,model,ask,p
+✓ CLI help labels NON-RELEASE / HOLD on the M1 bind path — usage: rdap [-h]
+            {try,doctor,health,selftest,init,raven-bind,identity,seal-under-session,relay-setup,trust,start,model,ask,ping,invite,discover,replies,goal,say,chat,status,watch,do,ls,board,mesh-build}
+            ...
+
+RDAP — signed agent-to-agent tasks. Newcomer path: `./rdap try` then `./rdap
+init --name you --no-internet`. NON-RELEASE / HOLD active.
+
+positional arguments:
+  {try,doctor,health,selftest,init,raven-bind,identity,seal-under-session,relay-setup,trust,start,model,ask,ping,invite,discover,replies,goal,say,chat,status,watch,do,ls,board,mesh-build}
+    try                 newcomer path: doctor + signed localhost selftest
+                        (same as CI)
+    doctor              check Python, Git, deps, signed-by-default, port, and
+                        /health
+
+✓ CLI help advertises seal-under-session as NON-RELEASE / not Proven — usage: rdap [-h]
+            {try,doctor,health,selftest,init,raven-bind,identity,seal-under-session,relay-setup,trust,start,model,ask,ping,invite,discover,replies,goal,say,chat,status,watch,do,ls,board,mesh-build}
+            ...
+
+RDAP — signed agent-to-agent tasks. Newcomer path: `./rdap try` then `./rdap
+init --name you --no-internet`. NON-RELEASE / HOLD active.
+
+positional arguments:
+  {try,doctor,health,selftest,init,raven-bind,identity,seal-under-session,relay-setup,trust,start,model,ask,ping,invite,discover,replies,goal,say,chat,status,watch,do,ls,board,mesh-build}
+    try                 newcomer path: doctor + signed localhost selftest
+                        (same as CI)
+    doctor              check Python, Git, deps, signed-by-default, port, and
+                        /health
+
+✓ raven-bind CLI principal matches imported whoami — rc=0 out='                        │\n│ fingerprint8VZf-kLcX-Az3                                                                                                       │\n│ pin        raven:rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv:08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa │\n│ source     file                                                                                                                │\n└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\nNON-RELEASE / HOLD active. Not confidential. No ATSAM seal / atsam_rvn1 send.\nOPEN MODE stays off. Invite/trust now pin this same user-identity RVN1.\n' state={'address': 'rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv', 'public_key': '08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa', 'fingerprint': '8VZf-kLcX-Az3', 'raven_bind': {'schema': 'raven.whoami.public.v1', 'source': 'file', 'hold': True, 'release': False, 'confidential': False, 'carrier': 'http_signed', 'pin': {'kind': 'ash-contact', 'address': 'rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv', 'public_key': '08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa', 'fingerprint': '8VZf-kLcX-Az3', 'invite': 'raven:rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv:08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa'}}}
+✓ from-node resolves public export and ignores private store
+✓ identity bind --from-node replaces principal with node RVN1 — rc=0 out='                        │\n│ fingerprintgJSW-kwOM-o6DE                                                                                                      │\n│ pin        raven:rvn1qxqff95nqwx28gxytdw0tjkn5zf3l0tasqzs9gls:e22d49657729743d266113ea8df870da219d598778c96f9c099e37bab51967df │\n│ source     from-node                                                                                                           │\n└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\nNON-RELEASE / HOLD active. Not confidential. No ATSAM seal / atsam_rvn1 send.\nOPEN MODE stays off. Invite/trust now pin this same user-identity RVN1.\n'
+✓ raven-bind CLI rejects private key material without echoing it — rc=1 out='whoami import rejected: private key material is present\n'
+✓ raven-bind CLI refuses claiming confidential — rc=1 out="NON-RELEASE / HOLD: M1 same-RVN1 public bind cannot claim confidential delivery or carrier 'confidential'; no ATSAM seal / atsam_rvn1 send\n"
+✓ seal-under-session CLI help is plaintext-to-daemon / NON-RELEASE — usage: rdap seal-under-session [-h] --peer-hint PEER_HINT
+                               [--payload-b64 PAYLOAD_B64]
+                               [--payload-file PAYLOAD_FILE]
+                               [--data-dir DATA_DIR]
+
+M2 plaintext-to-daemon SealUnderSession. Companion to RAVEN #54. NON-RELEASE /
+HOLD. Not O6 Proven. No HOLD lift. Submits peer_hint + app_payload_b64 to
+local raven-node IPC and prints daemon envelope_b64. Does not construct
+ATSAM/RVNA1 locally. Fail-closed: ATSAM_SESSION_REQUIRED,
+ATSAM_LINEAGE_REVOKED.
+
+options:
+  -h, --help            show this help message and exit
+  --peer-hint PEER_HINT
+                        peer device Ed25519 as 64 hex chars (same plane 
+✓ seal-under-session CLI surfaces ATSAM_SESSION_REQUIRED — rc=1 out='NON-RELEASE / HOLD active. plaintext-to-daemon SealUnderSession only. Not O6 E2E Proven. No HOLD lift. Soft-load P0 held. Seal still requires a raven-node ATSAM session.\nATSAM_SESSION_REQUIRED: no session\n'
+✓ bind then init keeps imported RVN1 and does not invent a seed — pre=0 init=0 state={'address': 'rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv', 'public_key': '08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa', 'fingerprint': '8VZf-kLcX-Az3', 'raven_bind': {'schema': 'raven.whoami.public.v1', 'source': 'file', 'hold': True, 'release': False, 'confidential': False, 'carrier': 'http_signed', 'pin': {'kind': 'ash-contact', 'address': 'rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv', 'public_key': '08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa', 'fingerprint': '8VZf-kLcX-Az3', 'invite': 'raven:rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv:08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa'}}, 'internet': False, 'name': 'bound-agent', 'role': 'test', 'repo': '/tmp/rdap-selftest-t7srvynh/bind-then-init/team-repo'} seed=False stderr=''
+✓ invite after bind is ash-style contact pin of the same RVN1 — RDAP1 bound-agent rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv 08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa
+raven:rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv:08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa
+ash-contact pin of this user-identity RVN1 (pin is not device_ed_pub). NON-RELEASE / HOLD.
+
+✓ trust maps ash contact pin to the same user-identity RVN1 — init=0 trust=0 peers={'rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv': '08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa'} mate={'address': 'rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv', 'public_key': '08e8663fcf2b2912cc606a003a3f5f1b22393ba49f07bcbd16272658c1c567fa', 'url': ''} stderr=''
+✓ POSIX launcher documents python3-venv recovery
+✓ doctor succeeds on a fresh initialized home — rc=0 out=' is off\n[ok] TEAM_REQUIRE_SIGNED — 1\n[ok] TEAM_ALLOW_SHELL — unset (shell tools off)\n! TEAM_REVOCATIONS / revocations_file is unset\n       next: signed mode still boots with a silent empty deny-list (no addresses revoked). That is not an affirmed empty list. Set TEAM_REVOCATIONS to a JSON file (`[]` is OK). See docs/rdap-revocation.md\n[ok] initialized — fresh-agent · test\n[ok] identity seed — 0600\n[ok] trust file — /tmp/rdap-selftest-t7srvynh/fresh-init-no-global-git-identity/peers.json\n\nnext: `./rdap start --provider echo`  (keep signed; do not pass --open)\n[ok] port 9001 — free on 127.0.0.1 (start will bind it)\n[ok] signed peer probe — skipped (no trusted teammate URL yet)\n\nRDAP_DOCTOR_OK\n'
+✓ doctor reports a configured empty revocations file — rc=0 out='ill use this interpreter because dependencies are already installed; install python3-venv for an isolated .venv\n[ok] signed tasks required by default — OPEN MODE is off\n[ok] TEAM_REQUIRE_SIGNED — 1\n[ok] TEAM_ALLOW_SHELL — unset (shell tools off)\n[ok] revocations file — /tmp/rdap-selftest-t7srvynh/empty-revocations.json (0 address(es))\n[ok] initialized — fresh-agent · test\n[ok] identity seed — 0600\n[ok] trust file — /tmp/rdap-selftest-t7srvynh/fresh-init-no-global-git-identity/peers.json\n\nnext: `./rdap start --provider echo`  (keep signed; do not pass --open)\n[ok] port 9001 — free on 127.0.0.1 (start will bind it)\n[ok] signed peer probe — skipped (no trusted teammate URL yet)\n\nRDAP_DOCTOR_OK\n'
+✓ doctor fails closed on a broken revocations file — rc=1 out='IRE_SIGNED — 1\n[ok] TEAM_ALLOW_SHELL — unset (shell tools off)\n[!!] revocations file failed closed\n       next: fix TEAM_REVOCATIONS=/tmp/rdap-selftest-t7srvynh/doctor-broken-revocations.json: Expecting property name enclosed in double quotes: line 1 column 2 (char 1) — docs/rdap-revocation.md\n[ok] initialized — fresh-agent · test\n[ok] identity seed — 0600\n[ok] trust file — /tmp/rdap-selftest-t7srvynh/fresh-init-no-global-git-identity/peers.json\n\nnext: `./rdap start --provider echo`  (keep signed; do not pass --open)\n[ok] port 9001 — free on 127.0.0.1 (start will bind it)\n[ok] signed peer probe — skipped (no trusted teammate URL yet)\n\ndoctor failed (1 check(s)). Fix the "next:" lines above.\n'
+✓ doctor refuses OPEN MODE from TEAM_REQUIRE_SIGNED=0 — rc=1 out='TEAM_ALLOW_SHELL — unset (shell tools off)\n! TEAM_REVOCATIONS / revocations_file is unset\n       next: signed mode still boots with a silent empty deny-list (no addresses revoked). That is not an affirmed empty list. Set TEAM_REVOCATIONS to a JSON file (`[]` is OK). See docs/rdap-revocation.md\n[ok] initialized — fresh-agent · test\n[ok] identity seed — 0600\n[ok] trust file — /tmp/rdap-selftest-t7srvynh/fresh-init-no-global-git-identity/peers.json\n\nnext: `./rdap start --provider echo`  (keep signed; do not pass --open)\n[ok] port 9001 — free on 127.0.0.1 (start will bind it)\n[ok] signed peer probe — skipped (no trusted teammate URL yet)\n\ndoctor failed (1 check(s)). Fix the "next:" lines above.\n'
+✓ doctor succeeds before init so newcomers can self-check first — rc=0 out='ill use this interpreter because dependencies are already installed; install python3-venv for an isolated .venv\n[ok] signed tasks required by default — OPEN MODE is off\n[ok] TEAM_REQUIRE_SIGNED — 1\n[ok] TEAM_ALLOW_SHELL — unset (shell tools off)\n! TEAM_REVOCATIONS / revocations_file is unset\n       next: signed mode still boots with a silent empty deny-list (no addresses revoked). That is not an affirmed empty list. Set TEAM_REVOCATIONS to a JSON file (`[]` is OK). See docs/rdap-revocation.md\n[ok] environment — ready before init\n\nnext: `./rdap try` proves signed localhost A2A, then `./rdap init --name you --no-internet`\n[ok] port 9001 — free on 127.0.0.1 (start will bind it)\n\nRDAP_DOCTOR_OK\n'
+✓ health command tells the next step when /health is down — rc=1 out='✗ /health failed: [Errno 111] Connection refused\n       next: cannot reach http://127.0.0.1:1. next: start the node (`rdap start --ip 127.0.0.1 --port <PORT> --provider echo` or `python -m team_agents serve --host 127.0.0.1 --port <PORT> --provider echo`) then `rdap health --url http://127.0.0.1:1` or `curl -sS http://127.0.0.1:1/health`.\n'
+✓ invite refuses a loopback lie when no default route exists
+✓ advertised endpoint is safe for the IPv4 listener and URL syntax
+✓ concurrent file claims produce exactly one winner — ['BUSY: shared.txt claimed by owner-6', 'BUSY: shared.txt claimed by owner-6', 'BUSY: shared.txt claimed by owner-6', 'BUSY: shared.txt claimed by owner-6', 'BUSY: shared.txt claimed by owner-6', 'BUSY: shared.txt claimed by owner-6', 'ok: claimed shared.txt', 'BUSY: shared.txt claimed by owner-6']
+✓ operational path validation safely rescans a vanished atomic temp
+✓ operational path validation fails closed after bounded churn — attempts=8
+✓ concurrent task writes preserve every delta and BOARD row — # Team Board
+
+| id | title | owner | status | notes |
+|----|-------|-------|--------|-------|
+| t-3 | task-3 | owner-3 | open |  |
+| t-2 | task-2 | owner-2 | open |  |
+| t-6 | task-6 | owner-6 | open |  |
+| t-5 | task-5 | owner-5 | open |  |
+| t-7 | task-7 | owner-7 | open |  |
+| t-1 | task-1 | owner-1 | open |  |
+| t-4 | task-4 | owner-4 | open |  |
+| t-0 | task-0 | owner-0 | open |  |
+
+✓ delta projection skips schema poison and contains unsafe writers — # Team Board
+
+| id | title | owner | status | notes |
+|----|-------|-------|--------|-------|
+| safe-task | survives poison | safe-owner | open |  |
+
+chat=(empty)
+✓ delta projection fails closed instead of starving capped entries — writers=[] files=[]
+✓ brain goal reader is bounded and refuses aliases
+✓ recent events preserve newest-first and limit semantics — [{'w': 'alpha', 'at': 3.0, 'kind': 'event', 'text': ' [31mnewest  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'}, {'w': 'beta', 'at': 2.0, 'kind': 'event', 'text': 'middle'}]
+✓ recent events expose only bounded terminal-safe fields — {'w': 'alpha', 'at': 3.0, 'kind': 'event', 'text': ' [31mnewest  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'}
+✓ recent events reject malformed, oversized, linked and hardlinked input — [{'w': 'alpha', 'at': 3.0, 'kind': 'event', 'text': ' [31mnewest  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'}, {'w': 'beta', 'at': 2.0, 'kind': 'event', 'text': 'middle'}, {'w': 'alpha', 'at': 1.0, 'kind': 'event', 'text': 'oldest'}]
+✓ recent event scan enforces writer/entry/file/byte/output ceilings — entries=7 writers=2 files=5 bytes=274 output=2
+✓ memory sync commits and pushes only allowlisted team state — commit=['.team/BOARD.md', '.team/deltas/scope-test/event-1788774897095-bd5bf6.json', '.team/facts.md', '.team/journal.md']
+✓ memory sync preserves unrelated staged and untracked changes — staged=['tracked.txt'] remote=['.team/BOARD.md', '.team/deltas/scope-test/event-1788774897095-bd5bf6.json', '.team/facts.md', '.team/journal.md', 'tracked.txt']
+✓ memory sync excludes private .team runtime state
+✓ automatic push pins one upstream ref despite adversarial push config — upstream=['.team/BOARD.md', '.team/deltas/scope-test/event-1788774897095-bd5bf6.json', '.team/facts.md', '.team/journal.md', 'tracked.txt'] redirect=['tracked.txt'] extra=['tracked.txt']
+✓ memory sync fast-forwards verified team-only history
+✓ memory sync fails closed on non-team remote history
+✓ memory sync rejects a remote .team symlink before checkout — 120000 blob 4f1ea5760841c5bb74d71151661c2e0484331f5d	.team/deltas/malicious/escape-link
+✓ Git relay never stages or commits unrelated project changes — commit=['.team/BOARD.md', '.team/deltas/rvn1q8c4vh/event-1788774897513-65c18d.json', '.team/facts.md', '.team/inbox/rvn1qxqff95nqwx28gxytdw0tjkn5zf3l0tasqzs9gls/20260907-095457-16bfe8977cac.json', '.team/journal.md'] staged=['tracked.txt']
+✓ Git relay excludes its private replay cache
+✓ team-scoped commits record relay deletions without touching user staging
+✓ operational team tree recursively rejects nested symlinks
+✓ operational team tree rejects special files
+✓ board tool derives a bounded delta projection instead of reading BOARD.md
+✓ read_file denies secrets, runtime state, traversal and aliases — denied={'.env': "ERROR: PermissionError('read denied by sensitive-path policy')", '.git/config': "ERROR: PermissionError('read denied by sensitive-path policy')", '.team/keys/device_ed25519.seed': "ERROR: PermissionError('read denied by sensitive-path policy')", '.team/mesh-store/private.bin': "ERROR: PermissionError('read denied by sensitive-path policy')", 'config/client_secret.json': "ERROR: PermissionError('read denied by sensitive-path policy')", 'docs/../.env': "ERROR: PermissionError('read denied by sensitive-path policy')", 'ordinary.txt:secret-stream': "ERROR: PermissionError('read denied by sensitive-path policy')", '.git /config': "ERROR: PermissionError('read denied by sensitive-path policy')", 'GIT~1/config': "ERROR: PermissionError('read denied by sensitive-path policy')"} hardlink=ERROR: PermissionError('read denied for unsafe file identity') operator=ERROR: PermissionError('read denied by sensitive-path policy')
+✓ agent git_commit requires explicit high-risk authorization — ERROR: PermissionError('git_commit requires explicit allow_shell authorization')
+✓ project write_file requires explicit high-risk authorization — denied=ERROR: project file writes disabled on this node (allow_shell=false) allowed=wrote 7 bytes to operator-enabled.txt
+✓ echo output revalidates mutated node-name containment
+✓ blocking brain and tool work stays off the ASGI event loop — [(True, 'echo-worker-finished'), (True, 'tool-worker-finished')]
+✓ malformed final_answer cannot reuse a previous task result — ('CLIENT A PRIVATE ANSWER', 'safe fallback after malformed call')
+✓ concurrent final_answer calls remain invocation-local — ['answer-for:concurrent-a', 'answer-for:concurrent-b']
+✓ LLM credentials are provider-bound and never fall back globally — {'groq': 'groq-only', 'openrouter': 'openrouter-only', 'ollama': '', 'custom': 'endpoint-specific', 'arbitrary_refused': True, 'http_refused': True}
+✓ authorized git_commit still refuses private .team state
+✓ cross-process lock holder acquired
+✓ contended lock times out and fails closed — elapsed=0.200s
+✓ lock is acquirable after holder release
+✓ memory imports without fcntl and never falls back unlocked — import-without-fcntl-ok
+
+✓ insecure seed permissions rejected
+✓ seed symlink rejected
+✓ server refuses occupied advertised port instead of silently moving
+✓ card has JWS signature
+✓ pinned card verifies
+✓ card signed by unpinned peer rejected
+✓ mailbox extension absent by default
+✓ explicit open mode is loud in public card
+✓ Bearer app preserves Starlette state
+✓ Bearer advertised only when configured
+✓ Bearer middleware is enforced independently with ASGI transport — {'card': 200, 'missing': 401, 'wrong': 401, 'accepted': 200, 'activity': 200}
+✓ remote activity fails closed without configured Bearer auth
+✓ outbound Bearer requires HTTPS even for loopback
+✓ remote card/identity fetches stop at the metadata byte cap
+✓ public Raven identity does not disclose trust/revocation graph — {'require_signed_tasks': True, 'open_mode': False}
+✓ bounded task store is race-safe, copy-safe and fail-closed — {'rejected': {'count': 0, 'bytes': 0, 'owners': 0}, 'terminal': {'count': 4, 'bytes': 2173, 'owners': 1}, 'valid': None, 'copy_context': 'bounded-context', 'preserved_state': 3, 'listed': 4, 'pagination_ok': True, 'owner_scoped': True, 'active_refused': True, 'active': {'count': 2, 'bytes': 1086, 'owners': 1}, 'byte_refused': True, 'expired': {'count': 0, 'bytes': 0, 'owners': 0}}
+✓ task-store environment tuning cannot exceed compiled hard max
+✓ unsigned executor rejection has zero durable/team side effects
+✓ authorization-policy exception rejects without durable mutation
+✓ transport/delegation mismatch rejects before replay insertion
+✓ RPC ingress bounds chunked body, body time and concurrency
+✓ oversized RPC is rejected before SDK and durable state
+✓ unique invalid RPC tasks cannot grow the live task store unbounded — {'count': 0, 'bytes': 0, 'owners': 0}
+✓ valid signed flow preserves wire whitespace during authentication — response=task ae0ee10b → completed
+[echo:node-1] completed task. output written to .team/outputs/node-1/valid-task-survives-bounded-store-pressu-b4f4fa.md. task summary: stats={'count': 1, 'bytes': 1557, 'owners': 1}
+✓ real routes isolate List/Get/Subscribe/Cancel by signed Raven owner — {'task_id': '38094dfb-f0b0-4077-8b38-d360942a8d9b', 'a_ids': {'38094dfb-f0b0-4077-8b38-d360942a8d9b'}, 'b_ids': set(), 'got_a': '38094dfb-f0b0-4077-8b38-d360942a8d9b', 'get_b_denied': True, 'cancel_b_denied': True, 'subscribe_b_denied': True, 'canceled': 5, 'canceled_value': 5, 'collision_a_context': '073eb8d2-4d44-43cb-b156-b4d8e7a38a35', 'collision_b_context': '6c14893e-bca4-400b-a0ea-b4e590c4ff14', 'collision_a_id': 'shared-96fb7b6e46d9d8d4', 'collision_b_id': 'shared-96fb7b6e46d9d8d4', 'collision_expected_id': 'shared-96fb7b6e46d9d8d4', 'collision_b_after_a_cancel': 2, 'unsigned_status': 401}
+✓ authorized cancellation publishes a terminal canceled Task — {'task_id': '38094dfb-f0b0-4077-8b38-d360942a8d9b', 'a_ids': {'38094dfb-f0b0-4077-8b38-d360942a8d9b'}, 'b_ids': set(), 'got_a': '38094dfb-f0b0-4077-8b38-d360942a8d9b', 'get_b_denied': True, 'cancel_b_denied': True, 'subscribe_b_denied': True, 'canceled': 5, 'canceled_value': 5, 'collision_a_context': '073eb8d2-4d44-43cb-b156-b4d8e7a38a35', 'collision_b_context': '6c14893e-bca4-400b-a0ea-b4e590c4ff14', 'collision_a_id': 'shared-96fb7b6e46d9d8d4', 'collision_b_id': 'shared-96fb7b6e46d9d8d4', 'collision_expected_id': 'shared-96fb7b6e46d9d8d4', 'collision_b_after_a_cancel': 2, 'unsigned_status': 401}
+✓ simultaneous same-ID tasks and cancellation stay owner local — {'task_id': '38094dfb-f0b0-4077-8b38-d360942a8d9b', 'a_ids': {'38094dfb-f0b0-4077-8b38-d360942a8d9b'}, 'b_ids': set(), 'got_a': '38094dfb-f0b0-4077-8b38-d360942a8d9b', 'get_b_denied': True, 'cancel_b_denied': True, 'subscribe_b_denied': True, 'canceled': 5, 'canceled_value': 5, 'collision_a_context': '073eb8d2-4d44-43cb-b156-b4d8e7a38a35', 'collision_b_context': '6c14893e-bca4-400b-a0ea-b4e590c4ff14', 'collision_a_id': 'shared-96fb7b6e46d9d8d4', 'collision_b_id': 'shared-96fb7b6e46d9d8d4', 'collision_expected_id': 'shared-96fb7b6e46d9d8d4', 'collision_b_after_a_cancel': 2, 'unsigned_status': 401}
+✓ secure JSON-RPC routes reject unsigned transport requests — {'task_id': '38094dfb-f0b0-4077-8b38-d360942a8d9b', 'a_ids': {'38094dfb-f0b0-4077-8b38-d360942a8d9b'}, 'b_ids': set(), 'got_a': '38094dfb-f0b0-4077-8b38-d360942a8d9b', 'get_b_denied': True, 'cancel_b_denied': True, 'subscribe_b_denied': True, 'canceled': 5, 'canceled_value': 5, 'collision_a_context': '073eb8d2-4d44-43cb-b156-b4d8e7a38a35', 'collision_b_context': '6c14893e-bca4-400b-a0ea-b4e590c4ff14', 'collision_a_id': 'shared-96fb7b6e46d9d8d4', 'collision_b_id': 'shared-96fb7b6e46d9d8d4', 'collision_expected_id': 'shared-96fb7b6e46d9d8d4', 'collision_b_after_a_cancel': 2, 'unsigned_status': 401}
+✓ plaintext mailbox requires explicit card opt-in
+✓ mailbox pagination consumes continuation cursor
+✓ mailbox adapter enforces the Rust store object-count bound
+✓ Git relay verifies task and signed reply end-to-end
+✓ malformed relay documents are quarantined without wedging polling
+✓ oversized relay poison becomes compact evidence, not a Git blob copy
+✓ relay directory poison is removed from polling without recursive deletion
+✓ interrupted relay tasks are not rerun and return an explicit outcome — ['relay execution was interrupted before a durable answer; it was not automatically retried to avoid duplicate side effects']
+✓ relay flushes durable reply/deletion after a later push recovers — attempts=2 replies=[{'id': 'ef7410b0a2f5', 'kind': 'answer', 'from': 'rvn1qxqff95nqwx28gxytdw0tjkn5zf3l0tasqzs9gls', 'to': 'rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv', 'text': 'signed answer: recover after push failure', 'at': '2026-09-07 09:55:01', 'raven': {'sender': 'rvn1qxqff95nqwx28gxytdw0tjkn5zf3l0tasqzs9gls', 'recipient': 'rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv', 'task_id': 'ef7410b0a2f5', 'kind': 'answer', 'issued_at': 1788774901, 'expires_at': 1788861301, 'nonce': '2e53b18c1d9bb9c43aa62097205cde7b', 'algorithm': 'ed25519', 'context': 'raven.a2a.delegation.v2', 'signature': '21dCHZfCtccmZNODcv6pankXHOtNzI3Xi1qBGboDAJ2AVLdnRPVXqHsBbKQc9eXccnD7HYYYMlvUteZiuyOeAQ=='}, '_file': PosixPath('/tmp/rdap-selftest-t7srvynh/relay-alice-clone/.team/outbox/rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv/55f62806592ec9b4c4d44f3cda70300ad186cf81541360a00abe42d5dd997142.json'), '_verified_reply': True}]
+✓ relay bounds UTF-8 answers by encoded bytes and marks truncation — bytes=49151
+✓ relay normalizes invalid Unicode before durable signing — '?'
+✓ relay rejects invalid Unicode in signed string siblings
+✓ chat normalizes invalid Unicode before writing a delta — '- 09:55:01 **user**:  '
+✓ relay outcome database enforces its byte ceiling on every write — size=49152
+✓ Git relay rejects outer sender/signature mismatch
+✓ invalid reply quarantined and not returned
+✓ relay scan fails closed instead of sorting an arbitrary capped prefix
+✓ peer task ids are hashed before becoming reply filenames — /tmp/rdap-selftest-t7srvynh/relay-bob-clone/.team/outbox/rvn1q8c4vhuskul4cr8hpgxkjtwq6n4xe87myv9jmdrv/35daa5f1aa2de5a4b2db1757a9ca30a1a3d7b1b935bcca31928c590cebc4e2b9.json
+✓ Git relay refuses local-only repositories instead of claiming queued
+✓ configured revocation read failure is fail-closed
+✓ configured trust-file loss is fail-closed
+
+162 passed, 0 failed
+RDAP_TRY_OK
