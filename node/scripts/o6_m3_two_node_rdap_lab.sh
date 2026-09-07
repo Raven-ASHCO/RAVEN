@@ -20,6 +20,10 @@
 #   RED session — seal against never-paired hint → ATSAM_SESSION_REQUIRED
 #   BLOCKED_HARDWARE — physical two-device WAN (this host has no second NIC/WAN peer)
 #
+# Reliability (SRE #19):
+#   WALL_CLOCK_SEC recorded. Soft p50/p95 only after a real snapshot (not here).
+#   One bring-up/listen retry max; still red → FAIL. No silent skip.
+#
 # Env:
 #   RDAP_HOME     existing checkout of raven-distributed-agent-protocol
 #                 (default: clone pinned SHA into the workdir)
@@ -53,12 +57,24 @@ GREEN_SEAL_RC=""
 GREEN_DIAL_RC=""
 PIN_STATUS="PENDING"
 RED_SESSION_STATUS="PENDING"
+BRING_UP_RETRY_COUNT=0
+T0="$(date +%s)"
+
+emit_reliability() {
+  local now
+  now="$(date +%s)"
+  echo "WALL_CLOCK_SEC=$((now - T0))"
+  echo "BRING_UP_RETRY_COUNT=${BRING_UP_RETRY_COUNT}"
+  echo "P50_MS=not_recorded"
+  echo "P95_MS=not_recorded"
+}
 
 fail() {
   echo "O6_M3_TWO_NODE_LAB=FAIL: $*" >&2
   echo "HOLD=ACTIVE"
   echo "CLAIM=none (not O6 E2E Proven; not HOLD lift; not confidential RDAP delivery)"
   echo "TWO_DEVICE_WAN=BLOCKED_HARDWARE"
+  emit_reliability
   echo "$BANNER" >&2
   exit 1
 }
@@ -211,16 +227,53 @@ wait_sock() {
   return 1
 }
 
+# One bring-up retry max on listen/bind race. Still red → hard FAIL. No silent skip.
+start_node_or_retry() {
+  local data_dir="$1" log="$2" listen="$3" pid_var="$4" label="$5"
+  local attempt=0 pid
+  while true; do
+    "$NODE" service --data-dir "$data_dir" --lan-listen "$listen" --ble-listen "127.0.0.1:0" \
+      >"$log" 2>&1 &
+    pid=$!
+    eval "$pid_var=$pid"
+    if wait_sock "$data_dir" "$log" "lan_direct: listen"; then
+      echo "BRING_UP_${label}=ok attempt=$((attempt + 1))"
+      return 0
+    fi
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    eval "$pid_var="
+    if [[ "$attempt" -ge 1 ]]; then
+      fail "BRING_UP_${label}=FAIL after one retry (listen/bind; no silent skip)"
+    fi
+    attempt=$((attempt + 1))
+    BRING_UP_RETRY_COUNT=$((BRING_UP_RETRY_COUNT + 1))
+    echo "BRING_UP_${label}=retry listen/bind race (one retry max; no silent skip)"
+    mv -f "$log" "${log}.attempt1" || true
+  done
+}
+
+# RED paths: RDAP must not report task success (ask complete / envelope delivered as task).
+# Do not treat the request payload marker as success.
+assert_no_rdap_task_success() {
+  local combined="$1" stdout="$2" label="$3"
+  if grep -Eqi 'completed task|task completed|RDAP_TASK_OK|ask completed|"status"[[:space:]]*:[[:space:]]*"success"' "$combined"; then
+    cat "$combined" >&2 || true
+    fail "${label}: RDAP reported task success (must not)"
+  fi
+  if [[ -s "$stdout" ]] && grep -q 'envelope_b64' "$stdout"; then
+    cat "$combined" >&2 || true
+    fail "${label}: RDAP returned envelope_b64 (seal/task success; must not)"
+  fi
+  echo "${label}_RDAP_TASK_SUCCESS=none"
+}
+
 # ── RED: no persisted ATSAM session ───────────────────────────────────────
 echo "=== RED no-session: raven-node up, identity present, no ATSAM session ==="
 RED="$WORKDIR/red/data"
 mkdir -p "$RED"
 "$ASH" --data-dir "$RED" init | tee "$WORKDIR/red/init.out"
-"$NODE" service --data-dir "$RED" --lan-listen "127.0.0.1:0" --ble-listen "127.0.0.1:0" \
-  >"$WORKDIR/red/node.log" 2>&1 &
-A_PID=$!
-wait_sock "$RED" "$WORKDIR/red/node.log" "lan_direct: listen" \
-  || fail "RED raven-node failed to bind IPC/LAN"
+start_node_or_retry "$RED" "$WORKDIR/red/node.log" "127.0.0.1:0" A_PID RED
 "$ASH" --data-dir "$RED" ipc-ping >/dev/null || fail "RED ipc-ping failed"
 
 DUMMY_HINT="$(printf 'ab%.0s' {1..32})"
@@ -248,6 +301,7 @@ if grep -q 'ATSAM_LINEAGE_REVOKED' "$WORKDIR/red/cli.combined"; then
   cat "$WORKDIR/red/cli.combined" >&2 || true
   fail "RED no-session collapsed into ATSAM_LINEAGE_REVOKED"
 fi
+assert_no_rdap_task_success "$WORKDIR/red/cli.combined" "$WORKDIR/red/cli.stdout" "RED_NO_SESSION"
 echo "RED_NO_SESSION=PASS rc=$RED_NO_SESSION_RC ATSAM_SESSION_REQUIRED (not LINEAGE_REVOKED)"
 
 kill "${A_PID}" 2>/dev/null || true
@@ -300,16 +354,8 @@ else
   fail "M1 same-RVN1 pin bind failed"
 fi
 
-"$NODE" service --data-dir "$A" --lan-listen "127.0.0.1:${A_PORT}" --ble-listen "127.0.0.1:0" \
-  >"$WORKDIR/green/a.node.log" 2>&1 &
-A_PID=$!
-"$NODE" service --data-dir "$B" --lan-listen "127.0.0.1:${B_PORT}" --ble-listen "127.0.0.1:0" \
-  >"$WORKDIR/green/b.node.log" 2>&1 &
-B_PID=$!
-wait_sock "$A" "$WORKDIR/green/a.node.log" "lan_direct: listen" \
-  || fail "GREEN node A failed to bind"
-wait_sock "$B" "$WORKDIR/green/b.node.log" "lan_direct: listen" \
-  || fail "GREEN node B failed to bind"
+start_node_or_retry "$A" "$WORKDIR/green/a.node.log" "127.0.0.1:${A_PORT}" A_PID GREEN_A
+start_node_or_retry "$B" "$WORKDIR/green/b.node.log" "127.0.0.1:${B_PORT}" B_PID GREEN_B
 "$ASH" --data-dir "$A" ipc-ping >/dev/null
 "$ASH" --data-dir "$B" ipc-ping >/dev/null
 echo "TOPOLOGY=localhost_two_process A=127.0.0.1:${A_PORT} B=127.0.0.1:${B_PORT}"
@@ -438,6 +484,7 @@ if [[ "$RED_HINT_RC" -eq 0 ]]; then
 fi
 if grep -q 'ATSAM_SESSION_REQUIRED' "$WORKDIR/green/red-hint.combined" \
   && ! grep -q 'ATSAM_LINEAGE_REVOKED' "$WORKDIR/green/red-hint.combined"; then
+  assert_no_rdap_task_success "$WORKDIR/green/red-hint.combined" "$WORKDIR/green/red-hint.stdout" "RED_MISSING_SESSION"
   echo "RED_MISSING_SESSION=PASS rc=$RED_HINT_RC ATSAM_SESSION_REQUIRED"
   RED_SESSION_STATUS="PASS"
 else
@@ -477,25 +524,29 @@ LABEL=NON-RELEASE
 RAVEN_TIP=$(git -C "$ROOT" rev-parse HEAD)
 RDAP_TIP=$RDAP_TIP
 TOPOLOGY=localhost_two_process
+UNIT_OR_PIN=PASS
+RED_NO_SESSION=PASS rc=$RED_NO_SESSION_RC ATSAM_SESSION_REQUIRED
+GREEN_SEAL=PASS rc=$GREEN_SEAL_RC
+GREEN_DIAL_OR_INBOX=PASS rc=$GREEN_DIAL_RC marker=$MARKER
+BLOCKED_ASK_ATSAM=BLOCKED
+RED_DROP_SESSION=BLOCKED
+RDAP_TASK_SUCCESS=none
+WALL_CLOCK_SEC=$(( $(date +%s) - T0 ))
+BRING_UP_RETRY_COUNT=${BRING_UP_RETRY_COUNT}
+P50_MS=not_recorded
+P95_MS=not_recorded
 UNIT_BASELINE=PASS rc=$UNIT_RC ${UNIT_PASSED:-} RDAP_TRY_OK
 PIN_M1=$PIN_STATUS
 PIN_CONTACT=PASS
-RED_NO_SESSION=PASS rc=$RED_NO_SESSION_RC ATSAM_SESSION_REQUIRED
 GREEN_LAB_SEAL=PASS rc=$GREEN_SEAL_RC
 GREEN_LAN_DIAL=PASS rc=$GREEN_DIAL_RC
 GREEN_INBOX=PASS marker=$MARKER
 RED_MISSING_SESSION=$RED_SESSION_STATUS
-RED_DROP_SESSION=BLOCKED
 RDAP_NO_LOCAL_ATSAM=PASS
 RDAP_ASK_ATSAM=BLOCKED
-BLOCKED_ASK_ATSAM=BLOCKED
 CARRIER_ENUM_ATSAM_RVN1=BLOCKED
-RDAP_TASK_SUCCESS=none
 TWO_DEVICE_WAN=BLOCKED_HARDWARE
 PHYSICAL_DEVICES=UNAVAILABLE
-UNIT_OR_PIN=PASS
-GREEN_SEAL=PASS
-GREEN_DIAL_OR_INBOX=PASS
 CLAIM=lab localhost two-process encrypted Raven↔RDAP path under HOLD
 NOT_PROVEN=O6 E2E; HOLD lift; WAN; confidential production; PRODUCTION_ENABLED; HTTP A2A as O6; RDAP ask-over-atsam_rvn1; physical two-device
 HARNESS_GREEN_NE_HOLD_LIFT=true
