@@ -444,7 +444,7 @@ jobs:
             -- --exact --ignored
           test -s "$RAVEN_DUMP_ENCAPS1_STATE_PATH"
       - name: Download portable Encaps1 state
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mlkem768-encaps1-portable
           path: node/target/libcrux-portable
@@ -482,7 +482,7 @@ jobs:
             -- --exact --ignored
           test -s "$RAVEN_DUMP_ENCAPS1_STATE_PATH"
       - name: Download portable Encaps1 state
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mlkem768-encaps1-portable
           path: node/target/libcrux-portable
