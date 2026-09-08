@@ -41,7 +41,7 @@ windows-sys = { version = "0.59", features = [
 
 # Secret Service needs libdbus — glibc desktop only (not musl static releases).
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-secret-service = "2.0"
+secret-service = "5.2"
 # Direct D-Bus access belongs only to the durable Full Braid lab. Existing
 # production-facing stores continue to use the unmodified crates.io client.
 zbus = { version = "1.9", optional = true }
