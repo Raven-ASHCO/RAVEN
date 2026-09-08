@@ -44,7 +44,7 @@ windows-sys = { version = "0.59", features = [
 secret-service = "2.0"
 # Direct D-Bus access belongs only to the durable Full Braid lab. Existing
 # production-facing stores continue to use the unmodified crates.io client.
-zbus = { version = "1.9", optional = true }
+zbus = { version = "5.19", optional = true }
 zvariant = { version = "2.10", optional = true }
 zvariant_derive = { version = "2.10", optional = true }
 
