@@ -42,7 +42,7 @@ base64 = "0.22"
 zeroize = { version = "1", features = ["derive"] }
 tempfile = "3"
 ml-kem = { version = "0.3", features = ["hazmat"] }
-rand_core = "0.6"
+rand_core = "0.10"
 snow = "0.9"
 
 # Task 0A.2: single links="sqlite3" owner — audited fork with frozen SQLCipher 4.17.0.
