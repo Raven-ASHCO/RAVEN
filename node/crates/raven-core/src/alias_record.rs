@@ -123,6 +123,10 @@ impl AliasRecord {
         off += 32;
         let mut signature = [0u8; 64];
         signature.copy_from_slice(&raw[off..off + 64]);
+        off += 64;
+        if off != raw.len() {
+            return Err("alias trailing bytes".into());
+        }
         Ok(Self {
             alias,
             identity_address,
@@ -154,21 +158,38 @@ impl Default for AliasPublishQuota {
 
 #[derive(Default)]
 struct PubStats {
-    live: usize,
     window_start_ms: u64,
     publishes_in_window: usize,
 }
 
+/// Default global cap on stored claims across all publishers.
+pub const ALIAS_STORE_MAX_CLAIMS: usize = 4096;
+
 /// In-process alias claim store (community/manual peer DHT stand-in).
 ///
 /// Keyed by `(alias, identity_address)` with LWW by `sequence`. Multiple live
-/// claims for the same alias are retained and surfaced as conflicts.
-#[derive(Default)]
+/// claims for the same alias are retained and surfaced as conflicts. Expired
+/// claims stay as sequence high-water marks (anti-rollback) but never count
+/// toward a publisher's live quota; they are evicted only when the store is at
+/// its global cap.
 pub struct AliasClaimStore {
     /// (normalized_alias, identity_address) → record
     claims: HashMap<(String, String), AliasRecord>,
     stats: HashMap<[u8; 32], PubStats>,
     pub quota: AliasPublishQuota,
+    /// Global cap across all publishers; admission fails closed beyond it.
+    pub max_total_claims: usize,
+}
+
+impl Default for AliasClaimStore {
+    fn default() -> Self {
+        Self {
+            claims: HashMap::new(),
+            stats: HashMap::new(),
+            quota: AliasPublishQuota::default(),
+            max_total_claims: ALIAS_STORE_MAX_CLAIMS,
+        }
+    }
 }
 
 impl AliasClaimStore {
@@ -179,43 +200,82 @@ impl AliasClaimStore {
         }
     }
 
+    /// Admit a claim from an untrusted (network / DHT) source: full
+    /// verification plus the per-publisher rate limit and Sybil quota.
     pub fn put(&mut self, rec: AliasRecord, now_ms: u64) -> Result<(), String> {
+        let (key, rec) = self.admit(rec, now_ms)?;
+
+        let pubk = rec.ed25519_pub;
+        let window_ms = self.quota.window_ms;
+        self.stats
+            .retain(|_, s| now_ms.saturating_sub(s.window_start_ms) <= window_ms);
+        let is_new_live = !self
+            .claims
+            .get(&key)
+            .is_some_and(|p| now_ms <= p.expires_at);
+        let live = self
+            .claims
+            .values()
+            .filter(|r| r.ed25519_pub == pubk && now_ms <= r.expires_at)
+            .count();
+        let stats = self.stats.entry(pubk).or_insert(PubStats {
+            window_start_ms: now_ms,
+            publishes_in_window: 0,
+        });
+        if stats.publishes_in_window >= self.quota.max_publishes_per_window {
+            return Err("ALIAS_RATE_LIMIT".into());
+        }
+        if is_new_live && live >= self.quota.max_live_claims_per_pub {
+            return Err("ALIAS_SYBIL_QUOTA".into());
+        }
+        stats.publishes_in_window += 1;
+        self.claims.insert(key, rec);
+        Ok(())
+    }
+
+    /// Insert a claim from a trusted local source (e.g. reloading the user's
+    /// own persisted publications) without the network rate limit or Sybil
+    /// quota, so a reload never silently drops rows. Signature, address
+    /// binding, expiry, sequence LWW and the global cap still apply.
+    pub fn put_trusted(&mut self, rec: AliasRecord, now_ms: u64) -> Result<(), String> {
+        let (key, rec) = self.admit(rec, now_ms)?;
+        self.claims.insert(key, rec);
+        Ok(())
+    }
+
+    /// Checks shared by every insert path. Returns the store key and the
+    /// record; does not insert.
+    ///
+    /// The signature is verified over the alias exactly as received, and the
+    /// received alias must already be the canonical (normalized) form. The
+    /// record is never rewritten before verification: that would let one valid
+    /// signature admit `kevin`, `KEVIN`, `@kevin` and `\u{212A}evin` as
+    /// distinct wire objects, and a Python verifier of the raw bytes would
+    /// disagree with the Rust store.
+    fn admit(
+        &mut self,
+        rec: AliasRecord,
+        now_ms: u64,
+    ) -> Result<((String, String), AliasRecord), String> {
         let alias = normalize_alias(&rec.alias)?;
-        let mut rec = rec;
-        rec.alias = alias.clone();
         rec.verify(now_ms)?;
+        if rec.alias != alias {
+            return Err("ALIAS_CHARSET".into());
+        }
 
         let key = (alias, rec.identity_address.clone());
         if let Some(prev) = self.claims.get(&key) {
             if rec.sequence <= prev.sequence {
                 return Err("ALIAS_STALE_SEQUENCE".into());
             }
+        } else if self.claims.len() >= self.max_total_claims {
+            // Under pressure, drop expired high-water marks before refusing.
+            self.claims.retain(|_, r| now_ms <= r.expires_at);
+            if self.claims.len() >= self.max_total_claims {
+                return Err("ALIAS_STORE_FULL".into());
+            }
         }
-
-        let pubk = rec.ed25519_pub;
-        let stats = self.stats.entry(pubk).or_insert(PubStats {
-            live: 0,
-            window_start_ms: now_ms,
-            publishes_in_window: 0,
-        });
-        if now_ms.saturating_sub(stats.window_start_ms) > self.quota.window_ms {
-            stats.window_start_ms = now_ms;
-            stats.publishes_in_window = 0;
-        }
-        if stats.publishes_in_window >= self.quota.max_publishes_per_window {
-            return Err("ALIAS_RATE_LIMIT".into());
-        }
-        let is_new_live = !self.claims.contains_key(&key);
-        if is_new_live && stats.live >= self.quota.max_live_claims_per_pub {
-            return Err("ALIAS_SYBIL_QUOTA".into());
-        }
-
-        if is_new_live {
-            stats.live += 1;
-        }
-        stats.publishes_in_window += 1;
-        self.claims.insert(key, rec);
-        Ok(())
+        Ok((key, rec))
     }
 
     /// All live, verified claims for an exact alias (conflict set).
@@ -268,6 +328,71 @@ mod tests {
         assert_eq!(normalize_alias("a_b-1").unwrap(), "a_b-1");
     }
 
+    /// The signature covers the alias bytes as transmitted. A record is not
+    /// admitted under a normalized spelling it was never signed over, so the
+    /// same signature cannot appear as several distinct wire objects.
+    #[test]
+    fn non_canonical_wire_alias_is_rejected_not_rewritten() {
+        let id = Identity::from_seed(&[0x49; 32]);
+        let canonical = AliasRecord {
+            alias: "kevin".into(),
+            identity_address: String::new(),
+            sequence: 1,
+            expires_at: u64::MAX,
+            signature: [0u8; 64],
+            ed25519_pub: [0u8; 32],
+        }
+        .sign(&id)
+        .unwrap();
+        let mut store = AliasClaimStore::default();
+
+        // Variants carrying the signature made over `kevin`: the signature does
+        // not cover the transmitted bytes.
+        for variant in ["KEVIN", "@kevin", " kevin ", "\u{212A}evin"] {
+            let mut rec = canonical.clone();
+            rec.alias = variant.into();
+            assert_eq!(
+                store.put(rec.clone(), 1).unwrap_err(),
+                "ALIAS_BAD_SIG",
+                "{variant:?}"
+            );
+            assert_eq!(
+                store.put_trusted(rec, 1).unwrap_err(),
+                "ALIAS_BAD_SIG",
+                "{variant:?}"
+            );
+        }
+        assert!(store.is_empty());
+
+        // Validly signed over a non-canonical spelling: refused as non-canonical
+        // (previously ALIAS_BAD_SIG, because admission re-derived the signed
+        // bytes from the normalized alias).
+        for variant in ["Kevin", "@kevin", " kevin ", "\u{212A}evin"] {
+            let rec = AliasRecord {
+                alias: variant.into(),
+                identity_address: String::new(),
+                sequence: 1,
+                expires_at: u64::MAX,
+                signature: [0u8; 64],
+                ed25519_pub: [0u8; 32],
+            }
+            .sign(&id)
+            .unwrap();
+            assert_eq!(
+                store.put(rec, 1).unwrap_err(),
+                "ALIAS_CHARSET",
+                "{variant:?}"
+            );
+        }
+        assert!(store.is_empty());
+
+        // The canonical record is admitted and found through any query spelling.
+        store.put(canonical, 1).unwrap();
+        for query in ["kevin", "@KEVIN", " @Kevin "] {
+            assert_eq!(store.lookup_exact(query, 1).unwrap().len(), 1, "{query:?}");
+        }
+    }
+
     #[test]
     fn conflict_set_both_claims() {
         let a = Identity::generate();
@@ -297,5 +422,136 @@ mod tests {
         store.put(r2, 1).unwrap();
         let hits = store.lookup_exact("@poline", 1).unwrap();
         assert_eq!(hits.len(), 2);
+    }
+
+    fn claim(id: &Identity, alias: &str, sequence: u64, expires_at: u64) -> AliasRecord {
+        AliasRecord {
+            alias: alias.into(),
+            identity_address: String::new(),
+            sequence,
+            expires_at,
+            signature: [0u8; 64],
+            ed25519_pub: [0u8; 32],
+        }
+        .sign(id)
+        .unwrap()
+    }
+
+    #[test]
+    fn expired_claims_do_not_consume_live_quota() {
+        let id = Identity::from_seed(&[0x41; 32]);
+        let mut store = AliasClaimStore::with_quota(AliasPublishQuota {
+            max_live_claims_per_pub: 2,
+            max_publishes_per_window: 100,
+            window_ms: 3_600_000,
+        });
+        store.put(claim(&id, "a1", 1, 100), 1).unwrap();
+        store.put(claim(&id, "a2", 1, 100), 1).unwrap();
+        assert_eq!(
+            store.put(claim(&id, "a3", 1, 1_000), 1).unwrap_err(),
+            "ALIAS_SYBIL_QUOTA"
+        );
+        // Both earlier claims have expired: the key may publish again.
+        store.put(claim(&id, "a3", 1, 1_000), 101).unwrap();
+        // Renewing an expired claim is a new live claim and is counted.
+        store.put(claim(&id, "a1", 2, 1_000), 101).unwrap();
+        assert_eq!(
+            store.put(claim(&id, "a2", 2, 1_000), 101).unwrap_err(),
+            "ALIAS_SYBIL_QUOTA"
+        );
+    }
+
+    #[test]
+    fn stale_sequence_rejected_after_prior_claim_expired() {
+        let id = Identity::from_seed(&[0x42; 32]);
+        let mut store = AliasClaimStore::default();
+        store.put(claim(&id, "poline", 5, 10), 1).unwrap();
+        assert_eq!(
+            store.put(claim(&id, "poline", 3, 1_000), 20).unwrap_err(),
+            "ALIAS_STALE_SEQUENCE"
+        );
+    }
+
+    #[test]
+    fn trusted_reload_keeps_every_row() {
+        let id = Identity::from_seed(&[0x43; 32]);
+        let rows: Vec<_> = (0..20)
+            .map(|i| claim(&id, &format!("alias{i}"), 1, u64::MAX))
+            .collect();
+        let mut network = AliasClaimStore::default();
+        let admitted = rows
+            .iter()
+            .filter(|r| network.put((*r).clone(), 1).is_ok())
+            .count();
+        assert_eq!(
+            admitted,
+            AliasPublishQuota::default().max_live_claims_per_pub
+        );
+        let mut local = AliasClaimStore::default();
+        for r in rows {
+            local.put_trusted(r, 1).unwrap();
+        }
+        assert_eq!(local.len(), 20);
+        // Trusted rows still go through signature / sequence checks.
+        let mut forged = claim(&id, "alias0", 2, u64::MAX);
+        forged.signature[0] ^= 1;
+        assert!(local.put_trusted(forged, 1).is_err());
+        assert_eq!(
+            local
+                .put_trusted(claim(&id, "alias0", 1, u64::MAX), 1)
+                .unwrap_err(),
+            "ALIAS_STALE_SEQUENCE"
+        );
+    }
+
+    #[test]
+    fn publish_rate_limit_resets_after_window() {
+        let id = Identity::from_seed(&[0x44; 32]);
+        let mut store = AliasClaimStore::with_quota(AliasPublishQuota {
+            max_live_claims_per_pub: 100,
+            max_publishes_per_window: 2,
+            window_ms: 1_000,
+        });
+        store.put(claim(&id, "a1", 1, u64::MAX), 1).unwrap();
+        store.put(claim(&id, "a2", 1, u64::MAX), 1).unwrap();
+        assert_eq!(
+            store.put(claim(&id, "a3", 1, u64::MAX), 2).unwrap_err(),
+            "ALIAS_RATE_LIMIT"
+        );
+        store.put(claim(&id, "a3", 1, u64::MAX), 1_002).unwrap();
+    }
+
+    #[test]
+    fn global_cap_fails_closed_then_evicts_expired() {
+        let mut store = AliasClaimStore {
+            max_total_claims: 2,
+            ..Default::default()
+        };
+        let a = Identity::from_seed(&[0x45; 32]);
+        let b = Identity::from_seed(&[0x46; 32]);
+        let c = Identity::from_seed(&[0x47; 32]);
+        store.put(claim(&a, "x", 1, 50), 1).unwrap();
+        store.put(claim(&b, "x", 1, u64::MAX), 1).unwrap();
+        assert_eq!(
+            store.put(claim(&c, "x", 1, u64::MAX), 1).unwrap_err(),
+            "ALIAS_STORE_FULL"
+        );
+        // Updating an existing key never needs a new slot.
+        store.put(claim(&b, "x", 2, u64::MAX), 1).unwrap();
+        store.put(claim(&c, "x", 1, u64::MAX), 51).unwrap();
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn decode_is_exact() {
+        let id = Identity::from_seed(&[0x48; 32]);
+        let rec = claim(&id, "poline", 1, u64::MAX);
+        let mut wire = rec.encode().unwrap();
+        assert_eq!(AliasRecord::decode(&wire).unwrap(), rec);
+        wire.push(0);
+        assert_eq!(
+            AliasRecord::decode(&wire).unwrap_err(),
+            "alias trailing bytes"
+        );
     }
 }

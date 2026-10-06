@@ -12,6 +12,17 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: jobs only read the repository. Third-party actions are
+# pinned to full commit SHAs (the comment names the release); bump them
+# deliberately. RUST_TOOLCHAIN pins rustc/clippy so a new stable release cannot
+# change CI results without a code change — raven-toolchain-canary.yml tracks
+# latest stable separately.
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.98.0"
+
 concurrency:
   group: raven-serverless-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,11 +31,12 @@ jobs:
   tree-presence:
     name: Detect optional product trees
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       libp2p_bridge: ${{ steps.detect.outputs.libp2p_bridge }}
       ios_app: ${{ steps.detect.outputs.ios_app }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: detect
         name: Record whether iOS / Libp2pBridge trees exist
         run: |
@@ -43,30 +55,144 @@ jobs:
             echo "ios_app=false" >> "$GITHUB_OUTPUT"
             echo "ios-native/RAVEN absent on this tree — iOS protocol security tests will skip"
           fi
+      # A skipped job looks green in the checks list. Say loudly which
+      # security suites did NOT run on this tree.
+      - name: Coverage manifest (skipped security suites)
+        run: |
+          set -euo pipefail
+          echo "## Security suites NOT exercised on this tree" >> "$GITHUB_STEP_SUMMARY"
+          if [[ ! -f ios-native/RAVEN/Libp2pBridge/go.mod ]]; then
+            echo "- go-bridge (Go libp2p bridge security): ios-native/RAVEN/Libp2pBridge absent" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Coverage gap::Go libp2p bridge security tests skipped (tree absent)"
+          fi
+          if [[ ! -f ios-native/RAVEN/RAVEN.xcodeproj/project.pbxproj ]]; then
+            echo "- ios-security (iOS protocol security + Swift rvn1 vector parity): ios-native/RAVEN absent" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Coverage gap::iOS/Swift protocol security and vector parity skipped (tree absent)"
+          fi
 
   messaging-product-boundary:
     name: Messaging-only product boundary
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Refuse public-social product regressions
         run: bash node/scripts/messaging_product_boundary_gate.sh
 
   secret-scan:
     name: Secret pattern scan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - name: Run secret history scan (CI mode)
         run: bash scripts/secret_history_scan.sh --ci
 
+  harness-integrity:
+    name: Harness self-tests + protocol freeze
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Protocol freeze hashes (docs/PROTOCOL_FREEZE_HASHES_V1.md)
+        run: bash scripts/freeze_protocol_hashes.sh --check
+      - name: No diverging docs/ duplicates under node/
+        run: bash scripts/check_doc_pointers.sh
+      # Proves a failing assertion inside a step turns the harness red (the
+      # historical `( ... ) && ok || fail` form silently ignored it).
+      - name: Proof / reliability harness self-tests
+        run: |
+          set -euo pipefail
+          bash scripts/final_serverless_proof.sh --self-test
+          bash scripts/reliability_matrix_20.sh --self-test
+          bash scripts/harness_util_selftest.sh
+      # The secret scanner must still see a real seed after many allow-listed RFC 8032
+      # test seeds, and the O6 IPC-surface guard must fire on an injected forbidden op
+      # (both used to be silent no-ops). Neither writes anything. The Keychain guard
+      # check keeps every macOS Keychain call behind macos_keychain::guarded.
+      - name: Scanner / guard self-tests (secret scan, O6 IPC guard, Keychain guard)
+        run: |
+          set -euo pipefail
+          bash scripts/secret_history_scan.sh --self-test
+          bash scripts/o6_m1_same_rvn1_bind_check.sh --self-test
+          bash scripts/keychain_guard_check.sh --self-test
+          bash scripts/keychain_guard_check.sh
+      - name: shellcheck (errexit pitfalls + harness warnings)
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          # SC2251: a bare `! cmd` never trips errexit, so it asserts nothing.
+          shellcheck --include=SC2251 scripts/*.sh scripts/lib/*.sh scripts/release/*.sh \
+            node/scripts/*.sh node/scripts/install/*.sh
+          shellcheck -S warning \
+            scripts/final_serverless_proof.sh scripts/reliability_matrix_20.sh \
+            scripts/lib/proof_assert.sh scripts/freeze_protocol_hashes.sh scripts/check_doc_pointers.sh \
+            scripts/secret_history_scan.sh scripts/release/*.sh node/scripts/install/*.sh \
+            node/scripts/lan_path_smoke.sh node/scripts/bridge_abc_demo.sh \
+            node/scripts/two_node_demo.sh node/scripts/internet_dial_smoke.sh \
+            node/scripts/libp2p_swarm_smoke.sh node/scripts/mailbox_opaque_smoke.sh \
+            node/scripts/bootstrap_manual_peer_smoke.sh node/scripts/internet_indexed_two_node.sh \
+            node/scripts/lan_direct_two_node.sh
+
+  # The ordinary SQLite amalgamation (~9.5 MB sqlite3.c) is compiled into every default
+  # build and its SHA-256 pins live in the same repo (libsqlite3-sys-raven/build.rs), so
+  # a commit that edits both builds green everywhere else. This ties the files AND the
+  # pins to the checksummed crates.io libsqlite3-sys 0.38.2 archive. It is merge-blocking
+  # only once this check is added to branch protection (the required-check pin is OFF).
+  # curl is retried: a provenance MISMATCH fails the same way every attempt.
+  supply-chain-provenance:
+    name: Vendored SQLite provenance vs crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: libsqlite3-sys-raven ordinary SQLite vs checksummed crates.io archive
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if bash node/scripts/verify_sqlcipher_fork_ordinary_sqlite_upstream.sh; then
+              exit 0
+            fi
+            echo "provenance verifier attempt $attempt failed" >&2
+            sleep $((attempt * 5))
+          done
+          exit 1
+
+  # The §59 harness cited by README.md. Lab build (unsafe-demo-crypto); exits 1
+  # unless every step is green. Artifacts hold public keys only.
+  final-serverless-proof:
+    name: Final serverless proof (lab harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: node
+          prefix-key: final-serverless-proof
+      - name: Run scripts/final_serverless_proof.sh
+        run: bash scripts/final_serverless_proof.sh
+      - name: Upload proof artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: final-serverless-proof
+          path: |
+            node/proof_artifacts/
+            !node/proof_artifacts/LATEST
+          if-no-files-found: warn
+
   rust-linux:
     name: Rust + vectors (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     # GNU/Linux Secret Service *creation* is fail-closed before R1. Debug CI
-    # uses locked-file so cargo test / ash init can create ephemeral identities.
+    # uses locked-file so cargo test --locked / ash init can create ephemeral identities.
     env:
       RAVEN_IDENTITY_BACKEND: locked-file
       RAVEN_ALLOW_EPHEMERAL_DATA_DIR: "1"
@@ -74,34 +200,47 @@ jobs:
       run:
         working-directory: node
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: node
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
         run: |
-          cargo clippy -p raven-core -p ash -p raven-node -p raven-swarm --all-targets -- -D warnings
-          cargo clippy -p raven-swarm --all-features --all-targets -- -D warnings
+          cargo clippy --locked -p raven-core -p ash -p raven-node -p raven-swarm --all-targets -- -D warnings
+          cargo clippy --locked -p raven-swarm --all-features --all-targets -- -D warnings
+          # Non-default debug / experimental features that ship in debug builds.
+          cargo clippy --locked -p ash -p raven-node --all-targets \
+            --features ash/debug-trace-delivery,raven-node/corebluetooth -- -D warnings
+      - name: fuzz targets type-check (cargo-fuzz crate, stable)
+        run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --lib --bins -- -D warnings
       - name: RustSec active dependency audit
         run: |
           set -euo pipefail
           cargo install cargo-audit --locked --version 0.22.2
           python3 -m unittest scripts/test_audit_active_dependencies.py
           python3 scripts/audit_active_dependencies.py
+      # The lab SQLCipher provider (bundled-sqlcipher*, full-braid-durable-lab)
+      # must never reach a shipped package's resolved feature graph. The script
+      # also self-tests that it fires on raven-core's lab feature graph, and asserts
+      # that libsqlite3-sys still resolves to the audited path fork (node + node/fuzz
+      # lockfiles): a rusqlite bump that drops the [patch] fails here.
+      - name: SQLCipher lab provider absent from release feature graphs
+        run: bash scripts/sqlcipher_release_feature_audit.sh
       - name: test raven-core + ash
-        run: cargo test -p raven-core -p ash -p raven-node
+        run: cargo test --locked -p raven-core -p ash -p raven-node
       # CLI DX: menu/CLI smoke only (not Keychain / launchd / Gatekeeper).
       # Must stay on script-default target/debug/ash — locked-file is refused in Release.
       # Script uses RAVEN_IDENTITY_BACKEND=locked-file and ephemeral mktemp dirs.
       - name: ash menu smoke
         run: ./scripts/ash_menu_smoke.sh
       - name: LAN handshake KAT (shared vectors, no live network)
-        run: cargo test -p raven-core --lib lan_
+        run: cargo test --locked -p raven-core --lib lan_
       # Must stay on script-default target/debug — locked-file is refused in Release.
       # Script uses RAVEN_IDENTITY_BACKEND=locked-file and
       # RAVEN_CHAT_HISTORY_BACKEND=locked-file so GNU/Linux SS connect-fail
@@ -109,15 +248,15 @@ jobs:
       - name: LAN direct two-node smoke
         run: ./scripts/lan_direct_two_node.sh
       - name: bridge + fuzz smoke
-        run: cargo test -p raven-core --test bridge_v1 --test fuzz_smoke
+        run: cargo test --locked -p raven-core --test bridge_v1 --test fuzz_smoke
       - name: 10,000-message queue reliability gate
-        run: cargo test -p raven-core --test reliability_10k -- --ignored
+        run: cargo test --locked -p raven-core --test reliability_10k -- --ignored
       - name: Deterministic 1,000-node adversarial DTN simulation
         run: |
-          cargo test -p raven-core --test network_sim_1000
-          cargo test --release -p raven-core --test network_sim_1000
+          cargo test --locked -p raven-core --test network_sim_1000
+          cargo test --locked --release -p raven-core --test network_sim_1000
       - name: build swarm
-        run: cargo build -p raven-swarm -p raven-node
+        run: cargo build --locked -p raven-swarm -p raven-node
       - name: experimental mailbox/NAT tests (still production-disabled)
         run: |
           set -euo pipefail
@@ -138,11 +277,11 @@ jobs:
             fi
             rm -f "$log"
           }
-          cargo test -p raven-swarm --all-features --all-targets
-          cargo build --release -p raven-swarm \
+          cargo test --locked -p raven-swarm --all-features --all-targets
+          cargo build --locked --release -p raven-swarm \
             --features experimental-offline-mailbox \
             --bin raven-swarm-mailbox-experimental
-          cargo build --release -p raven-swarm \
+          cargo build --locked --release -p raven-swarm \
             --features experimental-nat-connectivity \
             --bin raven-swarm-connectivity-experimental
           expect_failure_with_message \
@@ -155,10 +294,10 @@ jobs:
       - name: release crypto feature gate
         run: |
           set -euo pipefail
-          cargo build --release -p raven-core -p raven-node -p ash
+          cargo build --locked --release -p raven-core -p raven-node -p ash
           for package in raven-core raven-node ash; do
             log="$(mktemp)"
-            if cargo build --release -p "$package" --features unsafe-demo-crypto >"$log" 2>&1; then
+            if cargo build --locked --release -p "$package" --features unsafe-demo-crypto >"$log" 2>&1; then
               echo "unsafe-demo-crypto unexpectedly linked into $package release" >&2
               rm -f "$log"
               exit 1
@@ -204,11 +343,11 @@ jobs:
           python3 generate_rvn1.py
           git diff --exit-code -- ../../shared-vectors/rvn1
           test -z "$(git ls-files --others --exclude-standard -- ../../shared-vectors/rvn1)"
-      - name: SBOM (cargo tree + cyclonedx if available)
+      - name: SBOM (cargo tree --locked + cyclonedx if available)
         run: |
           set -euo pipefail
           mkdir -p target/sbom
-          cargo tree -p raven-core -p ash -p raven-node -p raven-swarm --prefix depth \
+          cargo tree --locked -p raven-core -p ash -p raven-node -p raven-swarm --prefix depth \
             > target/sbom/raven-cargo-tree.txt
           if cargo install --list 2>/dev/null | grep -q '^cargo-cyclonedx '; then
             cargo cyclonedx -p raven-core --format json --output-cdx target/sbom/raven-core.cdx.json || true
@@ -220,7 +359,7 @@ jobs:
           test -s target/sbom/raven-cargo-tree.txt
           ls -la target/sbom/
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: raven-sbom-linux
           path: node/target/sbom/
@@ -229,38 +368,41 @@ jobs:
   rust-macos:
     name: Rust (macOS)
     runs-on: macos-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: node
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: node
       - name: test raven-core + ash + swarm build
         run: |
-          cargo test -p raven-core -p ash -p raven-node
-          cargo test -p raven-core --lib lan_
-          cargo build -p raven-swarm -p raven-node
-          cargo build --release -p raven-core -p raven-node -p ash
+          cargo test --locked -p raven-core -p ash -p raven-node
+          cargo test --locked -p raven-core --lib lan_
+          cargo build --locked -p raven-swarm -p raven-node
+          cargo build --locked --release -p raven-core -p raven-node -p ash
       # CLI DX: menu/CLI smoke only (not Keychain / launchd / Gatekeeper).
       # Must stay on script-default target/debug/ash — locked-file is refused in Release.
       # locked-file avoids Keychain ACL hangs in CI — not a production Keychain claim.
       - name: ash menu smoke
         run: ./scripts/ash_menu_smoke.sh
       # Named reliability gates (Sprint 0 evidence bar). reliability_10k is
-      # #[ignore] and is NOT run by the umbrella cargo test above.
+      # #[ignore] and is NOT run by the umbrella cargo test --locked above.
       # reliability_10k on macOS is QUEUE DURABILITY ONLY — not a path proof.
       # Path proof: named bridge_v1 (this job) and/or ash_menu_smoke (CLI DX #16).
       - name: 10,000-message queue reliability gate
         run: |
           set -euo pipefail
-          cargo test -p raven-core --test reliability_10k -- --ignored
+          cargo test --locked -p raven-core --test reliability_10k -- --ignored
       - name: bridge_v1 (pure Rust)
         run: |
           set -euo pipefail
-          cargo test -p raven-core --test bridge_v1
+          cargo test --locked -p raven-core --test bridge_v1
       - name: libp2p swarm smoke
         run: ./scripts/libp2p_swarm_smoke.sh
       - name: bootstrap manual-peer smoke
@@ -275,27 +417,48 @@ jobs:
   rust-windows:
     name: Rust (Windows)
     runs-on: windows-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: node
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: node
+      # The runner's git defaults to core.autocrlf=true. build.rs hashes the ordinary
+      # SQLite amalgamation on every build and the protocol freeze manifest hashes
+      # protocol/ + shared-vectors/ byte for byte, so a CRLF checkout of any of them
+      # breaks the build with an opaque hash panic. .gitattributes pins them to LF /
+      # -text; fail here first with a clear message if that ever regresses.
+      - name: Byte-pinned inputs are LF in this checkout (core.autocrlf guard)
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          bad="$(git ls-files --eol -- node/third_party protocol shared-vectors \
+            | awk '$1 == "i/lf" && $2 != "w/lf" && $2 != "w/none"' || true)"
+          if [[ -n "$bad" ]]; then
+            echo "files that are LF in the index but not LF in the working tree (check .gitattributes / core.autocrlf):" >&2
+            echo "$bad" | head -n 20 >&2
+            exit 1
+          fi
+          echo "byte-pinned paths are LF in the working tree"
       - name: test raven-core + ash
         run: |
-          cargo test -p raven-core -p ash -p raven-node
-          cargo build -p ash -p raven-node -p raven-swarm
-          cargo build --release -p raven-core -p raven-node -p ash
+          cargo test --locked -p raven-core -p ash -p raven-node
+          cargo build --locked -p ash -p raven-node -p raven-swarm
+          cargo build --locked --release -p raven-core -p raven-node -p ash
       # Named reliability gates (Sprint 0 evidence bar). cargo, not bash.
       # reliability_10k on Windows is QUEUE DURABILITY ONLY — not a path proof.
       # Path proof: named bridge_v1 + ash_doctor_send_smoke.ps1 (this job).
       - name: 10,000-message queue reliability gate
-        run: cargo test -p raven-core --test reliability_10k -- --ignored
+        run: cargo test --locked -p raven-core --test reliability_10k -- --ignored
       - name: bridge_v1 (pure Rust)
-        run: cargo test -p raven-core --test bridge_v1
+        run: cargo test --locked -p raven-core --test bridge_v1
       - name: ash doctor→send smoke (Windows terminal path)
         shell: pwsh
         run: |
@@ -356,6 +519,50 @@ jobs:
               Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
             }
           }
+      # Upgrade path + task settings of the logon-task installer (never exercised by the
+      # -SkipScheduledTask run above):
+      #  * a running CLI session holds ash.exe open: Windows refuses to overwrite a running
+      #    image but allows renaming it (FileShare.Delete models exactly that), so the
+      #    installer must move it aside (ash.exe.old) instead of aborting on Copy-Item;
+      #  * the task must register with no execution time limit (PT0S): the Task Scheduler
+      #    default of 72h silently stops the always-on daemon after three days. A uniquely
+      #    named task is registered with -NoStart and always unregistered.
+      - name: windows_service.ps1 upgrade path + logon-task settings
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $script = "scripts/install/windows_service.ps1"
+          if (-not (Test-Path $script)) { throw "missing $script" }
+          $root = Join-Path $env:RUNNER_TEMP "raven-windows-service-upgrade"
+          $dataDir = Join-Path $root "data"
+          $binDir = Join-Path $root "bin"
+          $taskName = "RavenNodeBridgeCI-$PID"
+          $hold = $null
+          try {
+            New-Item -ItemType Directory -Force -Path $dataDir, $binDir | Out-Null
+            & (Resolve-Path $script) -DataDir $dataDir -BinDir $binDir -SkipScheduledTask
+            $ash = Join-Path $binDir "ash.exe"
+            $hold = [System.IO.File]::Open($ash, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Delete)
+            & (Resolve-Path $script) -DataDir $dataDir -BinDir $binDir -SkipScheduledTask
+            if (-not (Test-Path -LiteralPath "$ash.old")) { throw "locked ash.exe was not moved aside to ash.exe.old" }
+            if (-not (Test-Path -LiteralPath $ash)) { throw "ash.exe missing after upgrade over a locked copy" }
+            $hold.Dispose()
+            $hold = $null
+            & (Resolve-Path $script) -DataDir $dataDir -BinDir $binDir -TaskName $taskName -NoStart
+            $task = Get-ScheduledTask -TaskName $taskName
+            $limit = [string]$task.Settings.ExecutionTimeLimit
+            if ($limit -ne "PT0S") { throw "ExecutionTimeLimit is '$limit', expected PT0S (no limit)" }
+            if ($task.Settings.StartWhenAvailable -ne $true) { throw "StartWhenAvailable is not set" }
+            if ([int]$task.Settings.RestartCount -lt 3) { throw "RestartCount is $($task.Settings.RestartCount), expected restart-on-failure" }
+            if ([string]$task.State -eq "Running") { throw "-NoStart started the task" }
+            Write-Host "logon task settings OK (PT0S, StartWhenAvailable, restart-on-failure)"
+          } finally {
+            if ($null -ne $hold) { $hold.Dispose() }
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $root) {
+              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
       - name: bootstrap manual-peer smoke
         shell: bash
         run: ./scripts/bootstrap_manual_peer_smoke.sh
@@ -365,12 +572,13 @@ jobs:
     needs: tree-presence
     if: needs.tree-presence.outputs.libp2p_bridge == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: ios-native/RAVEN/Libp2pBridge
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: ios-native/RAVEN/Libp2pBridge/go.mod
           cache-dependency-path: ios-native/RAVEN/Libp2pBridge/go.sum
@@ -384,11 +592,12 @@ jobs:
     needs: tree-presence
     if: needs.tree-presence.outputs.ios_app == 'true'
     runs-on: macos-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: ios-native/RAVEN
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Select an available iOS simulator
         id: simulator
         run: |

@@ -26,6 +26,9 @@ pub const RAVEN_SQLCIPHER_HMAC_ALGORITHM: &str = "HMAC_SHA512";
 pub const RAVEN_SQLCIPHER_KDF_ALGORITHM: &str = "PBKDF2_HMAC_SHA512";
 pub const RAVEN_SQLCIPHER_SOURCE_SHA256: &str =
     "8adaff6b464052a74e7adaa3cfa2725400f48eca68f47856fa806eaf30bdf2c9";
+/// `PRAGMA fullfsync` / `checkpoint_fullfsync` are set and verified on Apple
+/// targets only (macOS and iOS share this profile).
+const APPLE_FULLFSYNC: bool = cfg!(target_vendor = "apple");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RavenSqlCipherProfileV1 {
@@ -69,16 +72,20 @@ pub struct RavenSqlCipherRawKey {
 }
 
 impl RavenSqlCipherRawKey {
-    pub fn ios_app_group(key: [u8; 32], salt: [u8; 16]) -> Self {
+    /// Takes the key by reference: the only copy made is the one this value
+    /// owns and wipes on drop (a by-value `[u8; 32]` would leave the caller's
+    /// copy behind).
+    pub fn ios_app_group(key: &[u8; 32], salt: [u8; 16]) -> Self {
         Self {
-            key,
+            key: *key,
             profile: RavenSqlCipherHeaderProfile::IosAppGroup { salt },
         }
     }
 
-    pub fn terminal(key: [u8; 32]) -> Self {
+    /// See [`Self::ios_app_group`] on why the key is borrowed.
+    pub fn terminal(key: &[u8; 32]) -> Self {
         Self {
-            key,
+            key: *key,
             profile: RavenSqlCipherHeaderProfile::Terminal,
         }
     }
@@ -176,10 +183,16 @@ impl RavenSqlCipherConnection {
         proof: RavenSqlCipherFirstInstallProof,
         key: &RavenSqlCipherRawKey,
     ) -> Result<Self, RavenSqlCipherOpenError> {
-        if proof.canonical_path.exists() {
-            return Err(RavenSqlCipherOpenError::FirstInstallProofStale);
+        // Exclusive, owner-only pre-creation closes the exists()→open window:
+        // a file planted in between fails `create_new` instead of SQLite
+        // adopting a foreign inode or mode. SQLite gives new -wal/-shm files
+        // the database file's mode, so the whole triplet ends up 0600.
+        precreate_private_database(&proof.canonical_path)?;
+        let opened = open_profile(proof.canonical_path.clone(), key);
+        if opened.is_err() {
+            remove_if_still_empty(&proof.canonical_path);
         }
-        open_profile(proof.canonical_path, true, key)
+        opened
     }
 
     pub fn open_existing(
@@ -187,7 +200,7 @@ impl RavenSqlCipherConnection {
         key: &RavenSqlCipherRawKey,
     ) -> Result<Self, RavenSqlCipherOpenError> {
         let path = validate_existing_path(path, key.uses_public_header())?;
-        open_profile(path, false, key)
+        open_profile(path, key)
     }
 
     pub fn report(&self) -> &RavenSqlCipherProfileV1 {
@@ -203,10 +216,23 @@ impl RavenSqlCipherConnection {
         &self.canonical_path
     }
 
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` reports a blocked checkpoint as a
+    /// `busy=1` result row, not as an error. Fail closed on it: callers hash
+    /// or snapshot the main file after this returns, and a checkpoint that a
+    /// concurrent reader blocked left that file behind the WAL. The busy
+    /// timeout already retried, so there is no retry loop here.
     pub fn checkpoint_truncate(&self) -> Result<(), RavenSqlCipherOpenError> {
-        self.connection
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .map_err(|error| sqlite_error("checkpoint", error))
+        let busy: i64 = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(|error| sqlite_error("checkpoint", error))?;
+        if busy != 0 {
+            return Err(RavenSqlCipherOpenError::Sqlite {
+                stage: "checkpoint_busy",
+                code: ffi::SQLITE_BUSY,
+            });
+        }
+        Ok(())
     }
 
     pub fn reverify_profile_for_lab(
@@ -220,18 +246,17 @@ impl RavenSqlCipherConnection {
     }
 }
 
+/// Never passes SQLITE_OPEN_CREATE: first install pre-creates the file
+/// exclusively (see `RavenSqlCipherConnection::create`), so SQLite never
+/// creates a database file itself.
 fn open_profile(
     canonical_path: PathBuf,
-    create: bool,
     key: &RavenSqlCipherRawKey,
 ) -> Result<RavenSqlCipherConnection, RavenSqlCipherOpenError> {
-    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_FULL_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
         | OpenFlags::SQLITE_OPEN_EXRESCODE;
-    if create {
-        flags |= OpenFlags::SQLITE_OPEN_CREATE;
-    }
     let connection = Connection::open_with_flags(&canonical_path, flags)
         .map_err(|error| sqlite_error("open", error))?;
 
@@ -291,6 +316,15 @@ fn harden_connection_before_key(connection: &Connection) -> Result<(), RavenSqlC
         false,
         "dqs_dml",
     )?;
+
+    // The flag is process-global, sticky, and off by default in SQLCipher
+    // 4.17.0. Turn it on before the key is applied, so the page decryption
+    // and the full integrity scan in the open path already run with
+    // mlock-on-allocate and wipe-on-free. The pragma needs no keyed database;
+    // verify_runtime_and_build_report still reads it back.
+    connection
+        .execute_batch("PRAGMA cipher_memory_security=ON;")
+        .map_err(|error| sqlite_error("memory_security", error))?;
     Ok(())
 }
 
@@ -350,8 +384,7 @@ fn configure_post_integrity_security(
 ) -> Result<(), RavenSqlCipherOpenError> {
     connection
         .execute_batch(
-            "PRAGMA cipher_memory_security=ON;
-             PRAGMA cipher_log='off';
+            "PRAGMA cipher_log='off';
              PRAGMA cipher_log_level='NONE';",
         )
         .map_err(|error| sqlite_error("post_integrity_security", error))?;
@@ -370,10 +403,24 @@ fn configure_runtime_profile(connection: &Connection) -> Result<(), RavenSqlCiph
              PRAGMA mmap_size=0;
              PRAGMA locking_mode=NORMAL;
              PRAGMA foreign_keys=ON;
-             PRAGMA synchronous=FULL;
-             PRAGMA journal_mode=WAL;",
+             PRAGMA synchronous=FULL;",
         )
         .map_err(|error| sqlite_error("runtime_profile", error))?;
+    // Profile revision (additive, Apple only): `synchronous=FULL` alone does
+    // not make a commit power-loss durable on macOS/iOS. Plain fsync does not
+    // flush the drive cache there, and SQLite issues F_FULLFSYNC only for
+    // `fullfsync` (commits) / `checkpoint_fullfsync` (checkpoints). The anchor
+    // update is ordered after the SQLite commit, so an unflushed commit would
+    // leave the container behind its anchor. No-ops elsewhere, so not set.
+    if APPLE_FULLFSYNC {
+        connection
+            .execute_batch("PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;")
+            .map_err(|error| sqlite_error("fullfsync", error))?;
+    }
+    // Last: the journal-mode switch commits through the settings above.
+    connection
+        .execute_batch("PRAGMA journal_mode=WAL;")
+        .map_err(|error| sqlite_error("journal_mode", error))?;
     Ok(())
 }
 
@@ -503,6 +550,13 @@ fn verify_runtime_and_build_report(
     require_string("journal_mode", &journal_mode, "wal")?;
     let synchronous = pragma_i64(connection, "synchronous", "synchronous")?;
     require_i64("synchronous", synchronous, 2)?;
+    if APPLE_FULLFSYNC {
+        let fullfsync = pragma_i64(connection, "fullfsync", "fullfsync")?;
+        require_i64("fullfsync", fullfsync, 1)?;
+        let checkpoint_fullfsync =
+            pragma_i64(connection, "checkpoint_fullfsync", "checkpoint_fullfsync")?;
+        require_i64("checkpoint_fullfsync", checkpoint_fullfsync, 1)?;
+    }
     let foreign_keys = pragma_i64(connection, "foreign_keys", "foreign_keys")?;
     require_i64("foreign_keys", foreign_keys, 1)?;
     let temp_store = pragma_i64(connection, "temp_store", "temp_store")?;
@@ -588,25 +642,74 @@ pub fn scan_profile_files_for_plaintext(
     if sentinel.len() < 32 {
         return Err(RavenSqlCipherOpenError::PathRejected("sentinel"));
     }
-    let mut candidates = vec![database_path.to_path_buf()];
-    candidates.push(PathBuf::from(format!("{}-wal", database_path.display())));
-    candidates.push(PathBuf::from(format!("{}-shm", database_path.display())));
-    if let Ok(entries) = fs::read_dir(temp_directory) {
-        for entry in entries.flatten() {
-            candidates.push(entry.path());
-        }
+    // Fail closed: a scan that inspected nothing must not read as "no
+    // plaintext". The main file must be readable; only the sidecars (gone
+    // after a TRUNCATE checkpoint) and temp entries that vanish mid-scan may
+    // be absent. Any other read error, or an unreadable temp directory, fails.
+    let mut candidates = vec![(database_path.to_path_buf(), true)];
+    for suffix in ["-wal", "-shm"] {
+        candidates.push((sidecar_path(database_path, suffix), false));
     }
-    for candidate in candidates {
-        if let Ok(bytes) = fs::read(candidate) {
-            if bytes
-                .windows(sentinel.len())
-                .any(|window| window == sentinel)
-            {
-                return Err(RavenSqlCipherOpenError::PlaintextSentinelFound);
+    let mut directories = vec![temp_directory.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let entries =
+            fs::read_dir(&directory).map_err(|_| RavenSqlCipherOpenError::TempDirectoryRejected)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| RavenSqlCipherOpenError::TempDirectoryRejected)?;
+            match entry.file_type() {
+                Ok(file_type) if file_type.is_dir() => directories.push(entry.path()),
+                Ok(_) => candidates.push((entry.path(), false)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(RavenSqlCipherOpenError::TempDirectoryRejected),
             }
         }
     }
+    for (candidate, required) in candidates {
+        match fs::read(&candidate) {
+            Ok(bytes) => {
+                if bytes
+                    .windows(sentinel.len())
+                    .any(|window| window == sentinel)
+                {
+                    return Err(RavenSqlCipherOpenError::PlaintextSentinelFound);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if required {
+                    return Err(RavenSqlCipherOpenError::PathRejected("scan_missing"));
+                }
+            }
+            Err(_) => return Err(RavenSqlCipherOpenError::PathRejected("scan_read")),
+        }
+    }
     Ok(())
+}
+
+fn precreate_private_database(path: &Path) -> Result<(), RavenSqlCipherOpenError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(RavenSqlCipherOpenError::FirstInstallProofStale)
+        }
+        Err(_) => Err(RavenSqlCipherOpenError::PathRejected("create")),
+    }
+}
+
+/// Undo our own pre-creation after a failed first open, never anything else.
+fn remove_if_still_empty(path: &Path) {
+    if fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file() && metadata.len() == 0)
+        .unwrap_or(false)
+    {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn validate_new_path(path: &Path) -> Result<PathBuf, RavenSqlCipherOpenError> {
@@ -632,6 +735,19 @@ fn validate_existing_path(
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(RavenSqlCipherOpenError::PathRejected("metadata"));
     }
+    // Only `create` may initialise an empty file. `open_profile` is that same
+    // code path, so on a zero-byte file `open_existing` would key it, pass the
+    // (trivially true) integrity gate and switch it to WAL: a truncated store
+    // becomes a valid, empty, correctly keyed one and the evidence of the
+    // loss is overwritten. Every store this profile wrote holds at least its
+    // first full page, because the journal-mode switch commits page 1 to the
+    // main file before the WAL exists.
+    if metadata.len() == 0 {
+        return Err(RavenSqlCipherOpenError::PathRejected("empty"));
+    }
+    if metadata.len() < RAVEN_SQLCIPHER_PAGE_SIZE as u64 {
+        return Err(RavenSqlCipherOpenError::PathRejected("short"));
+    }
     let canonical = canonicalize_parent(path)?;
     if require_public_header {
         validate_public_plaintext_header(&canonical)?;
@@ -646,7 +762,17 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn read_regular_sidecar(path: &Path) -> Result<Option<Vec<u8>>, RavenSqlCipherOpenError> {
+/// WAL header bytes the binding check reads (magic, version, page size, salts).
+const WAL_HEAD_LEN: usize = 32;
+/// Both 48-byte wal-index header copies at the start of `-shm`.
+const SHM_HEAD_LEN: usize = 96;
+
+/// First `max_len` bytes of a regular sidecar (all of it when shorter), so
+/// `len() < max_len` means the sidecar's length is exactly `len()`.
+fn read_regular_sidecar_head(
+    path: &Path,
+    max_len: usize,
+) -> Result<Option<Vec<u8>>, RavenSqlCipherOpenError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -655,23 +781,44 @@ fn read_regular_sidecar(path: &Path) -> Result<Option<Vec<u8>>, RavenSqlCipherOp
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(RavenSqlCipherOpenError::PathRejected("sidecar_metadata"));
     }
-    fs::read(path)
-        .map(Some)
-        .map_err(|_| RavenSqlCipherOpenError::PathRejected("sidecar_read"))
+    // Bounded: a WAL can be large and only its header is inspected.
+    let mut head = Vec::with_capacity(max_len);
+    fs::File::open(path)
+        .and_then(|file| file.take(max_len as u64).read_to_end(&mut head))
+        .map_err(|_| RavenSqlCipherOpenError::PathRejected("sidecar_read"))?;
+    Ok(Some(head))
 }
 
+/// `-shm` is volatile: SQLite rebuilds the wal-index from the WAL whenever
+/// its header is not valid. A file too short for both header copies, or
+/// zero-filled there, has no header to bind. That is the state after power
+/// loss before the mapped first page reached disk, or a crash right after
+/// the file was created, and it cannot be a swapped foreign `-shm`.
+fn shm_header_initialised(head: &[u8]) -> bool {
+    head.len() >= SHM_HEAD_LEN && head.iter().any(|byte| *byte != 0)
+}
+
+/// A live writer in another process (`ash` and `raven-node` share these
+/// files) can checkpoint-truncate or restart the WAL between the two sidecar
+/// reads and produce a spurious mismatch. One immediate re-read separates
+/// that from a sidecar pair that really disagrees.
 fn validate_sidecar_binding(path: &Path) -> Result<(), RavenSqlCipherOpenError> {
-    let wal = read_regular_sidecar(&sidecar_path(path, "-wal"))?;
-    let shm = read_regular_sidecar(&sidecar_path(path, "-shm"))?;
+    match check_sidecar_binding(path) {
+        Err(RavenSqlCipherOpenError::ProfileMismatch(_)) => check_sidecar_binding(path),
+        other => other,
+    }
+}
+
+fn check_sidecar_binding(path: &Path) -> Result<(), RavenSqlCipherOpenError> {
+    let wal = read_regular_sidecar_head(&sidecar_path(path, "-wal"), WAL_HEAD_LEN)?;
+    let shm = read_regular_sidecar_head(&sidecar_path(path, "-shm"), SHM_HEAD_LEN)?;
     if shm.is_some() && wal.is_none() {
         return Err(RavenSqlCipherOpenError::ProfileMismatch("orphan_shm"));
     }
     let Some(wal) = wal else { return Ok(()) };
+    let shm = shm.filter(|head| shm_header_initialised(head));
     if wal.is_empty() {
         let Some(shm) = shm else { return Ok(()) };
-        if shm.len() < 96 {
-            return Err(RavenSqlCipherOpenError::ProfileMismatch("shm_header"));
-        }
         for base in [0usize, 48] {
             if read_ne_u32(&shm, base) != 3_007_000
                 || shm[base + 12] != 1
@@ -684,7 +831,7 @@ fn validate_sidecar_binding(path: &Path) -> Result<(), RavenSqlCipherOpenError> 
         }
         return Ok(());
     }
-    if wal.len() < 32 {
+    if wal.len() < WAL_HEAD_LEN {
         return Err(RavenSqlCipherOpenError::ProfileMismatch("wal_header"));
     }
     let magic = read_be_u32(&wal, 0);
@@ -697,9 +844,6 @@ fn validate_sidecar_binding(path: &Path) -> Result<(), RavenSqlCipherOpenError> 
         return Err(RavenSqlCipherOpenError::ProfileMismatch("wal_header"));
     }
     let Some(shm) = shm else { return Ok(()) };
-    if shm.len() < 96 {
-        return Err(RavenSqlCipherOpenError::ProfileMismatch("shm_header"));
-    }
     for base in [0usize, 48] {
         let shm_version = read_ne_u32(&shm, base);
         let shm_page_size = read_ne_u16(&shm, base + 14) as u32;

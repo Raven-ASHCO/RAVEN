@@ -8,8 +8,9 @@ The Ed25519 **identity seed** for desktop `raven-node`, `ash`, and `raven-swarm`
 |----------|---------|--------|
 | macOS | **Keychain** (generic password, service `app.raven.node.identity`) | Account = SHA-256 of canonical `data_dir`. Marker file `identity.backend` = `macos-keychain`. |
 | Windows | **DPAPI** file (`CryptProtectData`, `CRYPTPROTECT_UI_FORBIDDEN`) | Blob in `identity.seed` with magic `RVNDPAPI` + version. Bound to the Windows user. |
-| Linux (glibc desktop) | **Secret Service** when session bus / collection unlock succeeds | Same service/account attributes as Keychain. |
-| Linux (musl, headless, no Secret Service) | **Locked file** mode `0600` | **Approved** fallback — see below. |
+| Linux (glibc desktop) | **Secret Service** — *loading existing identities only* | Same service/account attributes as Keychain. **Creating a new identity is disabled in Release builds until R1** (`GNU/Linux Secret Service identity creation is disabled before R1`); an existing Secret Service identity still loads, verifies and deletes. Without a session bus the error is a `secret-service connect:` failure instead. |
+| Linux (musl and other Unix targets) | **None** | No protected identity backend: creation fails closed (`no protected identity backend on this Unix target`). |
+| Any OS, **debug / lab / CI only** | **Locked file** mode `0600` (`RAVEN_IDENTITY_BACKEND=locked-file`) | Explicit override honoured only in debug builds; **refused in Release builds** (`locked-file identity backend is forbidden in Release builds`). **Not** an approved production fallback — see below. |
 
 `ash doctor` reports `secure_keystore: backend=…` only (no seed bytes).
 
@@ -23,15 +24,27 @@ If a legacy **plaintext** `identity.seed` (exactly 32 raw bytes, no DPAPI magic)
 
 Migration runs automatically on first `load_identity` / `load_or_create_identity`.
 
-## Linux Secret Service unavailable
+## Linux: identity creation is disabled in Release builds (R1 pending)
 
-Headless servers, containers, and **musl static** builds do not link Secret Service (needs libdbus). In those environments Raven uses a **mode `0600` locked file** under `--data-dir`. That is an intentional, checklist-approved local keystore design when Secret Service is unavailable:
+Source of truth is `raven_core::identity_store` (`secret_service_set` and the
+locked-file gate), not older prose in this document.
 
-- File owner read/write only
-- Not world-readable
-- Still protect the host user account and disk encryption; do not copy `data_dir` to untrusted machines
+- **Release builds:** a new identity cannot be created on Linux. On glibc,
+  Secret Service *creation* is hard-disabled until R1 authorizes an add-only,
+  prompt-free backend; existing Secret Service identities still load. On musl and
+  other Unix targets there is no protected backend at all. `ash init`, `raven
+  init` and `raven-node service` therefore fail closed on a fresh Linux Release
+  install — see the limitation note in [`INSTALL_Linux.md`](INSTALL_Linux.md).
+- **Debug / lab / CI builds:** `RAVEN_IDENTITY_BACKEND=locked-file` stores the
+  seed in a mode `0600` file under `--data-dir`. This exists so CI and lab
+  scripts can run headless; it is refused in Release builds and must **not** be
+  presented or used as a production keystore. Do not build a debug/lab binary
+  just to get around the Release limitation for real conversations: the file is
+  only as safe as the host account and disk encryption.
 
-Prefer a graphical session with Secret Service on multi-user Linux desktops when available — new identities try Secret Service first and fall back to the locked file.
+Treat a locked-file seed like any plaintext-at-rest secret: file owner
+read/write only, not world-readable, never copy `data_dir` to untrusted
+machines.
 
 ## Operator reminders
 

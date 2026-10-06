@@ -2,7 +2,7 @@
 
 **Status:** Binding UX for serverless friendship plane (V1)  
 **Companions:** [`protocol/RAVEN_ALIAS_V1.md`](../protocol/RAVEN_ALIAS_V1.md), [`docs/SERVERLESS_FRIEND_MESH_BRIDGE_DESIGN.md`](SERVERLESS_FRIEND_MESH_BRIDGE_DESIGN.md), [`docs/SERVERLESS_MODEL.md`](SERVERLESS_MODEL.md)  
-**Branch:** `feature/raven-serverless-v1`
+**Branch (historical):** authored on `feature/raven-serverless-v1`; this file now lives on `main` and is a dated snapshot, not a statement about an open branch
 
 ## Zooko's triangle (law)
 

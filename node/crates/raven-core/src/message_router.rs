@@ -5,10 +5,10 @@
 //!
 //! Invariants: same message_id; no protocol translation; hop/TTL/dedup/size limits.
 
-use crate::bridge::{prepare_forward, BridgeRole, DropReason, EnvelopeIdentity};
-use crate::envelope::{EnvType, Envelope};
+use crate::bridge::{is_relayable_type, prepare_forward, BridgeRole, DropReason, EnvelopeIdentity};
+use crate::envelope::Envelope;
 use crate::forward_queue::{
-    ForwardItem, ForwardQueue, ForwardQueueError, ForwardState, PeerRateDecision,
+    EnqueueOutcome, ForwardItem, ForwardQueue, ForwardQueueError, ForwardState, PeerRateDecision,
     MAX_ENVELOPE_BYTES,
 };
 use crate::transport::{plan_paths, select_path, PathChoice, PathContext, TransportKind};
@@ -131,7 +131,10 @@ impl MessageRouter {
                 reason: DropReason::Malformed,
             };
         };
-        if EnvType::from_u8(env.env_type).is_none() {
+        // Same policy as `bridge::decide`: only Message and Ack are relayed or
+        // delivered. Checked before the replay lookup so no seen-state is
+        // written for a type that is never carried.
+        if !is_relayable_type(env.env_type) {
             return RouterOutcome::Dropped {
                 reason: DropReason::UnsupportedType,
             };
@@ -153,15 +156,17 @@ impl MessageRouter {
             };
         }
 
-        // Endpoint may accept when not forcing bridge and endpoint role on.
-        // Bridge path always for cross-transport when bridge enabled.
+        // The router sees opaque envelopes only and has no way to tell whether
+        // this node is the destination (routing_tag is not addressable here).
+        // With the bridge enabled it therefore always relays; the endpoint
+        // branch is reached only when the bridge is off or has no egress.
+        // Multi-role nodes run endpoint ingest separately (see
+        // `bridge::classify_multi_role` for the destination-first rule).
         let want_bridge = force_bridge
             || (self.bridge_enabled
                 && self.pick_egress(inbound.ingress).is_some()
                 && !self.endpoint_only_mode());
 
-        // Multi-role: if bridge enabled and ingress needs cross-transport, bridge wins
-        // over local endpoint for Message (ACK reverse also bridges).
         if want_bridge && self.bridge_enabled {
             return self.queue_or_forward(queue, &env, &inbound, identity);
         }
@@ -229,13 +234,22 @@ impl MessageRouter {
             expires_at_ms: env.expires_at,
             previous_hop: inbound.previous_hop.clone(),
         };
-        if let Err(e) = queue.enqueue(&item) {
-            return match e {
-                ForwardQueueError::QueueFull(_) => RouterOutcome::Dropped {
-                    reason: DropReason::Malformed,
-                },
-                other => RouterOutcome::Error(other.to_string()),
-            };
+        match queue.enqueue(&item) {
+            Ok(EnqueueOutcome::Inserted) => {}
+            // The object already has a pending row or a dedup tombstone (the
+            // bounded seen cache may have evicted it): a replay, never a
+            // second custody or a re-forward.
+            Ok(EnqueueOutcome::AlreadyPresent(_)) => {
+                return RouterOutcome::Dropped {
+                    reason: DropReason::Duplicate,
+                };
+            }
+            Err(ForwardQueueError::QueueFull(_)) => {
+                return RouterOutcome::Dropped {
+                    reason: DropReason::StoreFull,
+                };
+            }
+            Err(other) => return RouterOutcome::Error(other.to_string()),
         }
         if let Err(e) = queue.mark_object_seen(
             &identity.object_digest,
@@ -290,12 +304,11 @@ impl MessageRouter {
     }
 }
 
-/// Bridge role helper for decide() compatibility.
-pub fn router_role(bridge: bool, endpoint: bool) -> BridgeRole {
-    if bridge && !endpoint {
-        BridgeRole::Relay
-    } else if bridge {
-        // Multi-role machine: bridge subsystem still uses Relay semantics for opaque forward.
+/// Bridge role helper for decide() compatibility. A multi-role machine's
+/// bridge subsystem still uses Relay semantics for opaque forward, so the
+/// endpoint flag does not change the answer.
+pub fn router_role(bridge: bool, _endpoint: bool) -> BridgeRole {
+    if bridge {
         BridgeRole::Relay
     } else {
         BridgeRole::Endpoint
@@ -305,6 +318,7 @@ pub fn router_role(bridge: bool, endpoint: bool) -> BridgeRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope::EnvType;
     use crate::identity::Identity;
     use tempfile::tempdir;
 

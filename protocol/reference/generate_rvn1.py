@@ -234,6 +234,57 @@ def main():
         },
     })
 
+    # RavenPrekeyBundleV1 — full canonical signing KATs (bundle_structure_001 is
+    # frozen and carries only sizes). Both OTP branches, a real ML-KEM-768 EK
+    # (from the integrity-pinned hybrid KAT) and the section 4 clock window.
+    kat = json.loads((REPO_ROOT / "shared-vectors/rvn1" / MLKEM_INTEROP_VECTOR).read_text())
+    kat_exp = kat["expected"]
+    real_ek = bytes.fromhex(kat_exp["mlkem_ek_hex"])
+    otp_pub = bytes.fromhex(kat_exp["bob_x25519_public_hex"])
+    spk_pub = bytes.fromhex(kat_exp["alice_x25519_public_hex"])
+    prekey_signing = {}
+    for case_id, otp_id, otp_key, desc in (
+        ("bundle_signing_001", 7, otp_pub, "one-time prekey present (otp id 7)"),
+        ("bundle_signing_002", 0, None, "no one-time prekey (otp id 0, key omitted from signing bytes)"),
+    ):
+        b = prekey.PrekeyBundle(
+            identity_ed25519_pub=ALICE_ED_PUB,
+            device_id="alice-device-1",
+            x25519_pub=spk_pub,
+            mlkem768_ek=real_ek,
+            signed_prekey_id=3,
+            one_time_prekey_id=otp_id,
+            one_time_x25519_pub=otp_key,
+            created_at_ms=EPOCH_MS,
+            expires_at_ms=EPOCH_MS + 604800000,
+        )
+        b.signature = Ed25519PrivateKey.from_private_bytes(ALICE_ED_PRIV).sign(prekey.signing_bytes(b))
+        assert prekey.verify(b)
+        prekey_signing[case_id] = b
+        write(out, f"prekey/{case_id}.json", vec(
+            f"RavenPrekeyBundleV1 — canonical signing bytes ({desc})",
+            "identity-signed prekey bundle; verify with identity_ed25519_pub; "
+            "validity window per RAVEN_PREKEY_BUNDLE_V1 section 4 (5 min skew)",
+            {"identity_ed25519_pub_hex": b.identity_ed25519_pub.hex(),
+             "device_id": b.device_id,
+             "x25519_pub_hex": b.x25519_pub.hex(),
+             "mlkem768_ek_hex": b.mlkem768_ek.hex(),
+             "mlkem768_ek_source_vector": MLKEM_INTEROP_VECTOR.as_posix(),
+             "signed_prekey_id": b.signed_prekey_id,
+             "one_time_prekey_id": b.one_time_prekey_id,
+             "one_time_x25519_pub_hex": None if otp_key is None else otp_key.hex(),
+             "created_at_ms": b.created_at_ms,
+             "expires_at_ms": b.expires_at_ms},
+            {"signing_bytes_hex": prekey.signing_bytes(b).hex(),
+             "signature_hex": b.signature.hex(),
+             "verify_result": "accept",
+             "clock_cases": [
+                 {"now_ms": b.created_at_ms - 300000, "result": "accept"},
+                 {"now_ms": b.created_at_ms - 300001, "result": "reject", "error": "PREKEY_NOT_YET_VALID"},
+                 {"now_ms": b.expires_at_ms + 300000, "result": "accept"},
+                 {"now_ms": b.expires_at_ms + 300001, "result": "reject", "error": "PREKEY_EXPIRED"},
+             ]}))
+
     mailbox = store_tags.mailbox_tag(K_ROUTE, EPOCH_S, 0)
     write_frozen_order(out, "store/mailbox_tag_001.json", {
         "id": "mailbox_tag_001",
@@ -315,11 +366,78 @@ def main():
         "expected": {"verify_result": "reject", "error": "PREKEY_BAD_SIG"},
     })
 
+    # prekey_bad_sig.json (frozen) has no inputs; _002 is a concrete bundle.
+    good = prekey_signing["bundle_signing_001"]
+    bad_sig = bytearray(good.signature); bad_sig[0] ^= 0x01
+    tampered = prekey.PrekeyBundle(**{**good.__dict__, "signature": bytes(bad_sig)})
+    assert not prekey.verify(tampered)
+    write(out, "negative/prekey_bad_sig_002.json", vec(
+        "Prekey bundle with a flipped signature bit must reject",
+        "bundle_signing_001 with signature byte 0 xor 0x01",
+        {"bundle_vector": "prekey/bundle_signing_001.json",
+         "signing_bytes_hex": prekey.signing_bytes(tampered).hex(),
+         "signature_hex": bytes(bad_sig).hex(),
+         "identity_ed25519_pub_hex": ALICE_ED_PUB.hex(),
+         "validation_clock_ms": EPOCH_MS},
+        {"verify_result": "reject", "error": "PREKEY_BAD_SIG"}))
+
+    # Strict RVN1 decoder rules (post-freeze tightening) as shared negatives so
+    # every port rejects the same bytes. Each case is re-signed where the field
+    # is covered by the signature, so only the rule under test is violated.
+    def signed_envelope(**overrides):
+        env = build_message_envelope()
+        for k, v in overrides.items():
+            setattr(env, k, v)
+        env.sender_authentication = Ed25519PrivateKey.from_private_bytes(ALICE_ED_PRIV).sign(
+            envelope.signing_bytes(env))
+        return env
+
+    base_packed = envelope.pack(e)
+    short_auth = signed_envelope()
+    short_auth.sender_authentication = short_auth.sender_authentication[:63]
+    strict_cases = [
+        ("envelope_expires_not_after_created_001", "expires_at == created_at",
+         envelope.pack(signed_envelope(expires_at=EPOCH_MS)), "RVN1 requires expires_at > created_at"),
+        ("envelope_auth_len_63_001", "auth_len 63 (signature truncated)",
+         envelope.pack(short_auth), "auth_len MUST be exactly 64"),
+        ("envelope_reserved_flag_001", "flags bit 2 set",
+         envelope.pack(signed_envelope(flags=0x0004)), "only flag bits 0-1 are defined"),
+        ("envelope_env_type_0_001", "env_type 0",
+         envelope.pack(signed_envelope(env_type=0)), "env_type MUST be registered (1-4)"),
+        ("envelope_env_type_5_001", "env_type 5",
+         envelope.pack(signed_envelope(env_type=5)), "env_type MUST be registered (1-4)"),
+        ("envelope_trailing_byte_001", "one byte after the signature",
+         base_packed + b"\x00", "total length MUST equal the declared lengths"),
+        ("envelope_truncated_001", "last signature byte missing",
+         base_packed[:-1], "total length MUST equal the declared lengths"),
+        ("envelope_bad_version_001", "version byte 2",
+         base_packed[:4] + b"\x02" + base_packed[5:], "version MUST be 1"),
+    ]
+    for case_id, desc, packed, rule in strict_cases:
+        assert envelope.unpack(packed) is None, case_id
+        write(out, f"negative/{case_id}.json", vec(
+            f"Strict RVN1 decoder must reject: {desc}", rule,
+            {"packed_hex": packed.hex()}, {"unpack_result": "reject"}))
+
+    # envelope_expired.json (frozen) carries only integers; _002 is a real,
+    # correctly signed envelope that a relay must drop at the given clock.
+    expired = signed_envelope(created_at=EPOCH_MS - 10_000, expires_at=EPOCH_MS - 1000)
+    assert envelope.unpack(envelope.pack(expired)) is not None
+    write(out, "negative/envelope_expired_002.json", vec(
+        "Signed envelope past expires_at must be dropped by relays",
+        "decodes (well-formed) but expires_at < validation clock",
+        {"packed_hex": envelope.pack(expired).hex(), "validation_clock_ms": EPOCH_MS,
+         "signer_ed_public_hex": ALICE_ED_PUB.hex()},
+        {"unpack_result": "accept", "relay_action": "drop", "drop_reason": "expired"}))
+
     # --- Portable ATSAM / interim KATs (no ML-KEM; label agreement only) ---
     local_pub = bytes([0x01] * 32)
     peer_pub = bytes([0x02] * 32)
     a, b = (local_pub, peer_pub) if local_pub <= peer_pub else (peer_pub, local_pub)
     interim_ikm = hashlib.sha256(b"raven/rvn1/interim-psk" + a + b"|" + b).digest()
+    # NOTE: the frozen `notes` string below says "HKDF-Expand", but this (and
+    # raven-core seal.rs) is full RFC 5869 HKDF with a zero salt — extract,
+    # then expand. The vector bytes are frozen; see protocol/SPEC.md known issues.
     interim_key = hkdf_sha256(interim_ikm, None, b"raven/rvn1/interim-seal/v0")
     write(out, "seal/interim_pairwise_001.json", {
         "id": "rvn1_interim_pairwise_001",
@@ -701,6 +819,50 @@ def main():
             "pair_response_wire_len": pair_init.RESPONSE_WIRE_LEN,
         },
     })
+    # PairInit V1 structural negatives derived from the pair_init_v1_001 wire.
+    # Each must be rejected by decode_init before any signature work.
+    pi_wire = pair_init.encode_init(pair)
+    otp_id_offset = (12 + pair_init.PROFILE_LEN + 2 * pair_init.ADDRESS_LEN
+                     + pair_init.INIT_ID_LEN + pair_init.NONCE_LEN + 5 * 32 + 3 * 32 + 4)
+    assert pair.one_time_prekey_id != 0
+    assert pi_wire[otp_id_offset:otp_id_offset + 4] == pair.one_time_prekey_id.to_bytes(4, "big")
+
+    def patched(offset, new_bytes):
+        return pi_wire[:offset] + new_bytes + pi_wire[offset + len(new_bytes):]
+
+    pi_cases = [
+        ("pair_init_v1_trailing_byte_001", "one byte after the signature",
+         pi_wire + b"\x00", "InvalidLength"),
+        ("pair_init_v1_truncated_001", "last byte missing", pi_wire[:-1], "InvalidLength"),
+        ("pair_init_v1_bad_magic_001", "magic byte 0 changed",
+         patched(0, bytes([pi_wire[0] ^ 0x01])), "InvalidMagic"),
+        ("pair_init_v1_bad_version_001", "version byte 2", patched(8, b"\x02"), "InvalidVersion"),
+        ("pair_init_v1_responder_role_001", "role byte = responder (1)",
+         patched(10, b"\x01"), "InvalidRole"),
+        ("pair_init_v1_wrong_profile_001", "profile id byte changed",
+         patched(12, bytes([pi_wire[12] ^ 0x01])), "InvalidProfile"),
+        ("pair_init_v1_otp_slot_inconsistent_001",
+         "one_time_prekey_id zeroed while the one-time X25519 slot is non-zero",
+         patched(otp_id_offset, b"\x00\x00\x00\x00"), "InvalidOneTimePrekey"),
+    ]
+    for case_id, desc, wire, err in pi_cases:
+        try:
+            pair_init.decode_init(wire)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{case_id}: reference decoder accepted a negative")
+        write(out, f"atsam/negative/{case_id}.json", {
+            "id": case_id,
+            "description": f"PairInit V1 decode must reject: {desc}",
+            "protocol_version": "rvn1",
+            "deterministic": True,
+            "production_enabled": pair_init.PRODUCTION_ENABLED,
+            "source_vector": "atsam/pair_init_v1_001.json",
+            "input": {"pair_init_wire_hex": wire.hex()},
+            "expected": {"decode_result": "reject", "rust_error": err},
+        })
+
     # Root HKDF (Z_X||Z_PQ + transcript) — matches raven-core::atsam_root / ATSAMRootDerivation
     z_x = bytes([0x11] * 32)
     z_pq = bytes([0x22] * 32)
@@ -1357,28 +1519,8 @@ def main():
         )
         for s in rev_conf.SURFACES
     ]
-    write(
-        out,
-        "device_revocation/corrupt_journal_recovery_001.json",
-        vec(
-            "Corrupt marker fail-closed authorization",
-            "Until explicit repair, every surface denies",
-            {
-                "identity_address": alice_addr,
-                "corrupt": [{"scope": alice_addr, "reason_code": 3}],
-                "peer": {
-                    "device_id_utf8": "bob-device-1",
-                    "device_ed_pub_hex": BOB_ED_PUB.hex(),
-                    "device_x_pub_hex": BOB_X_PUB.hex(),
-                    "device_cert_hash_hex": cert_hash.hex(),
-                },
-            },
-            {
-                "gates": gates_corrupt,
-                "all_unauthorized": True,
-            },
-        ),
-    )
+    # corrupt_journal_recovery_001.json is written once, below (with
+    # identity_ed_pub_hex); an earlier duplicate write here was dead code.
 
     # apply gates: bob revoked, carol not
     store_g = rev_conf.ConformanceStore(identity_address=alice_addr, max_claims=10_000)

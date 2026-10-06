@@ -26,6 +26,11 @@
 #
 # Forbidden: 0B.3+ without owner order, production enablement, commit/push/stage.
 # Task 0B.2 Independent PASS recorded (ledger Rev27 §37).
+# NOTE: lib/ios_full_braid_protected_anchor_physical_gate_lib.sh (the phase state
+# machine this script and its _negatives sibling depend on) is NOT in this
+# repository: it is absent from the tree and from git history. Until it is
+# restored from the original author's copy, the recorded PASS cannot be
+# reproduced or reviewed from this repo, and this script stops with a clear error.
 #
 set -euo pipefail
 
@@ -59,8 +64,14 @@ SUMMARY="$EVIDENCE_DIR/summary.md"
 DERIVED_DATA="${DERIVED_DATA:-$EVIDENCE_DIR/DerivedData}"
 PRODUCTS_IPHONEOS="$DERIVED_DATA/Build/Products/Debug-iphoneos"
 
+GATE_LIB="$ROOT/node/scripts/lib/ios_full_braid_protected_anchor_physical_gate_lib.sh"
+if [[ ! -f "$GATE_LIB" ]]; then
+  echo "FAIL: $GATE_LIB is missing from this tree; the phase state machine (enforce_phase_order," >&2
+  echo "      write_state_from_result, ...) cannot be reviewed or run. Restore it; do not re-create it by guesswork." >&2
+  exit 1
+fi
 # shellcheck source=lib/ios_full_braid_protected_anchor_physical_gate_lib.sh
-source "$ROOT/node/scripts/lib/ios_full_braid_protected_anchor_physical_gate_lib.sh"
+source "$GATE_LIB"
 
 [[ -n "$DEVICE_UDID" ]] || die "set DEVICE_UDID to a physical iPhone UDID (not a simulator)"
 

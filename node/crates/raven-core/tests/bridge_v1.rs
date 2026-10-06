@@ -4,7 +4,10 @@ use raven_core::ack::{Ack, STATUS_DELIVERED};
 use raven_core::atsam_aead::{seal_rvna1_v2, unseal_rvna1_v2};
 use raven_core::bridge::{authenticated_object_digest, DropReason};
 use raven_core::envelope::{EnvType, Envelope};
-use raven_core::forward_queue::{ForwardItem, ForwardQueue, ForwardState};
+use raven_core::forward_queue::{
+    ForwardItem, ForwardQueue, ForwardState, MAX_ENVELOPE_BYTES, MAX_FORWARD_TTL_MS,
+    MAX_RELAY_SEEN_OBJECTS,
+};
 use raven_core::identity::Identity;
 use raven_core::message_router::{InboundEnvelope, MessageRouter, RouterOutcome};
 use raven_core::transport::TransportKind;
@@ -604,5 +607,274 @@ fn case10b_destination_deliver_to_endpoint() {
             assert_eq!(got.message_ciphertext, env.message_ciphertext);
         }
         other => panic!("case10b: {other:?}"),
+    }
+}
+
+fn relay_router() -> MessageRouter {
+    MessageRouter {
+        bridge_enabled: true,
+        endpoint_enabled: false,
+        local_has_ble: true,
+        local_has_internet: true,
+        ..Default::default()
+    }
+}
+
+fn inbound(packed: Vec<u8>, hop: &str, now_ms: u64) -> InboundEnvelope {
+    InboundEnvelope {
+        packed,
+        ingress: TransportKind::Lan,
+        previous_hop: hop.into(),
+        now_ms,
+    }
+}
+
+/// 11. Replay after seen-cache eviction is still a duplicate.
+///
+/// The forward tombstone outlives the bounded seen cache, so the row is
+/// never resurrected (no INSERT OR REPLACE back to Queued).
+#[test]
+fn case11_replay_after_seen_eviction_is_duplicate() {
+    let dir = tempdir().unwrap();
+    let q = ForwardQueue::open(&dir.path().join("f.sqlite")).unwrap();
+    let a = Identity::generate();
+    let c = Identity::generate();
+    let packed = make_env(&a, &c, b"once-only", [0x11; 16], 8, now() + 60_000).pack();
+    let router = relay_router();
+    let identity = match router.handle_inbound(&q, inbound(packed.clone(), "a", now()), true) {
+        RouterOutcome::ForwardNow { identity, .. } => identity,
+        other => panic!("case11 first: {other:?}"),
+    };
+    q.mark_object_state(&identity.object_digest, ForwardState::Forwarded)
+        .unwrap();
+
+    // Attacker floods fresh digests until the original is evicted.
+    for i in 0..=MAX_RELAY_SEEN_OBJECTS {
+        let mut d = [0u8; 32];
+        d[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        d[31] = 0xEE;
+        q.mark_object_seen(&d, now() + 1 + i as u64, TransportKind::Lan, "flood")
+            .unwrap();
+    }
+    assert!(!q.object_was_seen(&identity.object_digest).unwrap());
+
+    let replay = router.handle_inbound(&q, inbound(packed, "a2", now() + 10_000), true);
+    assert!(
+        matches!(
+            replay,
+            RouterOutcome::Dropped {
+                reason: DropReason::Duplicate
+            }
+        ),
+        "case11 replay: {replay:?}"
+    );
+    assert_eq!(
+        q.get_object(&identity.object_digest)
+            .unwrap()
+            .unwrap()
+            .state,
+        ForwardState::Forwarded
+    );
+    assert_eq!(q.count_pending().unwrap(), 0);
+}
+
+/// 12. Full relay custody is reported as STORE_FULL, not Malformed.
+#[test]
+fn case12_queue_full_reports_store_full() {
+    let dir = tempdir().unwrap();
+    let q = ForwardQueue::open_with_limits(&dir.path().join("f.sqlite"), 1, MAX_ENVELOPE_BYTES)
+        .unwrap();
+    let a = Identity::generate();
+    let c = Identity::generate();
+    let router = relay_router();
+    let first = make_env(&a, &c, b"first", [0x12; 16], 8, now() + 60_000).pack();
+    assert!(matches!(
+        router.handle_inbound(&q, inbound(first, "a", now()), true),
+        RouterOutcome::ForwardNow { .. }
+    ));
+    let second = make_env(&a, &c, b"second", [0x13; 16], 8, now() + 60_000).pack();
+    let out = router.handle_inbound(&q, inbound(second, "b", now()), true);
+    assert!(
+        matches!(
+            out,
+            RouterOutcome::Dropped {
+                reason: DropReason::StoreFull
+            }
+        ),
+        "case12: {out:?}"
+    );
+}
+
+/// 13. Relay custody is capped at MAX_FORWARD_TTL_MS.
+///
+/// A far-future envelope expiry cannot squat a pending slot forever.
+#[test]
+fn case13_relay_custody_ttl_is_clamped() {
+    let dir = tempdir().unwrap();
+    let q = ForwardQueue::open(&dir.path().join("f.sqlite")).unwrap();
+    let a = Identity::generate();
+    let c = Identity::generate();
+    let mid = [0x14; 16];
+    let far = now() + 365 * 24 * 60 * 60 * 1_000;
+    let packed = make_env(&a, &c, b"long-lived", mid, 8, far).pack();
+    let router = MessageRouter {
+        local_has_internet: false,
+        ..relay_router()
+    };
+    assert!(matches!(
+        router.handle_inbound(
+            &q,
+            InboundEnvelope {
+                packed,
+                ingress: TransportKind::MockBle,
+                previous_hop: "c".into(),
+                now_ms: now(),
+            },
+            true
+        ),
+        RouterOutcome::QueuedForForward { .. }
+    ));
+    let row = q.get(&mid).unwrap().unwrap();
+    assert_eq!(row.expires_at_ms, now() + MAX_FORWARD_TTL_MS);
+    let later = now() + MAX_FORWARD_TTL_MS + 1;
+    assert!(router.recover_pending(&q, later).unwrap().is_empty());
+    assert_eq!(q.get(&mid).unwrap().unwrap().state, ForwardState::Expired);
+    q.maintain(later).unwrap();
+    assert_eq!(q.count_all().unwrap(), 0);
+}
+
+/// 14. Forwarded relay rows keep no ciphertext and are garbage-collected.
+#[test]
+fn case14_forwarded_rows_are_garbage_collected() {
+    let dir = tempdir().unwrap();
+    let q = ForwardQueue::open(&dir.path().join("f.sqlite")).unwrap();
+    let a = Identity::generate();
+    let c = Identity::generate();
+    let router = relay_router();
+    for i in 0u8..5 {
+        let packed = make_env(&a, &c, b"relay", [0x20 + i; 16], 8, now() + 60_000).pack();
+        match router.handle_inbound(&q, inbound(packed, "a", now() + i as u64), true) {
+            RouterOutcome::ForwardNow { identity, .. } => {
+                q.mark_object_state(&identity.object_digest, ForwardState::Forwarded)
+                    .unwrap();
+                let row = q.get_object(&identity.object_digest).unwrap().unwrap();
+                assert!(row.packed_envelope.is_empty());
+            }
+            other => panic!("case14: {other:?}"),
+        }
+    }
+    assert_eq!(q.count_pending().unwrap(), 0);
+    assert_eq!(q.count_all().unwrap(), 5);
+    q.maintain(now() + 60_001).unwrap();
+    assert_eq!(q.count_all().unwrap(), 0);
+}
+
+/// 15. Far-future replay after the custody period is still a duplicate.
+///
+/// The seen cache has forgotten the object, but the Forwarded tombstone lasts
+/// until the envelope's own expiry, so it is not re-forwarded every 7 days.
+#[test]
+fn case15_far_future_replay_after_custody_is_duplicate() {
+    let dir = tempdir().unwrap();
+    let q = ForwardQueue::open(&dir.path().join("f.sqlite")).unwrap();
+    let a = Identity::generate();
+    let c = Identity::generate();
+    let far = now() + 365 * 24 * 60 * 60 * 1_000;
+    let packed = make_env(&a, &c, b"long-lived", [0x15; 16], 8, far).pack();
+    let router = relay_router();
+    let identity = match router.handle_inbound(&q, inbound(packed.clone(), "a", now()), true) {
+        RouterOutcome::ForwardNow { identity, .. } => identity,
+        other => panic!("case15 first: {other:?}"),
+    };
+    q.mark_object_state(&identity.object_digest, ForwardState::Forwarded)
+        .unwrap();
+
+    let later = now() + MAX_FORWARD_TTL_MS + 1;
+    q.prune_seen_objects(later).unwrap();
+    assert!(!q.object_was_seen(&identity.object_digest).unwrap());
+    q.maintain(later).unwrap();
+
+    let replay = router.handle_inbound(&q, inbound(packed, "a2", later), true);
+    assert!(
+        matches!(
+            replay,
+            RouterOutcome::Dropped {
+                reason: DropReason::Duplicate
+            }
+        ),
+        "case15 replay: {replay:?}"
+    );
+    assert_eq!(q.count_pending().unwrap(), 0);
+    // The tombstone goes once the envelope itself has expired.
+    q.maintain(far + 1).unwrap();
+    assert_eq!(q.count_all().unwrap(), 0);
+}
+
+/// 16. Alias-gossip (3) and capabilities (4) envelopes are not relayable.
+///
+/// `bridge::decide`, `classify_multi_role` and `MessageRouter::handle_inbound`
+/// share one policy (`is_relayable_type`): only Message and Ack are carried.
+/// The router must also leave no seen-state or custody row behind.
+#[test]
+fn case16_non_message_ack_types_are_dropped_by_every_entry_point() {
+    use raven_core::bridge::{
+        classify_multi_role, decide, is_relayable_type, BridgeAction, BridgeRole,
+        MultiRoleDisposition,
+    };
+
+    assert!(is_relayable_type(EnvType::Message as u8));
+    assert!(is_relayable_type(EnvType::Ack as u8));
+    let a = Identity::generate();
+    let c = Identity::generate();
+    for env_type in [EnvType::AliasGossip, EnvType::Capabilities] {
+        let ty = env_type as u8;
+        assert!(!is_relayable_type(ty));
+        let mut env = make_env(&a, &c, b"gossip", [0x16; 16], 8, now() + 60_000);
+        env.env_type = ty;
+        env.sign_with(&a);
+        let packed = env.pack();
+        let digest = authenticated_object_digest(&Envelope::unpack(&packed).unwrap());
+
+        for role in [BridgeRole::Relay, BridgeRole::Endpoint] {
+            assert_eq!(
+                decide(&packed, role, now(), false),
+                BridgeAction::Drop {
+                    reason: DropReason::UnsupportedType
+                },
+                "decide type {ty} {role:?}"
+            );
+        }
+        for (local_is_destination, bridge_enabled) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            assert_eq!(
+                classify_multi_role(ty, local_is_destination, bridge_enabled),
+                MultiRoleDisposition::Drop,
+                "classify type {ty}"
+            );
+        }
+
+        let relay = relay_router();
+        let endpoint_only = MessageRouter {
+            bridge_enabled: false,
+            endpoint_enabled: true,
+            ..Default::default()
+        };
+        for (router, force_bridge) in [(&relay, true), (&relay, false), (&endpoint_only, false)] {
+            let dir = tempdir().unwrap();
+            let q = ForwardQueue::open(&dir.path().join("f.sqlite")).unwrap();
+            let out = router.handle_inbound(&q, inbound(packed.clone(), "p", now()), force_bridge);
+            assert!(
+                matches!(
+                    out,
+                    RouterOutcome::Dropped {
+                        reason: DropReason::UnsupportedType
+                    }
+                ),
+                "router type {ty} force={force_bridge}: {out:?}"
+            );
+            assert_eq!(q.count_all().unwrap(), 0);
+            assert!(!q.object_was_seen(&digest).unwrap());
+        }
     }
 }

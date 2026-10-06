@@ -11,7 +11,7 @@ Sprint 0 inventory of raven-swarm status vs that target: [`docs/network/raven-sw
 | Docker dual bridge nets | `scripts/nat_docker_sim.sh` | Two peers on isolated L2 cannot dial each other; a dual-homed relay can reach both |
 | pfctl | present at `/sbin/pfctl` | Operator may add divert rules; **not** automated here (needs root + careful host policy) |
 | Linux `unshare` netns | **not** on macOS | Use Linux CI / VM for true netns |
-| Localhost TCP + store-carry | `bridge_abc_demo`, `internet_dial_smoke`, `libp2p_swarm_smoke` | Path failure → opaque store / relay |
+| Localhost carrier checks | `bridge_abc_demo`, `internet_dial_smoke`, `libp2p_swarm_smoke` | Bridge/store software behavior plus an explicit raw-Internet production hold |
 
 ## Run Docker substitute
 

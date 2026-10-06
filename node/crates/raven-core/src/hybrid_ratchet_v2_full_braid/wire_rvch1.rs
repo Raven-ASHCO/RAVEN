@@ -88,4 +88,23 @@ mod tests {
         assert_eq!(wire.len(), RVCH1_LEN);
         assert_eq!(decode_rvch1(&wire).unwrap(), hdr);
     }
+
+    #[test]
+    fn reject_trailing_and_truncated_bytes() {
+        let hdr = Rvch1 {
+            ec_dh_pub: [0x11; 32],
+            ec_pn: 1,
+            ec_n: 2,
+            scka_epoch: 3,
+            scka_pn: 4,
+            scka_n: 5,
+            direction: 1,
+        };
+        let wire = encode_rvch1(&hdr);
+        let mut longer = wire.clone();
+        longer.push(0);
+        assert!(decode_rvch1(&longer).is_err());
+        assert!(decode_rvch1(&wire[..RVCH1_LEN - 1]).is_err());
+        assert!(decode_rvch1(&[]).is_err());
+    }
 }

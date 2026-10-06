@@ -7,6 +7,11 @@ Run from the monorepo root::
 
     python3 shared-vectors/generate_v1.py
 
+It also writes the DRAFT ``shared-vectors/v2/`` signing-input vectors
+(``docs/MESH_PROTOCOL_v2.md``, the fix for MESH_PROTOCOL.md §I.13). ``v1/`` is
+frozen: the v1 functions below reproduce the shipped (flawed) v1 bytes on
+purpose and must never be "fixed" in place.
+
 The values here are the SOURCE OF TRUTH for every RAVEN client. iOS, Mac,
 Windows, Android, Watch — all consume these JSON files as test fixtures.
 
@@ -356,7 +361,7 @@ dm_envelope_no_geo = {
     "geoFence": None,
 }
 
-def dm_pipe_bytes(env: dict) -> bytes:
+def dm_fields(env: dict) -> list[str]:
     fields = [
         env["clientMessageId"], env["roomId"], env["senderId"], env["senderName"],
         env["recipientId"], str(env["type"]),
@@ -372,7 +377,12 @@ def dm_pipe_bytes(env: dict) -> bytes:
     if env.get("geoFence"):
         g = env["geoFence"]
         fields += [g["h3Cell"], str(g["radiusInCells"]), "true" if g["deliverOnlyInside"] else "false"]
-    return "|".join(fields).encode("utf-8")
+    return fields
+
+def dm_pipe_bytes(env: dict) -> bytes:
+    # v1 (frozen): bare "|" join, no escaping or length prefixes. Not
+    # injective when a field contains "|" — see MESH_PROTOCOL.md §I.13.
+    return "|".join(dm_fields(env)).encode("utf-8")
 
 dm_bytes_no_geo = dm_pipe_bytes(dm_envelope_no_geo)
 dm_sig_no_geo = ed_sign(ALICE["ed_private_hex"], dm_bytes_no_geo)
@@ -423,15 +433,18 @@ post_envelope = {
     "signerPublicKeyB64": ALICE["ed_public_b64"],
 }
 
-def post_pipe_bytes(p: dict) -> bytes:
-    return "|".join([
+def post_fields(p: dict) -> list[str]:
+    return [
         "POST",
         p["postId"], p["authorId"], p["authorUsername"], p["authorAvatar"] or "",
         p["text"],
         str(int(round(p["createdAtSec"] * 1000))),
         p["scope"],
         p["signerPublicKeyB64"] or "",
-    ]).encode("utf-8")
+    ]
+
+def post_pipe_bytes(p: dict) -> bytes:
+    return "|".join(post_fields(p)).encode("utf-8")
 
 post_bytes = post_pipe_bytes(post_envelope)
 post_sig = ed_sign(ALICE["ed_private_hex"], post_bytes)
@@ -458,11 +471,14 @@ ack_envelope = {
     "timestampSec": float(FIXED_TS_SECONDS + 60),
 }
 
-def ack_pipe_bytes(a: dict) -> bytes:
-    return "|".join([
+def ack_fields(a: dict) -> list[str]:
+    return [
         a["originalMessageId"], a["senderId"], a["recipientId"], a["status"],
         str(int(round(a["timestampSec"] * 1000))),
-    ]).encode("utf-8")
+    ]
+
+def ack_pipe_bytes(a: dict) -> bytes:
+    return "|".join(ack_fields(a)).encode("utf-8")
 
 ack_bytes = ack_pipe_bytes(ack_envelope)
 ack_sig = ed_sign(BOB["ed_private_hex"], ack_bytes)
@@ -486,11 +502,14 @@ stop_command = {
     "timestampSec": float(FIXED_TS_SECONDS + 120),
 }
 
-def stop_pipe_bytes(s: dict) -> bytes:
-    return "|".join([
+def stop_fields(s: dict) -> list[str]:
+    return [
         "STOP", s["messageId"],
         str(int(round(s["timestampSec"] * 1000))),
-    ]).encode("utf-8")
+    ]
+
+def stop_pipe_bytes(s: dict) -> bytes:
+    return "|".join(stop_fields(s)).encode("utf-8")
 
 stop_bytes = stop_pipe_bytes(stop_command)
 stop_sig = ed_sign(ALICE["ed_private_hex"], stop_bytes)
@@ -548,6 +567,28 @@ write_vector("canonicalization/frame_json_001.json", vector(
         "signature_b64": b64(frame_sig),
     },
 ))
+
+# ----- MESH_PROTOCOL.md §I.13 self-check (asserts only; writes nothing) ------
+# The v1 pipe join is not injective. A relay can strip dm_pipe_002's geo-fence
+# and move its h3Cell|radius|deliverOnlyInside triple into replyToSenderName
+# ("" + "|8a283082aac7fff|1|true"); both envelopes share signing bytes, so
+# 002's signature verifies the unrestricted copy. v1 bytes stay frozen; the
+# interim v1 rule is that a receiver rejects any pipe-form envelope with a "|"
+# inside a signed field, and the real fix is the v2 draft framing (below).
+def v1_fields_pipe_free(fields: list[str]) -> bool:
+    """MESH_PROTOCOL.md §D "`|` inside signed fields": the v1 receiver check."""
+    return all("|" not in f for f in fields)
+
+dm_envelope_geo_stripped = dict(dm_envelope_no_geo, replyToSenderName="|8a283082aac7fff|1|true")
+assert dm_pipe_bytes(dm_envelope_geo_stripped) == dm_bytes_with_geo  # the v1 flaw
+assert ed_verify(ALICE["ed_public_hex"], dm_pipe_bytes(dm_envelope_geo_stripped), dm_sig_with_geo)
+assert not v1_fields_pipe_free(dm_fields(dm_envelope_geo_stripped))  # interim rule rejects it
+for _fields in (dm_fields(dm_envelope_no_geo), dm_fields(dm_envelope_with_geo),
+                post_fields(post_envelope), ack_fields(ack_envelope), stop_fields(stop_command)):
+    # Honest v1 vectors pass the rule, and for pipe-free fields splitting on
+    # "|" recovers the exact field list (the join is injective on them).
+    assert v1_fields_pipe_free(_fields)
+    assert "|".join(_fields).split("|") == _fields
 
 # ----- envelope vectors --------------------------------------------------
 # A complete signed-DM envelope: encode -> decode roundtrip + signature check.
@@ -843,4 +884,266 @@ write_vector("trust/tofu_verify_001.json", vector(
     },
 ))
 
+
+# =========================================================================
+# DRAFT v2 signing inputs — docs/MESH_PROTOCOL_v2.md (fixes §I.13 / §I.14)
+# =========================================================================
+# v1/ is frozen (VERSIONING.md), so the fixed encoding lives in its own tree,
+# v2/<same-relative-path>. Each v2 vector reuses its v1 counterpart's exact
+# inputs; only the byte framing of the signing input changes. Nothing ships
+# v2 yet: these files may still change until v2 is adopted, then they freeze.
+
+ROOT_V2 = Path(__file__).parent / "v2"
+
+def write_vector_v2(rel_path: str, body: dict) -> None:
+    path = ROOT_V2 / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(body, indent=2, sort_keys=False, ensure_ascii=False)
+    path.write_text(text + "\n", encoding="utf-8")
+    print(f"wrote v2/{rel_path}")
+
+def vector_v2(**kw) -> dict:
+    body = vector(**kw)
+    body["protocol_version"] = "v2-draft"
+    body.setdefault("notes", "DRAFT (docs/MESH_PROTOCOL_v2.md): no port ships v2 yet; frozen once v2 is adopted.")
+    return body
+
+# §2 — 0xFF never occurs in UTF-8, and every v1 signing input is UTF-8, so no
+# v2 input can equal any v1 input (no cross-version signature reuse).
+V2_MAGIC = b"\xffRVMESH2"
+V2_KIND_DM, V2_KIND_POST, V2_KIND_FRAME, V2_KIND_ACK, V2_KIND_STOP = 1, 2, 3, 4, 5
+
+def v2_lp_fields(fields: list[str]) -> bytes:
+    """u16be(field count) || for each field: u32be(len(utf8)) || utf8."""
+    out = bytearray(struct.pack(">H", len(fields)))
+    for f in fields:
+        raw = f.encode("utf-8")
+        out += struct.pack(">I", len(raw)) + raw
+    return bytes(out)
+
+def v2_lp_split(raw: bytes) -> list[str]:
+    """Inverse of v2_lp_fields (strict: exact length, valid UTF-8)."""
+    (n,) = struct.unpack_from(">H", raw, 0)
+    off, out = 2, []
+    for _ in range(n):
+        (ln,) = struct.unpack_from(">I", raw, off)
+        off += 4
+        assert off + ln <= len(raw), "truncated field"
+        out.append(raw[off:off + ln].decode("utf-8"))
+        off += ln
+    assert off == len(raw), "trailing bytes"
+    return out
+
+def v2_pipe_input(kind: int, fields: list[str]) -> bytes:
+    out = V2_MAGIC + bytes([kind]) + v2_lp_fields(fields)
+    assert v2_lp_split(out[len(V2_MAGIC) + 1:]) == fields  # injective by construction
+    return out
+
+def v2_ack_relay_key(a: dict) -> str:
+    return "ack2:" + hashlib.sha256(v2_lp_fields(
+        [a["originalMessageId"], a["senderId"], a["recipientId"], a["status"]]
+    )).hexdigest()
+
+# §3 — Rule 3 v2: RFC 8785 JSON Canonicalization Scheme (JCS).
+def jcs_number(x) -> str:
+    """ECMAScript Number::toString, as RFC 8785 §3.2.2.3 requires."""
+    if isinstance(x, int):
+        if abs(x) > 2**53 - 1:
+            raise ValueError("I-JSON: integer outside ±(2^53−1)")
+        x = float(x)
+    if x != x or x in (float("inf"), float("-inf")):
+        raise ValueError("JCS: NaN/Infinity have no JSON form")
+    if x == 0:
+        return "0"  # also -0
+    if x < 0:
+        return "-" + jcs_number(-x)
+    mant, _, exp = repr(x).partition("e")   # repr = shortest round-trip digits
+    ip, _, fp = mant.partition(".")
+    digits = ip + fp
+    lead = len(digits) - len(digits.lstrip("0"))
+    s = digits.lstrip("0").rstrip("0")
+    n = len(ip) + (int(exp) if exp else 0) - lead   # value = 0.s × 10^n
+    k = len(s)
+    if k <= n <= 21:
+        return s + "0" * (n - k)
+    if 0 < n <= 21:
+        return s[:n] + "." + s[n:]
+    if -6 < n <= 0:
+        return "0." + "0" * (-n) + s
+    e = n - 1
+    return (s if k == 1 else s[0] + "." + s[1:]) + ("e+" if e >= 0 else "e-") + str(abs(e))
+
+def jcs(value) -> str:
+    if value is None or isinstance(value, bool):
+        return json.dumps(value)
+    if isinstance(value, (int, float)):
+        return jcs_number(value)
+    if isinstance(value, str):
+        # Minimal escaping: `"`, `\`, U+0000–U+001F (\b \t \n \f \r short forms,
+        # else \u00xx lowercase); `/` and non-ASCII are emitted literally.
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(jcs(v) for v in value) + "]"
+    if isinstance(value, dict):
+        keys = sorted(value.keys(), key=lambda k: k.encode("utf-16-be"))  # UTF-16 code units
+        return "{" + ",".join(f"{jcs(k)}:{jcs(value[k])}" for k in keys) + "}"
+    raise TypeError(f"JCS: unsupported type {type(value).__name__}")
+
+# RFC 8785 Appendix B number samples (IEEE-754 bit pattern -> JCS text).
+for _bits, _want in [
+    ("0000000000000000", "0"), ("8000000000000000", "0"),
+    ("0000000000000001", "5e-324"), ("8000000000000001", "-5e-324"),
+    ("7fefffffffffffff", "1.7976931348623157e+308"),
+    ("ffefffffffffffff", "-1.7976931348623157e+308"),
+    ("4340000000000000", "9007199254740992"), ("c340000000000000", "-9007199254740992"),
+    ("4430000000000000", "295147905179352830000"),
+    ("44b52d02c7e14af5", "9.999999999999997e+22"), ("44b52d02c7e14af6", "1e+23"),
+    ("44b52d02c7e14af7", "1.0000000000000001e+23"),
+    ("444b1ae4d6e2ef4e", "999999999999999700000"), ("444b1ae4d6e2ef4f", "999999999999999900000"),
+    ("444b1ae4d6e2ef50", "1e+21"),
+    ("3eb0c6f7a0b5ed8c", "9.999999999999997e-7"), ("3eb0c6f7a0b5ed8d", "0.000001"),
+    ("41b3de4355555553", "333333333.3333332"), ("41b3de4355555554", "333333333.33333325"),
+    ("41b3de4355555555", "333333333.3333333"), ("41b3de4355555556", "333333333.3333334"),
+    ("41b3de4355555557", "333333333.33333343"),
+    ("becbf647612f3696", "-0.0000033333333333333333"),
+    ("43143ff3c1cb0959", "1424953923781206.2"),
+]:
+    (_x,) = struct.unpack(">d", bytes.fromhex(_bits))
+    assert jcs_number(_x) == _want, (_bits, jcs_number(_x), _want)
+assert jcs({"\u20ac": 1, "\r": 2, "\ufb33": 3, "1": 4, "\U0001f600": 5, "\u0080": 6, "\u00f6": 7}) \
+    == '{"\\r":2,"1":4,"\u0080":6,"\u00f6":7,"\u20ac":1,"\U0001f600":5,"\ufb33":3}'  # RFC 8785 §3.2.3
+# For ASCII keys and safe-range integers JCS equals the v1 reference output.
+assert jcs(frame_for_signing) == frame_canonical
+
+def v2_frame_input(frame: dict) -> tuple[str, bytes]:
+    canon = jcs({k: v for k, v in frame.items() if k not in ("s", "spk")})
+    return canon, V2_MAGIC + bytes([V2_KIND_FRAME]) + canon.encode("utf-8")
+
+def v2_pipe_vector(rel: str, name: str, description: str, spec: str, inputs: dict,
+                   kind: int, fields: list[str], signer: dict, extra: dict | None = None):
+    sb = v2_pipe_input(kind, fields)
+    sig = ed_sign(signer["ed_private_hex"], sb)
+    assert ed_verify(signer["ed_public_hex"], sb, sig)
+    expected = {
+        "fields": fields,
+        "signing_bytes_hex": hx(sb),
+        "signature_hex": hx(sig),
+        "signature_b64": b64(sig),
+    }
+    expected.update(extra or {})
+    write_vector_v2(rel, vector_v2(name=name, description=description, spec_reference=spec,
+                                   inputs=inputs, expected=expected))
+    return sb, sig
+
+V2_SPEC = "MESH_PROTOCOL_v2.md §2"
+v2_dm_no_geo, _ = v2_pipe_vector(
+    "canonicalization/dm_pipe_001.json", "DM v2 signing input — no geo-fence",
+    "v1 dm_pipe_001's envelope and field list, framed per v2 (magic, kind 0x01, u16 count, u32-length-prefixed UTF-8 fields).",
+    V2_SPEC + " + MESH_PROTOCOL.md §D Rule 1", {"envelope": dm_envelope_no_geo, "signer": "alice"},
+    V2_KIND_DM, dm_fields(dm_envelope_no_geo), ALICE)
+v2_dm_geo, v2_dm_geo_sig = v2_pipe_vector(
+    "canonicalization/dm_pipe_002.json", "DM v2 signing input — with geo-fence",
+    "v1 dm_pipe_002's envelope: 23 fields (geo-fence triple appended), framed per v2.",
+    V2_SPEC + " + MESH_PROTOCOL.md §D Rule 1", {"envelope": dm_envelope_with_geo, "signer": "alice"},
+    V2_KIND_DM, dm_fields(dm_envelope_with_geo), ALICE)
+
+dm_envelope_pipes = dict(
+    dm_envelope_no_geo,
+    clientMessageId="dm-003",
+    senderName="Al|ce \\ admin",
+    text="a|b\\|c",
+    replyToMessageId="dm-000",
+    replyToTextPreview="x|y",
+    replyToSenderName="Bob|",
+)
+v2_pipe_vector(
+    "canonicalization/dm_pipe_003.json", "DM v2 signing input — `|` and `\\` inside fields",
+    "Free-text fields containing `|` and `\\` are carried verbatim: length prefixes, not delimiters, separate fields, so no escaping is needed and no field can spill into another. (v1 forbids `|` in signed fields — MESH_PROTOCOL.md §I.13.)",
+    V2_SPEC, {"envelope": dm_envelope_pipes, "signer": "alice"},
+    V2_KIND_DM, dm_fields(dm_envelope_pipes), ALICE)
+
+# Negative: the §I.13 geo-fence strip. Under v1 the tampered envelope shares
+# 002's signing bytes; under v2 it cannot, so 002's signature must not verify.
+v2_dm_stripped = v2_pipe_input(V2_KIND_DM, dm_fields(dm_envelope_geo_stripped))
+assert v2_dm_stripped != v2_dm_geo
+assert not ed_verify(ALICE["ed_public_hex"], v2_dm_stripped, v2_dm_geo_sig)
+write_vector_v2("canonicalization/dm_pipe_004.json", vector_v2(
+    name="DM v2 — geo-fence strip via field re-split is rejected",
+    description="Negative. `envelope` is dm_pipe_002 with its geoFence removed and the h3Cell|radius|deliverOnlyInside triple appended to replyToSenderName; `claimed_signature_hex` is dm_pipe_002's v2 signature. The v2 signing input differs (20 fields, not 23), so verification MUST fail. Under v1 both envelopes have identical signing bytes (MESH_PROTOCOL.md §I.13).",
+    spec_reference=V2_SPEC + " + MESH_PROTOCOL.md §I.13",
+    inputs={
+        "envelope": dm_envelope_geo_stripped,
+        "signer": "alice",
+        "claimed_signature_hex": hx(v2_dm_geo_sig),
+    },
+    expected={
+        "fields": dm_fields(dm_envelope_geo_stripped),
+        "signing_bytes_hex": hx(v2_dm_stripped),
+        "verify_result": "reject",
+    },
+))
+
+v2_pipe_vector(
+    "canonicalization/post_pipe_001.json", "Post v2 signing input",
+    "v1 post_pipe_001's post and field list (leading \"POST\" literal kept), framed per v2 with kind 0x02.",
+    V2_SPEC + " + MESH_PROTOCOL.md §C.3", {"post": post_envelope, "signer": "alice"},
+    V2_KIND_POST, post_fields(post_envelope), ALICE)
+post_envelope_pipes = dict(post_envelope, postId="post-002", text="pipes | and back\\slashes|friends")
+v2_pipe_vector(
+    "canonicalization/post_pipe_002.json", "Post v2 signing input — `|` inside text",
+    "Post text ending in `|friends` cannot be confused with the scope field: the v2 input still has exactly 9 fields.",
+    V2_SPEC + " + MESH_PROTOCOL.md §C.3", {"post": post_envelope_pipes, "signer": "alice"},
+    V2_KIND_POST, post_fields(post_envelope_pipes), ALICE)
+v2_pipe_vector(
+    "canonicalization/ack_pipe_001.json", "ACK v2 signing input — delivered",
+    "v1 ack_pipe_001's ACK framed per v2 with kind 0x04, plus the v2 ACK relay dedup key (§2.3).",
+    V2_SPEC + " + MESH_PROTOCOL.md §C.4", {"ack": ack_envelope, "signer": "bob"},
+    V2_KIND_ACK, ack_fields(ack_envelope), BOB,
+    extra={"relay_key": v2_ack_relay_key(ack_envelope)})
+v2_pipe_vector(
+    "canonicalization/stop_pipe_001.json", "Stop v2 signing input",
+    "v1 stop_pipe_001's command (leading \"STOP\" literal kept) framed per v2 with kind 0x05.",
+    V2_SPEC + " + MESH_PROTOCOL.md §C.5", {"stop": stop_command, "signer": "alice"},
+    V2_KIND_STOP, stop_fields(stop_command), ALICE)
+
+def v2_frame_vector(rel: str, name: str, description: str, frame: dict):
+    canon, sb = v2_frame_input(frame)
+    sig = ed_sign(ALICE["ed_private_hex"], sb)
+    assert ed_verify(ALICE["ed_public_hex"], sb, sig)
+    write_vector_v2(rel, vector_v2(
+        name=name, description=description,
+        spec_reference="MESH_PROTOCOL_v2.md §3 + RFC 8785",
+        inputs={"raw_frame": frame, "signer": "alice"},
+        expected={
+            "canonical_utf8": canon,
+            "canonical_hex": hx(canon.encode("utf-8")),
+            "signing_bytes_hex": hx(sb),
+            "signature_hex": hx(sig),
+            "signature_b64": b64(sig),
+        },
+    ))
+
+v2_frame_vector(
+    "canonicalization/frame_json_001.json", "Feature-frame v2 signing input (RFC 8785)",
+    "v1 frame_json_001's frame: drop `s`/`spk`, canonicalize with RFC 8785 (JCS), prefix magic + kind 0x03. For this all-ASCII, integer-only frame the JCS text equals the v1 canonical text.",
+    raw_frame)
+raw_frame_edge = dict(
+    raw_frame,
+    mid="frame-002",
+    p={
+        "url": "https://cdn.raven.app/u/alice.png",
+        "caption": "caf\u00e9 \u2615 \"q\" \\ \u001f",
+        "nums": [0, -0.0, 1.0, 1.5, -2.25, 1e21, 1e-7, 0.000001, 333333333.3333333, 5e-324],
+        "\ue000": "private-use key sorts after the astral one",
+        "\U0001f600": "astral key (UTF-16 D83D DE00)",
+        "ok": True,
+        "none": None,
+    },
+)
+v2_frame_vector(
+    "canonicalization/frame_json_002.json", "Feature-frame v2 signing input — JCS edge cases",
+    "Floats (ECMAScript shortest form: 1.0→1, -0→0, 1e21→1e+21, 1e-7→1e-7, 0.000001 stays decimal), `/` not escaped, non-ASCII literal, control char as \\u001f, keys sorted by UTF-16 code units (U+1F600 before U+E000). These are the cases where \"sorted keys\" JSON diverges across languages (MESH_PROTOCOL.md §I.14).",
+    raw_frame_edge)
+
 print("\nAll v1 vectors generated. Run unit tests against shared-vectors/v1/ to verify.")
+print("DRAFT v2 signing-input vectors generated under shared-vectors/v2/ (docs/MESH_PROTOCOL_v2.md).")

@@ -14,7 +14,22 @@ cargo build -p raven-core -p raven-node -p ash --release
 .\target\release\ash.exe --data-dir $env:TEMP\raven-data doctor
 ```
 
-Task Scheduler / service helper: `scripts/install/windows_service.ps1`.
+Task Scheduler / service helper: `scripts/install/windows_service.ps1`
+(builds with `--locked`). Its default `-DataDir` is the profile `raven.exe` /
+`ash.exe` use without `--data-dir` (`RAVEN_DATA_DIR`, then `ASH_DATA_DIR`, then
+`%USERPROFILE%\.raven`); binaries go to `%LOCALAPPDATA%\RavenNode` (`-BinDir`).
+The named pipe is per user, not per profile, so a daemon installed with any other
+`-DataDir` must be addressed with `--data-dir <that dir>` on every CLI command, or
+the CLI would ping a daemon that serves a different profile. **LAN exposure is
+opt-in with this helper (same default on every OS):** the task listens on `127.0.0.1:7420`; pass `-LanListen <LAN-IP>:7420`
+and allow TCP 7420 for the local subnet in Windows Firewall to accept LAN peers.
+A bare `raven-node.exe service` without `--lan-listen` binds `0.0.0.0:7420`, so
+always pass an explicit address when you start it by hand.
+
+**Toolchain:** install Rust with [rustup](https://rustup.rs) (current stable);
+older compilers fail at dependency resolution (rustc 1.83.0: the locked graph
+needs edition 2024; its highest declared `rust-version` is 1.88). CI is validated
+on rustc 1.98.0 only; the exact minimum is not yet verified.
 
 ## Unsigned layout from macOS/Linux host
 

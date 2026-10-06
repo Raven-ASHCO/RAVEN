@@ -338,6 +338,52 @@ def main() -> None:
         ),
     )
 
+    # --- RVFI1 init: Python computes the initial RVFB1 for both roles ---
+    from raven_protocol import hybrid_ratchet_v2_tr as ec
+
+    def rvfi1(role: int, role_material: bytes, bob_spk_pub: bytes) -> bytes:
+        return (
+            sm.RVFI1_MAGIC
+            + (1).to_bytes(2, "big")
+            + bytes([0x53]) * 32
+            + bytes([role, 0])
+            + bytes([0x11]) * 32
+            + bytes([0x22]) * 32
+            + bob_spk_pub
+            + role_material
+            + bytes(4)
+        )
+
+    alice_eph_priv = bytes([0x44]) * 32
+    bob_spk_priv = bytes([0x33]) * 32
+    bob_spk_pub = ec.x25519_public(bob_spk_priv)
+    alice_init = rvfi1(0, alice_eph_priv, bob_spk_pub)
+    bob_init = rvfi1(1, bob_spk_priv, bob_spk_pub)
+    alice_state = sm.init_write(alice_init)
+    bob_state = sm.init_write(bob_init)
+    alice_tr = fbstate.decode_rvft1(fbstate.decode_rvfb1(alice_state).tr_bytes)
+    bob_tr = fbstate.decode_rvft1(fbstate.decode_rvfb1(bob_state).tr_bytes)
+    assert alice_tr.ec_dhs_pub == ec.x25519_public(alice_eph_priv)
+    assert bob_tr.ec_dhs_pub == bob_spk_pub and bob_tr.ec_rk == bytes([0x11]) * 32
+    write(
+        "full_braid_rvfi1_init_001.json",
+        vec(
+            "Full Braid RVFI1 init",
+            "Python-computed initial RVFB1 for Alice and Bob: SK_ec is only the EC "
+            "root; Alice ratchets with her ephemeral, Bob with his SPK (§3.3)",
+            {
+                "alice_rvfi1_hex": alice_init.hex(),
+                "bob_rvfi1_hex": bob_init.hex(),
+            },
+            {
+                "alice_rvfb1_hex": alice_state.hex(),
+                "bob_rvfb1_hex": bob_state.hex(),
+                "alice_ec_dhs_pub_hex": alice_tr.ec_dhs_pub.hex(),
+                "bob_ec_dhs_pub_hex": bob_tr.ec_dhs_pub.hex(),
+            },
+        ),
+    )
+
     print("wrote full_braid_* vectors under", OUT)
 
 

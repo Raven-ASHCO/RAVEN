@@ -506,12 +506,22 @@ class BraidReassembly:
             return None
         return b"".join(self.parts[i] for i in range(self.expected_count))
 
-    def promote_with_ss(self, ss: bytes, prev_dk: bytes) -> bytes:
+    def promote_with_ss(self, ss: bytes, prev_dk: bytearray) -> bytes:
+        """Promote and erase the caller's previous-epoch dk in place.
+
+        `deleted_prev_dk` is only set once that buffer is observably zero, so
+        the KAT's `prev_dk_zeroed` asserts real deletion.
+        """
         if self.promoted:
             raise ValueError("already promoted")
         if self.try_complete() is None:
             raise ValueError("incomplete")
-        self.prev_dk = bytes(len(prev_dk))
+        if not isinstance(prev_dk, bytearray):
+            raise TypeError("prev_dk must be a mutable bytearray to erase")
+        prev_dk[:] = bytes(len(prev_dk))
+        if any(prev_dk):
+            raise ValueError("previous decapsulation key not erased")
+        self.prev_dk = None
         self.deleted_prev_dk = True
         self.promoted = True
         return ss
@@ -785,8 +795,10 @@ def run_braid_kem_chunk_matrix(session_id: bytes, sk_scka: bytes) -> dict:
     except ValueError as e:
         tamper_result = str(e)
 
-    prev_dk = hashlib.sha256(b"prev-epoch-dk").digest()
+    prev_dk = bytearray(hashlib.sha256(b"prev-epoch-dk").digest())
     ss = reb.promote_with_ss(z_pq, prev_dk)
+    if any(prev_dk):
+        raise AssertionError("prev dk still live after promote")
     alice = scka_from_init(True, sk_scka)
     bob = scka_from_init(False, sk_scka)
     alice_p = scka_epoch_promote_initiator(alice, ss)

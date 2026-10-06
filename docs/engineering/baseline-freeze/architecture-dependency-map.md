@@ -59,7 +59,7 @@ RDAP is a **fourth companion plane** (delegated agent tasks). It is **not** yet 
 |---|---------|------------|----------------|------|
 | 1 | **Mesh relay** | BLE / nearby opaque forward of packed `RavenEnvelopeV1` (mock-BLE on headless node; GATT on flagged mobile when that tree lands) | A social graph; a plaintext radio; a place that learns contacts; **not** libp2p **Circuit Relay v2** | ADR 0003 Bridge; `RAVEN_BLE_FRAMING_V1.md`; `MESH_PROTOCOL.md` (legacy JSON, deferred with iOS) |
 | 2 | **Bridge** | Untrusted **cross-transport** store-and-forward of the **same** envelope (DTN gateway). **Sealed-ACK-only / opaque:** forwards envelopes; does **not** decrypt or mint endpoint ACKs. No conversation keys. | Friend introducer; contact-graph broker; decrypt/re-seal; ACK minter; **not** Circuit Relay v2 | ADR 0002 (relays never decrypt); ADR 0003; SERVERLESS plane 3; `RAVEN_BRIDGE_V1.md` |
-| 3 | **Direct internet** | `InternetTransport` (V1 shipping: length-prefixed envelope, Ed25519 hello) and/or `raven-swarm` dial (target libp2p) | A Raven-operated inbox; transport auth as E2EE | ADR 0002; `RAVEN_TRANSPORT_INTERFACE_V1.md`; [`docs/network/raven-swarm-connectivity-matrix.md`](https://github.com/Raven-ASHCO/RAVEN/blob/main/docs/network/raven-swarm-connectivity-matrix.md) §0 (on `main`) |
+| 3 | **Direct internet** | `InternetTransport` (V1 laboratory, production hold: RIH1 hello + length-prefixed envelope; `INTERNET_DIRECT_PRODUCTION_ENABLED=false`, localhost lab only) and/or `raven-swarm` dial (target libp2p) | A Raven-operated inbox; transport auth as E2EE | ADR 0002; `RAVEN_TRANSPORT_INTERFACE_V1.md`; [`docs/network/raven-swarm-connectivity-matrix.md`](https://github.com/Raven-ASHCO/RAVEN/blob/main/docs/network/raven-swarm-connectivity-matrix.md) §0 (on `main`) |
 
 **Mesh relay ≠ Circuit Relay v2.** Pathway 1 is BLE/nearby (or `mock_ble`) opaque envelope forward. libp2p Circuit Relay v2 is an experimental NAT hop in `raven-swarm-connectivity-experimental` only (`experimental-nat-connectivity`; production-disabled). Do not conflate them. `raven_core::transport` `PathChoice::Relay` is a **policy bit**, not Circuit Relay v2 (connectivity matrix §0).
 
@@ -163,7 +163,7 @@ flowchart TB
 
 | From | To | How | Evidence |
 |------|----|-----|----------|
-| `ash` | `raven-node` | Unix UDS `raven-node.sock`; ops in `IpcRequest` | `node/crates/raven-core/src/ipc.rs`, `raven-node/src/ipc_server.rs`, ADR 0003 |
+| `ash` | `raven-node` | Unix UDS `raven-node.sock` (`<data_dir>/raven-node.sock`, or `/tmp/raven-<euid>/raven-<hash>.sock` for a long data dir; use `ipc_endpoint()` / `raven doctor`, never a hard-coded path); Windows per-user named pipe; ops in `IpcRequest` | `node/crates/raven-core/src/ipc.rs`, `raven-node/src/ipc_server.rs`, ADR 0003 |
 | `ash` | `raven-node` | `Command::spawn` of sibling `raven-node` binary (`service` / lab send) | `node/crates/ash/src/ext.rs` `raven_node_bin()`, `ensure_mac_lan_daemon()` |
 | RDAP `team_agents.mesh` | `raven-swarm-mailbox-experimental` | subprocess; feature `experimental-offline-mailbox`; flag `--allow-experimental-mailbox` | RDAP `team_agents/mesh.py` `BIN_NAME`, `build_swarm_bin()` |
 | Platform install scripts | `raven-node` | launchd / systemd / Task Scheduler | ADR 0003; `node/scripts/install/WINDOWS_SERVICE.md` |
@@ -174,7 +174,7 @@ flowchart TB
 |------|----|--------|----------------------------------|
 | RDAP task send | `raven-node` IPC `EnqueueSealed` | Production carrier: already-sealed RVN1 through the daemon | RDAP README: “does not submit or receive application payloads through the production `raven-node` ATSAM session actor” |
 | RDAP identity | `raven-core::identity_store` | One user/device principal | RDAP README: “creates its own key under `.team/keys`”; `team_agents/raven_identity.py` `RavenIdentity.load_or_create` |
-| Windows `ash` | named pipe `\\.\pipe\raven-node` | Same IPC framing as UDS | `WINDOWS_SERVICE.md`: “Windows ash falls back to `--send-stdin` spawn until named-pipe client lands” |
+| Windows `ash` | per-user named pipe `\\.\pipe\raven-node-<user SID>` | Same IPC framing as UDS | `WINDOWS_SERVICE.md`: “Windows ash falls back to `--send-stdin` spawn until named-pipe client lands” |
 | iOS | `raven-node` | Clients are not the headless daemon | ADR 0001; **UNKNOWN** whether any iOS code talks UDS/IPC |
 
 ---

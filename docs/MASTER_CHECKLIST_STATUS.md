@@ -1,25 +1,31 @@
 # MASTER_CHECKLIST_STATUS — Raven Serverless Terminal Messaging
 
-**Branch:** `feature/raven-serverless-v1`  
+**Branch (historical):** authored on `feature/raven-serverless-v1`; this file now lives on `main` and is a dated snapshot, not a statement about an open branch  
 **Baseline start commit:** `18fa01e2a32ef014387ae2857ca272f34555cddd`  
-**Updated:** 2026-08-12 (reliability 20× + automatable 100%)  
+**Updated:** 2026-08-12 (reliability 20× + automatable 100%); headline and rows 28/59 re-qualified 2026-10-05 (see below)  
 **Checklist source:** `docs/MASTER_ENGINEERING_CHECKLIST.md`  
 **Walk log:** `docs/MASTER_CHECKLIST_WALK_IN_PROGRESS.md`  
 **Automatable 100% ledger:** `docs/CHECKLIST_100_AUTOMATABLE.md`
 
-> **Automatable checklist = 100% PASS** (software + software substitutes).  
+> **Automatable coverage "100% PASS" (2026-08-12) is withdrawn pending a fresh enforced run** of
+> `scripts/reliability_matrix_20.sh` and `scripts/final_serverless_proof.sh`: the earlier green
+> runs it rested on are INVALIDATED (see *Last green proofs*), and §50 is IN_PROGRESS.  
+> RVN1 messaging is under a **production HOLD** with no external review — see
+> [`protocol/SECURITY_ERRATA_RVN1_2026-08-13.md`](../protocol/SECURITY_ERRATA_RVN1_2026-08-13.md),
+> [`docs/THREAT_MODEL.md`](THREAT_MODEL.md) and connectivity matrix §0
+> ([`docs/network/raven-swarm-connectivity-matrix.md`](network/raven-swarm-connectivity-matrix.md)).  
 > Absolute marketing DoD (§60) is **not** claimed — physical BLE / CGNAT / notarize / external review remain BLOCKED_*.
 
-Status legend: `NOT_STARTED` | `IN_PROGRESS` | `IMPLEMENTED` | `REVIEWED` | `FROZEN` | `BLOCKED_HUMAN` | `BLOCKED_HARDWARE` | `PASS_SOFTWARE_SUBSTITUTE`
+Status legend: `NOT_STARTED` | `IN_PROGRESS` | `IMPLEMENTED` | `REVIEWED` | `FROZEN` | `BLOCKED_HUMAN` | `BLOCKED_HARDWARE` | `PASS_SOFTWARE_SUBSTITUTE` | `HOLD`
 
 Reviewer for all IMPLEMENTED rows: **pending human** unless noted.
 
 **Last green proofs (this machine):**
-- `scripts/reliability_matrix_20.sh` → `RELIABILITY_20_GREEN` (≥20 cycles; see `node/proof_artifacts/LATEST_RELIABILITY`)
+- `scripts/reliability_matrix_20.sh` → **INVALIDATED** — runs before the 2026-09-29 harness fix were false-green (scenario status was its last command, usually `rm -rf`; bridged sends used the refused `atsam` mode). Re-run: `scripts/reliability_matrix_20.sh` now enforces every assertion.
 - `scripts/nat_docker_sim.sh` → **PASS** via Lima Docker (`DOCKER_HOST=unix://…/lima/ash-amd64-preflight/sock/docker.sock`)
 - Linux: musl `ash --help` inside Lima `ash-amd64-preflight`
 - Windows: `ash.exe` PE32+ self-check (`PASS_SOFTWARE_SUBSTITUTE`; wine blocked on sudo/gstreamer)
-- iOS: iPhone + iPad sim XCTest loops (Discovery / ContactRequest / RavenEnvelope*) **TEST SUCCEEDED**
+- iOS: iPhone + iPad sim XCTest loops (Discovery / ContactRequest / RavenEnvelope*) **TEST SUCCEEDED** — **OFF-MAIN**: the `ios-native` tree is not in this repository, so this is not reproducible from this checkout
 - Desktop: `cargo test -p raven-core -p ash`; service SQLite race fixed (WAL busy_timeout + warmup)
 
 | § | Section | Status | Evidence / notes |
@@ -37,7 +43,7 @@ Reviewer for all IMPLEMENTED rows: **pending human** unless noted.
 | 11 | Aliases and Contacts | IMPLEMENTED | Soft Unique Tags; ash find/contact; matrix scenario 06 |
 | 12 | Asynchronous First Contact | IMPLEMENTED | request/accept/block; matrix 06 |
 | 13 | Cryptographic Requirements | IMPLEMENTED | Envelope + ATSAM KATs + tamper/replay matrix 09 (full ML-KEM interop optional debt) |
-| 14 | Key Storage | IMPLEMENTED | identity_store Keychain/DPAPI/SS + iOS PeerKeyDirectory |
+| 14 | Key Storage | IMPLEMENTED | identity_store Keychain/DPAPI; Linux Secret Service is load-only (creation disabled before R1, so Linux Release cannot create an identity yet); iOS PeerKeyDirectory is OFF-MAIN |
 | 15 | Canonical Raven Envelope | FROZEN | rust/swift/python vectors |
 | 16 | Delivery States and ACK | IMPLEMENTED | matrix + §59 |
 | 17 | Raven Node Core | IMPLEMENTED | raven-node daemon + service |
@@ -51,7 +57,7 @@ Reviewer for all IMPLEMENTED rows: **pending human** unless noted.
 | 25 | Send New Message | IMPLEMENTED | stdin / IPC |
 | 26 | Secure CLI Usage | IMPLEMENTED | argv refuse |
 | 27 | Local DB and Queues | IMPLEMENTED | SQLite outbox + forward_queue (busy_timeout) |
-| 28 | Internet P2P Networking | IMPLEMENTED | matrix 01 |
+| 28 | Internet P2P Networking | HOLD | direct Internet not proven; raw path refuses ATSAM origination (fail-closed); libp2p/NAT is experimental only — connectivity matrix §0. (Earlier “IMPLEMENTED / matrix 01” withdrawn; matches the walk log.) |
 | 29 | DHT and Peer Discovery | PASS_SOFTWARE_SUBSTITUTE | Local Kad/libp2p swarm; public Internet Kad **BLOCKED_HARDWARE** |
 | 30 | Bootstrap Nodes | IMPLEMENTED | matrix 10 |
 | 31 | NAT Traversal | PASS_SOFTWARE_SUBSTITUTE | Docker dual-net NAT sim **PASS** (Lima); live CGNAT **BLOCKED_HARDWARE** |
@@ -73,7 +79,7 @@ Reviewer for all IMPLEMENTED rows: **pending human** unless noted.
 | 47 | Cross-Platform Interop | IMPLEMENTED | macOS runtime + Win PE + Linux Lima/musl + Docker NAT |
 | 48 | Mandatory Network Tests | IMPLEMENTED | matrix 01–05, 15 |
 | 49 | Mandatory Security Tests | IMPLEMENTED | refuse argv, UDS, KATs, tamper |
-| 50 | Reliability and Scale Tests | IMPLEMENTED | `reliability_matrix_20.sh` ≥20 cycles |
+| 50 | Reliability and Scale Tests | IN_PROGRESS | `reliability_matrix_20.sh` — earlier green runs invalidated (false-green harness, fixed 2026-09-29); needs a fresh run. `reliability_10k` is a single-threaded queue test without fault injection. |
 | 51 | Terminal-Specific Security Tests | IMPLEMENTED | ash/raven-node refuse + doctor |
 | 52 | Packaging | IMPLEMENTED | unsigned release; MSI/notarize **BLOCKED_HUMAN** |
 | 53 | Node Operator Controls | IMPLEMENTED | ash node bridge/store/relay/bootstrap |
@@ -82,7 +88,7 @@ Reviewer for all IMPLEMENTED rows: **pending human** unless noted.
 | 56 | Documentation | IMPLEMENTED | INSTALL_*, CHECKLIST_100, walk |
 | 57 | CI Requirements | IMPLEMENTED | raven-serverless.yml declared |
 | 58 | Phase Exit Gates | IMPLEMENTED | Software gates maximized; human freeze **BLOCKED_HUMAN** |
-| 59 | Final Serverless Proof | IMPLEMENTED | Harness + reliability 20×; physical multi-device **BLOCKED_HARDWARE** |
+| 59 | Final Serverless Proof | IN_PROGRESS | Harness fixed 2026-09-29; fresh enforced run of `final_serverless_proof.sh` + `reliability_matrix_20.sh` pending (earlier green runs INVALIDATED); physical multi-device **BLOCKED_HARDWARE** |
 | 60 | Final Definition of Done | BLOCKED_HUMAN | External review / notarize / phones |
 
 ## Honest leftovers (absolute DoD only)
@@ -99,4 +105,4 @@ Reviewer for all IMPLEMENTED rows: **pending human** unless noted.
 - Headless CoreBluetooth desktop radio
 - Public Internet Kad soak
 
-**READY FOR FULL TEST (marketing) = NO** — automatable software path is 100%; absolute DoD needs human+hardware.
+**READY FOR FULL TEST (marketing) = NO** — the automatable-coverage claim is pending a fresh enforced run (rows 50/59), RVN1 is under production HOLD, and absolute DoD needs human+hardware.

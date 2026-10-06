@@ -1,4 +1,37 @@
-# Task 0A.1 / 0A.2 — byte-pinned SQLCipher amalgamation and provenance files.
-# SHA-256 must match on every host. Git must not convert CRLF on Windows.
+# Line-ending policy.
+#
+# Many files in this repo are hashed byte-for-byte (protocol/ + shared-vectors/
+# via scripts/freeze_protocol_hashes.sh --check, the vendored SQLite/SQLCipher
+# amalgamations via libsqlite3-sys-raven/build.rs, the secret-service fork via
+# node/scripts/verify_secret_service_2_0_2_raven_noprompt.sh) and the harness
+# scripts are bash. With Git for Windows' default core.autocrlf=true an
+# unmodified checkout would otherwise get CRLF: every hash would drift and
+# `#!/usr/bin/env bash` scripts would stop running.
+#
+# Rules are applied top to bottom and the LAST matching rule wins, so the
+# general rule comes first and the byte-pinned `-text` overrides come last.
+# Existing index blobs are already LF, so this needs no renormalisation
+# (verify with `git add --renormalize . && git status --short`).
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.ps1 text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+protocol/** text eol=lf
+shared-vectors/** text eol=lf
+
+# Task 0A.1 / 0A.2 / supply-chain pins — byte-pinned vendored sources and
+# provenance files. SHA-256 must match on every host. Git must not convert
+# CRLF on Windows. This covers the ordinary SQLite amalgamation
+# (libsqlite3-sys-raven/sqlite3/**, hashed on every build by build.rs), the
+# SQLCipher trees, and the vendored secret-service fork (which keeps one
+# upstream CRLF file; -text stops a later renormalize from touching it).
+node/third_party/** -text
 node/third_party/sqlcipher-4.17.0/** -text
 node/third_party/libsqlite3-sys-raven/sqlcipher/** -text
+node/third_party/libsqlite3-sys-raven/sqlite3/** -text

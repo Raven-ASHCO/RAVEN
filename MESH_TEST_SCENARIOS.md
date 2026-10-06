@@ -1,5 +1,20 @@
 # 🧪 Mesh Connectivity Test Scenarios — 3 iPhones
 
+> **LEGACY / OFF-MAIN — not the serverless RVN1 acceptance test.**
+> This is a Persian-language manual radio script for the **legacy iOS `MeshEnvelope` app** (3 iPhones,
+> serverless flag **OFF**). The iOS tree (`ios-native`) is **not in this repository**, so nothing here can
+> be run or verified from this checkout. In particular, scenario 3 ("Internet-First → Mesh Fallback":
+> a blue "Server" badge and a `MessageRouter` presence check against the server) describes the legacy
+> server-first routing; it is **not** part of the serverless RVN1 contract, which has no server in the
+> message path and no silent fallback (README "FastAPI: NEVER in the path"). Do not use it as the
+> project's mesh acceptance criteria. For the RVN1 hardware runbook see
+> [`docs/PHYSICAL_BLE_THREE_DEVICE.md`](docs/PHYSICAL_BLE_THREE_DEVICE.md); for the wire contract see
+> [`protocol/SPEC.md`](protocol/SPEC.md) and
+> [`protocol/SECURITY_ERRATA_RVN1_2026-08-13.md`](protocol/SECURITY_ERRATA_RVN1_2026-08-13.md).
+>
+> **قدیمی / خارج از این مخزن:** این سند فقط برای اپ قدیمی iOS با `MeshEnvelope` (فلگ serverless خاموش) است؛
+> سناریوی ۳ (نشان «Server» و بررسی حضور از سرور) بخشی از قرارداد serverless نیست.
+
 ## تنظیم اولیه
 
 | Device | نام | یوزر |

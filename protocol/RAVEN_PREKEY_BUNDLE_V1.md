@@ -45,12 +45,27 @@ key material.
 
 ## 4. Validation order
 
-1. Length / version / field bounds  
+1. Length / version / field bounds (including `device_id` ≤ 64 UTF-8 bytes;
+   a verifier MUST reject a longer id even under a valid signature)  
 2. `expires_at_ms > now` (clock skew tolerance ±5 min)  
 3. Signature verify against `identity_ed25519_pub`  
 4. Reject if `mlkem768_ek` length ≠ 1184 or is all zero
 5. Reject otp fields inconsistent with `one_time_prekey_id`  
 6. Cache by `(identity_ed25519_pub, signed_prekey_id)`; prefer highest id that still validates
+
+**Reference cache limitation.** The Rust `PrekeyStore` keeps exactly one
+bundle per `identity_ed25519_pub`, under the lookup key
+`SHA-256("rvn1/prekey-key" || identity_ed25519_pub)`: the highest valid
+`signed_prekey_id`, with same-id equivocation and lower-id rollback rejected.
+That matches item 6 for a single-device identity only. Two devices that sign
+bundles with the same identity key conflict in this cache, so multi-device
+publication under one identity needs a versioned lookup key that also binds
+`device_id`; it is not provided by V1.
+
+A publisher treats an expired or unverifiable copy of its own bundle as
+absent and rotates before the bundle's last 8 days (see
+[`RAVEN_PREKEY_LIFECYCLE_V1.md`](RAVEN_PREKEY_LIFECYCLE_V1.md) §3), so that a
+full-length PairInit always fits inside the published validity.
 
 ## 5. Publish / replicate (serverless)
 
@@ -75,8 +90,11 @@ reference is production-disabled and does not solve the confidential carrier.
 
 | Id | Path | Notes |
 |----|------|-------|
-| Structural KAT | `shared-vectors/rvn1/prekey/bundle_structure_001.json` | signing-bytes hex + field sizes (EK may be deterministic test bytes) |
-| Negative | `shared-vectors/rvn1/negative/prekey_bad_sig.json` | tampered signature → reject |
+| Structural KAT | `shared-vectors/rvn1/prekey/bundle_structure_001.json` | domain, version and field sizes only (no signing bytes, no signature — frozen as committed) |
+| Signing KAT (OTP) | `shared-vectors/rvn1/prekey/bundle_signing_001.json` | full signing bytes + signature, real ML-KEM-768 EK, one-time prekey present, §4 clock-window cases |
+| Signing KAT (no OTP) | `shared-vectors/rvn1/prekey/bundle_signing_002.json` | same, `one_time_prekey_id = 0` (key omitted from signing bytes) |
+| Negative | `shared-vectors/rvn1/negative/prekey_bad_sig.json` | tampered signature → reject (label only, no inputs — frozen as committed) |
+| Negative | `shared-vectors/rvn1/negative/prekey_bad_sig_002.json` | concrete bundle with a flipped signature bit → `PREKEY_BAD_SIG` |
 
 Rust: `raven_core::prekey_bundle`. Existing iOS HTTP publication is a held
 legacy path, not serverless activation evidence.

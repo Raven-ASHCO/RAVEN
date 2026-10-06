@@ -31,6 +31,8 @@ pub enum DropReason {
     UnsupportedType,
     /// Per-peer enqueue / pending / byte budget exceeded (abuse protection).
     RateLimited,
+    /// Relay custody (forward queue count or byte cap) is full (`STORE_FULL`).
+    StoreFull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +95,17 @@ impl EnvelopeIdentity {
     }
 }
 
+/// Envelope types a bridge or relay may carry: only `Message` and `Ack`.
+/// Alias-gossip and capabilities envelopes are not custody objects, so no
+/// relay/endpoint path ([`decide`], [`classify_multi_role`],
+/// `MessageRouter::handle_inbound`) may queue or forward them.
+pub fn is_relayable_type(env_type: u8) -> bool {
+    matches!(
+        EnvType::from_u8(env_type),
+        Some(EnvType::Message | EnvType::Ack)
+    )
+}
+
 /// Decide what a node should do with an inbound packed RavenEnvelopeV1.
 ///
 /// `is_duplicate` is supplied by the caller (persistent dedup). Relays never
@@ -113,19 +126,21 @@ pub fn decide(packed: &[u8], role: BridgeRole, now_ms: u64, is_duplicate: bool) 
             reason: DropReason::Expired,
         };
     }
-    match EnvType::from_u8(env.env_type) {
-        Some(EnvType::Message) | Some(EnvType::Ack) => match role {
-            BridgeRole::Endpoint => BridgeAction::DeliverLocal,
-            BridgeRole::Relay => match prepare_forward(env) {
-                Ok(fwd) => BridgeAction::Forward { packed: fwd.pack() },
-                Err(reason) => BridgeAction::Drop { reason },
+    if !is_relayable_type(env.env_type) {
+        let known = EnvType::from_u8(env.env_type).is_some();
+        return BridgeAction::Drop {
+            reason: if known {
+                DropReason::UnsupportedType
+            } else {
+                DropReason::Malformed
             },
-        },
-        Some(_) => BridgeAction::Drop {
-            reason: DropReason::UnsupportedType,
-        },
-        None => BridgeAction::Drop {
-            reason: DropReason::Malformed,
+        };
+    }
+    match role {
+        BridgeRole::Endpoint => BridgeAction::DeliverLocal,
+        BridgeRole::Relay => match prepare_forward(env) {
+            Ok(fwd) => BridgeAction::Forward { packed: fwd.pack() },
+            Err(reason) => BridgeAction::Drop { reason },
         },
     }
 }
@@ -170,7 +185,12 @@ pub fn classify_multi_role(
     local_is_destination: bool,
     bridge_enabled: bool,
 ) -> MultiRoleDisposition {
+    if !is_relayable_type(env_type) {
+        return MultiRoleDisposition::Drop;
+    }
     match EnvType::from_u8(env_type) {
+        // Destination wins for ACKs too: relaying our own ACK away would lose it.
+        Some(EnvType::Ack) if local_is_destination => MultiRoleDisposition::DeliverToEndpoint,
         Some(EnvType::Ack) if bridge_enabled => MultiRoleDisposition::AckRelay,
         Some(EnvType::Ack) => MultiRoleDisposition::DeliverToEndpoint,
         Some(EnvType::Message) if local_is_destination => MultiRoleDisposition::DeliverToEndpoint,
@@ -317,6 +337,18 @@ mod tests {
         assert_eq!(
             classify_multi_role(EnvType::Ack as u8, false, true),
             MultiRoleDisposition::AckRelay
+        );
+    }
+
+    #[test]
+    fn multi_role_ack_for_local_destination_is_not_relayed() {
+        assert_eq!(
+            classify_multi_role(EnvType::Ack as u8, true, true),
+            MultiRoleDisposition::DeliverToEndpoint
+        );
+        assert_eq!(
+            classify_multi_role(EnvType::Ack as u8, true, false),
+            MultiRoleDisposition::DeliverToEndpoint
         );
     }
 }

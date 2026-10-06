@@ -1,6 +1,6 @@
 # Migration: Legacy Raven Messaging → Serverless V1 (§54)
 
-**Branch:** `feature/raven-serverless-v1`  
+**Branch (historical):** authored on `feature/raven-serverless-v1`; this file now lives on `main` and is a dated snapshot, not a statement about an open branch  
 **Binding model:** `docs/SERVERLESS_MODEL.md` / `node/SERVERLESS_MODEL.md`
 
 ## Non-negotiable rule
@@ -34,7 +34,7 @@ Rust helper: `raven_core::messaging_path` (`MessagingPath::{ServerlessRvn1, Lega
 
 | Label | Meaning |
 |-------|---------|
-| `daemon_presence` | `ipc_client::ipc_ping` over `ipc_endpoint`. Success: `present` (not `up`). Connect fail: `down`. `IpcEndpoint::Unsupported`: `blocked (reason=ipc_transport_missing)` — never a ✓. Windows: `\\.\pipe\raven-node` only (never UDS). |
+| `daemon_presence` | `ipc_client::ipc_ping` over `ipc_endpoint`. Success: `present` (not `up`). Connect fail: `down`. `IpcEndpoint::Unsupported`: `blocked (reason=ipc_transport_missing)` — never a ✓. Windows: the per-user pipe `\\.\pipe\raven-node-<user SID>` only (never UDS); a pipe whose server runs as another user is refused. |
 | `daemon_ready` | Presence plus Status, `raven_core::identity_usable` (mismatch ⇒ ready FAIL), queue/DB or `forward_pending`, `serverless_rvn1`. |
 | `send_path` | Default `not_ready (reason=not_probed)`. Never green from presence or ready. |
 

@@ -3,6 +3,8 @@
 #   - cargo workspace: /node/Cargo.toml (+ Cargo.lock)
 #   - GitHub Actions: /.github/workflows
 #   - pip (protocol vectors): /protocol/reference/requirements.txt
+# Added since: cargo for /node/fuzz (its own Cargo.toml + Cargo.lock; the fuzz
+# crate is not a member of the /node workspace, so the /node entry never sees it).
 # Omitted: gomod — no go.mod on main (ios-native Libp2pBridge is not in this tree).
 # Do not add ecosystems until their manifests land on main.
 version: 2
@@ -11,6 +13,23 @@ updates:
     directory: /node
     schedule:
       interval: weekly
+    # rusqlite is pinned exactly (=0.40.2) and libsqlite3-sys is the audited path
+    # fork wired through [patch.crates-io]. An automatic bump could need a
+    # libsqlite3-sys the fork no longer satisfies; Cargo then only warns "Patch ...
+    # was not used" and the fork (ordinary-SQLite pins, profile guard, durable-lab
+    # release hold) silently drops out. Bump these by hand, together with a fork
+    # refresh (scripts/sqlcipher_release_feature_audit.sh fails if the fork is dropped).
+    ignore:
+      - dependency-name: "rusqlite"
+      - dependency-name: "libsqlite3-sys"
+
+  - package-ecosystem: cargo
+    directory: /node/fuzz
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "rusqlite"
+      - dependency-name: "libsqlite3-sys"
 
   - package-ecosystem: github-actions
     directory: /

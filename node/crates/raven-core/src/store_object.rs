@@ -198,12 +198,23 @@ impl StoreObject {
     }
 }
 
+/// A stored object plus its authenticated digest, computed once on insert so
+/// dedup never re-unpacks and re-hashes every stored envelope.
+struct StoredObject {
+    object: StoreObject,
+    digest: [u8; 32],
+}
+
 /// In-memory mailbox indexed by store_tag (software substitute for multi-node store).
 pub struct StoreMailbox {
-    items: Vec<StoreObject>,
+    items: Vec<StoredObject>,
     max_per_tag: usize,
     max_total: usize,
     max_total_bytes: usize,
+    /// Set when contents differ from the last snapshot written/read, so
+    /// idempotent re-puts (a peer resending one object) never force a full
+    /// snapshot rewrite.
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl Default for StoreMailbox {
@@ -231,10 +242,23 @@ impl StoreMailbox {
             max_per_tag: max_per_tag.max(1),
             max_total: max_total.max(1),
             max_total_bytes: max_total_bytes.max(1),
+            // Never persisted yet: the first save must write a snapshot.
+            dirty: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
+    fn mark_dirty(&self) {
+        self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Idempotent for an exact duplicate (same tag + authenticated digest).
     pub fn put(&mut self, obj: StoreObject) -> Result<(), String> {
+        self.insert(obj).map(|_| ())
+    }
+
+    /// Like [`Self::put`], but reports whether a new row was stored
+    /// (`Ok(false)` for an exact duplicate, which changes nothing).
+    pub fn insert(&mut self, obj: StoreObject) -> Result<bool, String> {
         let env = obj.validated_envelope()?;
         if obj.expired(
             std::time::SystemTime::now()
@@ -245,19 +269,18 @@ impl StoreMailbox {
             return Err("STORE_EXPIRED".into());
         }
         let digest = authenticated_object_digest(&env);
-        if self.items.iter().any(|item| {
-            item.store_tag == obj.store_tag
-                && Envelope::unpack(&item.packed_envelope)
-                    .map(|known| authenticated_object_digest(&known) == digest)
-                    .unwrap_or(false)
-        }) {
-            return Ok(());
+        if self
+            .items
+            .iter()
+            .any(|item| item.object.store_tag == obj.store_tag && item.digest == digest)
+        {
+            return Ok(false);
         }
         if self.items.len() >= self.max_total {
             return Err("STORE_FULL".into());
         }
         let used_bytes = self.items.iter().try_fold(0usize, |used, item| {
-            used.checked_add(item.packed_envelope.len())
+            used.checked_add(item.object.packed_envelope.len())
         });
         if used_bytes
             .and_then(|used| used.checked_add(obj.packed_envelope.len()))
@@ -269,7 +292,7 @@ impl StoreMailbox {
         let count = self
             .items
             .iter()
-            .filter(|i| i.store_tag == obj.store_tag)
+            .filter(|i| i.object.store_tag == obj.store_tag)
             .count();
         if count >= self.max_per_tag {
             return Err("STORE_FULL".into());
@@ -277,25 +300,52 @@ impl StoreMailbox {
         // Different authenticated objects with the same public message_id are
         // independent bounded rows. An attacker cannot pre-poison a genuine
         // object by racing an ID collision.
-        self.items.push(obj);
-        Ok(())
+        self.items.push(StoredObject {
+            object: obj,
+            digest,
+        });
+        self.mark_dirty();
+        Ok(true)
     }
 
     pub fn get(&self, store_tag: &[u8; 16], now_ms: u64) -> Vec<&StoreObject> {
         self.items
             .iter()
-            .filter(|i| i.store_tag == *store_tag && !i.expired(now_ms))
+            .map(|i| &i.object)
+            .filter(|o| o.store_tag == *store_tag && !o.expired(now_ms))
             .collect()
     }
 
     pub fn purge_expired(&mut self, now_ms: u64) -> usize {
         let before = self.items.len();
-        self.items.retain(|i| !i.expired(now_ms));
-        before - self.items.len()
+        self.items.retain(|i| !i.object.expired(now_ms));
+        let removed = before - self.items.len();
+        if removed > 0 {
+            self.mark_dirty();
+        }
+        removed
     }
 
     /// Persist mailbox as opaque JSON (store_tag hex → objects). Never indexes usernames.
+    ///
+    /// A no-op when nothing changed since the last successful save or load,
+    /// so duplicate puts cannot be used to force full-snapshot rewrites.
     pub fn save_disk(&self, path: &std::path::Path) -> Result<(), String> {
+        if !self.dirty.load(std::sync::atomic::Ordering::SeqCst) && path.exists() {
+            return Ok(());
+        }
+        self.write_snapshot(path)?;
+        self.dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Stream the snapshot as compact JSON, one row at a time: each envelope is
+    /// hex-encoded only while its own row is serialized, so peak memory is a
+    /// row, not a second and third copy of the whole (up to 64 MiB) store.
+    /// `load_disk` reads whitespace-agnostic JSON, so the stored format is
+    /// unchanged apart from being compact.
+    fn write_rows<W: std::io::Write>(&self, out: W) -> Result<(), String> {
+        use serde::Serializer as _;
         #[derive(Serialize)]
         struct Row {
             store_tag_hex: String,
@@ -306,23 +356,25 @@ impl StoreMailbox {
             packed_envelope_hex: String,
             custody_sig_hex: Option<String>,
         }
-        let rows: Vec<Row> = self
-            .items
-            .iter()
-            .map(|o| Row {
-                store_tag_hex: hex::encode(o.store_tag),
-                message_id_hex: hex::encode(o.message_id),
-                created_at_ms: o.created_at_ms,
-                expires_at_ms: o.expires_at_ms,
-                flags: o.flags,
-                packed_envelope_hex: hex::encode(&o.packed_envelope),
-                custody_sig_hex: o.custody_sig.map(hex::encode),
-            })
-            .collect();
+        let rows = self.items.iter().map(|i| &i.object).map(|o| Row {
+            store_tag_hex: hex::encode(o.store_tag),
+            message_id_hex: hex::encode(o.message_id),
+            created_at_ms: o.created_at_ms,
+            expires_at_ms: o.expires_at_ms,
+            flags: o.flags,
+            packed_envelope_hex: hex::encode(&o.packed_envelope),
+            custody_sig_hex: o.custody_sig.map(hex::encode),
+        });
+        let mut serializer = serde_json::Serializer::new(out);
+        (&mut serializer)
+            .collect_seq(rows)
+            .map_err(|e| e.to_string())
+    }
+
+    fn write_snapshot(&self, path: &std::path::Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let raw = serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
             use std::io::Write;
@@ -336,28 +388,35 @@ impl StoreMailbox {
                 rand::random::<u64>()
             ));
             let result = (|| -> Result<(), String> {
-                let mut file = std::fs::OpenOptions::new()
+                let file = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .mode(0o600)
                     .open(&tmp)
                     .map_err(|e| e.to_string())?;
-                file.write_all(raw.as_bytes()).map_err(|e| e.to_string())?;
-                file.sync_all().map_err(|e| e.to_string())?;
+                let mut writer = std::io::BufWriter::new(file);
+                self.write_rows(&mut writer)?;
+                writer.flush().map_err(|e| e.to_string())?;
+                writer.get_ref().sync_all().map_err(|e| e.to_string())?;
                 std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-                std::fs::File::open(parent)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(|e| e.to_string())?;
                 Ok(())
             })();
             if result.is_err() {
                 let _ = std::fs::remove_file(&tmp);
+                return result;
             }
-            result
+            // The rename has committed: a directory fsync problem must not be
+            // reported as a failed write (see `sync_dir_best_effort`).
+            crate::paths::sync_dir_best_effort(parent);
+            Ok(())
         }
         #[cfg(not(unix))]
         {
-            std::fs::write(path, raw).map_err(|e| e.to_string())
+            // Temp + fsync + replace, never a truncate-and-write: a torn
+            // snapshot makes the whole mailbox unloadable (fail-closed).
+            let mut raw = Vec::new();
+            self.write_rows(&mut raw)?;
+            crate::paths::atomic_write_private(path, &raw)
         }
     }
 
@@ -371,6 +430,39 @@ impl StoreMailbox {
             flags: u16,
             packed_envelope_hex: String,
             custody_sig_hex: Option<String>,
+        }
+        fn row_object(r: Row) -> Result<StoreObject, String> {
+            let st = hex::decode(&r.store_tag_hex).map_err(|e| e.to_string())?;
+            let mid = hex::decode(&r.message_id_hex).map_err(|e| e.to_string())?;
+            if st.len() != 16 || mid.len() != 16 {
+                return Err("invalid mailbox row identifier".into());
+            }
+            let mut store_tag = [0u8; 16];
+            store_tag.copy_from_slice(&st);
+            let mut message_id = [0u8; 16];
+            message_id.copy_from_slice(&mid);
+            let packed_envelope = hex::decode(&r.packed_envelope_hex).map_err(|e| e.to_string())?;
+            let custody_sig = match r.custody_sig_hex {
+                Some(h) => {
+                    let v = hex::decode(h).map_err(|e| e.to_string())?;
+                    if v.len() != 64 {
+                        return Err("invalid custody signature length".into());
+                    }
+                    let mut s = [0u8; 64];
+                    s.copy_from_slice(&v);
+                    Some(s)
+                }
+                None => None,
+            };
+            Ok(StoreObject {
+                store_tag,
+                message_id,
+                created_at_ms: r.created_at_ms,
+                expires_at_ms: r.expires_at_ms,
+                flags: r.flags,
+                packed_envelope,
+                custody_sig,
+            })
         }
         let mut mb = Self::new(max_per_tag);
         let Ok(metadata) = std::fs::symlink_metadata(path) else {
@@ -390,50 +482,27 @@ impl StoreMailbox {
             }
         }
         let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        // An unparseable snapshot is corrupt as a whole: fail closed.
         let rows: Vec<Row> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut dropped = false;
         for r in rows {
-            let st = hex::decode(&r.store_tag_hex).map_err(|e| e.to_string())?;
-            let mid = hex::decode(&r.message_id_hex).map_err(|e| e.to_string())?;
-            if st.len() != 16 || mid.len() != 16 {
-                return Err("invalid mailbox row identifier".into());
-            }
-            let mut store_tag = [0u8; 16];
-            store_tag.copy_from_slice(&st);
-            let mut message_id = [0u8; 16];
-            message_id.copy_from_slice(&mid);
-            let packed_envelope = hex::decode(&r.packed_envelope_hex).map_err(|e| e.to_string())?;
-            let custody_sig = match r.custody_sig_hex {
-                Some(h) => {
-                    let v = hex::decode(h).map_err(|e| e.to_string())?;
-                    if v.len() != 64 {
-                        return Err("invalid custody signature length".into());
-                    } else {
-                        let mut s = [0u8; 64];
-                        s.copy_from_slice(&v);
-                        Some(s)
+            // A single row that no longer passes current rules (expired,
+            // malformed, over a tightened limit) is skipped rather than making
+            // the whole mailbox unloadable; the next save drops it for good.
+            match row_object(r) {
+                Ok(obj) if !obj.expired(now_ms) => {
+                    if mb.insert(obj).is_err() {
+                        dropped = true;
                     }
                 }
-                None => None,
-            };
-            let obj = StoreObject {
-                store_tag,
-                message_id,
-                created_at_ms: r.created_at_ms,
-                expires_at_ms: r.expires_at_ms,
-                flags: r.flags,
-                packed_envelope,
-                custody_sig,
-            };
-            if obj.expired(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-            ) {
-                continue;
+                _ => dropped = true,
             }
-            mb.put(obj)?;
         }
+        mb.dirty.store(dropped, std::sync::atomic::Ordering::SeqCst);
         Ok(mb)
     }
 }
@@ -544,7 +613,12 @@ mod tests {
             packed_envelope: packed_envelope([5u8; 16], 100, 2),
             custody_sig: None,
         };
-        expired_mb.items.push(expired);
+        let digest =
+            authenticated_object_digest(&Envelope::unpack(&expired.packed_envelope).unwrap());
+        expired_mb.items.push(StoredObject {
+            object: expired,
+            digest,
+        });
         assert!(expired_mb.get(&[3u8; 16], 100).is_empty());
         assert_eq!(expired_mb.purge_expired(100), 1);
     }
@@ -659,6 +733,119 @@ mod tests {
             .starts_with(".mailbox.tmp")));
         let loaded = StoreMailbox::load_disk(&path, 4).unwrap();
         assert_eq!(loaded.get(&[7u8; 16], 2).len(), 1);
+    }
+
+    fn sample_object(tag: u8, mid: u8, body: u8) -> StoreObject {
+        let expires = 9_000_000_000_000;
+        StoreObject {
+            store_tag: [tag; 16],
+            message_id: [mid; 16],
+            created_at_ms: 1,
+            expires_at_ms: expires,
+            flags: 0,
+            packed_envelope: packed_envelope([mid; 16], expires, body),
+            custody_sig: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_put_does_not_rewrite_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mailbox.json");
+        let mut mailbox = StoreMailbox::new(4);
+        let object = sample_object(1, 2, 3);
+        assert!(mailbox.insert(object.clone()).unwrap());
+        mailbox.save_disk(&path).unwrap();
+        // Sentinel content (mode preserved) proves whether a rewrite happens.
+        std::fs::write(&path, b"[]").unwrap();
+        for _ in 0..3 {
+            assert!(!mailbox.insert(object.clone()).unwrap(), "exact duplicate");
+            mailbox.put(object.clone()).unwrap();
+            mailbox.save_disk(&path).unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"[]");
+        assert!(mailbox.insert(sample_object(1, 5, 6)).unwrap());
+        mailbox.save_disk(&path).unwrap();
+        assert_eq!(
+            StoreMailbox::load_disk(&path, 4)
+                .unwrap()
+                .get(&[1; 16], 2)
+                .len(),
+            2
+        );
+    }
+
+    /// The snapshot is streamed row by row as compact JSON (no whole-store
+    /// pretty-printed string, no full-store hex copy) and stays loadable, with
+    /// custody signatures intact, and leaves no temp file behind.
+    #[test]
+    fn snapshot_is_compact_streamed_json_that_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mailbox.json");
+        let store_id = Identity::generate();
+        let mut mailbox = StoreMailbox::new(4);
+        let mut signed = sample_object(1, 2, 3);
+        signed.sign_custody(&store_id).unwrap();
+        mailbox.put(signed.clone()).unwrap();
+        mailbox.put(sample_object(1, 4, 5)).unwrap();
+        mailbox.put(sample_object(2, 6, 7)).unwrap();
+        mailbox.save_disk(&path).unwrap();
+        // A second save of changed contents replaces the file atomically.
+        mailbox.put(sample_object(2, 8, 9)).unwrap();
+        mailbox.save_disk(&path).unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.contains(&b'\n'), "snapshot must be compact JSON");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(rows.len(), 4);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("mailbox.json")]);
+
+        let loaded = StoreMailbox::load_disk(&path, 4).unwrap();
+        assert_eq!(loaded.get(&[1; 16], 2).len(), 2);
+        assert_eq!(loaded.get(&[2; 16], 2).len(), 2);
+        let back = loaded
+            .get(&[1; 16], 2)
+            .into_iter()
+            .find(|o| o.message_id == [2; 16])
+            .unwrap();
+        assert!(back.verify_custody(&store_id.public_key_bytes()));
+        assert_eq!(*back, signed);
+    }
+
+    #[test]
+    fn one_invalid_row_does_not_make_the_mailbox_unloadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mailbox.json");
+        let mut mailbox = StoreMailbox::new(4);
+        mailbox.put(sample_object(1, 2, 3)).unwrap();
+        mailbox.put(sample_object(1, 4, 5)).unwrap();
+        mailbox.save_disk(&path).unwrap();
+        let mut rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        rows[0]["packed_envelope_hex"] = serde_json::Value::String("zz".into());
+        std::fs::write(&path, serde_json::to_vec(&rows).unwrap()).unwrap();
+
+        let loaded = StoreMailbox::load_disk(&path, 4).unwrap();
+        assert_eq!(loaded.get(&[1; 16], 2).len(), 1);
+        // A tightened per-tag limit also drops excess rows instead of failing.
+        let mut full = StoreMailbox::new(4);
+        full.put(sample_object(7, 1, 1)).unwrap();
+        full.put(sample_object(7, 2, 2)).unwrap();
+        full.save_disk(&path).unwrap();
+        assert_eq!(
+            StoreMailbox::load_disk(&path, 1)
+                .unwrap()
+                .get(&[7; 16], 2)
+                .len(),
+            1
+        );
+        // A snapshot that is not JSON at all still fails closed.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(StoreMailbox::load_disk(&path, 4).is_err());
     }
 
     #[test]

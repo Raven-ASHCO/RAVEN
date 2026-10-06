@@ -21,19 +21,27 @@ codesign --verify --verbose=2 dist/.../bin/ash
 ```
 
 6. Zip/app-bundle as required by `notarytool`.
-7. Submit:
+7. Store credentials once, then submit. **Never pass the app-specific password
+   with `--password` on the command line**: it lands in shell history, `ps`
+   output and process listings (this repo's "no secrets in argv" rule). Omit it
+   so `notarytool` prompts interactively and keeps it in the Keychain:
 
 ```bash
-xcrun notarytool submit <archive.zip> \
-  --apple-id "<apple-id>" --team-id "<TEAMID>" --password "<app-specific-password>" \
-  --wait
+# one time on the signing Mac (prompts for the app-specific password)
+xcrun notarytool store-credentials "raven-notary" \
+  --apple-id "<apple-id>" --team-id "<TEAMID>"
+# every release
+xcrun notarytool submit <archive.zip> --keychain-profile "raven-notary" --wait
 xcrun stapler staple <artifact>
 ```
+
+   Alternative: App Store Connect API-key auth (`--key <AuthKey.p8> --key-id <ID>
+   --issuer <issuer-uuid>`), with the key file kept out of the repo.
 
 8. Gatekeeper check: download on a clean Mac; open without right-click bypass.
 9. Optional: Developer ID Installer + productbuild for `.pkg`.
 
-**Blocked without:** Apple ID with paid membership, certs, app-specific password / API key.
+**Blocked without:** Apple ID with paid membership, certs, and a stored `notarytool` keychain profile (app-specific password) or an API key.
 
 ---
 

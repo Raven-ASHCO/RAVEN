@@ -1,7 +1,7 @@
 # RAVEN Protocol Version Inventory
 
 **Status:** Living inventory (docs only). Not a wire change.
-**Updated:** 2026-09-06
+**Updated:** 2026-09-29
 **Audience:** protocol owners, ports, CI readers.
 
 This page lists which protocol families are frozen, which are draft / production-disabled, and which CI jobs in `.github/workflows/raven-serverless.yml` (workflow display name: **Raven Serverless Node**) and `.github/workflows/raven-b1-always-on.yml` (workflow display name: **Raven B1 Always-On**) can be cited as evidence on the current serverless `main` tree.
@@ -95,6 +95,7 @@ Cite present-tree evidence first. The six names in **RAVEN Serverless B1** above
 |---|---|---|
 | **Rust + vectors (Linux)** | **protocol vectors (python)** | Intended `rvn1` vector regen/drift gate (`pytest` + `generate_rvn1.py` + `git diff --exit-code` on `shared-vectors/rvn1`). Parent job is **main-green verified** on `e0a317aa` (pin not enabled). |
 | **Rust + vectors (Linux)** | **experimental mailbox/NAT tests (still production-disabled)** | Intended fail-closed hold: experimental binaries must refuse to run without explicit opt-in. Parent job is **main-green verified** on `e0a317aa` (pin not enabled). Profile remains production-disabled. |
+| **Harness self-tests + protocol freeze** | **Protocol freeze hashes (docs/PROTOCOL_FREEZE_HASHES_V1.md)** | `scripts/freeze_protocol_hashes.sh --check`: any change / addition / removal under `protocol/` or `shared-vectors/rvn1/` fails unless the manifest is regenerated in the same change. New job; not a B1 name. |
 | **.NET / C# rvn1 shared-vector consumer** | — | **NOT YET.** No smoke gate in `raven-serverless.yml`. Do not invent a C# harness. |
 
 Jobs that remain **skip-when-absent / N/A** on this serverless `main` (not B1 candidates; not required gates):
@@ -109,3 +110,32 @@ Jobs that remain **skip-when-absent / N/A** on this serverless `main` (not B1 ca
 Watch jobs remain **N/A** on this serverless tree (no `RAVEN-WatchApp/` paths). Other lab job display names (not claimed as RAVEN B1 here): **ML-KEM-768 incremental (portable)**, **ML-KEM-768 incremental (AVX2)**, **ML-KEM-768 incremental (NEON)**, **Full Braid Slice 2 lab**, **Full Braid Task 0A provenance (0A.1)**, **Full Braid Task 0A Linux (0A.2/0A.4/0A.5)**, **Full Braid Task 0A Windows MSVC (0A.2/0A.4)**.
 
 Platform vector consumers outside this workflow: see [`../shared-vectors/README.md`](../shared-vectors/README.md). **.NET / C# `rvn1` CI consumer is NOT YET.**
+
+---
+
+## Freeze record changes (2026-09-29)
+
+No wire format, key derivation or signature input changed. Docs / vectors only:
+
+- **Freeze manifest re-baselined.** `docs/PROTOCOL_FREEZE_HASHES_V1.md` (last
+  generated 2026-08-12 at `7acbef7`) no longer matched the tree: 15 of its 68
+  entries had changed — `SPEC.md`, `RAVEN_ENVELOPE_V1.md`, `RAVEN_ACK_V1.md`,
+  `RAVEN_PREKEY_BUNDLE_V1.md`, `RAVEN_ROUTING_TAG_V1.md`,
+  `RAVEN_STORE_OBJECT_V1.md`, `RAVEN_TRANSPORT_INTERFACE_V1.md`,
+  `RAVEN_ALIAS_V1.md`, `RAVEN_INTEROPERABILITY_MATRIX.md`,
+  `ATSAM_PRIMITIVE_MAPPING_V1.md`, `generate_rvn1.py`, `raven_protocol/__init__.py`,
+  `raven_protocol/envelope.py` and two reference tests — mostly the post-freeze
+  strict-decoder tightening and the security errata. The manifest is now a pure
+  function of the tree (no timestamp header), covers **every** file under
+  `protocol/` and `shared-vectors/rvn1/`, and CI enforces it with `--check`.
+- **Additive vectors** (new files; no committed vector changed):
+  `prekey/bundle_signing_001.json` / `_002.json`, `negative/prekey_bad_sig_002.json`,
+  `negative/envelope_expired_002.json`, strict-decoder negatives
+  `negative/envelope_{expires_not_after_created,auth_len_63,reserved_flag,env_type_0,env_type_5,trailing_byte,truncated,bad_version}_001.json`,
+  and PairInit V1 structural negatives `atsam/negative/pair_init_v1_*.json`.
+  Rust consumer: `node/crates/raven-core/tests/rvn1_strict_vectors.rs`; the
+  generator asserts the Python reference agrees.
+- `RAVEN_ENVELOPE_V1.md` §6.1 now states the `expires_at > created_at` decode
+  rule both reference decoders already enforced. `SPEC.md` marks the
+  formats that have no byte-level contract as **implementation-defined**.
+

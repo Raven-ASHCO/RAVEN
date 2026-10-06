@@ -2,7 +2,9 @@
 //!
 //! Builds length-delimited AEAD AD from RVBA1‖RVCH1‖RVBC1, enforces mode0/mode1
 //! body caps, rejects all-zero DH shared secrets as `TR_CONFIRM`, and seals /
-//! opens with `KDF_HYBRID` + ChaCha20-Poly1305.
+//! opens with `KDF_HYBRID` + ChaCha20-Poly1305. The engine maps every confirm
+//! error to a no-commit Reject (ATSAM §4.2 step 7); the RVBC1 in the AD is the
+//! encapsulator's first CT1 frame on both sides, so each hybrid key seals once.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -23,14 +25,13 @@ use crate::hybrid_ratchet_v2_full_braid::wire_rvbm1::{
 use crate::hybrid_ratchet_v2_full_braid::wire_rvch1::{
     decode_rvch1, encode_rvch1, Rvch1, RVCH1_LEN,
 };
-use crate::hybrid_ratchet_v2_full_braid::wire_rvft1::{EcSkippedEntry, Rvft1};
+use crate::hybrid_ratchet_v2_full_braid::wire_rvft1::{EcSkippedEntry, Rvft1, MAX_EC_SKIPPED};
 use crate::hybrid_ratchet_v2_full_braid::wire_util::{
     expect_magic, read_array32, read_u8, reject_trailing, write_array32, write_bytes, write_u16be,
     write_u32be, write_u8, WireResult,
 };
 use crate::hybrid_ratchet_v2_tr::{
     ec_dr_decrypt, ec_dr_encrypt, x25519_dh, x25519_public, EcDrHeader, EcDrState,
-    MAX_MKSKIPPED_RETAINED,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -46,19 +47,13 @@ pub const TERMINAL_REASON_TR_CONFIRM: u16 = 5;
 const _: () = assert!(SEALED_PROTO as u16 == SEALED_PROTO_U16);
 const _: () = assert!(RVBA1_LEN == 176);
 
+/// `Parse`: malformed/inconsistent confirm input. `TrConfirm`: cryptographic
+/// confirm failure (DH, skip budget, AEAD). Both are no-commit rejections in
+/// the engine; neither terminalizes the session (ATSAM §4.2 step 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrConfirmError {
     Parse,
     TrConfirm,
-}
-
-impl TrConfirmError {
-    pub const fn terminal_reason(self) -> Option<u16> {
-        match self {
-            Self::TrConfirm => Some(TERMINAL_REASON_TR_CONFIRM),
-            Self::Parse => None,
-        }
-    }
 }
 
 /// `SHA-256("ATSAM/hybrid-ratchet/v2")`.
@@ -573,12 +568,14 @@ pub fn advance_ec_candidate(
             Ok((next, mk))
         }
         OP_RECEIVE => {
+            // Retain at most what RVFT1 can encode: a larger skipped map would
+            // pass the AEAD and then fail canonical encoding on every retry.
             let (next, mk) = ec_dr_decrypt(
                 &current,
                 header,
                 MAX_SKIP,
                 new_local_dh_priv,
-                MAX_MKSKIPPED_RETAINED,
+                MAX_EC_SKIPPED,
             )
             .map_err(|err| {
                 if err.contains("MAX_SKIP")
@@ -670,6 +667,9 @@ pub fn seal_compare(
 }
 
 /// Mode1 open: decrypt ciphertext; opened PT > 8192 → `TR_CONFIRM`.
+///
+/// The opened application body is wiped on drop (including the oversize
+/// rejection below); the pipeline only needs the tag/length check.
 pub fn open_confirm(
     ec_mk: &[u8; 32],
     scka_mk: &[u8; 32],
@@ -677,23 +677,25 @@ pub fn open_confirm(
     ciphertext: &[u8],
     oracle_len: u16,
     oracle: &[u8; 32],
-) -> Result<Vec<u8>, TrConfirmError> {
+) -> Result<Zeroizing<Vec<u8>>, TrConfirmError> {
     validate_mode_body_caps(MODE_OPEN, ciphertext.len())?;
     check_ec_mk_oracle(ec_mk, oracle_len, oracle)?;
     let (key_raw, nonce_raw) = kdf_hybrid(ec_mk, scka_mk);
     let key = Zeroizing::new(key_raw);
     let nonce = Zeroizing::new(nonce_raw);
     let cipher = aead_cipher(&key);
-    let plaintext = match cipher.decrypt(
-        Nonce::from_slice(nonce.as_ref()),
-        Payload {
-            msg: ciphertext,
-            aad: effective_ad,
+    let plaintext = Zeroizing::new(
+        match cipher.decrypt(
+            Nonce::from_slice(nonce.as_ref()),
+            Payload {
+                msg: ciphertext,
+                aad: effective_ad,
+            },
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(TrConfirmError::TrConfirm),
         },
-    ) {
-        Ok(bytes) => bytes,
-        Err(_) => return Err(TrConfirmError::TrConfirm),
-    };
+    );
     if plaintext.len() > BRAID_MAX_AEAD_PLAINTEXT_BYTES {
         return Err(TrConfirmError::TrConfirm);
     }
@@ -900,10 +902,6 @@ mod tests {
             contributory_dh(&sk, &[0u8; 32]).unwrap_err(),
             TrConfirmError::TrConfirm
         );
-        assert_eq!(
-            TrConfirmError::TrConfirm.terminal_reason(),
-            Some(TERMINAL_REASON_TR_CONFIRM)
-        );
         let pk = x25519_public(&[0x77; 32]).unwrap();
         assert_ne!(contributory_dh(&sk, &pk).unwrap(), [0u8; 32]);
     }
@@ -943,7 +941,7 @@ mod tests {
             TrConfirmError::TrConfirm
         );
         let opened = open_confirm(&ec_mk, &scka_mk, &ad, &expected, 0, &[0u8; 32]).unwrap();
-        assert_eq!(opened, plaintext);
+        assert_eq!(*opened, plaintext);
         let mut bad = expected.clone();
         bad[0] ^= 1;
         assert_eq!(
@@ -974,7 +972,7 @@ mod tests {
             .unwrap();
         assert_eq!(ct.len(), BRAID_MAX_AEAD_CIPHERTEXT_BYTES);
         assert_eq!(
-            open_confirm(&ec_mk, &scka_mk, &ad, &ct, 0, &[0u8; 32]).unwrap(),
+            *open_confirm(&ec_mk, &scka_mk, &ad, &ct, 0, &[0u8; 32]).unwrap(),
             max_pt
         );
         let mut oversize_ct = ct.clone();
@@ -1221,6 +1219,59 @@ mod tests {
         assert_eq!(got0, mk0);
         assert_eq!(bob.ec_ns, before_ns);
         assert!(bob.ec_skipped.is_empty());
+    }
+
+    #[test]
+    fn receive_skip_budget_never_exceeds_rvft1_encodable_cap() {
+        use crate::hybrid_ratchet_v2_full_braid::wire_rvft1::encode_rvft1;
+
+        let bob_priv = [0x71; 32];
+        let alice_old = x25519_public(&[0x72; 32]).unwrap();
+        let alice_new = x25519_public(&[0x73; 32]).unwrap();
+        let mut tr = Rvft1 {
+            scka_rk: [0; 32],
+            scka_sending_epoch: 0,
+            scka_receiving_epoch: 0,
+            scka_send_chain: Vec::new(),
+            scka_recv_chain: Vec::new(),
+            scka_send_pn: 0,
+            scka_skipped: Vec::new(),
+            ec_rk: [0x10; 32],
+            ec_dhs_priv: bob_priv,
+            ec_dhs_pub: x25519_public(&bob_priv).unwrap(),
+            ec_dhr_present: 1,
+            ec_dhr_pub: alice_old,
+            ec_ck_send_present: 0,
+            ec_ck_recv_present: 1,
+            ec_ck_send: [0; 32],
+            ec_ck_recv: [0x20; 32],
+            ec_ns: 0,
+            ec_nr: 0,
+            ec_pn: 0,
+            ec_skipped: Vec::new(),
+        };
+        // Each chain stays within MAX_SKIP, but together they need 1200
+        // skipped keys: more than RVFT1 can persist. Fail before any AEAD.
+        let header = EcDrHeader {
+            dh_pub: alice_new,
+            pn: 600,
+            n: 600,
+        };
+        assert_eq!(
+            advance_ec_candidate(&tr, OP_RECEIVE, &header, Some(&[0x74; 32])).unwrap_err(),
+            TrConfirmError::TrConfirm
+        );
+        // At the cap the candidate always stays canonically encodable.
+        let header = EcDrHeader {
+            dh_pub: alice_new,
+            pn: 500,
+            n: 500,
+        };
+        let (candidate, _) =
+            advance_ec_candidate(&tr, OP_RECEIVE, &header, Some(&[0x74; 32])).unwrap();
+        apply_ec_dr_to_rvft1(&mut tr, &candidate);
+        assert_eq!(tr.ec_skipped.len(), MAX_EC_SKIPPED);
+        encode_rvft1(&tr).unwrap();
     }
 
     #[test]

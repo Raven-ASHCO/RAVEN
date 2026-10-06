@@ -111,10 +111,25 @@ class SpqrHeader:
 
 
 def encode_composite_header(ec: EcHeader, spqr: SpqrHeader) -> bytes:
+    """Frozen pre-Full-Braid stub header (u32 epoch/counter fields).
+
+    Normative Braid epochs are u64be (§5.1; Full Braid RVCH1/RVBC1). This stub
+    keeps its frozen width, so out-of-range values fail closed rather than
+    truncating or wrapping.
+    """
     if len(ec.dh_pub) != 32:
         raise ValueError("dh_pub")
     if len(spqr.kem_ct_digest) != 32:
         raise ValueError("kem_ct_digest")
+    for name, value in (
+        ("pn", ec.pn),
+        ("n", ec.n),
+        ("sending_epoch", spqr.sending_epoch),
+        ("receiving_epoch", spqr.receiving_epoch),
+        ("send_ctr", spqr.send_ctr),
+    ):
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError(f"composite header {name} out of u32 range")
     return b"".join(
         (
             HEADER_DOMAIN,

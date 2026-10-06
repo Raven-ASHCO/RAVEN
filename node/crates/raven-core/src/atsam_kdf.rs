@@ -1,8 +1,10 @@
 //! ATSAM chain / label KATs portable without ML-KEM.
 //!
-//! Full hybrid pairing + ratchet decrypt still lives on iOS
-//! (`ATSAMChainRatchet.swift`). These helpers prove label/info encoding and
-//! HKDF agreement so Rust can verify shared vectors and harden the opaque path.
+//! Hybrid ML-KEM pairing lives in `atsam_mlkem.rs` (`begin_hybrid_initiation` /
+//! `respond_hybrid_root`); this module performs no pairing itself and mirrors
+//! the iOS chain ratchet (`ATSAMChainRatchet.swift`). These helpers prove
+//! label/info encoding and HKDF agreement so Rust can verify shared vectors and
+//! harden the opaque path.
 //! See `protocol/ATSAM_PRIMITIVE_MAPPING_V1.md` § honesty table.
 
 use hkdf::Hkdf;

@@ -1,8 +1,13 @@
 # RAVEN terminal demo (safe — no secrets)
 
 Local-only walkthrough for the serverless **`ash`** product CLI and `raven-node`.
-Uses **ephemeral identities** (`mktemp -d` / Windows TEMP). Never paste real production keys,
-tokens, APNs/JWT material, or recovery secrets into this file or shell history demos.
+Demos below use **throwaway identities** (`mktemp -d` / Windows TEMP). An explicit
+`--data-dir` is always used as given — ash never remaps it onto your real `~/.raven`
+profile; a mktemp-looking path only prints a note (silence it with
+`RAVEN_ALLOW_EPHEMERAL_DATA_DIR=1`). For a stable Mac identity that a phone keeps
+pinned, run `ash` **without** `--data-dir` (default `~/.raven`).
+Never paste real production keys, tokens, APNs/JWT material, or recovery secrets into
+this file or shell history demos.
 
 **Brand:** [raven-messager.com](https://raven-messager.com/) · public logo  
 `https://raven-messager.com/raven_logo.png` (also `/raven_logo_64.png`, `/raven_logo_192.png`)  
@@ -14,9 +19,9 @@ Terminal welcome uses **black & white** (monochrome bold/dim ANSI — or plain t
 |---|---|---|
 | 1 | Clone/copy the **whole** repo on **this** Mac (your home path) | کل ریپو را روی **همین** مک کپی/کلون کنید (مسیر خانهٔ خودتان) |
 | 2 | `bash scripts/ash_first_run.sh` | اسکریپت پرتابل — مسیر `/Users/ahmd` لازم نیست |
-| 3 | Menu **4 Status** → creates identity | منوی **۴** هویت می‌سازد |
-| 4 | Share `ash whoami` (address + pub_hex only) | فقط address و pub_hex را بفرستید — **هرگز seed** |
-| 5 | Menu **3** add contact → Menu **2** send | مخاطب → ارسال (شماره مخاطب، نه host:port) |
+| 3 | First run: answer **Y** → creates identity (menu **3 Status** shows it) | اجرای اول: **Y** هویت می‌سازد (منوی **۳** وضعیت) |
+| 4 | Share `ash whoami` (address + pub_hex, or the one-line `invite`) | فقط address و pub_hex (یا خط invite) را بفرستید — **هرگز seed** |
+| 5 | Menu **5** add contact → Menu **1** send · Menu **4** listen · Menu **2** inbox | مخاطب (۵) → ارسال (۱) · دریافت (۴) · صندوق (۲) |
 
 ```bash
 # From repo root — works on any Mac username:
@@ -40,12 +45,11 @@ export PATH="$HOME/.cargo/bin:$PATH"
 bash scripts/ash_first_run.sh --init-only
 # copy address + fingerprint + pub_hex to Mac1 (Messages / AirDrop / …)
 
-# Mac1 — add Mac2 as contact (menu 3), then:
-# Mac2 starts a listener, e.g.:
-DATA=$(mktemp -d)
-./node/target/debug/raven-node run --data-dir "$DATA" --listen 0.0.0.0:7420 \
-  --peer-pub-hex <MAC1_PUB_HEX> --timeout-secs 300
-# Mac1: menu 2 → pick contact # → enter Mac2_LAN_IP:7420 once (saved on contact)
+# Both Macs add each other as contacts (menu 5 — paste the other's whoami / invite).
+# Mac2 listens (LAN-direct receiver on port 7420, trusts contacts only):
+./node/target/debug/ash listen          # or menu 4
+# Mac1: menu 1 → pick contact # → enter Mac2_LAN_IP:7420 once (saved after delivery)
+# Mac2: menu 2 Inbox shows the message, attributed to Mac1's petname + fingerprint
 ```
 
 Automated loopback proof (same machine):
@@ -56,6 +60,8 @@ cd node
 ./scripts/ash_menu_smoke.sh
 ```
 
+Both use the same secure default-build send as `ash send`: LAN-direct (Noise XX) +
+PairInit + indexed session + sealed ACK — never `--body-mode unsafe-interim`.
 CI (`rust-linux` / `rust-macos` / `rust-windows`) runs `ash_menu_smoke.sh` against **debug** `target/debug/ash` with `RAVEN_IDENTITY_BACKEND=locked-file`. That is **menu/CLI smoke only** — not Keychain, launchd, or Gatekeeper/notarize. Operators must not set `locked-file` for a normal Keychain install (Option A default). See [`docs/INSTALL_macOS.md`](../docs/INSTALL_macOS.md).
 
 ## Prerequisites
@@ -81,39 +87,44 @@ cd /path/to/hybrid_messenger/protocol/reference
 
 ```bash
 cd /path/to/hybrid_messenger/node
-DATA=$(mktemp -d)
-./target/debug/ash --data-dir "$DATA"          # interactive — menu 4 creates identity
+DATA=$(mktemp -d)                              # throwaway demo identity
+./target/debug/ash --data-dir "$DATA"          # interactive — first-run prompt creates identity
 ./target/debug/ash --data-dir "$DATA" init     # or create identity up front (public bits only)
 ./target/debug/ash --data-dir "$DATA" banner   # welcome only
 ```
 
 1. Run `ash` with a fresh `--data-dir` — the banner explains first-run steps.
-2. Create identity via menu **4 Status** (auto-creates if missing) or `ash init`.
-3. **Add a contact** (menu **3**) before Send / Chat — paste their `ash whoami` or rvn1… + pub_hex.
-4. Then menu **2** → pick contact **#** or `@tag`. Enter LAN `host:port` **once**; it is saved on the contact (`lan_dial`). Beginners should not re-type host:port every send.
+2. Answer **Y** at "Create your Raven identity now?" (or run `ash init`); menu **3 Status** shows it.
+3. **Add a contact** (menu **5** → `a`) before Send / Chat — paste their `ash whoami` block, their one-line `invite raven:…`, or rvn1… + pub_hex. The contact is **merged** into your book (existing contacts, pins and dials are kept); a key that does not encode to the pasted address is refused.
+4. Then menu **1** → pick contact **#**, `@tag` or petname (several matches → a fingerprint picker, never a silent pick). Enter LAN `host:port` **once**; it is saved on the contact (`lan_dial`) after the first delivery.
 
 ## Add a contact
 
 ### Interactive (recommended)
 
 ```text
-raven> 3
-Contacts menu
+raven> 5
+ ── Contacts ──
   a  Add contact
 contacts> a
-Enter Raven address (rvn1…) / @alias / paste whoami:   # paste full whoami OK
+Enter Raven address (rvn1…) / @alias / paste whoami:   # whoami block or invite line OK
 …
-Optional LAN dial host:port (Enter to skip — set later on Send): 192.168.1.20:7420
-[V]erify & pin  /  [C]ontinue unpinned  /  [A]bort: V
+Optional LAN dial host:port (Enter to skip — Send auto-resolves / Mac-listens): 192.168.1.20:7420
+[V]erify & pin  /  [C]ontinue unpinned  /  [A]bort: V      # anything else = cancel, nothing saved
 ```
+
+`V` records that you compared the fingerprint out-of-band. `C` still adds the contact, and the
+receiving daemon admits PairInit from **any** key in the contact book — pinned or not — and refuses a
+key that is not in it. Pinning is therefore your own record of an out-of-band check, not something the
+daemon enforces; skip it and a spoofed `whoami` block is accepted like a genuine one.
 
 Soft Unique Tags (brief):
 
 | Layer | What | Notes |
 |---|---|---|
 | A | `rvn1…` address | Durable identity |
-| B | `@alias` / public tag | Soft Unique — conflicts show a picker |
-| C | petname (e.g. Poline) | Local-only primary label |
+| B | `@alias` / public tag | Soft Unique — conflicts show a picker; charset `a-z 0-9 _ -` |
+| C | petname (e.g. Poline) | Local-only primary label; unique on this device |
 | — | fingerprint verify | Pins Tag+key locally (`V` or `--verify-fp`) |
 | — | `lan_dial` | Optional saved `host:port` for Send |
 
@@ -145,37 +156,52 @@ DATA=$(mktemp -d)
 NO_COLOR=1 ./target/debug/ash --data-dir "$DATA" banner   # plain text
 ```
 
-**Welcome (B&W stand-in; bold/dim ANSI in a real TTY):**
+**Welcome (B&W; bold/dim ANSI only when stdout is a TTY and `NO_COLOR` is unset):**
 
 ```
-      ┌──────────────────────────────────────────────────┐
-      │                                                  │
-      │      .--.     ≺═══◈═══≻                         │
-      │     /  ◉\      NODE                            │
-      │    /  /\ \                                       │
-      │   /__/  \_\   Welcome to Raven Node            │
-      │              Messaging Beyond Connectivity     │
-      │                                                  │
-      │  serverless · ATSAM · peer-to-peer               │
-      └──────────────────────────────────────────────────┘
+  ╭──────────────────────────────────────────────────╮
+  │                                                  │
+  │  R A V E N                                       │
+  │  N O D E                                         │
+  │                                                  │
+  │  Messaging Beyond Connectivity                   │
+  │                                                  │
+  │  ◆ serverless · P2P · private                    │
+  │                                                  │
+  │  "The Raven bears witness as the Phoenix         │
+  │   rises from the ASH"                            │
+  │                                                  │
+  ╰──────────────────────────────────────────────────╯
 
-Brand logo (PNG): https://raven-messager.com/raven_logo.png
-Site:             https://raven-messager.com/
+   https://raven-messager.com
+   profile: /path/to/profile
 
-● identity ready (public bits only — never a seed)
-address     rvn1q…          # placeholder — yours will differ
-fingerprint XXXX-XXXX-XXXX
-pub_hex     <64 hex chars>  # public Ed25519 only — never a seed
+● identity ready
+  address       rvn1q…          # placeholder — yours will differ
+  fingerprint   XXXX-XXXX-XXXX
+  pub_hex       <64 hex chars>  # public Ed25519 only — never a seed
 
-  Menu
-  1  Messages      outgoing queue + local chat history (ids only)
-  2  Send / Chat   message a contact — add contacts first if empty
-  3  Contacts      add by rvn1… / @alias / petname + fingerprint
-  4  Status        identity, bridge, transports (public fields)
-  q  Quit
+◆ MESSAGES
+    1  Chat / Send              send one message to a contact
+    2  Inbox                    messages you received
+◆ NETWORK
+    3  Status                   your invite, contacts, is the node running
+    4  Listen                   stay online to receive (keep this window open)
+◆ PEOPLE
+    5  Contacts                 add a friend (paste their invite) · list · verify
+◆ TOOLS
+    6  Mailbox                  advanced tool, this computer only (not your inbox)
+    7  Nearby scan              demo, this computer only (no Bluetooth yet)
+    8  Tutorial                 new here? start here
 
-raven>
+    q  quit
+
+raven ❯
 ```
+
+Note: **6 Mailbox** is a local-only store (`mailbox_store.json` in the data dir; it contacts no peer or
+store node) and **7 Nearby scan** is a local software mock (it lists only this device's own ephemeral
+tokens; there is no BLE radio or receive side). Neither reaches another device.
 
 ### Banner / CLI security checklist
 
@@ -183,10 +209,11 @@ raven>
 |---|---|
 | No private keys / seeds / session keys / tokens in banner or menu | **Yes** |
 | After identity: only `address` / `fingerprint` / `pub_hex` | **Yes** |
-| Messages view: msg id prefix + delivery state + peer address — no plaintext, no packed envelopes logged | **Yes** |
+| Inbox / chat: one sanitized line per message (CR/LF → `⏎`; ANSI, C0/C1, bidi and invisible code points dropped), attributed to the sender's petname + pin state + fingerprint (`unknown device [fp=…]` otherwise) | **Yes** |
 | Contacts store public `address` + `pub_hex` (+ optional alias) only | **Yes** |
 | No unauthenticated localhost admin HTTP | **Yes** — ash/raven-node local files only; no daemon HTTP |
-| Demo data dirs ephemeral (`mktemp -d`) | **Yes** |
+| Explicit `--data-dir` used as given (never remapped onto `~/.raven`); `mktemp -d` demo dirs are throwaway identities | **Yes** |
+| Colour escapes only on a TTY; `NO_COLOR` / `TERM=dumb` / pipes get plain text | **Yes** |
 | E2EE / ATSAM path unchanged; node logs lengths / opaque status only | **Yes** |
 
 ## One-shot reliability demo
@@ -201,7 +228,7 @@ cd /path/to/hybrid_messenger/node
 cargo test -p raven-core --test bridge_v1
 ```
 
-**Expected:** four `round N OK` + `ALL DEMO CHECKS PASSED`; `mode=interim OK`, `mode=opaque-atsam OK`;  
+**Expected:** four `round N OK` + `ALL DEMO CHECKS PASSED`; `mode=unsafe-interim OK`, `mode=failclosed OK (ATSAM_SESSION_REQUIRED enforced, …)` (from `lan_path_smoke.sh`);  
 `bridge_abc_demo` → three A–B–C rounds + store-carry + `ALL BRIDGE A-B-C CHECKS PASSED`;  
 `ash_menu_smoke` / `ash_contacts_lan_demo` → menu + contact LAN deliver green.
 
@@ -253,43 +280,46 @@ Start B daemon separately (survives ash quit):
   --timeout-secs 0
 ```
 
-## Manual two-node DM (`raven-node`)
+## Manual two-node DM (`raven-node service` + `ash send`)
 
-Terminal A (receiver):
+`raven-node run` cannot originate messages in default builds (it answers
+`ATSAM_SESSION_REQUIRED`), and `--send "<text>"` is refused because it puts
+plaintext on argv. The secure path is two `raven-node service` receivers plus
+`ash send` (message on stdin), exactly what `scripts/lan_direct_two_node.sh` runs:
 
 ```bash
 cd /path/to/hybrid_messenger/node
+export RAVEN_IDENTITY_BACKEND=locked-file RAVEN_CHAT_HISTORY_BACKEND=locked-file  # debug demo only
 DATA_A=$(mktemp -d) DATA_B=$(mktemp -d)
-./target/debug/raven-node init --data-dir "$DATA_A"
-./target/debug/raven-node init --data-dir "$DATA_B"
-# Note pub_hex from each init (public only).
-./target/debug/raven-node run \
-  --data-dir "$DATA_B" \
-  --listen 127.0.0.1:0 \
-  --peer-pub-hex <A_PUB_HEX> \
-  --write-addr /tmp/raven-b.listen \
-  --exit-after-recv 1 \
-  --timeout-secs 30
+./target/debug/ash --data-dir "$DATA_A" init     # note address / pub_hex / fingerprint
+./target/debug/ash --data-dir "$DATA_B" init
+./target/debug/raven-node service --data-dir "$DATA_A" --lan-listen 127.0.0.1:18001 --ble-listen 127.0.0.1:0 &
+./target/debug/raven-node service --data-dir "$DATA_B" --lan-listen 127.0.0.1:18002 --ble-listen 127.0.0.1:0 &
+# Each side trusts only its contact book:
+./target/debug/ash --data-dir "$DATA_A" contact add --address <B_ADDR> --pub-hex <B_PUB_HEX> \
+  --petname Bob --tag bob --lan-dial 127.0.0.1:18002 --verify-fp <B_FP>
+./target/debug/ash --data-dir "$DATA_B" contact add --address <A_ADDR> --pub-hex <A_PUB_HEX> \
+  --petname Alice --tag alice --verify-fp <A_FP>
+printf 'hello from terminal\n' | ./target/debug/ash --data-dir "$DATA_A" send --contact @bob
+./target/debug/ash --data-dir "$DATA_B" inbox
 ```
 
-Terminal B (sender) — after `/tmp/raven-b.listen` exists:
-
-```bash
-./target/debug/raven-node run \
-  --data-dir "$DATA_A" \
-  --listen 127.0.0.1:0 \
-  --peer "$(cat /tmp/raven-b.listen)" \
-  --peer-pub-hex <B_PUB_HEX> \
-  --send "hello from terminal" \
-  --exit-after-ack \
-  --timeout-secs 30
-```
-
-**Expected:** `ACK delivered` / `DELIVERED bytes=…` (length only).
+**Expected:** sender `status delivered`; receiver inbox row
+`← Alice [pinned fp=…]: hello from terminal`.
 
 ## Phone ↔ Mac terminal (flagged LAN)
 
-**Goal:** iOS packs sealed chat bytes into `RavenEnvelopeV1` and TCP to `raven-node`. MeshEnvelope stays active.
+> **LAB / NON-RELEASE only.** RVN1 messaging is under a production HOLD
+> ([`SECURITY_ERRATA_RVN1_2026-08-13.md`](../protocol/SECURITY_ERRATA_RVN1_2026-08-13.md),
+> [`THREAT_MODEL.md`](../docs/THREAT_MODEL.md)). This walkthrough needs a **lab build**
+> (`cargo build -p raven-node --features raven-node/unsafe-demo-crypto`) and a Debug/lab iOS build
+> (`ios-native` is **not in this repository**, OFF-MAIN). It uses the interim cipher, whose key is
+> derivable from the two **public** keys by any observer (a LAN sniffer or bridge included), over plain
+> TCP framing — send nothing private. A default build answers `UNSAFE_INTERIM_DISABLED` /
+> `ATSAM_SESSION_REQUIRED` and never delivers. For the default-build path use "Manual two-node DM"
+> above (`ash send` + `raven-node service`). See also the README "Lab demos".
+
+**Goal:** iOS packs interim-sealed chat bytes into `RavenEnvelopeV1` and TCP to `raven-node` (lab). MeshEnvelope stays active.
 
 ### A. Mac listener
 
@@ -297,9 +327,10 @@ Terminal B (sender) — after `/tmp/raven-b.listen` exists:
 cd /path/to/hybrid_messenger/node
 DATA=$(mktemp -d)
 ./target/debug/raven-node init --data-dir "$DATA"
+# Use the Mac's LAN IP rather than 0.0.0.0 (all interfaces) where practical.
 ./target/debug/raven-node run \
   --data-dir "$DATA" \
-  --listen 0.0.0.0:7420 \
+  --listen <MAC_LAN_IP>:7420 \
   --peer-pub-hex <IOS_PUB_HEX> \
   --timeout-secs 300
 ```
@@ -321,7 +352,7 @@ DATA=$(mktemp -d)
 
 ### D. Send a chat message
 
-Mac: `DELIVERED opaque_atsam …` or `DELIVERED bytes=N`. Never screenshot seeds/plaintext.
+Mac (lab build): `DELIVERED bytes=N`, preceded by an `INCOMING` block that prints the received plaintext on stderr. Never screenshot seeds/plaintext or share that log. (There is no `opaque_atsam` delivery line: synthetic opaque ATSAM bodies are refused with `ATSAM_SESSION_REQUIRED` and get no ACK.)
 
 ```bash
 ./scripts/lan_path_smoke.sh   # automated stand-in
@@ -340,7 +371,7 @@ Behind `FeatureFlag.ravenEnvelopeV1` (default **OFF**):
 - MeshEnvelope default path **unchanged** when flag is off
 
 Unit tests: `RavenBleRvn1CarrierTests`, `RavenEnvelopeBridgeServiceTests`, `RavenEnvelopeEndpointIngestTests`, `RavenEnvelopeChatWireTests`.  
-Rust: `cargo test -p raven-core --test bridge_v1` (cases 1–10).
+Rust: `cargo test -p raven-core --test bridge_v1` (case01–case13 + `e2ee_survives_bridge_hop`).
 
 ### Verify locally (run twice)
 
@@ -364,11 +395,11 @@ cargo test -p raven-core --test bridge_v1 && ./scripts/bridge_abc_demo.sh
 | `shared-vectors/rvn1/atsam/rvna1_header_layouts_001.json` | Header classify |
 | `shared-vectors/rvn1/atsam/rvna1_v2_aead_known_root_001.json` | RVNA1 v2 AEAD + AAD with **known** `K_root` (no ML-KEM) |
 
-Network path for shipping ATSAM without a known root remains **opaque ACK**.
+Production body-mode fails closed: without a persisted authenticated ATSAM session, origination returns `ATSAM_SESSION_REQUIRED` and emits no envelope (errata rule 2; synthetic opaque ATSAM bytes are not ciphertext). There is no "opaque ACK" shipping path.
 
 ## What is NOT ready yet
 
-- Full ATSAM ML-KEM pairing in Rust (needs known root or ML-KEM port)
+- Full PQ ratchet and iOS parity: the ML-KEM-768 + X25519 hybrid is implemented in `raven-core` (`atsam_mlkem`, `pair_init`) but PairInit is production-disabled (live only on the unreviewed LAN-direct slice); not a shipping claim
 - libp2p DHT / NAT in Rust (InternetTransport stubbed behind path selection)
 - Windows MSI/MSIX installer / WinUI LAN UI
 - raven-node CoreBluetooth/BlueZ GATT (mock_ble stays for CI; iOS GATT via BLEMeshEngine)

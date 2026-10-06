@@ -1,17 +1,22 @@
 //! Windows named-pipe IPC transport.
 //!
-//! Binds the canonical `WINDOWS_NAMED_PIPE` endpoint with a current-user-only
-//! DACL. Fail closed: if DACL setup fails, do not bind (NULL DACL is world-writable).
+//! Binds the per-user pipe `{WINDOWS_NAMED_PIPE}-{user SID}` with a
+//! current-user-only DACL and `FILE_FLAG_FIRST_PIPE_INSTANCE` (a squatted name
+//! fails closed). Fail closed: if DACL setup fails, do not bind (NULL DACL is
+//! world-writable). Clients verify the server process owner before sending.
 //! Framing and request handling are shared with the Unix UDS server
 //! (including `SealUnderSession`; unsigned callers never reach handle_req).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use raven_core::ipc::{default_pipe_name, WINDOWS_NAMED_PIPE};
+#[cfg(test)]
+use raven_core::ipc::WINDOWS_NAMED_PIPE;
+use raven_core::ipc::{default_pipe_name, windows_user_pipe_name};
 use tokio::net::windows::named_pipe::NamedPipeServer;
+use tokio::sync::Semaphore;
 
-use super::{open_forward_queue, serve_one};
+use super::{open_forward_queue, serve_one, MAX_IPC_CONNECTIONS};
 
 /// Well-known Everyone / World SID. Must never appear on the pipe DACL.
 const EVERYONE_SID: &str = "S-1-1-0";
@@ -233,6 +238,7 @@ fn last_error() -> u32 {
 }
 
 fn create_pipe_instance(
+    name: &str,
     sec: &UserOnlyPipeSecurity,
     first: bool,
 ) -> Result<NamedPipeServer, String> {
@@ -245,10 +251,7 @@ fn create_pipe_instance(
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
 
-    let name: Vec<u16> = WINDOWS_NAMED_PIPE
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let sa = sec.attributes();
     let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if first {
@@ -256,7 +259,7 @@ fn create_pipe_instance(
     }
     let handle = unsafe {
         CreateNamedPipeW(
-            name.as_ptr(),
+            wide_name.as_ptr(),
             open_mode,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
@@ -269,7 +272,7 @@ fn create_pipe_instance(
     if handle == INVALID_HANDLE_VALUE || handle.is_null() {
         return Err(format!(
             "CreateNamedPipeW {} failed (GLE={}); fail closed",
-            WINDOWS_NAMED_PIPE,
+            name,
             unsafe { GetLastError() }
         ));
     }
@@ -283,12 +286,39 @@ fn create_pipe_instance(
 /// `UserOnlyPipeSecurity` holds a `PSECURITY_DESCRIPTOR` (`*mut c_void`),
 /// which is `!Send`. It must not be live across any `.await` — otherwise
 /// `run_named_pipe_server` is `!Send` and `tokio::spawn` fails to compile.
-fn bind_pipe_instance(first: bool) -> Result<NamedPipeServer, String> {
+fn bind_pipe_instance(name: &str, first: bool) -> Result<NamedPipeServer, String> {
     // Fail closed *before* CreateNamedPipeW — never bind a world-readable pipe.
     let sec = UserOnlyPipeSecurity::new()?;
-    let server = create_pipe_instance(&sec, first)?;
+    let server = create_pipe_instance(name, &sec, first)?;
     drop(sec);
     Ok(server)
+}
+
+/// Per-user pipe name for this process (fail closed if the SID is unreadable).
+fn user_pipe_name() -> Result<&'static str, String> {
+    windows_user_pipe_name().ok_or_else(|| {
+        format!(
+            "cannot derive per-user pipe name under {}; fail closed — not binding pipe",
+            default_pipe_name()
+        )
+    })
+}
+
+/// Next listening instance. Transient failures (handle/memory pressure) are
+/// retried with backoff instead of killing the daemon; the pipe name stays
+/// owned while any of our instances is open.
+async fn bind_next_instance(name: &str) -> NamedPipeServer {
+    let mut delay = crate::ACCEPT_BACKOFF_MIN;
+    loop {
+        match bind_pipe_instance(name, false) {
+            Ok(server) => return server,
+            Err(e) => {
+                eprintln!("raven-node ipc: pipe instance: {e}; retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(crate::ACCEPT_BACKOFF_MAX);
+            }
+        }
+    }
 }
 
 pub(crate) async fn run_named_pipe_server(
@@ -296,24 +326,46 @@ pub(crate) async fn run_named_pipe_server(
     forward_path: Option<PathBuf>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-    eprintln!("raven-node ipc: listening {}", default_pipe_name());
+    let name = user_pipe_name()?;
+    // Before the pipe is published: a queue that cannot open must not leave an
+    // endpoint that answers and then loses envelopes.
+    let forward = open_forward_queue(forward_path)?;
+    // First instance: FILE_FLAG_FIRST_PIPE_INSTANCE — a squatted (or already
+    // served) name is a hard, fail-closed error.
+    let mut server = bind_pipe_instance(name, true)?;
+    eprintln!("raven-node ipc: listening {name}");
 
-    let forward = open_forward_queue(forward_path);
     let data_dir = Arc::new(data_dir);
-    let mut first = true;
+    let slots = Arc::new(Semaphore::new(MAX_IPC_CONNECTIONS));
 
     loop {
-        let mut server = bind_pipe_instance(first)?;
-        first = false;
-        server
-            .connect()
+        let permit = slots
+            .clone()
+            .acquire_owned()
             .await
-            .map_err(|e| format!("named pipe connect: {e}"))?;
-        let dd = data_dir.clone();
-        let fq = forward.clone();
-        tokio::spawn(async move {
-            serve_one(server, dd, fq).await;
-        });
+            .map_err(|_| "ipc connection limiter closed".to_string())?;
+        // Create the replacement instance *before* dropping or handing off the
+        // current one so the name is never unowned (no squatting window).
+        match server.connect().await {
+            Ok(()) => {
+                let connected = server;
+                server = bind_next_instance(name).await;
+                let dd = data_dir.clone();
+                let fq = forward.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    serve_one(connected, dd, fq).await;
+                });
+            }
+            Err(e) => {
+                // A client that vanished before ConnectNamedPipe completed must
+                // not take the daemon down.
+                eprintln!("raven-node ipc: named pipe connect: {e}");
+                let replacement = bind_next_instance(name).await;
+                server = replacement;
+                drop(permit);
+            }
+        }
     }
 }
 
@@ -322,10 +374,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pipe_name_is_canonical() {
+    fn pipe_name_is_per_user() {
         assert_eq!(WINDOWS_NAMED_PIPE, r"\\.\pipe\raven-node");
-        assert_eq!(default_pipe_name(), r"\\.\pipe\raven-node");
         assert_eq!(default_pipe_name(), WINDOWS_NAMED_PIPE);
+        let name = user_pipe_name().expect("per-user pipe name");
+        assert!(name.starts_with(r"\\.\pipe\raven-node-S-1-"), "{name}");
+        let sids = UserOnlyPipeSecurity::new()
+            .expect("current-user DACL")
+            .allowed_sids()
+            .expect("walk DACL");
+        assert_eq!(name, format!("{WINDOWS_NAMED_PIPE}-{}", sids[0]));
     }
 
     #[test]
@@ -346,8 +404,15 @@ mod tests {
     async fn bind_canonical_pipe_with_user_dacl() {
         // bind_pipe_instance drops the SD before return — same Send boundary as
         // the accept loop (security descriptor must not live across .await).
-        let pipe = bind_pipe_instance(true)
-            .expect("CreateNamedPipeW \\\\.\\pipe\\raven-node with user DACL");
+        // Test-only unique name so a running daemon does not collide.
+        let name = format!(
+            "{}-test-{}",
+            user_pipe_name().expect("per-user pipe name"),
+            std::process::id()
+        );
+        let pipe = bind_pipe_instance(&name, true).expect("CreateNamedPipeW with user DACL");
+        // FIRST_PIPE_INSTANCE: a second "first" bind of the same name fails closed.
+        assert!(bind_pipe_instance(&name, true).is_err());
         drop(pipe);
     }
 

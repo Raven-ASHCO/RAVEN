@@ -55,3 +55,18 @@ def test_inconsistent_one_time_prekey_rejected():
         assert "requires" in str(error)
     else:
         raise AssertionError("inconsistent one-time prekey was accepted")
+
+
+def test_device_id_is_bounded_to_64_utf8_bytes():
+    value = bundle()
+    value.device_id = "d" * prekey.MAX_DEVICE_ID_BYTES
+    prekey.signing_bytes(value)
+    value.device_id = "d" * (prekey.MAX_DEVICE_ID_BYTES + 1)
+    try:
+        prekey.signing_bytes(value)
+    except ValueError as error:
+        assert "device_id" in str(error)
+    else:
+        raise AssertionError("oversized device_id was accepted")
+    value.signature = bytes(64)
+    assert not prekey.verify(value)

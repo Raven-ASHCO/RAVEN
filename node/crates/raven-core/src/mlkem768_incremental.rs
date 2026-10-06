@@ -9,6 +9,15 @@ compile_error!(
     "mlkem768-incremental-lab is forbidden in release builds; lab-only incremental ML-KEM"
 );
 
+// Second layer: `debug_assertions` is only a proxy for the build profile and a
+// release profile can switch it on. `RAVEN_BUILD_PROFILE` is Cargo's `PROFILE`
+// as emitted by `build.rs`. `full-braid-lab` and both lab FFI crates pull this
+// module in, so they inherit the gate.
+const _: () = assert!(
+    !matches!(env!("RAVEN_BUILD_PROFILE").as_bytes(), b"release"),
+    "mlkem768-incremental-lab is forbidden in release builds; lab-only incremental ML-KEM"
+);
+
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Libcrux compressed incremental private key length; not the ATSAM 64-byte seed.

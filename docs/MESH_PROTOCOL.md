@@ -1,7 +1,7 @@
 # RAVEN Mesh Wire-Protocol Specification
 
 **Version:** 1 (matches iOS app v1.5)
-**Status:** Single source of truth. Any deviation = interop failure.
+**Status:** Single source of truth for the **legacy v1 BLE GATT transport and the legacy iOS JSON mesh envelope** (`MeshEnvelope`, the default mobile path while the RVN1 flag is OFF). Any deviation from *this* protocol = interop failure. It is **not** the RVN1 wire contract: `RavenEnvelopeV1` is specified in [`protocol/SPEC.md`](../protocol/SPEC.md) and [`protocol/RAVEN_BLE_FRAMING_V1.md`](../protocol/RAVEN_BLE_FRAMING_V1.md), and RVN1 messaging is under a production HOLD ([`protocol/SECURITY_ERRATA_RVN1_2026-08-13.md`](../protocol/SECURITY_ERRATA_RVN1_2026-08-13.md)).
 **Audience:** anyone re-implementing the RAVEN mesh in another language (C# on Windows, Kotlin on Android, Rust, etc.).
 
 > **Important:** This document describes the protocol **as currently shipped on iOS/Mac**. Several known quirks and bugs are surfaced in §I — read those before writing a port. Bug fixes that change the wire format must be coordinated as a `v2` upgrade (or the iOS app must keep `v1` compatibility).
@@ -191,7 +191,7 @@ Plaintext inside the AES-GCM seal is the JSON of a `SecureMeshEnvelope` encoded 
 POST | postId | authorId | authorUsername | authorAvatar | text | <Int64 round(ca*1000)> | scope | signerPublicKey
 ```
 
-- Literal pipe `|` (`0x7C`) delimiter.
+- Literal pipe `|` (`0x7C`) delimiter, no escaping. No field may contain `|` (§D "`|` inside signed fields", §I.13).
 - Missing optional `authorAvatar` and `signerPublicKey` are emitted as **empty** between delimiters (i.e. two pipes adjacent).
 
 ### C.4 `MeshACKEnvelope` (ACK)
@@ -223,6 +223,7 @@ originalMessageId | senderId | recipientId | status | <Int64 round(timestamp*100
 
 ACK relay key for dedup: `"<originalMessageId>|<senderId>|<recipientId>|<status>"`.
 Dedup id stored as `"ack:<relayKey>"`.
+Compute it only for an ACK that passed the §D "`|` inside signed fields" check; with a `|` inside a field a crafted ACK could produce another ACK's key and dedup-suppress it (§I.13).
 
 Relay rule: when forwarded, hopCount++, append device to routePath, **preserve original signature/signerPublicKey** (relays do not re-sign).
 
@@ -248,7 +249,7 @@ Unsigned/invalid stops are dropped.
 
 JSON keys: `mk`, `p`, `sid`, `mid`, `hc`, `hl`, `sc`, `ts` (`Int64` ms), `rp`, `ttl`, `s`, `spk`.
 
-Signing uses **JSON-canonical** form: serialize the entire JSON object with `JSONSerialization` `options: [.sortedKeys]`, then **remove keys `s` and `spk`**, then UTF-8 the result. Sign that. (See §D.)
+Signing uses **JSON-canonical** form: serialize the entire JSON object with `JSONSerialization` `options: [.sortedKeys]`, then **remove keys `s` and `spk`**, then UTF-8 the result. Sign that. (See §D.) "Sorted keys" is not byte-exact across serializers for every payload — see §I.14.
 
 Dedup id: `"frame:<mid>"`.
 
@@ -359,6 +360,31 @@ If a geo-fence is present, append:
 (Swift bool string-form is `"true"` or `"false"`.)
 
 Missing optionals are **empty** strings between pipes. Mutable DTN fields (`sc`, `hc`, `hl`, `rp`, `nf`, `ttl`, `ib`) are **excluded**.
+
+#### `|` inside signed fields (Rules 1, 2, 4, 5)
+
+The v1 pipe forms are frozen: fields are joined with a bare `|` and are
+**not** escaped or length-prefixed, so the signing bytes identify a single
+envelope only when no field contains `|` (§I.13). Until v2
+(`docs/MESH_PROTOCOL_v2.md`, draft):
+
+- A recipient MUST reject — not deliver, act on or ACK — a DM, Post, ACK or
+  Stop any of whose signing-input fields (as listed for its rule, missing
+  optionals mapped to empty strings) contains `|` (`0x7C`), even when the
+  signature verifies. With no `|` in any field, splitting the signing input on
+  `|` recovers the exact field list (20, or 23 with a geo-fence, for a DM; 9
+  for a Post; 5 for an ACK; 3 for a Stop).
+- A sender MUST NOT sign such a field. A UI that lets users type `|` SHOULD
+  substitute a look-alike (for example U+FF5C FULLWIDTH VERTICAL LINE) before
+  signing, or refuse the input.
+- Relays SHOULD apply the same check before forwarding; that also protects
+  receivers that predate this rule.
+
+This rule changes no signing bytes and no `shared-vectors/v1/` vector: every
+v1 message without a `|` in a signed field verifies exactly as before. A
+message from a sender that predates the rule and put `|` in, say, its text is
+refused by receivers that apply it; such messages were never safe to trust
+(§I.13).
 
 #### Rule 2 — Post (`MeshPostEnvelope`) — pipe form
 
@@ -567,6 +593,10 @@ Outbound ACKs are signed by the receiving device. Relays preserve the original s
 
 12. **No forward secrecy:** static X25519 key forever; constant HKDF salt `"RAVEN-MESH"`. v2 should adopt Double Ratchet or per-session ephemeral keys.
 
+13. **Pipe-joined signing inputs are ambiguous (security; v1 wire flaw).** Rules 1, 2, 4 and 5 join fields with a literal `|` with no escaping or length prefixes, while free-text fields (`senderName`, `text`, `replyToTextPreview`, `replyToSenderName`, post `text`, …) may contain `|`, and the optional geo-fence triple is appended last. Different envelopes can therefore share signing bytes. Example: an envelope with `geoFence {h3Cell, radiusInCells, deliverOnlyInside=true}` verifies identically to one with no geo-fence whose `replyToSenderName` is `"<original>|<h3Cell>|<radius>|true"`. `SignedMeshPayload` (§C.1) is relayable and unencrypted, so a relay can strip delivery restrictions, or move content between `text` and `mediaUrl`, without breaking the Ed25519 signature. `shared-vectors/generate_v1.py` asserts this collision against `dm_pipe_002`. The v1 bytes cannot change (`shared-vectors/VERSIONING.md`); the interim v1 mitigation is the receiver-side rejection in §D "`|` inside signed fields". The fix — domain-separated, length-prefixed signing inputs — is drafted in `docs/MESH_PROTOCOL_v2.md` §2, with vectors under `shared-vectors/v2/canonicalization/`.
+
+14. **Rule 3 "sorted keys" JSON is not a cross-language canonical form (interop).** Serializers differ on number spelling (`1.0` vs `1`, `1e21` vs `1e+21`), on escaping (`JSONSerialization` writes `/` as `\/` unless `.withoutEscapingSlashes` is set; the reference generator does not escape it), on non-ASCII (the reference generator `\u`-escapes non-ASCII in keys but not in values), and on key order for characters outside the BMP (UTF-16 code units vs code points). Two honest ports can then compute different Rule 3 bytes for the same frame and fail to verify each other. This is an interoperability failure, not a forgery: it cannot make a signature verify over a different object. v1 interop is only assured for payloads every port serializes identically — ASCII keys, printable-ASCII strings without `/`, integers within ±(2⁵³−1), booleans and null (`frame_json_001` stays in that subset) — and senders SHOULD keep signed `p` payloads within it. Receivers are not asked to reject anything. The v2 draft replaces Rule 3's serialization with RFC 8785 (JCS) (`docs/MESH_PROTOCOL_v2.md` §3).
+
 ---
 
 ## J. Versioning policy
@@ -575,6 +605,7 @@ Outbound ACKs are signed by the receiving device. Relays preserve the original s
 - A new wire-incompatible release MUST bump `v` to `2`.
 - Receivers seeing a higher `v` than they support should drop the envelope silently (or surface "update required").
 - Implementations should declare in their handshake which protocol versions they support (future addition).
+- Draft v2 signing inputs that fix §I.13 and §I.14 are in `docs/MESH_PROTOCOL_v2.md`, with vectors under `shared-vectors/v2/`. They are not deployed, and v1 (`shared-vectors/v1/`) stays the contract until the fleet adopts v2.
 
 ---
 

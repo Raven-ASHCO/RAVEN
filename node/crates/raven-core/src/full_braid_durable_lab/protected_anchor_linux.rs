@@ -13,7 +13,7 @@ use super::protected_anchor::{
 use super::protected_anchor_linux_ss::{NopromptError, NopromptSs};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 use zvariant::OwnedObjectPath;
 
 pub const PRODUCTION_ENABLED: bool = false;
@@ -95,16 +95,36 @@ impl FirstInstallProof {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Carries the raw installation seed: deliberately not `Clone`/`PartialEq`
+/// (no silent copies, no variable-time comparisons), `Debug` is redacted, and
+/// the seed is wiped when the result is dropped.
 pub enum SeedCreateResult {
-    Created([u8; SEED_LEN]),
-    Existing([u8; SEED_LEN]),
+    Created(Zeroizing<[u8; SEED_LEN]>),
+    Existing(Zeroizing<[u8; SEED_LEN]>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// See [`SeedCreateResult`]: same no-copy / redacted-`Debug` / wipe rules.
 pub enum SeedLoadResult {
     Missing,
-    Exact([u8; SEED_LEN]),
+    Exact(Zeroizing<[u8; SEED_LEN]>),
+}
+
+impl std::fmt::Debug for SeedCreateResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Created(_) => f.write_str("Created(<redacted seed>)"),
+            Self::Existing(_) => f.write_str("Existing(<redacted seed>)"),
+        }
+    }
+}
+
+impl std::fmt::Debug for SeedLoadResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("Missing"),
+            Self::Exact(_) => f.write_str("Exact(<redacted seed>)"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,15 +197,18 @@ impl Namespace {
             return Err(StoreError::CorruptAttributes);
         }
 
-        let secret = *guard.0;
+        let secret = Zeroizing::new(*guard.0);
         let attrs = seed_attrs_owned(&self.scope_id_hex);
-        match ss.create_item_noprompt(SEED_LABEL, attrs, &secret, CONTENT_TYPE) {
+        match ss.create_item_noprompt(SEED_LABEL, attrs, secret.as_slice(), CONTENT_TYPE) {
             Ok(_) => {}
             Err(NopromptError::LockedOrPromptRequired) => {
                 return Err(StoreError::LockedOrPromptRequired);
             }
             Err(NopromptError::Capacity) => return Err(StoreError::Capacity),
             Err(NopromptError::Unavailable) => return Err(StoreError::Unavailable),
+            Err(NopromptError::VolatileCollection) => {
+                return Err(StoreError::WrongAccessibilityOrPersistence);
+            }
             Err(NopromptError::Io) => {}
         }
 
@@ -203,7 +226,7 @@ impl Namespace {
             return Err(StoreError::Duplicate);
         }
         self.seed_collection_path = Some(coll);
-        let outcome = if seed == secret {
+        let outcome = if *seed == *secret {
             SeedCreateResult::Created(seed)
         } else {
             SeedCreateResult::Existing(seed)
@@ -238,12 +261,17 @@ impl Namespace {
         k_anchor: &[u8; 32],
     ) -> Result<Vec<[u8; RVFA1_LEN]>, StoreError> {
         require_lab()?;
-        let _ = self.require_seed_collection()?;
-        let ss = connect()?;
+        let ss = self.connect_in_seed_collection()?;
+        let seed_collection = self.require_seed_collection()?.to_owned();
         let record_hex = hex32(record_key32);
         let paths = search_anchor_paths(&ss, &self.scope_id_hex, Some(record_hex.as_str()), None)?;
         let mut out = Vec::with_capacity(paths.len());
         for path in &paths {
+            // Lookup searches every collection: an anchor outside the seed's
+            // collection means the chain is split across keyrings.
+            if collection_path_of(path.as_str())? != seed_collection {
+                return Err(StoreError::WrongAccessibilityOrPersistence);
+            }
             let raw = read_anchor_verified(
                 &ss,
                 path.as_str(),
@@ -298,7 +326,7 @@ impl Namespace {
             AppendDecision::Appended => {}
         }
 
-        let ss = connect()?;
+        let ss = self.connect_in_seed_collection()?;
         let unique_records = count_unique_records_in_scope(&ss, &self.scope_id_hex)?;
         let already = unique_records.contains(&record_hex);
         if !already && unique_records.len() >= MAX_FULL_BRAID_SESSIONS {
@@ -334,20 +362,12 @@ impl Namespace {
             }
             Err(NopromptError::Capacity) => return Err(StoreError::Capacity),
             Err(NopromptError::Unavailable) => return Err(StoreError::Unavailable),
+            Err(NopromptError::VolatileCollection) => {
+                return Err(StoreError::WrongAccessibilityOrPersistence);
+            }
             Err(NopromptError::Io) => {
                 let after = self.anchor_list(&decoded.record_key, k_index, k_anchor)?;
-                let matches: Vec<_> = after
-                    .iter()
-                    .filter(|b| b.as_slice() == exact_rvfa1)
-                    .collect();
-                if matches.len() != 1 {
-                    return Err(StoreError::Conflict);
-                }
-                let refs: Vec<&[u8]> = after.iter().map(|b| b.as_slice()).collect();
-                return match classify_append(&refs, exact_rvfa1, k_anchor, k_index) {
-                    AppendDecision::ExactReplay => Ok(AnchorAppendResult::ExactReplay),
-                    _ => Err(StoreError::CorruptAttributes),
-                };
+                return resolve_failed_create(&after, exact_rvfa1, k_anchor, k_index);
             }
         }
 
@@ -375,8 +395,7 @@ impl Namespace {
         expected_digest32: &[u8; 32],
     ) -> Result<(), StoreError> {
         require_lab()?;
-        let _ = self.require_seed_collection()?;
-        let ss = connect()?;
+        let ss = self.connect_in_seed_collection()?;
         let record_hex = hex32(record_key32);
         let seq_hex = format!("{:016x}", seq);
         let paths = search_anchor_paths(
@@ -430,6 +449,23 @@ impl Namespace {
         Ok(())
     }
 
+    /// Connects for an anchor operation and pins it to the seed's collection.
+    ///
+    /// `connect()` re-reads the `default` alias every time, so a long-lived
+    /// namespace could otherwise create anchors in whatever collection the
+    /// alias points at now, splitting them from the seed. The comparison is on
+    /// the very connection that then searches, creates or deletes, and that
+    /// connection creates items in the collection path it captured, so there
+    /// is no window between check and use.
+    fn connect_in_seed_collection(&mut self) -> Result<NopromptSs, StoreError> {
+        let seed_collection = self.require_seed_collection()?.to_owned();
+        let ss = connect()?;
+        if ss.default_collection_path() != seed_collection {
+            return Err(StoreError::WrongAccessibilityOrPersistence);
+        }
+        Ok(ss)
+    }
+
     fn require_seed_collection(&mut self) -> Result<&str, StoreError> {
         if self.seed_collection_path.is_none() {
             match self.seed_load_exact()? {
@@ -475,6 +511,7 @@ fn map_np(err: NopromptError) -> StoreError {
         NopromptError::LockedOrPromptRequired => StoreError::LockedOrPromptRequired,
         NopromptError::Capacity => StoreError::Capacity,
         NopromptError::Io => StoreError::IoOrPlatform,
+        NopromptError::VolatileCollection => StoreError::WrongAccessibilityOrPersistence,
     }
 }
 
@@ -566,7 +603,7 @@ fn read_seed_verified(
     ss: &NopromptSs,
     path: &str,
     scope_hex: &str,
-) -> Result<([u8; SEED_LEN], String), StoreError> {
+) -> Result<(Zeroizing<[u8; SEED_LEN]>, String), StoreError> {
     if ss.item_locked(path).map_err(map_np)? {
         return Err(StoreError::LockedOrPromptRequired);
     }
@@ -593,8 +630,8 @@ fn read_seed_verified(
     if secret.len() != SEED_LEN {
         return Err(StoreError::CorruptLength);
     }
-    let mut owned = [0u8; SEED_LEN];
-    owned.copy_from_slice(&secret);
+    let mut owned = Zeroizing::new([0u8; SEED_LEN]);
+    owned.copy_from_slice(secret.as_slice());
     let coll = collection_path_of(path)?;
     Ok((owned, coll))
 }
@@ -659,7 +696,7 @@ fn read_anchor_verified(
     if secret.len() != RVFA1_LEN {
         return Err(StoreError::CorruptLength);
     }
-    Ok(secret)
+    Ok(secret.to_vec())
 }
 
 fn verify_exact_attrs(
@@ -712,6 +749,31 @@ fn hex32(bytes: &[u8; 32]) -> String {
 
 fn sha256_32(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// Outcome of an append whose create call failed with an I/O-class error,
+/// given the chain re-listed afterwards. If the exact record is there, the
+/// create landed despite the error. If it is absent the create genuinely
+/// failed: that is a retryable platform error. `Conflict` is reserved for a
+/// different anchor that disagrees, so a transient keystore failure must not
+/// be reported as tamper- or rollback-class evidence.
+fn resolve_failed_create(
+    after: &[[u8; RVFA1_LEN]],
+    exact_rvfa1: &[u8],
+    k_anchor: &[u8; 32],
+    k_index: &[u8; 32],
+) -> Result<AnchorAppendResult, StoreError> {
+    let landed = after.iter().filter(|b| b.as_slice() == exact_rvfa1).count();
+    match landed {
+        0 => return Err(StoreError::IoOrPlatform),
+        1 => {}
+        _ => return Err(StoreError::Duplicate),
+    }
+    let refs: Vec<&[u8]> = after.iter().map(|b| b.as_slice()).collect();
+    match classify_append(&refs, exact_rvfa1, k_anchor, k_index) {
+        AppendDecision::ExactReplay => Ok(AnchorAppendResult::ExactReplay),
+        _ => Err(StoreError::CorruptAttributes),
+    }
 }
 
 struct CandidateGuard<'a>(&'a mut [u8; SEED_LEN]);
@@ -817,7 +879,7 @@ mod tests {
             panic!("expected Created");
         };
         match ns.seed_load_exact().expect("load") {
-            SeedLoadResult::Exact(loaded) => assert_eq!(loaded, seed),
+            SeedLoadResult::Exact(loaded) => assert!(*loaded == *seed),
             SeedLoadResult::Missing => panic!("missing"),
         }
         let mut other = [0xABu8; 32];
@@ -827,7 +889,7 @@ mod tests {
         let SeedCreateResult::Existing(existing) = second else {
             panic!("expected Existing");
         };
-        assert_eq!(existing, seed);
+        assert!(*existing == *seed);
         assert!(other.iter().all(|&b| b == 0));
         let probe = ns.namespace_probe();
         assert_eq!(probe.backend, "secret-service");
@@ -935,6 +997,13 @@ mod tests {
         ns.lab_delete_all_scoped_items().expect("cleanup");
     }
 
+    const NO_BUS_CHILD_ENV: &str = "RAVEN_0B3_NO_BUS_CHILD";
+
+    /// The bogus bus address is handed to a child process through
+    /// `Command::env`. Mutating this process's environment would race
+    /// `connect()` in sibling tests (spurious `Unavailable`) and
+    /// `setenv`/`getenv` themselves, and the gate runs the module's tests in
+    /// parallel.
     #[test]
     fn unavailable_without_secret_service() {
         assert_eq!(StoreError::Unavailable.as_code(), "UNAVAILABLE");
@@ -942,22 +1011,86 @@ mod tests {
             StoreError::LockedOrPromptRequired.as_code(),
             "LOCKED_OR_PROMPT_REQUIRED"
         );
-        let prev = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
-        std::env::set_var(
-            "DBUS_SESSION_BUS_ADDRESS",
-            "unix:path=/tmp/raven-0b3-missing-bus",
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .args([
+                "--exact",
+                &format!("{module}::unavailable_without_secret_service_child"),
+                "--nocapture",
+            ])
+            .env(NO_BUS_CHILD_ENV, "1")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/tmp/raven-0b3-missing-bus",
+            )
+            .output()
+            .expect("spawn no-bus child");
+        assert!(output.status.success(), "no-bus child failed: {output:?}");
+        // `--exact` on a renamed or moved helper would run nothing and still
+        // exit 0, which would turn this into a vacuous pass.
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "no-bus child did not run the helper test: {output:?}"
         );
-        let err = NopromptSs::connect().err();
-        match prev {
-            Some(v) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", v),
-            None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
+    }
+
+    #[test]
+    fn unavailable_without_secret_service_child() {
+        if std::env::var_os(NO_BUS_CHILD_ENV).is_none() {
+            return;
         }
+        let err = NopromptSs::connect().err();
         assert!(
             matches!(
                 err,
                 Some(NopromptError::Unavailable) | Some(NopromptError::LockedOrPromptRequired)
             ),
             "expected Unavailable/Locked, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn volatile_collection_maps_to_wrong_accessibility() {
+        assert_eq!(
+            map_np(NopromptError::VolatileCollection),
+            StoreError::WrongAccessibilityOrPersistence
+        );
+        assert_eq!(
+            StoreError::WrongAccessibilityOrPersistence.as_code(),
+            "WRONG_ACCESSIBILITY_OR_PERSISTENCE"
+        );
+    }
+
+    #[test]
+    fn failed_create_without_a_landed_item_is_retryable_not_a_conflict() {
+        let keys = derive_store_keys(&[0x11u8; 32]);
+        let session = [0x22u8; 32];
+        let first = make_head(&keys, &session, INITIAL_ANCHOR_SEQ, 1, 0x33, [0u8; 32]);
+        let second = make_head(&keys, &session, 2, 2, 0x44, [0x55u8; 32]);
+
+        // The create failed and nothing with the exact bytes is in the chain.
+        assert_eq!(
+            resolve_failed_create(&[], &first, &keys.k_anchor, &keys.k_index),
+            Err(StoreError::IoOrPlatform)
+        );
+        assert_eq!(
+            resolve_failed_create(&[first], &second, &keys.k_anchor, &keys.k_index),
+            Err(StoreError::IoOrPlatform)
+        );
+        // The create landed despite the error: replay-equivalent.
+        assert_eq!(
+            resolve_failed_create(&[first], &first, &keys.k_anchor, &keys.k_index),
+            Ok(AnchorAppendResult::ExactReplay)
+        );
+        assert_eq!(
+            resolve_failed_create(&[first, second], &second, &keys.k_anchor, &keys.k_index),
+            Ok(AnchorAppendResult::ExactReplay)
+        );
+        // The same record twice is a duplicate, never a conflict.
+        assert_eq!(
+            resolve_failed_create(&[first, first], &first, &keys.k_anchor, &keys.k_index),
+            Err(StoreError::Duplicate)
         );
     }
 

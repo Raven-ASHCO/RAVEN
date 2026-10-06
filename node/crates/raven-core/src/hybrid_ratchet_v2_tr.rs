@@ -284,7 +284,11 @@ pub fn ec_dr_decrypt(
     let key = mk_key(&dh, n);
     if let Some(mk) = state.mkskipped.get(&key) {
         let mut out = state.clone();
-        out.mkskipped.remove(&key);
+        // The consumed skipped key is removed from the cloned state; wipe the
+        // removed copy instead of letting the map hand it back to the allocator.
+        if let Some(mut removed) = out.mkskipped.remove(&key) {
+            zeroize::Zeroize::zeroize(&mut removed);
+        }
         return Ok((out, *mk));
     }
 
@@ -636,18 +640,27 @@ impl BraidReassembly {
         Some(body)
     }
 
+    /// Promote the epoch and erase the previous epoch's decapsulation key in
+    /// the caller's own buffer; `deleted_prev_dk` is only set once that buffer
+    /// is observably all-zero (the KAT field asserts real deletion).
     pub fn promote_with_ss(
         &mut self,
         ss: &[u8; 32],
-        prev_dk: &[u8; 32],
+        prev_dk: &mut [u8; 32],
     ) -> Result<[u8; 32], String> {
+        use zeroize::Zeroize;
+
         if self.promoted {
             return Err("already promoted".into());
         }
         if self.try_complete().is_none() {
             return Err("incomplete".into());
         }
-        self.prev_dk = Some(vec![0u8; prev_dk.len()]);
+        prev_dk.zeroize();
+        if prev_dk.iter().any(|&byte| byte != 0) {
+            return Err("previous decapsulation key not erased".into());
+        }
+        self.prev_dk = None;
         self.deleted_prev_dk = true;
         self.promoted = true;
         Ok(*ss)
@@ -758,7 +771,10 @@ pub fn run_braid_kem_chunk_matrix(
     let prev_dk = Sha256::digest(b"prev-epoch-dk");
     let mut prev_dk_arr = [0u8; 32];
     prev_dk_arr.copy_from_slice(&prev_dk);
-    let ss = reb.promote_with_ss(&z_pq, &prev_dk_arr)?;
+    let ss = reb.promote_with_ss(&z_pq, &mut prev_dk_arr)?;
+    if prev_dk_arr != [0u8; 32] {
+        return Err("prev dk still live after promote".into());
+    }
 
     let alice = scka_from_init(true, sk_scka);
     let bob = scka_from_init(false, sk_scka);
@@ -1178,9 +1194,9 @@ pub fn run_tr_combo_matrix(
         return Err("ec mk mismatch".into());
     }
 
-    let (a_scka1, pq0) = scka_next_send_mk(&a_scka);
+    let (a_scka1, pq0) = scka_next_send_mk(&a_scka)?;
     a_scka = a_scka1;
-    let (b_scka1, pq0b) = scka_next_recv_mk(&b_scka);
+    let (b_scka1, pq0b) = scka_next_recv_mk(&b_scka)?;
     b_scka = b_scka1;
     let (hy0, _) = kdf_hybrid(&mk0, &pq0);
     if pq0 != pq0b {
@@ -1224,8 +1240,8 @@ pub fn run_tr_combo_matrix(
 
     let b_scka2 = scka_epoch_promote_initiator(&b_scka, ss_scka2)?;
     let a_scka2 = scka_epoch_promote_responder(&a_scka, ss_scka2)?;
-    let (b_scka3, pq_b) = scka_next_send_mk(&b_scka2);
-    let (a_scka3, pq_a) = scka_next_recv_mk(&a_scka2);
+    let (b_scka3, pq_b) = scka_next_send_mk(&b_scka2)?;
+    let (a_scka3, pq_a) = scka_next_recv_mk(&a_scka2)?;
     if pq_b != pq_a {
         return Err("pq_b/pq_a mismatch".into());
     }
@@ -1276,6 +1292,32 @@ mod tests {
 
     fn load(name: &str) -> Value {
         serde_json::from_str(&std::fs::read_to_string(root().join(name)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn promote_with_ss_erases_the_callers_previous_dk() {
+        let mut reb = BraidReassembly::new(1, 1).unwrap();
+        let session = [0x5A; 32];
+        let chunk = BraidChunk {
+            epoch: 1,
+            chunk_type: CHUNK_CT1,
+            chunk_index: 0,
+            payload: vec![0x11; 8],
+            session_id: session,
+            binding_digest: [0u8; 32],
+        };
+        let wire = encode_braid_chunk(&chunk).unwrap();
+        assert_eq!(
+            reb.ingest(&decode_braid_chunk(&wire, &session).unwrap()),
+            "stored"
+        );
+        let mut prev_dk = [0x55; 32];
+        let ss = reb.promote_with_ss(&[0x66; 32], &mut prev_dk).unwrap();
+        assert_eq!(ss, [0x66; 32]);
+        // The flag now reflects real deletion of the caller's key material.
+        assert_eq!(prev_dk, [0u8; 32]);
+        assert!(reb.deleted_prev_dk);
+        assert!(reb.prev_dk.is_none());
     }
 
     fn assert_ec_dh_expected(out: &EcDhRatchetMatrixOut, exp: &Value) {

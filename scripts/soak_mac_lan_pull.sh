@@ -23,6 +23,8 @@ set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 NODE_ROOT="$REPO/node"
+# shellcheck source=scripts/lib/harness_util.sh
+source "$REPO/scripts/lib/harness_util.sh"
 source "${HOME}/.cargo/env" 2>/dev/null || true
 export PATH="${HOME}/.cargo/bin:${PATH}"
 export NO_COLOR=1
@@ -54,12 +56,21 @@ log() {
 }
 
 write_summary() {
+  # verdict is self-describing for callers/schedulers that only read this file:
+  # any failed cycle => FAIL; otherwise PASS once at least one cycle passed.
+  local verdict=NONE
+  if [[ "$2" -gt 0 ]]; then
+    verdict=FAIL
+  elif [[ "$1" -gt 0 ]]; then
+    verdict=PASS
+  fi
   cat >"$SUMMARY" <<EOF
 soak_mac_lan_pull
 updated_utc=$(ts)
 cycle=$3 / max=$MAX_CYCLES
 pass=$1
 fail=$2
+verdict=$verdict
 max_hours=$MAX_HOURS
 sleep_secs=$SLEEP_SECS
 pid=$$
@@ -125,11 +136,19 @@ log "SOAK_START max_hours=$MAX_HOURS max_cycles=$MAX_CYCLES sleep_secs=$SLEEP_SE
 log "bins ash=$ASH node=$NODE"
 write_summary 0 0 0 "started"
 
+# Python, not sed: BSD sed (macOS, where this soak runs) has no `\b`, so the old
+# `sed -E 's/\b...\b/'` redacted nothing. On any failure print nothing rather than raw.
 redact_file() {
-  sed -E \
-    -e '/[Ss]eed|[Pp]rivate.?key|identity\.seed/d' \
-    -e 's/\b[0-9a-fA-F]{64}\b/<HEX64>/g' \
-    "$1" 2>/dev/null || true
+  python3 - "$1" <<'PY' 2>/dev/null || echo "[redaction failed: output withheld]"
+import re, sys
+drop = re.compile(rb"[Ss]eed|[Pp]rivate.?key|identity\.seed")
+hex64 = re.compile(rb"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
+out = sys.stdout.buffer
+with open(sys.argv[1], "rb") as f:
+    for line in f:
+        if not drop.search(line):
+            out.write(hex64.sub(b"<HEX64>", line))
+PY
 }
 
 pick_free_port() {
@@ -197,14 +216,14 @@ run_cycle() {
 
   local i
   for i in $(seq 1 100); do
-    [[ -S "$mac/raven-node.sock" ]] && break
+    raven_ipc_up "$ASH" "$mac" && break
     if ! kill -0 "$svc_pid" 2>/dev/null; then
       FAIL_REASON="service_died"
       break
     fi
     sleep 0.05
   done
-  if [[ ! -S "$mac/raven-node.sock" ]]; then
+  if ! raven_ipc_up "$ASH" "$mac"; then
     FAIL_REASON="${FAIL_REASON:-service_sock}"
     # keep logs
     {
@@ -378,4 +397,9 @@ done
 
 log "SOAK_DONE pass=$PASS fail=$FAIL cycles=$CYCLE"
 write_summary "$PASS" "$FAIL" "$CYCLE" "done"
-exit 0
+# The verdict decides the exit code: a nohup/launchd/CI wrapper that only sees the
+# status must not mark a soak green when cycles failed (or none ran).
+if [[ "$FAIL" -eq 0 && "$PASS" -gt 0 ]]; then
+  exit 0
+fi
+exit 1

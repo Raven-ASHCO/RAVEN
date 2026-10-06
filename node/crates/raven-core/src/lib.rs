@@ -50,6 +50,7 @@ pub mod lan_gate;
 pub mod lan_noise;
 pub mod lan_rlb1;
 pub mod lan_vectors;
+pub mod macos_keychain;
 pub mod message_router;
 pub mod messaging_path;
 #[cfg(feature = "mlkem768-incremental-lab")]
@@ -75,8 +76,7 @@ pub use address::{decode_address, encode_address, from_display, to_display};
 pub use alias_record::{normalize_alias, AliasClaimStore, AliasPublishQuota, AliasRecord};
 pub use atsam_aead::{build_aad_v1, build_aad_v2, seal_rvna1_v2, unseal_rvna1_v2};
 pub use atsam_mlkem::{
-    begin_hybrid_initiation, initiate_hybrid_root, respond_hybrid_root, HybridKeypair,
-    PendingHybridInitiation,
+    begin_hybrid_initiation, respond_hybrid_root, HybridKeypair, PendingHybridInitiation,
 };
 pub use atsam_root::{derive_root, transcript_hash, x25519_shared, x25519_shared_checked};
 pub use ble_adapter::{

@@ -188,3 +188,30 @@ def test_response_is_bound_to_exact_init_root_role_profile_and_time(kat, decoded
         with pytest.raises(ValueError):
             pair_init.decode_response(bytes(tampered))
     assert inputs["z_x_hex"] and inputs["z_pq_hex"]
+
+
+LOW_ORDER_X25519 = [
+    bytes.fromhex("00" * 32),
+    bytes.fromhex("01" + "00" * 31),
+    bytes.fromhex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+    bytes.fromhex("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+    bytes.fromhex("ec" + "ff" * 30 + "7f"),
+    bytes.fromhex("ed" + "ff" * 30 + "7f"),
+    bytes.fromhex("ee" + "ff" * 30 + "7f"),
+]
+
+
+def test_low_order_initiator_ephemeral_is_rejected(kat, decoded):
+    assert pair_init.is_contributory_x25519(decoded.initiator_ephemeral_x25519_pub)
+    wire = bytes.fromhex(kat["expected"]["pair_init_wire_hex"])
+    offset = 236
+    assert wire[offset : offset + 32] == decoded.initiator_ephemeral_x25519_pub
+    for point in LOW_ORDER_X25519:
+        assert not pair_init.is_contributory_x25519(point)
+        with pytest.raises(ValueError):
+            pair_init.decode_init(wire[:offset] + point + wire[offset + 32 :])
+        hostile = copy.copy(decoded)
+        hostile.initiator_ephemeral_x25519_pub = point
+        with pytest.raises(ValueError):
+            pair_init.init_signing_bytes(hostile)
+        assert not pair_init.verify_init(hostile, **_verify_args(kat, hostile))

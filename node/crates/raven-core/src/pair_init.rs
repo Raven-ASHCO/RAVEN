@@ -10,10 +10,13 @@ use thiserror::Error;
 
 use crate::address::encode_address;
 use crate::atsam_indexed_session::{session_context, PROFILE_ID};
-use crate::atsam_root::{derive_root, transcript_hash as atsam_transcript_hash};
+use crate::atsam_root::{
+    derive_root, transcript_hash as atsam_transcript_hash, x25519_public_is_contributory,
+};
 use crate::device_cert::DeviceCertificate;
 use crate::identity::Identity;
 use crate::prekey_bundle::{PrekeyBundle, MLKEM768_EK_LEN};
+use crate::prekey_lifecycle::MAX_PREKEY_FUTURE_SKEW_MS;
 use crate::records::device_cert_signing_bytes;
 
 pub const VERSION: u8 = 1;
@@ -139,6 +142,8 @@ pub enum PairInitError {
     SameEndpoint,
     #[error("PairInit required field is all-zero")]
     AllZeroField,
+    #[error("PairInit initiator ephemeral X25519 key is low-order (non-contributory)")]
+    NonContributoryKey,
     #[error("PairInit one-time prekey id/key slot is inconsistent")]
     InvalidOneTimePrekey,
     #[error("PairInit validity interval is invalid")]
@@ -192,6 +197,12 @@ fn validate_init(value: &PairInit) -> Result<(), PairInitError> {
         || all_zero(&value.mlkem768_ciphertext)
     {
         return Err(PairInitError::AllZeroField);
+    }
+    // Every responder X25519 agreement with a small-order point is all-zero.
+    // Reject it structurally so such a PairInit is never signed, hashed,
+    // journaled, or claimed; the later checked DH is only a second guard.
+    if !x25519_public_is_contributory(&value.initiator_ephemeral_x25519_pub) {
+        return Err(PairInitError::NonContributoryKey);
     }
     if value.initiator_device_ed_pub == value.responder_device_ed_pub {
         return Err(PairInitError::CertificateMismatch);
@@ -453,10 +464,23 @@ pub fn verify_init(
         .not_after_ms
         .min(trust.responder_certificate.not_after_ms)
         .min(prekey.expires_at_ms);
-    if value.created_at_ms < trust_not_before || value.expires_at_ms > trust_not_after {
+    // The two peers' wall clocks are never identical: the initiator stamps
+    // `created_at_ms` from its clock while the cert/prekey `created`/`not_before`
+    // instants come from the responder's. Tolerate the same bounded skew as
+    // `PrekeyBundle::verify` and the claim path (`MAX_PREKEY_FUTURE_SKEW_MS`),
+    // otherwise that tolerance is dead and a few seconds of drift makes pairing
+    // fail with a time error on one side after the other already accepted it.
+    if value
+        .created_at_ms
+        .saturating_add(MAX_PREKEY_FUTURE_SKEW_MS)
+        < trust_not_before
+        || value.expires_at_ms > trust_not_after
+    {
         return Err(PairInitError::TrustWindowMismatch);
     }
-    if now_ms < value.created_at_ms || now_ms >= value.expires_at_ms {
+    if value.created_at_ms > now_ms.saturating_add(MAX_PREKEY_FUTURE_SKEW_MS)
+        || now_ms >= value.expires_at_ms
+    {
         return Err(PairInitError::NotCurrentlyValid);
     }
     let signing = init_signing_bytes(value)?;
@@ -567,7 +591,9 @@ pub fn verify_response(
         || value.created_at_ms < accepted_init.created_at_ms
         || value.created_at_ms >= accepted_init.expires_at_ms
         || value.expires_at_ms > accepted_init.expires_at_ms
-        || now_ms < value.created_at_ms
+        // Same bounded peer-clock skew as `verify_init`: the responder stamps
+        // the response from its own clock.
+        || value.created_at_ms > now_ms.saturating_add(MAX_PREKEY_FUTURE_SKEW_MS)
         || now_ms >= value.expires_at_ms
     {
         return Err(PairInitError::ConfirmationMismatch);
@@ -733,6 +759,154 @@ mod tests {
         );
     }
 
+    /// Self-contained trust records where a test picks the init's and the
+    /// prekey's instants independently (the vector fixes them together).
+    fn skew_fixture(
+        init_created: u64,
+        prekey_created: u64,
+    ) -> (PairInit, DeviceCertificate, DeviceCertificate, PrekeyBundle) {
+        let base = 1_700_000_000_000u64;
+        let alice_user = Identity::from_seed(&[0x31; 32]);
+        let bob_user = Identity::from_seed(&[0x32; 32]);
+        let alice_device = Identity::from_seed(&[0x33; 32]);
+        let bob_device = Identity::from_seed(&[0x34; 32]);
+        let issue = |user: &Identity, device: &Identity, id: &str| {
+            DeviceCertificate::issue(
+                user,
+                device.public_key_bytes(),
+                [0x62; 32],
+                id,
+                base - 86_400_000,
+                base + 31_536_000_000,
+                0,
+            )
+            .unwrap()
+        };
+        let alice_cert = issue(&alice_user, &alice_device, "alice-device");
+        let bob_cert = issue(&bob_user, &bob_device, "bob-device");
+        let prekey = PrekeyBundle {
+            identity_ed25519_pub: bob_user.public_key_bytes(),
+            device_id: "bob-device".into(),
+            x25519_pub: [0x62; 32],
+            mlkem768_ek: vec![0x63; MLKEM768_EK_LEN],
+            signed_prekey_id: 1,
+            one_time_prekey_id: 0,
+            one_time_x25519_pub: None,
+            created_at_ms: prekey_created,
+            expires_at_ms: base + 604_800_000,
+            signature: [0u8; 64],
+        }
+        .sign(&bob_user)
+        .unwrap();
+        let ephemeral =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([0x42; 32]));
+        let mut init = PairInit {
+            initiator_address: encode_address(&alice_user.public_key_bytes()),
+            responder_address: encode_address(&bob_user.public_key_bytes()),
+            init_id: [7; 16],
+            pairing_nonce: [8; 32],
+            initiator_device_ed_pub: alice_device.public_key_bytes(),
+            responder_device_ed_pub: bob_device.public_key_bytes(),
+            initiator_ephemeral_x25519_pub: ephemeral.to_bytes(),
+            responder_signed_x25519_pub: prekey.x25519_pub,
+            responder_one_time_x25519_pub: [0u8; 32],
+            initiator_device_cert_hash: device_certificate_hash(&alice_cert).unwrap(),
+            responder_device_cert_hash: device_certificate_hash(&bob_cert).unwrap(),
+            responder_prekey_bundle_hash: prekey_bundle_hash(&prekey).unwrap(),
+            signed_prekey_id: 1,
+            one_time_prekey_id: 0,
+            responder_mlkem768_ek: prekey.mlkem768_ek.clone(),
+            mlkem768_ciphertext: vec![0x55; MLKEM768_CT_LEN],
+            created_at_ms: init_created,
+            expires_at_ms: init_created + 3_600_000,
+            signature: [0u8; 64],
+        };
+        init.signature = alice_device.sign(&init_signing_bytes(&init).unwrap());
+        (init, alice_cert, bob_cert, prekey)
+    }
+
+    #[test]
+    fn verify_init_tolerates_bounded_peer_clock_skew() {
+        let base = 1_700_000_000_000u64;
+        let skew = MAX_PREKEY_FUTURE_SKEW_MS;
+        let (init, alice, bob, prekey) = skew_fixture(base, base - 60_000);
+        let trust = PairInitTrust {
+            initiator_certificate: &alice,
+            responder_certificate: &bob,
+            responder_prekey: &prekey,
+            initiator_revoked: false,
+            responder_revoked: false,
+        };
+        // The verifier's clock is behind the initiator's by up to the bound.
+        verify_init(&init, &trust, base).unwrap();
+        verify_init(&init, &trust, base - skew).unwrap();
+        assert_eq!(
+            verify_init(&init, &trust, base - skew - 1),
+            Err(PairInitError::NotCurrentlyValid)
+        );
+        // Expiry stays exact.
+        assert_eq!(
+            verify_init(&init, &trust, init.expires_at_ms),
+            Err(PairInitError::NotCurrentlyValid)
+        );
+    }
+
+    #[test]
+    fn verify_init_trust_window_tolerates_bounded_peer_clock_skew() {
+        let base = 1_700_000_000_000u64;
+        let skew = MAX_PREKEY_FUTURE_SKEW_MS;
+        // The responder's prekey "was created" up to the bound after the
+        // initiator's own clock reads at init time.
+        let (init, alice, bob, prekey) = skew_fixture(base, base + skew);
+        let trust = PairInitTrust {
+            initiator_certificate: &alice,
+            responder_certificate: &bob,
+            responder_prekey: &prekey,
+            initiator_revoked: false,
+            responder_revoked: false,
+        };
+        verify_init(&init, &trust, base + skew).unwrap();
+        let (init, alice, bob, prekey) = skew_fixture(base, base + skew + 1);
+        let trust = PairInitTrust {
+            initiator_certificate: &alice,
+            responder_certificate: &bob,
+            responder_prekey: &prekey,
+            initiator_revoked: false,
+            responder_revoked: false,
+        };
+        assert_eq!(
+            verify_init(&init, &trust, base + skew + 1),
+            Err(PairInitError::TrustWindowMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_response_tolerates_bounded_peer_clock_skew() {
+        let vector = vector();
+        let input = &vector["input"];
+        let expected = &vector["expected"];
+        let init =
+            decode_init(&hex::decode(expected["pair_init_wire_hex"].as_str().unwrap()).unwrap())
+                .unwrap();
+        let root = derive_provisional_root(
+            &hex_arr(input["z_x_hex"].as_str().unwrap()),
+            &hex_arr(input["z_pq_hex"].as_str().unwrap()),
+            &init,
+        )
+        .unwrap();
+        let response = decode_response(
+            &hex::decode(expected["pair_response_wire_hex"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        // The responder's clock is ahead of the verifier's by up to the bound.
+        let behind = response.created_at_ms - MAX_PREKEY_FUTURE_SKEW_MS;
+        verify_response(&response, &init, &root, behind).unwrap();
+        assert_eq!(
+            verify_response(&response, &init, &root, behind - 1),
+            Err(PairInitError::ConfirmationMismatch)
+        );
+    }
+
     #[test]
     fn strict_decoder_and_signed_bindings_reject_tampering() {
         let vector = vector();
@@ -762,6 +936,39 @@ mod tests {
         assert_eq!(
             init_signing_bytes(&inconsistent),
             Err(PairInitError::InvalidOneTimePrekey)
+        );
+    }
+
+    #[test]
+    fn low_order_initiator_ephemeral_is_rejected_before_any_use() {
+        let vector = vector();
+        let wire = hex::decode(vector["expected"]["pair_init_wire_hex"].as_str().unwrap()).unwrap();
+        let init = decode_init(&wire).unwrap();
+        // Spec §3 offset 236: initiator ephemeral X25519 public key.
+        let offset = 12 + PROFILE_ID.len() + ADDRESS_LEN * 2 + 16 + 32 + 32 * 2;
+        assert_eq!(offset, 236);
+        assert_eq!(
+            wire[offset..offset + 32],
+            init.initiator_ephemeral_x25519_pub
+        );
+        let mut u_one = [0u8; 32];
+        u_one[0] = 1;
+        let mut tampered = wire.clone();
+        tampered[offset..offset + 32].copy_from_slice(&u_one);
+        assert_eq!(
+            decode_init(&tampered),
+            Err(PairInitError::NonContributoryKey)
+        );
+        let mut low = init;
+        low.initiator_ephemeral_x25519_pub = u_one;
+        assert_eq!(
+            init_signing_bytes(&low),
+            Err(PairInitError::NonContributoryKey)
+        );
+        assert_eq!(init_hash(&low), Err(PairInitError::NonContributoryKey));
+        assert_eq!(
+            transcript_hash(&low),
+            Err(PairInitError::NonContributoryKey)
         );
     }
 

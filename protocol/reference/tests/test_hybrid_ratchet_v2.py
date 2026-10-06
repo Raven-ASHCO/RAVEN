@@ -38,6 +38,79 @@ def test_pair_init_v2_roundtrip_and_expand():
     assert resp.confirmation_tag.hex() == v["expected"]["confirmation_tag_hex"]
 
 
+def test_pair_init_v2_002_is_transcript_derivable():
+    """Trust-binding KAT: Z_X, prekey digest and cert digests follow from wire."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey,
+        X25519PublicKey,
+    )
+
+    from raven_protocol import pair_init
+
+    v = _load("pair_init_v2_002.json")
+    inp, exp = v["inputs"], v["expected"]
+    wire = bytes.fromhex(exp["pair_init_wire_hex"])
+    rec = piv2.decode_init(wire)
+    assert piv2.encode_init(rec) == wire
+    assert piv2.verify_init_signature(rec)
+
+    def priv(name):
+        return X25519PrivateKey.from_private_bytes(bytes.fromhex(inp[name]))
+
+    eph = priv("initiator_ephemeral_x25519_priv_hex")
+    otp = priv("responder_otp_x25519_priv_hex")
+    spk = priv("responder_spk_x25519_priv_hex")
+    assert eph.public_key().public_bytes_raw() == rec.initiator_ephemeral_x25519_pub
+    assert otp.public_key().public_bytes_raw() == rec.responder_one_time_x25519_pub
+    assert spk.public_key().public_bytes_raw() == rec.responder_signed_x25519_pub
+
+    # Z_X = X25519(eph, OTP) over exactly the wire keys, from either side.
+    z_x = eph.exchange(X25519PublicKey.from_public_bytes(rec.responder_one_time_x25519_pub))
+    assert z_x == otp.exchange(X25519PublicKey.from_public_bytes(rec.initiator_ephemeral_x25519_pub))
+    assert z_x.hex() == exp["z_x_hex"]
+
+    # The wire's prekey digest is a real identity-signed RavenPrekeyBundleV1.
+    bundle = inp["responder_prekey_bundle"]
+    bundle_sb = bytes.fromhex(bundle["signing_bytes_hex"])
+    bundle_sig = bytes.fromhex(bundle["signature_hex"])
+    bob_identity = bytes.fromhex(inp["responder_identity_ed_pub_hex"])
+    Ed25519PublicKey.from_public_bytes(bob_identity).verify(bundle_sig, bundle_sb)
+    assert bundle_sb.startswith(b"rvn1/prekey\x01" + bob_identity)
+    assert pair_init.prekey_bundle_hash(bundle_sb, bundle_sig) == rec.responder_prekey_bundle_hash
+    bound = (
+        rec.responder_signed_x25519_pub
+        + rec.responder_mlkem768_ek
+        + rec.signed_prekey_id.to_bytes(4, "big")
+        + rec.one_time_prekey_id.to_bytes(4, "big")
+        + rec.responder_one_time_x25519_pub
+    )
+    assert bound in bundle_sb
+
+    # Identity-signed device certs; Alice's device X key is not her ephemeral.
+    for side, identity_hex, wire_hash in (
+        ("initiator_device_cert", "initiator_identity_ed_pub_hex", rec.initiator_device_cert_hash),
+        ("responder_device_cert", "responder_identity_ed_pub_hex", rec.responder_device_cert_hash),
+    ):
+        cert_sb = bytes.fromhex(inp[side]["signing_bytes_hex"])
+        cert_sig = bytes.fromhex(inp[side]["signature_hex"])
+        identity = bytes.fromhex(inp[identity_hex])
+        Ed25519PublicKey.from_public_bytes(identity).verify(cert_sig, cert_sb)
+        assert pair_init.device_certificate_hash(identity, cert_sb, cert_sig) == wire_hash
+    alice_cert_sb = bytes.fromhex(inp["initiator_device_cert"]["signing_bytes_hex"])
+    assert rec.initiator_ephemeral_x25519_pub not in alice_cert_sb
+
+    expand = piv2.pair_expand(z_x, bytes.fromhex(inp["z_pq_hex"]), wire)
+    assert expand.sk_ec.hex() == exp["sk_ec_hex"]
+    assert expand.sk_scka.hex() == exp["sk_scka_hex"]
+    assert expand.k_route_master.hex() == exp["k_route_master_hex"]
+    assert expand.k_confirm.hex() == exp["k_confirm_hex"]
+    assert expand.session_id.hex() == exp["session_id_hex"]
+    resp = piv2.decode_response(bytes.fromhex(exp["pair_response_wire_hex"]))
+    assert piv2.verify_response_signature(resp)
+    assert resp.confirmation_tag == piv2.confirmation_tag(expand.k_confirm, expand.init_hash_v2)
+
+
 def test_pair_init_v1_rejected_as_v2():
     v = _load("negative/pair_init_v1_as_v2_001.json")
     wire = bytes.fromhex(v["inputs"]["wire_hex"])

@@ -1,6 +1,6 @@
 # Master Engineering Checklist — Walk In Progress
 
-**Branch:** `feature/raven-serverless-v1`  
+**Branch (historical):** authored on `feature/raven-serverless-v1`; this file now lives on `main` and is a dated snapshot, not a statement about an open branch  
 **Walk started:** 2026-08-12  
 **Walk closed (document):** 2026-08-12 (this continuation)  
 **Baseline HEAD at walk start:** `6189f2e`  
@@ -18,8 +18,8 @@
 
 | Proof | Result | Artifact / command |
 |-------|--------|-------------------|
-| Reliability matrix 20× | **RELIABILITY_20_GREEN** | `scripts/reliability_matrix_20.sh` → `node/proof_artifacts/reliability_20_*` / `LATEST_RELIABILITY` |
-| §59 harness | **17/17 PASS** (prior) | `scripts/final_serverless_proof.sh` → `node/proof_artifacts/LATEST` |
+| Reliability matrix 20× | **INVALIDATED** — runs before the 2026-09-29 harness fix were false-green (scenario status was its last command, usually `rm -rf`; bridged sends used the refused `atsam` mode). Re-run: `scripts/reliability_matrix_20.sh` now enforces every assertion | `scripts/reliability_matrix_20.sh` → `node/proof_artifacts/reliability_20_*` / `LATEST_RELIABILITY` |
+| §59 harness | **INVALIDATED** — runs before the 2026-09-29 harness fix counted only each step's last command. Re-run `scripts/final_serverless_proof.sh` (16 enforced steps, lab build; also a CI job) | `scripts/final_serverless_proof.sh` → `node/proof_artifacts/LATEST` |
 | raven-core + ash tests | PASS | `cargo test -p raven-core -p ash` |
 | bridge / mailbox / swarm / two_node / lan | PASS | matrix scenarios 01–11 + node/scripts/* |
 | macOS build | PASS | `cargo build -p raven-core -p ash -p raven-node` |
@@ -66,7 +66,7 @@
 | 25 | Send New Message | PASS | ash send via stdin / node IPC (no argv plaintext) |
 | 26 | Secure CLI Usage | PASS | ash refuse argv; **raven-node `--send` REFUSE** (`113bf33`) |
 | 27 | Local DB and Queues | PASS | SQLite outbox + forward_queue (+ busy_timeout) |
-| 28 | Internet P2P | PASS | InternetTransport + libp2p swarm + matrix 01 |
+| 28 | Internet P2P | HOLD | raw path refuses ATSAM origination; libp2p/NAT composition is experimental only |
 | 29 | DHT / Peer Discovery | PASS_SOFTWARE_SUBSTITUTE | DiscoveryResolver + local Kad; public Internet Kad **BLOCKED_HARDWARE** |
 | 30 | Bootstrap Nodes | PASS | disable-raven-defaults + manual peer smoke |
 | 31 | NAT Traversal | PASS_SOFTWARE_SUBSTITUTE | `nat_docker_sim.sh` **PASS** via Lima Docker; live CGNAT/DCUtR **BLOCKED_HARDWARE** |
@@ -88,7 +88,7 @@
 | 47 | Cross-Platform Interop | PASS | macOS + Win PE substitute + Linux Lima/musl + Docker NAT |
 | 48 | Mandatory Network Tests | PASS | Demos + matrix network scenarios |
 | 49 | Mandatory Security Tests | PASS | Refuse argv, UDS peer-UID, envelope KATs, anti-spam, tamper |
-| 50 | Reliability and Scale Tests | PASS | `reliability_matrix_20.sh` ≥20 cycles green |
+| 50 | Reliability and Scale Tests | IN_PROGRESS | `reliability_matrix_20.sh` — earlier green runs invalidated (false-green harness, fixed 2026-09-29); needs a fresh run |
 | 51 | Terminal-Specific Security Tests | PASS | ash/raven-node argv refuse + doctor redaction |
 | 52 | Packaging | PASS (unsigned) | `scripts/release/build_unsigned.sh` prior; MSI/notarize **BLOCKED_HUMAN** |
 | 53 | Node Operator Controls | PASS | ash node bridge/store/relay/bootstrap |
@@ -97,7 +97,7 @@
 | 56 | Documentation | PASS | SERVERLESS_MODEL, INSTALL_*, CHECKLIST_100_AUTOMATABLE, this walk |
 | 57 | CI Requirements | PASS (declared) | `.github/workflows/raven-serverless.yml` matrix |
 | 58 | Phase Exit Gates | PASS (software) | Software maximized; A human freeze **BLOCKED_HUMAN** |
-| 59 | Final Serverless Proof | PASS (automated) | Harness + reliability 20×; physical multi-device **BLOCKED_HARDWARE** |
+| 59 | Final Serverless Proof | IN_PROGRESS | Harness fixed 2026-09-29; fresh enforced run pending (earlier green runs INVALIDATED); physical multi-device **BLOCKED_HARDWARE** |
 | 60 | Final Definition of Done | BLOCKED_HUMAN | External auditors / notarize / phones |
 
 ---
@@ -105,13 +105,13 @@
 ## Progress estimate
 
 - **Sections with a terminal status recorded:** **60 / 60 (100% walked)**  
-- **Automatable PASS / soft-PASS / FROZEN / PASS_SOFTWARE_SUBSTITUTE:** **100%** of automatable rows (see `docs/CHECKLIST_100_AUTOMATABLE.md`)  
+- **Automatable PASS / soft-PASS / FROZEN / PASS_SOFTWARE_SUBSTITUTE:** claimed **100%** on 2026-08-12 (see `docs/CHECKLIST_100_AUTOMATABLE.md`); **withdrawn pending a fresh enforced run** (rows 50/59; row 28 is HOLD)  
 - **Explicit absolute-DoD leftovers:** §60 BLOCKED_HUMAN; nested hardware notes on §29/§31/§36–37/§59; nested human notes on §5/§8/§18/§45/§52/§58  
 
-**Checklist automatable 100%?** **YES**  
+**Checklist automatable 100%?** **NOT CURRENTLY CLAIMED** — pending a fresh enforced run of the reliability matrix and §59 harness  
 **Absolute marketing DoD closed?** **NO** (phones / notarize / external review)
 
-**READY for user physical test?** **YES for terminal + sim software on this Mac.** **NO for multi-device BLE / notarized installers / public CGNAT.**
+**READY for user physical test?** **CONDITIONAL / lab only.** Terminal + sim software on this Mac is a lab path under the RVN1 production HOLD (not a confidentiality or release claim), pending a fresh enforced harness run. **NO** for multi-device BLE / notarized installers / public CGNAT.
 
 ---
 
@@ -120,7 +120,7 @@
 1. iOS `PeerKeyDirectory` UserDefaults → Keychain (+ one-shot migration, peer index, tests)  
 2. `AuthService.logout` → `PeerKeyDirectory.purgeAllPins()` (cross-account pin wipe)  
 3. `ATSAMRootStorage` Keychain queries set `kSecAttrSynchronizable = false`  
-4. Desktop `raven_core::identity_store` — macOS Keychain / Windows DPAPI / Linux Secret Service + locked-file `0600`; plaintext `identity.seed` migrate; ash/raven-node/raven-swarm wired  
+4. Desktop `raven_core::identity_store` — macOS Keychain / Windows DPAPI / Linux Secret Service + locked-file `0600` (historical, 2026-08-12; since then Linux creation is disabled before R1 and locked-file is a debug/lab/CI-only override refused in Release — see `docs/IDENTITY_SEED_STORAGE.md`); plaintext `identity.seed` migrate; ash/raven-node/raven-swarm wired  
 5. `ForwardQueue` SQLite `busy_timeout` + `raven-node service` queue warmup (fixes IPC/bridge race → ash-close flake)  
 6. `scripts/reliability_matrix_20.sh` + Lima Docker NAT auto-wire; iPhone/iPad sim loops  
 

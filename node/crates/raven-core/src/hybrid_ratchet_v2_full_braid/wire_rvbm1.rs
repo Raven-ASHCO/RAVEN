@@ -1,5 +1,9 @@
 //! RVBM1 mutation body wire codec (design §4.6).
 
+use std::fmt;
+
+use zeroize::Zeroize;
+
 use crate::hybrid_ratchet_v2_full_braid::wire_util::{
     expect_magic, read_bytes, read_u32be, read_u8, reject_trailing, write_bytes, write_u16be,
     write_u32be, write_u8, WireResult,
@@ -15,7 +19,9 @@ pub const BRAID_MIN_AEAD_CIPHERTEXT_BYTES: usize = 16;
 pub const MODE_SEAL_COMPARE: u8 = 0;
 pub const MODE_OPEN: u8 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Mode-0 `body` is application plaintext and `ec_mk_oracle` may be a message
+/// key: both are wiped on drop and never printed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Rvbm1 {
     pub needs_aead: u8,
     pub ec_mk_oracle_len: u16,
@@ -24,6 +30,26 @@ pub struct Rvbm1 {
     pub mode: u8,
     pub body: Vec<u8>,
     pub expected_ct: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for Rvbm1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rvbm1")
+            .field("needs_aead", &self.needs_aead)
+            .field("ec_mk_oracle_len", &self.ec_mk_oracle_len)
+            .field("aad_len", &self.aad.len())
+            .field("mode", &self.mode)
+            .field("body_len", &self.body.len())
+            .field("expected_ct_len", &self.expected_ct.as_ref().map(Vec::len))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Rvbm1 {
+    fn drop(&mut self) {
+        self.ec_mk_oracle.zeroize();
+        self.body.zeroize();
+    }
 }
 
 impl Rvbm1 {

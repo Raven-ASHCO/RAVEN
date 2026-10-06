@@ -74,6 +74,10 @@ pub fn encode_rvbo1(outputs: &Rvbo1) -> WireResult<Vec<u8>> {
 }
 
 pub fn decode_rvbo1(data: &[u8]) -> WireResult<Rvbo1> {
+    // Cap the input before parsing (RVBC1/RVOR1/RVFT1/RVFB1 do the same).
+    if data.len() > MAX_RVBO1 {
+        return Err("rvbo1 too large".into());
+    }
     if data.len() == EMPTY_RVBO1_LEN {
         let empty = encode_empty_rvbo1();
         if data == empty.as_slice() {
@@ -88,7 +92,9 @@ pub fn decode_rvbo1(data: &[u8]) -> WireResult<Rvbo1> {
     }
     let num_frames =
         crate::hybrid_ratchet_v2_full_braid::wire_util::read_u16be(data, &mut off)? as usize;
-    let mut frames = Vec::with_capacity(num_frames);
+    // `num_frames` is attacker-controlled: each frame needs at least its 4-byte
+    // length prefix, so never reserve more than the remaining bytes can hold.
+    let mut frames = Vec::with_capacity(num_frames.min(data.len().saturating_sub(off) / 4));
     for _ in 0..num_frames {
         let frame_len = read_u32be(data, &mut off)? as usize;
         let frame = read_bytes(data, &mut off, frame_len)?.to_vec();
@@ -113,9 +119,6 @@ pub fn decode_rvbo1(data: &[u8]) -> WireResult<Rvbo1> {
         return Err("rvbo1 sealed_present".into());
     };
     reject_trailing(data, off)?;
-    if data.len() > MAX_RVBO1 {
-        return Err("rvbo1 too large".into());
-    }
     Ok(Rvbo1 {
         frames,
         ch_out,
@@ -201,5 +204,22 @@ mod tests {
         let mut wire = encode_empty_rvbo1();
         wire.push(0);
         assert!(decode_rvbo1(&wire).is_err());
+    }
+
+    #[test]
+    fn oversize_and_inflated_frame_count_are_rejected_without_parsing() {
+        // magic | schema | num_frames = 0xFFFF, but no frame bytes follow.
+        let mut inflated = Vec::new();
+        inflated.extend_from_slice(RVBO1_MAGIC);
+        inflated.extend_from_slice(&RVBO1_SCHEMA.to_be_bytes());
+        inflated.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        assert!(decode_rvbo1(&inflated).is_err());
+        inflated.extend_from_slice(&[0u8; 3]);
+        assert!(decode_rvbo1(&inflated).is_err());
+        // Anything above MAX_RVBO1 is refused before the body is looked at.
+        assert!(decode_rvbo1(&vec![0u8; MAX_RVBO1 + 1]).is_err());
+        let mut valid_prefix_oversize = encode_empty_rvbo1();
+        valid_prefix_oversize.resize(MAX_RVBO1 + 1, 0);
+        assert!(decode_rvbo1(&valid_prefix_oversize).is_err());
     }
 }

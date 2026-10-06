@@ -2,24 +2,47 @@
 //!
 //! This is intentionally a separate binary. Building or running the normal
 //! `raven-swarm` does not advertise `/raven/offline-mailbox/1.0.0`.
+//!
+//! The server bounds connections (globally, per PeerId and per source IP),
+//! charges each request to the sending PeerId and to the connection's source
+//! network (see `MailboxService::handle_from`), handles requests (parse,
+//! quota, fsync'd snapshot) on the blocking pool so the swarm event loop never
+//! stalls, and drops requests beyond a fixed in-flight budget, global and per
+//! peer.
 
+use std::collections::HashMap;
 use std::error::Error;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
-use libp2p::request_response::{Event, Message, OutboundRequestId};
-use libp2p::swarm::SwarmEvent;
-use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
+use libp2p::request_response::{Event, Message, OutboundRequestId, ResponseChannel};
+use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
+use libp2p::{connection_limits, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use raven_core::identity::Identity;
 use raven_core::store_object::StoreObject;
+use raven_swarm::ip_limits::{IpLimitConfig, IpLimits};
 use raven_swarm::mailbox::{
-    mailbox_behaviour, unix_time_ms, MailboxBehaviour, MailboxRequest, MailboxResponse,
-    MailboxRole, MailboxService, MAX_PAGE_OBJECTS, MAX_STORE_OBJECT_WIRE_BYTES,
+    mailbox_behaviour, multiaddr_ip, unix_time_ms, InflightLimiter, MailboxBehaviour,
+    MailboxReject, MailboxRequest, MailboxResponse, MailboxRole, MailboxService,
+    MAX_INFLIGHT_PER_PEER, MAX_INFLIGHT_REQUESTS, MAX_PAGE_OBJECTS, MAX_STORE_OBJECT_WIRE_BYTES,
 };
+
+const MAX_ESTABLISHED: u32 = 128;
+const MAX_PENDING_INCOMING: u32 = 32;
+const MAX_ESTABLISHED_PER_PEER: u32 = 2;
+
+#[derive(NetworkBehaviour)]
+struct MailboxNode {
+    limits: connection_limits::Behaviour,
+    ip_limits: IpLimits,
+    mailbox: MailboxBehaviour,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -100,7 +123,7 @@ fn libp2p_keypair(identity: &Identity) -> Keypair {
 fn build_swarm(
     identity: &Identity,
     role: MailboxRole,
-) -> Result<Swarm<MailboxBehaviour>, Box<dyn Error>> {
+) -> Result<Swarm<MailboxNode>, Box<dyn Error>> {
     Ok(
         SwarmBuilder::with_existing_identity(libp2p_keypair(identity))
             .with_tokio()
@@ -110,7 +133,17 @@ fn build_swarm(
                 yamux::Config::default,
             )?
             .with_quic()
-            .with_behaviour(|_| mailbox_behaviour(role))?
+            .with_behaviour(|_| MailboxNode {
+                limits: connection_limits::Behaviour::new(
+                    connection_limits::ConnectionLimits::default()
+                        .with_max_established(Some(MAX_ESTABLISHED))
+                        .with_max_pending_incoming(Some(MAX_PENDING_INCOMING))
+                        .with_max_established_per_peer(Some(MAX_ESTABLISHED_PER_PEER)),
+                ),
+                // PeerIds are free, so also cap what one source address holds.
+                ip_limits: IpLimits::new(IpLimitConfig::default()),
+                mailbox: mailbox_behaviour(role),
+            })?
             .with_swarm_config(|config| {
                 config.with_idle_connection_timeout(Duration::from_secs(30))
             })
@@ -143,10 +176,21 @@ async fn serve(
     timeout_secs: u64,
 ) -> Result<(), Box<dyn Error>> {
     let identity = load_identity(&data_dir)?;
-    let mut service = MailboxService::open(&data_dir)?;
+    let service = Arc::new(Mutex::new(MailboxService::open(&data_dir)?));
     let mut swarm = build_swarm(&identity, MailboxRole::Server)?;
     let local_peer = *swarm.local_peer_id();
     swarm.listen_on(listen.parse()?)?;
+    // Requests being handled at once, overall and per peer; further requests
+    // are dropped (the client sees an outbound failure) instead of queueing
+    // without bound or letting one peer take the whole budget.
+    let inflight = InflightLimiter::new(MAX_INFLIGHT_REQUESTS, MAX_INFLIGHT_PER_PEER);
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<(
+        ResponseChannel<MailboxResponse>,
+        MailboxResponse,
+    )>(MAX_INFLIGHT_REQUESTS);
+    // Remote IP per live connection (bounded by the connection limits), so a
+    // deposit is charged to its source network, not only to a free PeerId.
+    let mut origins: HashMap<ConnectionId, Option<IpAddr>> = HashMap::new();
 
     let deadline =
         (timeout_secs > 0).then(|| tokio::time::Instant::now() + Duration::from_secs(timeout_secs));
@@ -160,6 +204,14 @@ async fn serve(
                     std::future::pending::<()>().await;
                 }
             } => return Ok(()),
+            Some((channel, response)) = done_rx.recv() => {
+                let accepted = matches!(response, MailboxResponse::Stored | MailboxResponse::Objects { .. });
+                if swarm.behaviour_mut().mailbox.send_response(channel, response).is_err() {
+                    eprintln!("mailbox_response_dropped");
+                } else {
+                    println!("mailbox_request_complete accepted={}", u8::from(accepted));
+                }
+            }
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -172,19 +224,55 @@ async fn serve(
                             std::fs::write(path, local_peer.to_string())?;
                         }
                     }
-                    SwarmEvent::Behaviour(Event::Message {
-                        message: Message::Request { request, channel, .. },
-                        ..
-                    }) => {
-                        let response = service.handle(request, unix_time_ms());
-                        let accepted = matches!(response, MailboxResponse::Stored | MailboxResponse::Objects { .. });
-                        if swarm.behaviour_mut().send_response(channel, response).is_err() {
-                            eprintln!("mailbox_response_dropped");
-                        } else {
-                            println!("mailbox_request_complete accepted={}", u8::from(accepted));
-                        }
+                    SwarmEvent::ConnectionEstablished { connection_id, endpoint, .. } => {
+                        origins.insert(connection_id, multiaddr_ip(endpoint.get_remote_address()));
                     }
-                    SwarmEvent::Behaviour(Event::InboundFailure { error, .. }) => {
+                    SwarmEvent::ConnectionClosed { connection_id, .. } => {
+                        origins.remove(&connection_id);
+                    }
+                    SwarmEvent::Behaviour(MailboxNodeEvent::Mailbox(Event::Message {
+                        peer,
+                        connection_id,
+                        message: Message::Request { request, channel, .. },
+                    })) => {
+                        // Unknown connection: charge the shared "no address" bucket.
+                        let origin = origins.get(&connection_id).copied().flatten();
+                        let Some(permit) = inflight.try_acquire(peer) else {
+                            // Dropping the channel fails the request for the client.
+                            eprintln!("mailbox_busy_dropped");
+                            continue;
+                        };
+                        let service = service.clone();
+                        let done = done_tx.clone();
+                        // Parsing, quota checks and the fsync'd snapshot write are
+                        // blocking work: keep them off the swarm event loop.
+                        tokio::task::spawn_blocking(move || {
+                            let response = match service.lock() {
+                                Ok(mut service) => {
+                                    let was_available = service.is_available();
+                                    let response =
+                                        service.handle_from(peer, origin, request, unix_time_ms());
+                                    // Never a silent latch: report each way in or out.
+                                    match (was_available, service.is_available()) {
+                                        (true, false) => eprintln!(
+                                            "mailbox_unavailable persistence_failures={}",
+                                            service.persistence_failures()
+                                        ),
+                                        (false, true) => eprintln!(
+                                            "mailbox_recovered recoveries={}",
+                                            service.recoveries()
+                                        ),
+                                        _ => {}
+                                    }
+                                    response
+                                }
+                                Err(_) => MailboxResponse::Rejected(MailboxReject::Persistence),
+                            };
+                            let _ = done.blocking_send((channel, response));
+                            drop(permit);
+                        });
+                    }
+                    SwarmEvent::Behaviour(MailboxNodeEvent::Mailbox(Event::InboundFailure { error, .. })) => {
                         eprintln!("mailbox_inbound_failure error={error}");
                     }
                     _ => {}
@@ -215,16 +303,16 @@ async fn request(
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id: connected, .. }
                         if connected == remote_peer && request_id.is_none() => {
-                        request_id = Some(swarm.behaviour_mut().send_request(&remote_peer, request.clone()));
+                        request_id = Some(swarm.behaviour_mut().mailbox.send_request(&remote_peer, request.clone()));
                     }
                     SwarmEvent::OutgoingConnectionError { error, .. } => {
                         return Err(format!("mailbox dial failed: {error}").into());
                     }
-                    SwarmEvent::Behaviour(Event::Message {
+                    SwarmEvent::Behaviour(MailboxNodeEvent::Mailbox(Event::Message {
                         message: Message::Response { request_id: got, response },
                         ..
-                    }) if Some(got) == request_id => return Ok(response),
-                    SwarmEvent::Behaviour(Event::OutboundFailure { request_id: got, error, .. })
+                    })) if Some(got) == request_id => return Ok(response),
+                    SwarmEvent::Behaviour(MailboxNodeEvent::Mailbox(Event::OutboundFailure { request_id: got, error, .. }))
                         if Some(got) == request_id => {
                         return Err(format!("mailbox request failed: {error}").into());
                     }

@@ -33,7 +33,7 @@
 | Experimental NAT stack (Circuit Relay v2 client / DCUtR / AutoNAT v2 client) — **contrast only** | **blocked** (production-disabled); localhost composition only | Spec: `protocol/RAVEN_NAT_CONNECTIVITY_V1.md`. Gate: `PRODUCTION_NAT_CONNECTIVITY_ENABLED = false`; Cargo `experimental-nat-connectivity` **and** `--enable-experimental-nat-connectivity`. CI: `expect_failure_with_message` “…requires explicit runtime opt-in”. Tests: reservation + limits on `127.0.0.1` only (§2.4–§2.10, §4.1). | Dual compile/runtime hold. Default `raven-swarm` does not compose relay/DCUtR/AutoNAT. No two-client circuit, no `dcutr=direct_connection_established` test, no AutoNAT server. Live multi-NAT/CGNAT: `NAT_STATUS` **BLOCKED_HARDWARE**. Not a production path and not a WAN proof. |
 | `plan_paths` Direct vs Internet vs Relay (`raven-core`) | **yes** as **policy order only** — not a live WAN dial | `node/crates/raven-core/src/transport.rs`: Direct if `peer_reachable_direct`; Internet if `local_has_internet && peer_reachable_internet`; Relay if `relay_enabled && local_has_internet`. Test: `relay_and_store_are_ordered_fallbacks_not_delivery_claims`. Defaults: `MessageRouter.relay_enabled = false`, `NodePolicy.relay = false`. | **Direct** ≠ public Internet (local/LAN reachability flag). **Internet** is a carrier label, not a proving dial. **Relay** is a policy bit, **not** Circuit Relay v2, and is off by default. No `raven-swarm` caller walks this list onto a WAN or `/p2p-circuit` dial (§3.3). |
 
-`docs/adr/0002-internet-transport.md` still names InternetTransport the “V1 shipping path”; `node/adr/0002-internet-transport.md` names the same module a “V1 laboratory path” and requires the negative smoke. This section follows the **node ADR + CI gate**: codec exists, message origination must refuse.
+`docs/adr/0002-internet-transport.md` and `node/adr/0002-internet-transport.md` now agree (2026-10-05): InternetTransport is a “V1 laboratory path” under production hold, there is no relay server, and the negative smoke is required. (This file's 2026-09-04 text recorded an earlier conflict between the two copies.) This section follows the ADR + CI gate: codec exists, message origination must refuse.
 
 ### Execution evidence (2026-09-04)
 
@@ -104,7 +104,7 @@ Related **non-swarm** surfaces (in scope only as fallback / policy neighbors):
 
 | Surface | Role vs swarm |
 |---------|----------------|
-| `raven_core::internet` | V1 shipping TCP hello+frame (`RIH1`). ADR-0002 “first land”. Fail-closed for message origination (`node/scripts/internet_dial_smoke.sh`). |
+| `raven_core::internet` | V1 laboratory (production hold) TCP hello+frame (`RIH1`). ADR-0002 “first land”. Fail-closed for message origination (`node/scripts/internet_dial_smoke.sh`). |
 | `raven_core::transport::{plan_paths,select_path}` | Application carrier order: Direct → Internet → Relay → Bridge → Store. `PathChoice::Relay` is a **policy flag**, not Circuit Relay v2. |
 | `raven_core::message_router::MessageRouter` | Defaults `relay_enabled: false`. `NodePolicy.relay` also defaults `false`. |
 | `raven_core::discovery::NAT_STATUS` | Compile-time honesty string: live multi-NAT/CGNAT/DCUtR matrix not run. |
@@ -148,7 +148,7 @@ Desired behavior is taken from existing docs. Primary sources:
 
 | | |
 |--|--|
-| **Desired** | Signed `PeerRecord` MAY be published into a Kademlia DHT. V1 shipping path must still dial explicit multiaddrs. Public Internet Kad is **BLOCKED_HARDWARE**. **documented** — Transport Interface §5–6; Interop matrix “DHT discovery / live libp2p DHT network”. |
+| **Desired** | Signed `PeerRecord` MAY be published into a Kademlia DHT. The V1 laboratory path must still dial explicit multiaddrs. Public Internet Kad is **BLOCKED_HARDWARE**. **documented** — Transport Interface §5–6; Interop matrix “DHT discovery / live libp2p DHT network”. |
 | **Status** | **partial**: local MemoryStore put/get + two-node smoke **present**. Routing table / provider records / public bootstrap DHT **missing**. Kad is **absent** from the NAT-connectivity behaviour. |
 | **Evidence** | Protocol `/raven/kad/1.0.0` (`src/main.rs:22`). Server mode always (`kad.set_mode(Some(Mode::Server))`, `src/main.rs:137`). Query timeout 20s (`src/main.rs:135`). Serve writes local store then `put_record(..., Quorum::One)` (`src/main.rs:251–264`). Dial `get_record` after connect (`src/main.rs:364–366`) and verifies Ed25519 (`src/main.rs:376–382`). Smoke: `libp2p_swarm_smoke.sh`. Bootstrap is **manual-peer JSON** (`bootstrap-init` / `bootstrap-show`); `cmd_dial` prints `effective_peers()` but still dials the CLI `--peer` only (`src/main.rs:315–333`). `raven-swarm::connectivity` has **no** `kad` field. |
 

@@ -1,5 +1,9 @@
 //! RVBJ1 mutation journal intent wire codec (design §4.10).
 
+use std::fmt;
+
+use zeroize::Zeroize;
+
 use crate::hybrid_ratchet_v2_full_braid::constants::RVBJ1_HEADER_LEN;
 use crate::hybrid_ratchet_v2_full_braid::wire_util::{
     expect_magic, read_array32, read_bytes, read_u32be, read_u64be, read_u8, reject_trailing,
@@ -35,11 +39,31 @@ pub struct Rvbj1Header {
     pub outputs_len: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Decoded journal intent. `candidate_bytes` is the complete canonical RVFB1
+/// state (auth keys, ratchet keys, ML-KEM `dk`, skipped keys), so it is wiped on
+/// drop (every early-return path after `decode_rvbj1` included) and redacted
+/// from `Debug`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Rvbj1 {
     pub header: Rvbj1Header,
     pub candidate_bytes: Vec<u8>,
     pub outputs_bytes: Vec<u8>,
+}
+
+impl fmt::Debug for Rvbj1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rvbj1")
+            .field("header", &self.header)
+            .field("candidate_len", &self.candidate_bytes.len())
+            .field("outputs_len", &self.outputs_bytes.len())
+            .finish()
+    }
+}
+
+impl Drop for Rvbj1 {
+    fn drop(&mut self) {
+        self.candidate_bytes.zeroize();
+    }
 }
 
 pub fn encode_rvbj1_header(header: &Rvbj1Header) -> Vec<u8> {
@@ -202,6 +226,19 @@ mod tests {
         };
         let wire = encode_rvbj1(&intent).unwrap();
         assert_eq!(decode_rvbj1(&wire).unwrap(), intent);
+    }
+
+    #[test]
+    fn debug_redacts_candidate_state() {
+        let intent = Rvbj1 {
+            header: sample_header(),
+            candidate_bytes: vec![0xDE, 0xAD, 0xBE],
+            outputs_bytes: vec![0u8; 14],
+        };
+        let shown = format!("{intent:?}");
+        assert!(shown.contains("candidate_len: 3"), "{shown}");
+        assert!(!shown.contains("222") && !shown.contains("0xDE"), "{shown}");
+        assert!(!shown.contains("candidate_bytes"), "{shown}");
     }
 
     #[test]

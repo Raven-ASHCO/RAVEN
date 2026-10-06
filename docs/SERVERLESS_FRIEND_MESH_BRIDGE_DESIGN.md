@@ -1,7 +1,8 @@
 # Serverless Friend Add, Mesh Relay, and Bridge — Design Memo
 
 **Status:** Binding product/protocol UX for V1 terminal + flagged mobile  
-**Branch:** `feature/raven-serverless-v1`  
+**Security override:** [`protocol/SECURITY_ERRATA_RVN1_2026-08-13.md`](../protocol/SECURITY_ERRATA_RVN1_2026-08-13.md) overrides this memo where they conflict — in particular rule 6 (relays MUST NOT durably dedup on unverified `message_id`) and rule 8 (`hop_limit` / `replication_budget` are unauthenticated; they constrain cooperative nodes only, not Byzantine retransmission). The "bounds" below are cooperative policy, not enforced security properties.  
+**Branch (historical):** authored on `feature/raven-serverless-v1`; this file now lives on `main` and is a dated snapshot, not a statement about an open branch  
 **Companions:** `node/SERVERLESS_MODEL.md`, `protocol/RAVEN_BRIDGE_V1.md`, `protocol/RAVEN_PREKEY_BUNDLE_V1.md`, `docs/PRIOR_ART_REVIEW_V1.md`, `docs/MULTI_DEVICE_PARTITION_REVOCATION.md`
 
 ## Law: three planes (never collapse)
@@ -66,12 +67,12 @@ not a Raven-operated people directory.
 
 ## 2. Mesh / relay algorithm claim (V1)
 
-**Claim for V1:** Spray-and-Wait–style **bounds** only:
+**Claim for V1:** Spray-and-Wait–style **cooperative-policy bounds** only (not authenticated; see the security override above):
 
-- `replication_budget` decremented on forward,
-- `hop_limit` / TTL (`expires_at`),
+- `replication_budget` decremented on forward (unsigned, mutable; cooperative nodes only),
+- `hop_limit` (unsigned, mutable; cooperative nodes only) and TTL (`expires_at`, which **is** signed),
 - per-peer rate limits,
-- dedup by `message_id`.
+- relay dedup via a bounded, expiring replay cache keyed on `SHA-256(domain || envelope_signing_bytes || outer_signature)` (`raven_core::bridge::authenticated_object_digest`), recorded only after admission — a relay never durably dedups on an unverified `message_id`; endpoints dedup on `message_id` only inside the authenticated commit (errata rules 5 and 6).
 
 Implemented in `raven-core::bridge` / forward queue. Software demos: `bridge_abc_demo`, mock_ble, store-carry.
 
@@ -106,7 +107,7 @@ Per `protocol/RAVEN_BRIDGE_V1.md`:
 | NAT helpers ≠ social authority | TURN/relay/bootstrap peers forward bytes; they MUST NOT mint trust or contact lists. Raven defaults: empty/disableable bootstrap (`BootstrapConfig`). |
 | DHT privacy cost | Putting dial/prekey records in a public DHT leaks **availability metadata** (online windows, record churn). Prefer OOB for high-sensitivity adds. |
 | Sybil | Cheap identities; fingerprint verify + rate limits + local accept lists are the V1 mitigations — not a global PKI. |
-| Epidemic scale | Unbounded spray harms battery/radio; V1 hard-bounds replication/hop/TTL. |
+| Epidemic scale | Unbounded spray harms battery/radio; V1 applies cooperative-policy bounds only (hop/replication are unauthenticated and a relay can reset them; TTL is signed) — a relay can always copy ciphertext. |
 | Partition revocation lag | See `docs/MULTI_DEVICE_PARTITION_REVOCATION.md`. |
 
 ---
@@ -136,7 +137,7 @@ Full table: `docs/PRIOR_ART_REVIEW_V1.md`.
 | Trust | `ash contact *`, fingerprints, `prekey_bundle`, local `contacts.json`, QR OOB |
 | Delivery | `OutgoingQueue`, `ForwardQueue`, `StoreObject`, InternetTransport, mock_ble, swarm |
 | Interop | `bridge` / `BRIDGE_V1`, `RavenEnvelopeBridgeService` (flag ON) |
-| Algorithm bounds | `hop_limit`, `replication_budget` in envelope + bridge decide |
+| Algorithm bounds | `hop_limit`, `replication_budget` in envelope + bridge decide (unauthenticated cooperative-node bounds) |
 | Migration | `docs/MIGRATION_SERVERLESS_V1.md`, `messaging_path` labels; MeshEnvelope default when iOS flag OFF |
 
 ---

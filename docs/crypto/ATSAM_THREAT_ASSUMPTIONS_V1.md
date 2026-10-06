@@ -54,6 +54,7 @@ Normative executable rules remain the errata + threat-model posture:
 2. **No public-material / stub seal** in production paths. `STUB_PROTO=0x7F`, `RavenInterimSeal`, and any key derived only from public Ed25519 identities are laboratory fixtures (`SECURITY_ERRATA` rule 1; `unsafe-demo-crypto` off by default).
 3. Synthetic “opaque ATSAM” bytes are not ciphertext and MUST NOT be originated.
 4. Indexed-session v1 and Hybrid Ratchet v2 remain **production disabled** (`ATSAM_INDEXED_SESSION_PROFILE_V1.md`; `ATSAM_HYBRID_RATCHET_V2.md` header / §16). Companion APPROVED (e.g. RVDR1) does not enable flags.
+   - **Exception — LAN-direct slice.** Indexed-session v1 (via PairInit V1 and sealed ACKs) is live in default builds on the terminal-to-terminal LAN slice only, behind its own `raven_core::lan_gate::LAN_DIRECT_PRODUCTION_ENABLED = true`; the generic `atsam_indexed_session::PRODUCTION_ENABLED` / `pair_init::PRODUCTION_ENABLED` / prekey / session-store flags stay `false` and Hybrid Ratchet v2 is not wired there. That slice is **unreviewed**, trusts any key in the local contact book (pinned or not), and installs no one-time prekeys. Its posture row is in [`docs/THREAT_MODEL.md`](../THREAT_MODEL.md) (LAN-direct slice); this addendum does not approve it.
 
 This addendum restates those holds. It does not close any release gate in the errata.
 
@@ -95,7 +96,7 @@ Status remains `REQUIRED / NOT YET APPROVED`. Crash-ordering KATs are not durabi
 | Sealed proto | RVNA1 **`0x03`** | **`0x04`** (`SEALED_PROTO`) |
 | `K_root` / expand | Single 32-byte root + directional HKDF lanes | Split `SK_ec` / `SK_scka` / route-master / confirm |
 
-**PairInit V1 MUST NOT be read as V2** (`ATSAM_HYBRID_RATCHET_V2.md` §0; vector `shared-vectors/rvn1/atsam/negative/pair_init_v1_as_v2_001.json`; `hybrid_ratchet_v2::reject_if_pair_init_v1`). No silent upgrade. No overload of proto `0x03` as `0x04`. Indexed v1 is lab/interop only.
+**PairInit V1 MUST NOT be read as V2** (`ATSAM_HYBRID_RATCHET_V2.md` §0; vector `shared-vectors/rvn1/atsam/negative/pair_init_v1_as_v2_001.json`; `hybrid_ratchet_v2::reject_if_pair_init_v1`). No silent upgrade. No overload of proto `0x03` as `0x04`. Indexed v1 is lab/interop only, **except** on the LAN-direct slice, where it is live in default builds, unreviewed, and not a release claim (§3, item 4).
 
 ---
 

@@ -8,6 +8,7 @@ systematic SPQR chunking are computed in Python.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import hmac
 from dataclasses import dataclass
@@ -31,6 +32,9 @@ WIRE_CT2 = 6
 BRAID_RVOR_TTL_MS = 604_800_000
 RVBJ1_HEADER_LEN = 366
 INTENT_NORMAL = 0
+MAX_REPLAYS = 64
+REPLAY_RECORD_LEN = 102
+BRAID_MAX_CHUNKS_PER_EPOCH = 64
 AGENT_KEYS_SAMPLED = 1
 AGENT_EK_SENT_CT1_RECEIVED = 4
 AGENT_NO_HEADER_RECEIVED = 5
@@ -256,7 +260,10 @@ def _prepare_candidate(
     retention_origin_ms: int,
     meta_flags: int,
     output_key_epoch: Optional[int],
+    replay_window: int = MAX_REPLAYS,
 ) -> PipelineResult:
+    if replay_window <= 0:
+        raise ValueError("replay window capacity")
     before_digest = dig.state_digest(1, before_bytes)
     output_d = dig.output_digest(outputs)
     transition_id = dig.transition_id_digest(
@@ -267,7 +274,14 @@ def _prepare_candidate(
         execution,
         before_digest,
     )
+    # FIFO replay window: evict the oldest committed records so the new
+    # (pending) record always fits.
     candidate.replays = list(candidate.replays)
+    if any(r.transition_id == transition_id for r in candidate.replays):
+        raise ValueError("duplicate replay transition_id")
+    excess = len(candidate.replays) + 1 - min(replay_window, MAX_REPLAYS)
+    if excess > 0:
+        del candidate.replays[:excess]
     candidate.replays.append(
         st.ReplayRecord(
             transition_id=transition_id,
@@ -277,7 +291,6 @@ def _prepare_candidate(
             flags=meta_flags,
         )
     )
-    candidate.replays.sort(key=lambda r: r.transition_id)
     candidate.prefix.flags &= ~1
     candidate.prefix.pending_phase = 1
     candidate.prefix.pending_transition_id = transition_id
@@ -473,10 +486,11 @@ def _emit_active(state: st.Rvfb1State) -> wire.Rvbc1:
         raise ValueError("active send required")
     if (
         active.epoch != state.prefix.braid_agent_epoch
-        or active.next_spqr_index > 63
+        or active.next_spqr_index > BRAID_MAX_CHUNKS_PER_EPOCH
     ):
         raise ValueError("active send contract")
-    index = active.next_spqr_index
+    # The cursor cycles through the 64-index space (64 = legacy sentinel → 0).
+    index = 0 if active.next_spqr_index > 63 else active.next_spqr_index
     payload = systematic_chunk(active.source_bytes, index)
     frame = wire.Rvbc1(
         epoch=active.epoch,
@@ -492,7 +506,7 @@ def _emit_active(state: st.Rvfb1State) -> wire.Rvbc1:
             state.prefix.session_id,
         ),
     )
-    active.next_spqr_index += 1
+    active.next_spqr_index = (index + 1) % BRAID_MAX_CHUNKS_PER_EPOCH
     return frame
 
 
@@ -834,6 +848,26 @@ def _confirm_receive(
     state.tr_bytes = st.encode_rvft1(tr)
 
 
+def _first_ct1_frame(
+    state: st.Rvfb1State, direction: int, epoch: int, ct1: bytes
+) -> wire.Rvbc1:
+    """The encapsulator's first CT1 frame (index 0) for `epoch`.
+
+    Both nested TR confirms bind this exact RVBC1 into the AEAD AD, so the
+    keygen side opens the peer's one `sealed_ct` and no hybrid key seals twice.
+    """
+    payload = systematic_chunk(ct1, 0)
+    return wire.Rvbc1(
+        epoch=epoch,
+        chunk_type=WIRE_CT1,
+        index=0,
+        payload=payload,
+        binding=dig.binding_digest(
+            direction, epoch, WIRE_CT1, 0, payload, state.prefix.session_id
+        ),
+    )
+
+
 def _apply_header_received_send(
     state: st.Rvfb1State,
     inp: wire.Rvbi1,
@@ -907,7 +941,8 @@ def _apply_ek_sent_ct1_received_receive(
         raise ValueError("CT2 authenticator")
     state.prefix.auth_root = auth_state.root_key
     state.prefix.auth_mac_key = auth_state.mac_key
-    _confirm_receive(state, inp, env, frame, output_key, epoch)
+    confirm_frame = _first_ct1_frame(state, inp.direction, epoch, ct1)
+    _confirm_receive(state, inp, env, confirm_frame, output_key, epoch)
     tr = st.decode_rvft1(state.tr_bytes)
     _promote_scka_receive(tr, epoch, output_key)
     state.tr_bytes = st.encode_rvft1(tr)
@@ -1003,6 +1038,119 @@ def transition(
     )
 
 
+RVFI1_MAGIC = b"RVFI1\0\0\0"
+RVFI1_LEN = 176
+
+
+def init_write(rvfi1: bytes) -> bytes:
+    """RVFI1 → initial canonical RVFB1 (mirror of Rust `init_write`).
+
+    `SK_ec` is only the EC root (§3.3): Alice ratchets with her ephemeral
+    `role_material`, Bob with his SPK private key (`role_material`).
+    """
+    if len(rvfi1) != RVFI1_LEN or rvfi1[:8] != RVFI1_MAGIC:
+        raise ValueError("rvfi1 framing")
+    if int.from_bytes(rvfi1[8:10], "big") != 1:
+        raise ValueError("rvfi1 bad schema")
+    session_id = rvfi1[10:42]
+    role, reserved0 = rvfi1[42], rvfi1[43]
+    if role not in (st.ROLE_ALICE, st.ROLE_BOB) or reserved0 != 0:
+        raise ValueError("rvfi1 role")
+    sk_ec, sk_scka = rvfi1[44:76], rvfi1[76:108]
+    bob_spk_pub, role_material = rvfi1[108:140], rvfi1[140:172]
+    if rvfi1[172:176] != bytes(4):
+        raise ValueError("rvfi1 reserved_tail")
+
+    if role == st.ROLE_ALICE:
+        ec_state = ec.ec_dr_init_alice(sk_ec, role_material, bob_spk_pub)
+        scka_init = tr_base.ratchet_init_alice_scka(sk_scka)
+        agent = st.AGENT_KEYS_UNSAMPLED
+        inbound_sets: list[st.InboundSet] = []
+    else:
+        if ec.x25519_public(role_material) != bob_spk_pub:
+            raise ValueError("rvfi1 bob spk mismatch")
+        ec_state = ec.ec_dr_init_bob(sk_ec, role_material)
+        scka_init = tr_base.ratchet_init_bob_scka(sk_scka)
+        agent = st.AGENT_NO_HEADER_RECEIVED
+        inbound_sets = [_empty_inbound_set(st.DIR_A2B, 1, st.SOURCE_KIND_HDR)]
+
+    tr = st.Rvft1(
+        scka_rk=scka_init.rk,
+        scka_sending_epoch=0,
+        scka_receiving_epoch=0,
+        scka_send_chain=[st.SckaChainEntry(0, scka_init.ck_send, 0)],
+        scka_recv_chain=[st.SckaChainEntry(0, scka_init.ck_recv, 0)],
+        scka_send_pn=0,
+        scka_skipped=[],
+        ec_rk=bytes(32),
+        ec_dhs_priv=bytes(32),
+        ec_dhs_pub=bytes(32),
+        ec_dhr_present=0,
+        ec_dhr_pub=bytes(32),
+        ec_ck_send_present=0,
+        ec_ck_recv_present=0,
+        ec_ck_send=bytes(32),
+        ec_ck_recv=bytes(32),
+        ec_ns=0,
+        ec_nr=0,
+        ec_pn=0,
+        ec_skipped=[],
+    )
+    _apply_ec_to_rvft1(tr, ec_state)
+    auth_state = auth.AuthState.init(1, sk_scka)
+    state = st.Rvfb1State(
+        prefix=st.Rvfb1Prefix(
+            session_id=session_id,
+            role=role,
+            generation=0,
+            agent=agent,
+            terminal_reason=0,
+            auth_root=auth_state.root_key,
+            auth_mac_key=auth_state.mac_key,
+            braid_agent_epoch=1,
+            braid_send_epoch=0,
+            braid_recv_epoch=0,
+            flags=0,
+            pending_phase=0,
+            pending_transition_id=bytes(32),
+            pending_before_digest=bytes(32),
+            pending_output_digest=bytes(32),
+            pending_execution_digest=bytes(32),
+        ),
+        inbound_sets=inbound_sets,
+        active_send=None,
+        objects=[],
+        replays=[],
+        tlvs=[],
+        tr_bytes=st.encode_rvft1(tr),
+    )
+    return st.encode_rvfb1(state)
+
+
+def journal_input_digest(inp: wire.Rvbi1) -> bytes:
+    """RVBJ1/RVOR1 input digest with any mode-0 plaintext zeroed.
+
+    The plaintext stays bound through `expected_ct`; the persisted digest no
+    longer lets a storage dump confirm guessed plaintexts offline.
+    """
+    mutation = inp.mutation
+    if mutation.needs_aead != 1 or mutation.mode != wire.MODE_SEAL_COMPARE:
+        return dig.input_digest(wire.encode_rvbi1(inp))
+    redacted = dataclasses.replace(
+        inp,
+        mutation=dataclasses.replace(mutation, body=bytes(len(mutation.body))),
+    )
+    return dig.input_digest(wire.encode_rvbi1(redacted))
+
+
+def replay_window(env: wire.Rvbe1) -> int:
+    return min(
+        MAX_REPLAYS,
+        env.cap_replay_entries,
+        env.cap_replay_bytes // REPLAY_RECORD_LEN,
+    )
+
+
 def transition_prepare(
     state_bytes: bytes,
     input_bytes: bytes,
@@ -1036,10 +1184,11 @@ def transition_prepare(
         candidate,
         inp.direction,
         dig.execution_digest(input_bytes, env_bytes),
-        dig.input_digest(input_bytes),
+        journal_input_digest(inp),
         inp.object_digest or bytes(32),
         outputs,
         env.clock,
         transitioned.meta.flags,
         transitioned.meta.output_key_epoch,
+        replay_window(env),
     )

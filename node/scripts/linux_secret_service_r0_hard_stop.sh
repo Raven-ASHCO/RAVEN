@@ -142,11 +142,28 @@ pattern = re.compile(
 )
 if not pattern.search(text):
     raise SystemExit("release hold is not the raven-core/build.rs panic payload")
+# libsqlite3-sys-raven/build.rs holds release bundled-sqlcipher builds with the
+# same payload; in a warm target dir it can run alongside raven-core's hold.
+# Accept that secondary failure only with the exact hold payload.
+fork_payloads = [
+    m.group(1).strip()
+    for m in re.finditer(
+        r"panicked at [^\n]*libsqlite3-sys-raven/build\.rs:\d+:\d+:\s*\n[ \t]*([^\n]+)", text
+    )
+]
+for payload in fork_payloads:
+    if payload != expected:
+        raise SystemExit(f"unrelated libsqlite3-sys-raven/build.rs panic: {payload}")
+fork_failures = 0
 for line in text.splitlines():
     if not line.startswith("error:"):
         continue
     if "failed to run custom build command for `raven-core" in line:
         continue
+    if "failed to run custom build command for `libsqlite3-sys " in line:
+        fork_failures += 1
+        if fork_failures <= len(fork_payloads):
+            continue
     raise SystemExit(f"unrelated cargo error polluted release hold: {line}")
 print(f"R0_RELEASE_HOLD_OK={expected}")
 PY

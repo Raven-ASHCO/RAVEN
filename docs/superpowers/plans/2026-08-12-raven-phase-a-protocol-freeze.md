@@ -121,7 +121,7 @@ are untracked and `bridge.go`/`go.mod` are modified — a `git clean` would dest
 copy. Preserve it before doing anything else.
 
 ```bash
-cd /Users/ahmd/hybrid_messenger
+cd /path/to/hybrid_messenger
 git add ios-native/RAVEN/Libp2pBridge/
 git commit -m "chore(bridge): commit working-tree rendezvous + bridge modifications before protocol freeze"
 ```
@@ -1257,7 +1257,7 @@ echo "rvn1 vectors OK."
 
 Run:
 ```bash
-cd /Users/ahmd/hybrid_messenger && bash tools/sync-vectors.sh && (cd protocol/reference && python3 -m pytest -q)
+cd /path/to/hybrid_messenger && bash tools/sync-vectors.sh && (cd protocol/reference && python3 -m pytest -q)
 ```
 Expected: sync clean (no diff), all reference tests pass.
 

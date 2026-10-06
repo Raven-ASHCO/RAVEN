@@ -170,35 +170,35 @@ fn pending_plus_rvor_duplicate_resumes_clear_not_release() {
     );
 }
 
+fn send_input(direction: u8) -> Rvbi1 {
+    Rvbi1 {
+        op: OP_SEND,
+        direction,
+        ch: None,
+        expected_ch: None,
+        object_digest: None,
+        frame: None,
+        mutation: Rvbm1::no_aead(),
+    }
+}
+
+fn receive_input(direction: u8, frame: &Rvbc1) -> Rvbi1 {
+    Rvbi1 {
+        op: OP_RECEIVE,
+        direction,
+        ch: None,
+        expected_ch: None,
+        object_digest: Some([0xD2; 32]),
+        frame: Some(encode_rvbc1(frame).unwrap()),
+        mutation: Rvbm1::no_aead(),
+    }
+}
+
 #[test]
 fn actor_mailbox_loss_reorder_duplicate_ct1_completes_with_erasure() {
     use crate::hybrid_ratchet_v2_full_braid::agent::{
         AGENT_CT1_RECEIVED, AGENT_HEADER_RECEIVED, AGENT_HEADER_SENT,
     };
-
-    fn send_input(direction: u8) -> Rvbi1 {
-        Rvbi1 {
-            op: OP_SEND,
-            direction,
-            ch: None,
-            expected_ch: None,
-            object_digest: None,
-            frame: None,
-            mutation: Rvbm1::no_aead(),
-        }
-    }
-
-    fn receive_input(direction: u8, frame: &Rvbc1) -> Rvbi1 {
-        Rvbi1 {
-            op: OP_RECEIVE,
-            direction,
-            ch: None,
-            expected_ch: None,
-            object_digest: Some([0xD2; 32]),
-            frame: Some(encode_rvbc1(frame).unwrap()),
-            mutation: Rvbm1::no_aead(),
-        }
-    }
 
     let mut alice = decode_rvfb1(&actor_before_bytes(ROLE_ALICE)).unwrap();
     let mut bob = decode_rvfb1(&actor_before_bytes(ROLE_BOB)).unwrap();
@@ -284,4 +284,154 @@ fn actor_mailbox_loss_reorder_duplicate_ct1_completes_with_erasure() {
             .len(),
         L_CT1
     );
+}
+
+/// Mailbox faults on the EK and CT2 phases (the CT1 phase has its own test):
+/// systematic index 0 is lost, the queue is delivered in reverse order, and the
+/// parity frame is duplicated. Both phases still complete from the remaining
+/// distinct chunks (any `N` distinct chunks decode), duplicates are decoder
+/// no-ops, and the epoch hands off to the next PQ epoch.
+#[test]
+fn actor_mailbox_loss_reorder_duplicate_ek_and_ct2_complete_with_erasure() {
+    use crate::hybrid_ratchet_v2_full_braid::agent::{
+        AGENT_CT1_ACKNOWLEDGED, AGENT_CT1_RECEIVED, AGENT_CT2_SAMPLED, AGENT_EK_SENT_CT1_RECEIVED,
+        AGENT_NO_HEADER_RECEIVED,
+    };
+    use crate::hybrid_ratchet_v2_full_braid::spqr_codec::WIRE_CT2;
+    use crate::hybrid_ratchet_v2_full_braid::spqr_pin_audit::{N_CT2, N_EK};
+
+    /// Drop index 0, reverse, then duplicate the parity frame at the front.
+    fn fault(mut mailbox: Vec<Rvbc1>, n: u32) -> Vec<Rvbc1> {
+        mailbox.retain(|frame| frame.index != 0);
+        mailbox.sort_by_key(|frame| std::cmp::Reverse(frame.index));
+        mailbox.insert(0, mailbox[0].clone());
+        assert_eq!(mailbox[0].index, n);
+        assert_eq!(mailbox[1].index, n);
+        mailbox
+    }
+
+    let mut alice = decode_rvfb1(&actor_before_bytes(ROLE_ALICE)).unwrap();
+    let mut bob = decode_rvfb1(&actor_before_bytes(ROLE_BOB)).unwrap();
+    let mut alice_crypto = LabCrypto::default();
+    let mut bob_crypto = LabCrypto::default();
+    let plain_env = Rvbe1::default_caps(0);
+    let mut alice_env = Rvbe1::default_caps(0);
+    alice_env.keygen_seed = vec![0x91; mlkem::SEED_LEN];
+    let mut bob_env = Rvbe1::default_caps(0);
+    bob_env.encaps_coins = vec![0x92; mlkem::COINS_LEN];
+
+    // HDR then CT1 in order: this test is about the later phases.
+    for _ in 0..N_HDR {
+        let sent = transition(&alice, &send_input(DIR_A2B), &alice_env, &mut alice_crypto);
+        assert_eq!(sent.disposition, Disposition::Accept);
+        alice = sent.candidate;
+        let frame = sent.frame.unwrap();
+        let received = transition(
+            &bob,
+            &receive_input(DIR_A2B, &frame),
+            &plain_env,
+            &mut bob_crypto,
+        );
+        assert_eq!(received.disposition, Disposition::Accept);
+        bob = received.candidate;
+    }
+    for _ in 0..N_CT1 {
+        let sent = transition(&bob, &send_input(DIR_B2A), &bob_env, &mut bob_crypto);
+        assert_eq!(sent.disposition, Disposition::Accept);
+        bob = sent.candidate;
+        let frame = sent.frame.unwrap();
+        let received = transition(
+            &alice,
+            &receive_input(DIR_B2A, &frame),
+            &plain_env,
+            &mut alice_crypto,
+        );
+        assert_eq!(received.disposition, Disposition::Accept);
+        alice = received.candidate;
+    }
+    assert_eq!(alice.prefix.agent, AGENT_CT1_RECEIVED);
+    let epoch = alice.prefix.braid_agent_epoch;
+
+    // EK phase (Alice -> Bob): one redundancy frame beyond N_EK.
+    let mut mailbox = Vec::new();
+    for _ in 0..=N_EK {
+        let sent = transition(&alice, &send_input(DIR_A2B), &alice_env, &mut alice_crypto);
+        assert_eq!(sent.disposition, Disposition::Accept);
+        alice = sent.candidate;
+        let frame = sent.frame.unwrap();
+        assert_eq!(frame.chunk_type, WIRE_EK_CT1_ACK);
+        mailbox.push(frame);
+    }
+    for (position, frame) in fault(mailbox, N_EK as u32).into_iter().enumerate() {
+        let before = bob.clone();
+        let received = transition(
+            &bob,
+            &receive_input(DIR_A2B, &frame),
+            &plain_env,
+            &mut bob_crypto,
+        );
+        assert_eq!(
+            received.disposition,
+            Disposition::Accept,
+            "ek frame {position}"
+        );
+        match position {
+            // First frame carries the CT1 ack: Bob stops sending CT1.
+            0 => assert_eq!(received.candidate.prefix.agent, AGENT_CT1_ACKNOWLEDGED),
+            // Identical duplicate: accepted decoder no-op.
+            1 => assert_eq!(received.candidate, before),
+            _ => {}
+        }
+        bob = received.candidate;
+    }
+    assert_eq!(bob.prefix.agent, AGENT_CT2_SAMPLED);
+    assert_eq!(bob.prefix.braid_agent_epoch, epoch);
+
+    // CT2 phase (Bob -> Alice): one redundancy frame beyond N_CT2.
+    let mut mailbox = Vec::new();
+    for _ in 0..=N_CT2 {
+        let sent = transition(&bob, &send_input(DIR_B2A), &bob_env, &mut bob_crypto);
+        assert_eq!(sent.disposition, Disposition::Accept);
+        bob = sent.candidate;
+        let frame = sent.frame.unwrap();
+        assert_eq!(frame.chunk_type, WIRE_CT2);
+        mailbox.push(frame);
+    }
+    let mut saw_ek_sent = false;
+    for (position, frame) in fault(mailbox, N_CT2 as u32).into_iter().enumerate() {
+        let before = alice.clone();
+        let received = transition(
+            &alice,
+            &receive_input(DIR_B2A, &frame),
+            &plain_env,
+            &mut alice_crypto,
+        );
+        assert_eq!(
+            received.disposition,
+            Disposition::Accept,
+            "ct2 frame {position}"
+        );
+        if position == 1 && received.candidate.prefix.agent == AGENT_EK_SENT_CT1_RECEIVED {
+            assert_eq!(received.candidate, before, "duplicate CT2 is a no-op");
+        }
+        saw_ek_sent |= received.candidate.prefix.agent == AGENT_EK_SENT_CT1_RECEIVED;
+        alice = received.candidate;
+    }
+    assert!(saw_ek_sent, "Alice must pass through EkSentCt1Received");
+    assert_eq!(alice.prefix.agent, AGENT_NO_HEADER_RECEIVED);
+    assert_eq!(alice.prefix.braid_agent_epoch, epoch + 1);
+    // Both sides derived the same epoch secret: Bob's next-epoch handoff frame
+    // advances him as well.
+    let handoff = transition(&alice, &send_input(DIR_A2B), &alice_env, &mut alice_crypto);
+    assert_eq!(handoff.disposition, Disposition::Accept);
+    let frame = handoff.frame.unwrap();
+    assert_eq!(frame.epoch, epoch + 1);
+    let received = transition(
+        &bob,
+        &receive_input(DIR_A2B, &frame),
+        &plain_env,
+        &mut bob_crypto,
+    );
+    assert_eq!(received.disposition, Disposition::Accept);
+    assert_eq!(received.candidate.prefix.braid_agent_epoch, epoch + 1);
 }

@@ -15,6 +15,7 @@ from ._canon import lp, u64
 DOMAIN = b"rvn1/prekey"
 VERSION = 1
 MLKEM768_EK_LEN = 1184
+MAX_DEVICE_ID_BYTES = 64
 
 
 @dataclass
@@ -38,6 +39,8 @@ def signing_bytes(bundle: PrekeyBundle) -> bytes:
         raise ValueError("X25519 public key must be 32 bytes")
     if len(bundle.mlkem768_ek) != MLKEM768_EK_LEN:
         raise ValueError(f"ML-KEM-768 encapsulation key must be {MLKEM768_EK_LEN} bytes")
+    if len(bundle.device_id.encode("utf-8")) > MAX_DEVICE_ID_BYTES:
+        raise ValueError(f"device_id must be at most {MAX_DEVICE_ID_BYTES} UTF-8 bytes")
     if not 0 <= bundle.signed_prekey_id <= 0xFFFFFFFF:
         raise ValueError("signed prekey id exceeds u32")
     if not 0 <= bundle.one_time_prekey_id <= 0xFFFFFFFF:

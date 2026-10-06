@@ -1,14 +1,22 @@
 //! No-prompt Secret Service client for Task 0B.3 (lab-only).
 //!
-//! Opens a **plain** session. CreateItem/Delete that return a prompt path map to
+//! Opens a **plain** session: the installation seed and RVFA1 anchors cross
+//! the per-user session bus unencrypted. That is acceptable only because this
+//! module is lab-only (`PRODUCTION_ENABLED = false`, release builds held); it
+//! does NOT meet hard stop #1 of the audited no-prompt fork (negotiate
+//! `dh-ietf1024-sha256-aes128-cbc-pkcs7`, never `plain`). Any R1/production
+//! use must replace this client with a DH-session implementation first.
+//! CreateItem/Delete that return a prompt path map to
 //! `LockedOrPromptRequired` without calling `Prompt.Prompt`.
 //! Only the existing unlocked default collection is used (no create_collection).
+//! Secret buffers are zeroized on drop and never printed via `Debug`.
 
 #![cfg(all(target_os = "linux", target_env = "gnu"))]
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use zbus::dbus_proxy;
+use zeroize::{Zeroize, Zeroizing};
 use zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zvariant_derive::Type;
 
@@ -23,14 +31,33 @@ pub enum NopromptError {
     LockedOrPromptRequired,
     Capacity,
     Io,
+    /// The default collection is one the seed and anchors would not survive
+    /// logout in (see [`is_volatile_collection_path`]).
+    VolatileCollection,
 }
 
-#[derive(Debug, Serialize, Deserialize, Type)]
+#[derive(Serialize, Deserialize, Type)]
 struct SecretStruct {
     session: OwnedObjectPath,
     parameters: Vec<u8>,
     value: Vec<u8>,
     content_type: String,
+}
+
+impl Drop for SecretStruct {
+    fn drop(&mut self) {
+        self.value.zeroize();
+    }
+}
+
+impl std::fmt::Debug for SecretStruct {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretStruct")
+            .field("session", &self.session)
+            .field("value", &"<redacted>")
+            .field("content_type", &self.content_type)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Type)]
@@ -111,6 +138,9 @@ impl NopromptSs {
         if default_collection.as_str() == "/" {
             return Err(NopromptError::Unavailable);
         }
+        if is_volatile_collection_path(default_collection.as_str()) {
+            return Err(NopromptError::VolatileCollection);
+        }
         let coll = CollectionProxy::new_for(&conn, SS_NAME, default_collection.as_str())
             .map_err(|_| NopromptError::Unavailable)?;
         match coll.locked() {
@@ -156,15 +186,16 @@ impl NopromptSs {
         item.attributes().map_err(|_| NopromptError::Io)
     }
 
-    pub fn item_secret(&self, path: &str) -> Result<(Vec<u8>, String), NopromptError> {
+    pub fn item_secret(&self, path: &str) -> Result<(Zeroizing<Vec<u8>>, String), NopromptError> {
         let item = ItemProxy::new_for(&self.conn, SS_NAME, path).map_err(|_| NopromptError::Io)?;
         if item.locked().map_err(|_| NopromptError::Io)? {
             return Err(NopromptError::LockedOrPromptRequired);
         }
-        let secret = item
+        let mut secret = item
             .get_secret(&self.session_path)
             .map_err(map_connect_err)?;
-        Ok((secret.value, secret.content_type))
+        let value = Zeroizing::new(std::mem::take(&mut secret.value));
+        Ok((value, std::mem::take(&mut secret.content_type)))
     }
 
     /// CreateItem (`replace=false`). Never executes Prompt.
@@ -187,6 +218,7 @@ impl NopromptSs {
         properties.insert(SS_ITEM_LABEL, Value::from(label));
         properties.insert(SS_ITEM_ATTRIBUTES, Value::from(attributes));
 
+        // Zeroized on drop once CreateItem has serialized it.
         let secret_struct = SecretStruct {
             session: self.session_path.clone(),
             parameters: Vec::new(),
@@ -218,6 +250,15 @@ impl NopromptSs {
     }
 }
 
+/// gnome-keyring's in-memory `session` collection is the one volatile
+/// collection recognisable from its path: a seed or anchor stored there
+/// vanishes at logout while the SQLCipher store it protects stays on disk.
+/// The Secret Service spec exposes no persistence attribute, so persistence of
+/// any other default collection remains an unverified provider assumption.
+fn is_volatile_collection_path(path: &str) -> bool {
+    path.rsplit('/').next() == Some("session")
+}
+
 fn map_connect_err(err: zbus::Error) -> NopromptError {
     let msg = err.to_string();
     if msg.contains("NoSpace") || msg.contains("ENOSPC") {
@@ -237,5 +278,26 @@ fn map_mutate_err(err: zbus::Error) -> NopromptError {
         NopromptError::LockedOrPromptRequired
     } else {
         NopromptError::Io
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_volatile_collection_path;
+
+    #[test]
+    fn only_the_session_collection_is_volatile() {
+        assert!(is_volatile_collection_path(
+            "/org/freedesktop/secrets/collection/session"
+        ));
+        for path in [
+            "/org/freedesktop/secrets/collection/login",
+            "/org/freedesktop/secrets/collection/Default_keyring",
+            "/org/freedesktop/secrets/collection/my_session",
+            "/org/freedesktop/secrets/collection/session/12",
+            "/org/freedesktop/secrets/aliases/default",
+        ] {
+            assert!(!is_volatile_collection_path(path), "{path}");
+        }
     }
 }

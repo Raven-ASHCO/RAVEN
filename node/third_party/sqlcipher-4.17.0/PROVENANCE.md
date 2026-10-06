@@ -2,7 +2,16 @@
 
 **Status:** Frozen for Task 0A.1. This directory is the only authorized amalgamation provenance pin for Full Braid Slice 3 SQLCipher work.
 
-**Scope:** Source provenance freeze only. No Cargo/SPM/pbxproj dependency wiring (Task 0A.2+). **Task 0A.2+ remains NOT AUTHORIZED.**
+**Scope (Task 0A.1, historical):** Source provenance freeze only. Task 0A.1 itself performed no Cargo/SPM/pbxproj dependency wiring; that began with Task 0A.2. The pins in this document are unchanged since the freeze. For what happened after it, see "Current wiring status" below.
+
+## Current wiring status (as of 2026-10-05)
+
+This section is the only part of this document that describes anything after Task 0A.1.
+
+- **Cargo wiring exists.** `node/Cargo.toml` patches `libsqlite3-sys` to the audited fork `node/third_party/libsqlite3-sys-raven` through `[patch.crates-io]` (Task 0A.2). The fork's `sqlcipher/` amalgamation is the artifact pinned below, and its `build.rs` re-verifies the SHA-256 pins before compiling it.
+- **Lab only.** The SQLCipher amalgamation is compiled only for the `full-braid-durable-lab` feature of `raven-core` (rusqlite `bundled-sqlcipher-vendored-openssl`, using the OpenSSL pin below). Default and release builds of the shipped packages compile the ordinary SQLite amalgamation; `node/scripts/sqlcipher_release_feature_audit.sh` checks the resolved feature graphs.
+- **Release hold in force.** Release builds of the lab feature fail closed (`FULL_BRAID_SQLCIPHER_NOT_APPROVED`). Production and release use of SQLCipher remains held and is not approved by this document.
+- **Gates exist.** Tasks 0A.2 through 0A.5 have CI gates (`node/scripts/full_braid_task0a_ci_gate.sh` and the scripts it runs). Passing them is lab evidence only.
 
 ## Upstream Git pins
 
@@ -75,9 +84,9 @@ It is **not** RAVEN’s provenance authority for SQLCipher 4.17.0 because:
 
 Therefore `make verify-source` may remain useful upstream hygiene, but it is explicitly rejected as the reference provenance gate for this fork’s vendored amalgamation.
 
-## Terminal OpenSSL pin (Task 0A.1 freeze; not wired yet)
+## Terminal OpenSSL pin (Task 0A.1 freeze; used by the lab build since Task 0A.2)
 
-Terminal / `bundled-sqlcipher-vendored-openssl` builds must use this exact OpenSSL source pin (crate packaging of upstream OpenSSL). No Cargo dependency mutation is performed in Task 0A.1.
+Terminal / `bundled-sqlcipher-vendored-openssl` builds must use this exact OpenSSL source pin (crate packaging of upstream OpenSSL). Task 0A.1 itself performed no Cargo dependency mutation; the lab wiring that consumes this pin is described under "Current wiring status".
 
 | Item | Value |
 |---|---|

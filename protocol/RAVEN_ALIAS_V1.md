@@ -119,6 +119,29 @@ untrusted store MUST satisfy all of:
   pass a signature-only check. The binding is `address.encode(signer_pub) ==
   identity_address`. The same rule applies to `RavenProtocolCapabilitiesV1`
   ([`RAVEN_CAPABILITIES_V1.md`](RAVEN_CAPABILITIES_V1.md)).
+- **Exactly decoded.** The stored encoding
+  (`lp(alias) || lp(identity_address) || u64(sequence) || u64(expires_at) ||
+  ed25519_pub(32) || signature(64)`) is decoded exactly; trailing bytes are
+  rejected so each record has one encoding.
+
+### 4.1 Store quotas
+
+A store fed by untrusted publishers bounds each signing key and itself:
+
+- **Live-claim quota** (default 8 per key). Only *unexpired* claims count;
+  expired ones never consume quota. Expired records are kept as `sequence`
+  high-water marks for §2 anti-rollback, and are evicted only when the store
+  is at its global cap. Renewing an expired claim counts as a new live claim.
+- **Publish rate** (default 16 per key per rolling hour), including sequence
+  updates.
+- **Global cap** across all keys (default 4096 records); admission of a new
+  `(alias, identity_address)` fails closed (`ALIAS_STORE_FULL`) when the cap
+  is reached after evicting expired records.
+
+Records the local user published themselves and reloads from local storage
+are not network publications: they go through signature, binding, expiry,
+sequence and global-cap checks but not the per-key rate limit or live quota,
+so a reload never silently drops rows.
 
 ## Reference implementation
 

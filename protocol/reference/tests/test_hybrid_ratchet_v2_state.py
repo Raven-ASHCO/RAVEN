@@ -286,3 +286,68 @@ def test_tr_combo_multi_001():
     assert out == v["expected"]
     assert out["dh_epochs"] == 2
     assert out["scka_epochs"] == 2
+
+
+def test_scka_epochs_are_u64_and_fail_closed():
+    import pytest
+
+    state = trs.scka_from_init(True, bytes([0x42]) * 32)
+    ss = bytes([0x07]) * 32
+    state.sending_epoch = (1 << 32) - 1
+    # Past the old u32 range: no wrap, no truncation.
+    assert trs.scka_epoch_promote_initiator(state, ss).sending_epoch == 1 << 32
+    state.sending_epoch = trs.EPOCH_MAX
+    state.receiving_epoch = trs.EPOCH_MAX
+    with pytest.raises(ValueError, match="EPOCH_TYPE=u64"):
+        trs.scka_epoch_promote_initiator(state, ss)
+    with pytest.raises(ValueError, match="EPOCH_TYPE=u64"):
+        trs.scka_epoch_promote_responder(state, ss)
+    state.send_ctr = trs.CTR_MAX
+    with pytest.raises(ValueError, match="counter overflow"):
+        trs.scka_next_send_mk(state)
+
+
+def test_ec_skip_keys_global_retention_cap():
+    import pytest
+
+    dh = bytes([0x04]) * 32
+    state = trs.EcRecvState(ck=bytes([0x03]) * 32, n=0, dh_pub=dh)
+    for n in range(1500):
+        state.mkskipped[bytes([0x05]) * 32 + n.to_bytes(4, "big")] = bytes(32)
+    with pytest.raises(ValueError, match="MAX_MKSKIPPED_RETAINED"):
+        trs.ec_skip_keys(state, 600)
+    assert len(trs.ec_skip_keys(state, 500).mkskipped) == trs.MAX_MKSKIPPED_RETAINED
+
+
+def test_braid_promote_erases_callers_prev_dk():
+    import pytest
+
+    from raven_protocol import hybrid_ratchet_v2_tr as trtr
+
+    reb = trtr.BraidReassembly(epoch=1, expected_count=1)
+    reb.parts[0] = b"ct"
+    prev_dk = bytearray(b"\x55" * 32)
+    assert reb.promote_with_ss(b"\x66" * 32, prev_dk) == b"\x66" * 32
+    assert prev_dk == bytearray(32)
+    assert reb.deleted_prev_dk is True and reb.prev_dk is None
+    with pytest.raises(TypeError):
+        trtr.BraidReassembly(epoch=1, expected_count=1, parts={0: b"x"}).promote_with_ss(
+            b"\x66" * 32, b"\x55" * 32
+        )
+
+
+def test_composite_header_stub_rejects_out_of_range_epoch():
+    import pytest
+
+    from raven_protocol import hybrid_ratchet_v2 as tr
+
+    ec = tr.EcHeader(dh_pub=bytes(32), pn=0, n=0)
+    spqr = tr.SpqrHeader(
+        sending_epoch=1 << 32,
+        receiving_epoch=0,
+        send_ctr=0,
+        chunk_flags=0,
+        kem_ct_digest=bytes(32),
+    )
+    with pytest.raises(ValueError, match="u32 range"):
+        tr.encode_composite_header(ec, spqr)

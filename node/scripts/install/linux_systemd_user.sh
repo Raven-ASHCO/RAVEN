@@ -1,18 +1,73 @@
 #!/usr/bin/env bash
 # Install user-scoped raven-node systemd unit (Linux). Never touches /bin/ash.
+#
+# LAN exposure is opt-in and identical on every OS installer: the service binds
+# 127.0.0.1:7420 unless RAVEN_LAN_LISTEN is set, e.g.
+#   RAVEN_LAN_LISTEN=192.168.1.20:7420 bash node/scripts/install/linux_systemd_user.sh
+#
+# Lifetime: a `systemd --user` manager is torn down when the user's last
+# session ends, so on a headless / SSH-managed host (Raspberry Pi bridge node)
+# the daemon would stop at logout and not start at boot. Lingering fixes that
+# but is a host-wide setting, so it is opt-in:
+#   RAVEN_ENABLE_LINGER=1 bash node/scripts/install/linux_systemd_user.sh
+# (or run `loginctl enable-linger "$USER"` yourself; it may need admin rights).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN_DIR="${RAVEN_BIN_DIR:-$HOME/.local/bin}"
-DATA_DIR="${RAVEN_DATA_DIR:-$HOME/.raven}"
+# Same profile resolution as `raven`/`ash` and raven-core (RAVEN_DATA_DIR, then
+# ASH_DATA_DIR, then a legacy ~/.raven-ash while ~/.raven does not exist, else
+# ~/.raven). Resolved BEFORE anything is created: `mkdir ~/.raven` below would
+# otherwise orphan an existing legacy identity (contacts pinned its key) and flip
+# plain `ash` onto a brand-new, empty profile.
+resolve_data_dir() {
+  if [[ -n "${RAVEN_DATA_DIR:-}" ]]; then
+    printf '%s' "$RAVEN_DATA_DIR"
+  elif [[ -n "${ASH_DATA_DIR:-}" ]]; then
+    printf '%s' "$ASH_DATA_DIR"
+  elif [[ -d "$HOME/.raven-ash" && ! -e "$HOME/.raven" ]]; then
+    printf '%s' "$HOME/.raven-ash"
+  else
+    printf '%s' "$HOME/.raven"
+  fi
+}
+DATA_DIR="$(resolve_data_dir)"
+LAN_LISTEN="${RAVEN_LAN_LISTEN:-127.0.0.1:7420}"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/raven-node.service"
 
-mkdir -p "$BIN_DIR" "$DATA_DIR" "$UNIT_DIR"
-cargo build -p raven-node -p ash --release --manifest-path "$ROOT/Cargo.toml"
+mkdir -p "$BIN_DIR" "$UNIT_DIR"
+# Identity, sessions and chat history live here: owner-only.
+mkdir -p "$DATA_DIR"
+chmod 700 "$DATA_DIR"
+# `systemd --user` starts the unit from the user's home: register absolute paths
+# only. A relative RAVEN_DATA_DIR / RAVEN_BIN_DIR would make the daemon serve (or
+# exec from) a different directory than the one `raven init` just created.
+BIN_DIR="$(CDPATH='' cd -- "$BIN_DIR" && pwd)"
+DATA_DIR="$(CDPATH='' cd -- "$DATA_DIR" && pwd)"
+# systemd.service(5): a word may be double-quoted (so spaces survive), and `%`
+# and `$` are special inside it (specifiers / variable expansion).
+sd_quote() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//%/%%}
+  s=${s//\$/\$\$}
+  printf '"%s"' "$s"
+}
+# --locked: build exactly the audited Cargo.lock.
+cargo build --locked -p raven-node -p ash --release --manifest-path "$ROOT/Cargo.toml"
 install -m 755 "$ROOT/target/release/raven-node" "$BIN_DIR/raven-node"
 install -m 755 "$ROOT/target/release/ash" "$BIN_DIR/raven"
-ln -sfn "$BIN_DIR/raven" "$BIN_DIR/ash"
-echo "user-local ash -> raven (system /bin/ash untouched)"
+# `ash` is also the BusyBox / Alpine shell, and ~/.local/bin usually precedes
+# /bin in PATH: only add the alias when no other `ash` exists.
+EXISTING_ASH="$(PATH="${PATH//$BIN_DIR:/}" command -v ash 2>/dev/null || true)"
+if [[ -z "$EXISTING_ASH" && ! -e /bin/ash && ! -e /usr/bin/ash ]] \
+  || [[ "$(readlink -f "$BIN_DIR/ash" 2>/dev/null || true)" == "$(readlink -f "$BIN_DIR/raven")" ]]; then
+  ln -sfn "$BIN_DIR/raven" "$BIN_DIR/ash"
+  echo "linked $BIN_DIR/ash -> raven (user-local only)"
+else
+  echo "NOTE: a system 'ash' shell exists (${EXISTING_ASH:-/bin/ash}) — not shadowing it; use '$BIN_DIR/raven'"
+fi
 
 cat >"$UNIT" <<EOF
 [Unit]
@@ -21,9 +76,19 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${BIN_DIR}/raven-node service --data-dir ${DATA_DIR} --lan-listen 0.0.0.0:7420 --ble-listen 127.0.0.1:7421 --timeout-secs 0
+ExecStart=$(sd_quote "${BIN_DIR}/raven-node") service --data-dir $(sd_quote "${DATA_DIR}") --lan-listen $(sd_quote "${LAN_LISTEN}") --ble-listen 127.0.0.1:7421 --timeout-secs 0
 Restart=on-failure
 RestartSec=3
+# Sandboxing that works in a --user manager without a mount namespace (the
+# Protect*/ReadWritePaths/PrivateTmp family needs unprivileged user namespaces
+# and fails the unit with status=226/NAMESPACE where those are disabled, so it
+# is deliberately not set). AF_NETLINK stays allowed: interface enumeration
+# (getifaddrs) uses it.
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target
@@ -32,8 +97,32 @@ EOF
 systemctl --user daemon-reload
 # Identity + prekey must exist before LAN preflight will keep the service up.
 "${BIN_DIR}/raven" --data-dir "${DATA_DIR}" init
-systemctl --user enable --now raven-node.service
-echo "enabled systemd --user raven-node.service"
-echo "IPC sock: ${DATA_DIR}/raven-node.sock"
-echo "Firewall: allow inbound TCP 7420 (e.g. ufw allow 7420/tcp)."
+# `enable --now` is a no-op for an already-active unit, which would keep the
+# previous binary running after an upgrade; `restart` also starts an inactive unit.
+systemctl --user enable raven-node.service
+systemctl --user restart raven-node.service
+echo "enabled + (re)started systemd --user raven-node.service"
+LINGER_USER="${USER:-$(id -un)}"
+if [[ "${RAVEN_ENABLE_LINGER:-0}" == "1" ]]; then
+  loginctl enable-linger "$LINGER_USER" \
+    || echo "WARN: could not enable lingering; run 'loginctl enable-linger $LINGER_USER' (may need admin)"
+fi
+if [[ "$(loginctl show-user "$LINGER_USER" -p Linger 2>/dev/null || true)" == "Linger=no" ]]; then
+  echo "NOTE: lingering is off: this user service stops when your last session ends and does not start at boot."
+  echo "  Headless host? Run 'loginctl enable-linger $LINGER_USER' (or re-run with RAVEN_ENABLE_LINGER=1)."
+fi
+# Where the daemon really listens: a long data dir is served at
+# /tmp/raven-<uid>/raven-<hash>.sock, not at <data-dir>/raven-node.sock. Ask the
+# installed binary (`doctor` prints `ipc_endpoint=`) instead of guessing.
+IPC_EP="$("${BIN_DIR}/raven" --data-dir "${DATA_DIR}" doctor 2>/dev/null \
+  | sed -n 's/^[[:space:]]*ipc_endpoint=//p' | head -n1 || true)"
+echo "IPC sock: ${IPC_EP:-<unknown: run '${BIN_DIR}/raven --data-dir ${DATA_DIR} doctor' and look for ipc_endpoint=>}"
+echo "LAN listen: ${LAN_LISTEN}"
+case "$LAN_LISTEN" in
+  127.*|localhost:*|\[::1\]:*)
+    echo "LAN peers cannot reach this node (loopback only). To accept LAN peers, re-run with"
+    echo "  RAVEN_LAN_LISTEN=<this-host-LAN-IP>:7420 and allow inbound TCP 7420 (e.g. ufw allow 7420/tcp)." ;;
+  *)
+    echo "Exposed on ${LAN_LISTEN}: allow inbound TCP only from your LAN (e.g. ufw allow from 192.168.0.0/16 to any port 7420 proto tcp)." ;;
+esac
 echo "export PATH=\"${BIN_DIR}:\$PATH\""

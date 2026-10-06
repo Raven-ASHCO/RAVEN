@@ -71,6 +71,17 @@ write cannot roll the monotonic id backward.
 Limits are normative for this profile: at most 4 retained generations and 32
 signed bundle variants per generation. Rotation fails closed when this bound
 would be exceeded; the caller must explicitly run safe expiry pruning first.
+The reference `rotate_generation` does exactly that (expiry pruning, then
+installation) and is the publisher entry point.
+
+A publisher MUST rotate before its current bundle enters the last
+`7 days + 1 day` of its signed validity (`PREKEY_ROTATION_LEAD_MS`), and MUST
+treat a missing, expired, or unverifiable local bundle as due for rotation
+rather than as a hard error. PairInit verification requires
+`PairInit.expires_at_ms <= bundle.expires_at_ms` and initiators sign PairInits
+valid for up to 7 days, so a bundle closer to expiry than that would reject
+ordinary PairInits. With 30-day bundles this rotates about every 22 days,
+which keeps at most three generations inside their retention grace.
 
 ## 4. Exact PairInit claim key
 
@@ -109,27 +120,38 @@ increments only a saturating numeric anomaly counter. Implementations MUST NOT
 log or expose identity, device, OTP id, key, transcript, claim, or session
 values with that counter.
 
-At most 512 accepted claims/tombstones are retained. New claims fail closed at
-the bound; pruning cannot remove a root that is still inside its handoff
-window.
+At most 512 accepted claims/tombstones are retained, and at most 32 of them
+may belong to one signed `initiator_address` (the initiator's user identity,
+so additional device certificates do not add quota). New claims fail closed at
+either bound, so one contact can exhaust only its own share; pruning cannot
+remove a root that is still inside its handoff window.
 
 ## 5. Crash-safe claim and root handoff
 
 Under the cross-process writer lock, acceptance ordering is exactly:
 
 1. reload and recover protected state;
-2. validate the full PairInit, exact retained generation and bundle digest;
-3. write a protected journal containing the exact signed PairInit wire and
+2. validate the full PairInit (including a contributory initiator ephemeral),
+   exact retained generation and bundle digest;
+3. use the selected retained X25519 private key and ML-KEM seed with the exact
+   `PairInitV1` transcript hash and ciphertext to derive the root; any failure
+   rejects the PairInit without mutation;
+4. write a protected journal containing the exact signed PairInit wire and
    acceptance time;
-4. use the selected retained X25519 private key and ML-KEM seed with the exact
-   `PairInitV1` transcript hash and ciphertext;
 5. write a protected accepted claim containing the root, session id, replay
    binding, and pending-handoff state while clearing the journal; and
 6. return a zeroizing root handoff object.
 
-Recovery deterministically repeats steps 4-5 from the protected journal. It
-does not create a second claim, reset session state, or increment the OTP
-anomaly for an exact retry.
+Recovery deterministically repeats steps 3 and 5 from the protected journal.
+It does not create a second claim, reset session state, or increment the OTP
+anomaly for an exact retry. Because step 3 already succeeded against the same
+protected state before the journal existed, a journal can never fail replay
+for input-dependent reasons. A claim journal whose replay nevertheless fails
+(for example one persisted by an earlier build that journaled before
+deriving) MUST be dropped rather than retried forever: its claim never
+returned a root, so dropping it restores the exact pre-claim state. Each drop
+increments a saturating numeric `quarantined_claim_journals` counter under the
+same redaction rule as the OTP anomaly counter.
 
 The session actor MUST durably commit the exact provisional session before it
 calls `complete_claim(claim_id)`. Completion clears the lifecycle actor's root
@@ -162,6 +184,22 @@ This policy intentionally trades literal immediate OTP destruction for
 reliable offline delivery across stale, distributed bundle copies. It does
 not silently merge competing sessions and does not retain private material
 forever.
+
+The resulting forward-secrecy bound is stated explicitly: an OTP private key
+lives exactly as long as the signed-prekey material of its generation (bundle
+expiry plus the 7-day grace, extended only by a pending handoff). A compromise
+of the protected state inside that window exposes the X25519 contribution of
+every PairInit that used either key, so OTPs add no forward secrecy beyond the
+signed prekey; the ML-KEM contribution is protected by the same retention
+bound. This lifecycle therefore does **not** satisfy the "monotonic one-time
+prekey consumption" production gate of
+[`SECURITY_ERRATA_RVN1_2026-08-13.md`](SECURITY_ERRATA_RVN1_2026-08-13.md);
+that gate stays open. Meeting it requires a versioned change to the
+"recipient MUST accept both" race rule of
+[`RAVEN_PREKEY_BUNDLE_V1.md`](RAVEN_PREKEY_BUNDLE_V1.md) §6 (for example,
+destroying an OTP secret a short grace after its first completed claim). The
+LAN-direct integration currently installs no OTPs, so its first-contact
+forward secrecy is bounded by signed-prekey rotation alone.
 
 ## 7. Reference and activation gates
 

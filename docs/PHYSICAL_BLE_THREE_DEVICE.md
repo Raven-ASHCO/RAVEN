@@ -3,6 +3,14 @@
 **Status:** `BLOCKED_HARDWARE` until three physical devices are operated by a human.  
 Software stand-in: `node/scripts/bridge_abc_demo.sh` (mock_ble over TCP).
 
+> **LAB / NON-RELEASE.** RVN1 messaging is under a production HOLD
+> ([`protocol/SECURITY_ERRATA_RVN1_2026-08-13.md`](../protocol/SECURITY_ERRATA_RVN1_2026-08-13.md),
+> [`THREAT_MODEL.md`](THREAT_MODEL.md)). A passing run of this runbook would show opaque forwarding and
+> delivery mechanics only: the in-repo bridge evidence uses the lab interim cipher (key derivable from
+> public keys), and bridging under authenticated ATSAM sessions is not yet exercised. It is **not** a
+> confidentiality claim. The iOS steps below drive `ios-native`, which is **not in this repository**
+> (OFF-MAIN) and whose Release builds hard-disable RVN1.
+
 ## Topology
 
 ```
@@ -23,7 +31,9 @@ DATA="$HOME/.raven-bridge-b"
 ./target/release/ash --data-dir "$DATA" node bridge on
 ./target/release/ash --data-dir "$DATA" node store on
 
-# Foreground proof (or use scripts/install/macos_launchd.sh for service)
+# Foreground proof (or use scripts/install/macos_launchd.sh for service).
+# The bridge must be reachable from phone A, so --lan-listen is non-loopback;
+# prefer this host's specific LAN IP over 0.0.0.0 (all interfaces) where practical.
 ./target/release/raven-node service \
   --data-dir "$DATA" \
   --lan-listen "0.0.0.0:7420" \

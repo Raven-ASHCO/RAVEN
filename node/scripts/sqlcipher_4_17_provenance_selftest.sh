@@ -197,9 +197,16 @@ pass "isolated OUT_DIR full + generated-only verify + diff-check"
 rm -rf "$ISO_OUT" "$ISO_PARENT"
 
 echo "=== dependency leakage audit ===" >&2
-if rg -n 'Cargo\.(toml|lock)|Package\.resolved|project\.pbxproj' "$REGEN" "$VERIFY"; then
-  fail "regen/verify scripts reference Cargo/SPM/pbxproj paths"
-fi
+# grep (POSIX, always present), not rg: `if rg ...; then fail; fi` read a missing
+# ripgrep (rc 127) as "no leak" and passed without scanning anything. Treat only
+# rc 1 (no match) as clean; a match (0) or any error (2: unreadable file, 127: no grep) fails.
+leak_rc=0
+grep -nE 'Cargo\.(toml|lock)|Package\.resolved|project\.pbxproj' "$REGEN" "$VERIFY" || leak_rc=$?
+case "$leak_rc" in
+  1) ;;
+  0) fail "regen/verify scripts reference Cargo/SPM/pbxproj paths" ;;
+  *) fail "dependency leakage audit could not run (grep rc=$leak_rc)" ;;
+esac
 snapshot_dep_hashes "$DEP_AFTER"
 if ! cmp -s "$DEP_BEFORE" "$DEP_AFTER"; then
   echo "FAIL: dependency content hashes changed during selftest:" >&2

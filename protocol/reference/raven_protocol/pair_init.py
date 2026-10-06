@@ -12,6 +12,10 @@ import hmac
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
 
 from . import address, indexed_session
 
@@ -117,6 +121,21 @@ def _address_bytes(value: str, field_name: str) -> bytes:
     return encoded
 
 
+# Any scalar works: clamped X25519 scalars are cofactor multiples smaller than
+# both prime orders, so the agreement is all-zero exactly for small-order
+# inputs, whatever the responder's real private key is.
+_CONTRIBUTORY_PROBE = X25519PrivateKey.from_private_bytes(bytes([0x5A]) * 32)
+
+
+def is_contributory_x25519(public: bytes) -> bool:
+    """False for low-order (non-contributory) X25519 public keys."""
+    try:
+        _CONTRIBUTORY_PROBE.exchange(X25519PublicKey.from_public_bytes(public))
+    except ValueError:
+        return False
+    return True
+
+
 def _validate_time(created_at_ms: int, expires_at_ms: int) -> None:
     _u64(created_at_ms)
     _u64(expires_at_ms)
@@ -183,6 +202,8 @@ def _validate_init(value: PairInit, require_signature: bool) -> None:
     )
     if value.initiator_ephemeral_x25519_pub == bytes(X25519_KEY_LEN):
         raise ValueError("initiator_ephemeral_x25519_pub must not be all-zero")
+    if not is_contributory_x25519(value.initiator_ephemeral_x25519_pub):
+        raise ValueError("initiator_ephemeral_x25519_pub must not be a low-order point")
     _require_bytes(
         value.responder_signed_x25519_pub,
         X25519_KEY_LEN,

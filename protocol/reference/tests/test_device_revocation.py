@@ -27,6 +27,51 @@ def test_wrong_signer_rejects():
     assert device_revocation.verify(rec, pub) is False
 
 
+def test_long_id_short_tail_rejects_without_index_error():
+    v = json.loads(
+        (VEC / "negative/device_revocation_long_id_short_tail.json").read_text()
+    )
+    wire = bytes.fromhex(v["inputs"]["wire_hex"])
+    assert len(wire) == v["expected"]["wire_len"]
+    try:
+        device_revocation.decode(wire)
+    except ValueError:
+        pass
+    else:  # pragma: no cover - must reject
+        raise AssertionError("decode accepted a truncated tail")
+    # device_id 64 + issuer 20 at the 253-byte floor: the old decoder raised
+    # IndexError reading reason_code past the end.
+    w = bytearray(wire[:56])
+    w[54:56] = (64).to_bytes(2, "big")
+    w += b"d" * 64 + bytes(96) + (20).to_bytes(2, "big") + b"i" * 20
+    w += bytes(253 - len(w))
+    try:
+        device_revocation.decode(bytes(w))
+    except ValueError:
+        pass
+    else:  # pragma: no cover - must reject
+        raise AssertionError("decode accepted a truncated tail")
+
+
+def test_decode_never_raises_non_value_error():
+    v = json.loads((VEC / "device_revocation/valid_001.json").read_text())
+    wire = bytes.fromhex(v["expected"]["wire_hex"])
+    # Every truncation, and every device_id length prefix, must be a ValueError.
+    candidates = [wire[:n] for n in range(len(wire))]
+    for n in range(0, 70):
+        w = bytearray(wire)
+        w[54:56] = n.to_bytes(2, "big")
+        candidates.append(bytes(w))
+        candidates.append(bytes(w[:253]))
+    for w in candidates:
+        try:
+            device_revocation.decode(w)
+        except ValueError:
+            continue
+        # Only the untouched prefix length (12) re-parses successfully.
+        assert w == wire
+
+
 def test_store_hash_vectors():
     for name in (
         "device_revocation/store_hash_001.json",

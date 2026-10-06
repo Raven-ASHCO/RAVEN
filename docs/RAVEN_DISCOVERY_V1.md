@@ -1,6 +1,6 @@
 # Raven Discovery V1 — Multi-lane Search / Contact Request
 
-**Status:** Software V1 implemented on `feature/raven-serverless-v1`
+**Status:** Software V1 implemented (authored on the historical branch `feature/raven-serverless-v1`; now on `main`)
 **Companions:** [`RAVEN_TAG_V1.md`](RAVEN_TAG_V1.md), [`SERVERLESS_MODEL.md`](SERVERLESS_MODEL.md), [`SERVERLESS_FRIEND_MESH_BRIDGE_DESIGN.md`](SERVERLESS_FRIEND_MESH_BRIDGE_DESIGN.md), [`protocol/RAVEN_ALIAS_V1.md`](../protocol/RAVEN_ALIAS_V1.md), [`protocol/RAVEN_BRIDGE_V1.md`](../protocol/RAVEN_BRIDGE_V1.md), [`protocol/RAVEN_PREKEY_BUNDLE_V1.md`](../protocol/RAVEN_PREKEY_BUNDLE_V1.md), [`protocol/RAVEN_PROFILE_RECORD_V1.md`](../protocol/RAVEN_PROFILE_RECORD_V1.md), [`protocol/RAVEN_INTRODUCTION_V1.md`](../protocol/RAVEN_INTRODUCTION_V1.md), [`protocol/RAVEN_CONTACT_REQUEST_V1.md`](../protocol/RAVEN_CONTACT_REQUEST_V1.md)
 
 ## Architectural law
@@ -42,7 +42,7 @@ scopes: LOCAL | EXACT_ID | EXACT_ALIAS | MY_NETWORK | NEARBY | PUBLIC | ALL
 | LocalContactsProvider | Implemented |
 | ExactRavenIdProvider | Implemented (`H("raven/profile/v1"\|\|id)`) |
 | AliasDhtProvider | Implemented — bounded signed claims + conflict_count |
-| NearbyBleProvider | Implemented — ephemeral adv; no permanent ID until confirm |
+| NearbyBleProvider | Implemented as a resolver over *confirmed* nearby results — ephemeral adv; no permanent ID until confirm. The only producer in this repo, `ash nearby`, is a **local software mock** (it lists only this device's own ephemeral tokens; no BLE radio or receive side), so no real nearby peer is ever discovered here |
 | SocialIntroductionProvider | Implemented — recipient-specific encrypted intros |
 | PublicProfileIndexProvider | **STUB/OFF** (exact search first) |
 | PrivateDirectoryProvider | **NOT V1** |
@@ -60,7 +60,7 @@ DiscoveryResult {
 
 ### Verification states
 
-`DIRECTLY_VERIFIED` · `TRUSTED_CONTACT` · `INTRODUCED` · `SCOPED_VERIFIED` (optional) · `NEARBY_VERIFIED` · `PUBLIC_SIGNED_PROFILE` · `ALIAS_CONFLICT` · `EXPIRED_OR_STALE` · `BLOCKED`
+`DIRECTLY_VERIFIED` · `TRUSTED_CONTACT` · `INTRODUCED` · `SCOPED_VERIFIED` (optional) · `NEARBY_VERIFIED` · `PUBLIC_SIGNED_PROFILE` · `ALIAS_CONFLICT` · `EXPIRED_OR_STALE` · `BLOCKED` · `UNVERIFIED` (checksum-valid exact ID with no signed profile)
 
 ## Protocol objects
 

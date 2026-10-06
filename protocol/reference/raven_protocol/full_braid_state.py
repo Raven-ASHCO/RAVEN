@@ -649,9 +649,11 @@ def _validate_state(state: Rvfb1State) -> None:
         lambda item: (item.direction, item.epoch, item.source_kind),
         "rvfb1 objects",
     )
-    _strictly_sorted(
-        state.replays, lambda item: item.transition_id, "rvfb1 replays"
-    )
+    # Replay records are a FIFO window in commit order (oldest first); the
+    # canonical form is the recorded sequence, with unique transition ids.
+    replay_ids = [item.transition_id for item in state.replays]
+    if len(set(replay_ids)) != len(replay_ids):
+        raise ValueError("rvfb1 replays duplicate transition_id")
     _strictly_sorted(state.tlvs, lambda item: item.tag, "rvfb1 tlvs")
     for replay in state.replays:
         _require_len(replay.transition_id, 32, "replay transition_id")

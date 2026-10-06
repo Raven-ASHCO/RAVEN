@@ -29,14 +29,48 @@ Transport {
 | Caps | `ble`/`internet`/`relay`/`store`/`bridge` only — never contacts |
 | Errors | Map to [`RAVEN_ERROR_CODES_V1.md`](RAVEN_ERROR_CODES_V1.md) |
 
-## 3. Internet framing (shipping)
+## 3. Internet framing (lab-gated)
+
+InternetTransport is compiled into default builds but runs only in debug
+builds with `RAVEN_LAB_TEST_A=1` (`INTERNET_DIRECT_PRODUCTION_ENABLED=false`).
+Implemented in `raven_core::internet` (codec) and `raven-node`
+`internet_direct` (sockets).
 
 ```
-Hello: RIH1 || caps_u32_be || nonce12 || ed25519_pub32 || sig64
-Frame: u32_be(len) || payload
+Frame:     u32_be(len) || noise_msg        1 <= len <= 65535, checked before allocating
+Handshake: Noise_XX_25519_ChaChaPoly_BLAKE2s, prologue "raven/internet/v1",
+           static = the LAN Noise static (HKDF of the identity seed), empty payloads
+Hello:     Noise transport plaintext, initiator first, then responder:
+           RIH1 || caps_u32_be || ed25519_pub32 || sig64                  (104 bytes)
+sig input: "rvn1/internet-hello/v1" || role_u8 || caps_u32_be
+           || noise_handshake_hash32 || signer_noise_static_pub32 || ed25519_pub32
+           role_u8: 1 = initiator, 2 = responder
+Then:      RLB1 offer each way, then PairInit / envelopes / ACKs,
+           each one Noise transport message (plaintext <= 65519 bytes)
 ```
 
-Proto id string in signing bytes: `raven/internet/v1`. Implemented in `raven_core::internet`.
+Verification rules:
+
+- The receiver verifies the peer hello against the peer's role, its own final
+  Noise handshake hash, and the peer static key authenticated by XX. Any
+  mismatch closes the connection. Both sides require `CAP_INTERNET`; the dialer
+  also requires `ed25519_pub` to equal the identity it dialed.
+- The handshake hash covers both ephemeral keys, so a hello is valid for exactly
+  one connection and one direction. A captured hello cannot be replayed on
+  another connection, and a reflected hello fails on `role_u8`.
+- The prologue gives domain separation: a LAN Noise transcript (no prologue)
+  cannot complete against an Internet endpoint, or the reverse.
+- Only Noise handshake messages are sent in the clear. XX encrypts the static
+  keys. RLB1 offers and PairInit expose addresses and trust material
+  ([`RAVEN_PAIR_INIT_V1.md`](RAVEN_PAIR_INIT_V1.md) §7), so they are sent only
+  as Noise ciphertext. An on-path observer still sees IP/port, timing and frame
+  sizes. Transport authentication is not E2EE.
+
+**Retired:** the earlier cleartext hello (`RIH1 || caps || nonce12 || pub ||
+sig` over a nonce the signer chose, followed by plaintext frames) has been
+removed. It was replayable, had no channel binding, and exposed RLB1 and
+PairInit to any observer. Pre-revision lab builds do not interoperate with this
+version and fail closed at the first length prefix.
 
 ## 4. Path selection
 
@@ -58,7 +92,7 @@ Ed25519-signed. MAY be published into a Kademlia DHT when `rust-libp2p` integrat
 
 | Feature | V1 status |
 |---------|-----------|
-| TCP length-prefix + hello | **IMPLEMENTED** |
+| TCP length-prefix + Noise XX + channel-bound hello | **IMPLEMENTED** (lab-gated, §3) |
 | QUIC / Noise / Yamux stack | **IMPLEMENTED** local swarm (`raven-swarm`: TCP+Noise+Yamux; QUIC listen attempted) |
 | DHT signed discovery | Record format **IMPLEMENTED**; local Kad put/get **IMPLEMENTED**; public Internet Kad **BLOCKED_HARDWARE** |
 | Circuit relay / DCUtR | Not complete — see BLOCKED_HARDWARE |

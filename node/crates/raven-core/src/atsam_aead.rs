@@ -2,12 +2,14 @@
 //!
 //! Primitives match `ATSAMMessageSealer` / `ATSAMChainRatchet` on iOS:
 //! HKDF-SHA256 chain labels + ChaCha20-Poly1305 + SHA-256 AAD.
-//! This does **not** establish a hybrid root — ML-KEM pairing remains iOS-only
-//! until ported. Relays must still treat unknown-root frames as opaque.
+//! This module does **not** establish a hybrid root itself: ML-KEM + X25519
+//! pairing (`begin_hybrid_initiation` / `respond_hybrid_root`) lives in
+//! `atsam_mlkem.rs`. Relays must still treat unknown-root frames as opaque.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::atsam_kdf::{advance_chain_key, initial_chain_key, message_key};
 use crate::seal::{ATSAM_PROTO_V2, SEAL_MAGIC_RVNA1, STUB_SUITE};
@@ -55,12 +57,12 @@ pub fn build_aad_v2(
 }
 
 /// Derive `K_msg` at chain `index` from `K_root` (send/receive at exact index).
-fn key_at_index(root: &[u8; 32], sender: &str, recipient: &str, index: u32) -> [u8; 32] {
-    let mut ck = initial_chain_key(root, sender, recipient);
+fn key_at_index(root: &[u8; 32], sender: &str, recipient: &str, index: u32) -> Zeroizing<[u8; 32]> {
+    let mut ck = Zeroizing::new(initial_chain_key(root, sender, recipient));
     for _ in 0..index {
-        ck = advance_chain_key(&ck);
+        *ck = advance_chain_key(&ck);
     }
-    message_key(&ck, sender, recipient)
+    Zeroizing::new(message_key(&ck, sender, recipient))
 }
 
 /// Seal plaintext under RVNA1 v2 with a known root and fixed nonce (KATs / tests).
@@ -87,7 +89,7 @@ pub fn seal_rvna1_v2(
     }
     let key = key_at_index(root, sender, recipient, index);
     let aad = build_aad_v2(ATSAM_PROTO_V2, STUB_SUITE, index, sender, recipient, msg_id);
-    let cipher = ChaCha20Poly1305::new((&key).into());
+    let cipher = ChaCha20Poly1305::new((&*key).into());
     let nonce = Nonce::from_slice(nonce12);
     let ct = cipher
         .encrypt(
@@ -133,7 +135,7 @@ pub fn unseal_rvna1_v2(
     let ct = &wire[26..];
     let key = key_at_index(root, sender, recipient, index);
     let aad = build_aad_v2(ATSAM_PROTO_V2, STUB_SUITE, index, sender, recipient, msg_id);
-    let cipher = ChaCha20Poly1305::new((&key).into());
+    let cipher = ChaCha20Poly1305::new((&*key).into());
     cipher
         .decrypt(nonce, Payload { msg: ct, aad: &aad })
         .map_err(|_| "unseal failed".to_string())

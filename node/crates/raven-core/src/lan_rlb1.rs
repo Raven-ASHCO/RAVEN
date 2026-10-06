@@ -55,16 +55,18 @@ pub fn decode_offer(bytes: &[u8]) -> Result<LanBundle, String> {
     if bytes.len() > MAX_OFFER_WIRE {
         return Err("rlb1 offer exceeds transport plaintext".into());
     }
+    // Attacker-chosen u32 lengths: every offset below is checked, so a length
+    // near u32::MAX cannot wrap `usize` on 32-bit targets (armv7, wasm32).
     let cert_len = u32::from_be_bytes(bytes[6..10].try_into().unwrap()) as usize;
     let cert_start: usize = 10;
     let cert_end = cert_start
         .checked_add(cert_len)
         .ok_or_else(|| "rlb1 cert overflow".to_string())?;
-    if cert_end + 4 > bytes.len() {
-        return Err("rlb1 cert truncated".into());
-    }
-    let prekey_len = u32::from_be_bytes(bytes[cert_end..cert_end + 4].try_into().unwrap()) as usize;
-    let prekey_start = cert_end + 4;
+    let prekey_start = cert_end
+        .checked_add(4)
+        .filter(|&end| end <= bytes.len())
+        .ok_or_else(|| "rlb1 cert truncated".to_string())?;
+    let prekey_len = u32::from_be_bytes(bytes[cert_end..prekey_start].try_into().unwrap()) as usize;
     let prekey_end = prekey_start
         .checked_add(prekey_len)
         .ok_or_else(|| "rlb1 prekey overflow".to_string())?;
@@ -146,6 +148,27 @@ mod tests {
         let back = decode_offer(&wire).unwrap();
         assert_eq!(back.cert, offer.cert);
         assert_eq!(back.prekey, offer.prekey);
+    }
+
+    #[test]
+    fn hostile_lengths_are_rejected_without_panic() {
+        // Header-only frames whose u32 lengths point past the buffer. On a
+        // 32-bit target `cert_end + 4` used to overflow for these values.
+        for cert_len in [u32::MAX, u32::MAX - 3, u32::MAX - 13, 0x7fff_ffff, 5] {
+            let mut wire = RLB1_MAGIC.to_vec();
+            wire.extend_from_slice(&[RLB1_VERSION, RLB1_KIND_OFFER]);
+            wire.extend_from_slice(&cert_len.to_be_bytes());
+            wire.extend_from_slice(&[0u8; 8]);
+            assert!(decode_offer(&wire).is_err(), "cert_len={cert_len:#x}");
+        }
+        // Valid cert length, hostile prekey length.
+        for prekey_len in [u32::MAX, u32::MAX - 13, 1] {
+            let mut wire = RLB1_MAGIC.to_vec();
+            wire.extend_from_slice(&[RLB1_VERSION, RLB1_KIND_OFFER]);
+            wire.extend_from_slice(&0u32.to_be_bytes());
+            wire.extend_from_slice(&prekey_len.to_be_bytes());
+            assert!(decode_offer(&wire).is_err(), "prekey_len={prekey_len:#x}");
+        }
     }
 
     #[test]

@@ -23,9 +23,23 @@ cleanup() {
 trap cleanup EXIT
 
 ARCHIVE="$WORK/secret-service-2.0.2.crate"
-curl -A 'cargo/1.97' -fsSL \
-  https://static.crates.io/crates/secret-service/secret-service-2.0.2.crate \
-  -o "$ARCHIVE"
+# RAVEN_SS_CRATE_ARCHIVE (optional): a local copy of the crate, e.g. from
+# ~/.cargo/registry/cache, so the selftest can run offline. The verifier still checks its SHA-256.
+if [[ -n "${RAVEN_SS_CRATE_ARCHIVE:-}" ]]; then
+  cp "$RAVEN_SS_CRATE_ARCHIVE" "$ARCHIVE"
+else
+  curl -A 'cargo/1.97' -fsSL \
+    https://static.crates.io/crates/secret-service/secret-service-2.0.2.crate \
+    -o "$ARCHIVE"
+fi
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
 
 run_verify() {
   RAVEN_SS_CRATE_ARCHIVE="$ARCHIVE" RAVEN_SS_FORK_DIR="$1" "$VERIFY"
@@ -62,5 +76,21 @@ expect_reject missing_file "$WORK/missing"
 cp -R "$SOURCE" "$WORK/stale-digest"
 printf '\n# stale digest negative\n' >>"$WORK/stale-digest/src/item.rs"
 expect_reject stale_digest "$WORK/stale-digest"
+
+# Modified file + regenerated digest: self-consistent, so only the pinned hash of
+# RAVEN_PATCH_DIGEST in the verifier can reject it (the original review gap).
+cp -R "$SOURCE" "$WORK/redigested"
+printf '\n// modified and re-digested negative\n' >>"$WORK/redigested/src/session.rs"
+: >"$WORK/redigested/RAVEN_PATCH_DIGEST"
+while read -r _digest relpath; do
+  printf '%s  %s\n' "$(sha256_file "$WORK/redigested/$relpath")" "$relpath" \
+    >>"$WORK/redigested/RAVEN_PATCH_DIGEST"
+done <"$SOURCE/RAVEN_PATCH_DIGEST"
+expect_reject redigested "$WORK/redigested"
+if ! grep -q 'not the pinned frozen digest' "$WORK/redigested.log"; then
+  echo "SECRET_SERVICE_R0_SELFTEST_FAIL: redigested fork rejected for the wrong reason" >&2
+  cat "$WORK/redigested.log" >&2
+  exit 1
+fi
 
 echo "SECRET_SERVICE_R0_PROVENANCE_SELFTEST_OK"

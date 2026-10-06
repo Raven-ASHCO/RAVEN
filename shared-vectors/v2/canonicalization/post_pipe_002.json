@@ -1,0 +1,38 @@
+{
+  "name": "Post v2 signing input — `|` inside text",
+  "description": "Post text ending in `|friends` cannot be confused with the scope field: the v2 input still has exactly 9 fields.",
+  "protocol_version": "v2-draft",
+  "spec_reference": "MESH_PROTOCOL_v2.md §2 + MESH_PROTOCOL.md §C.3",
+  "created_at": "2026-05-15T00:00:00Z",
+  "deterministic": true,
+  "inputs": {
+    "post": {
+      "postId": "post-002",
+      "authorId": "alice",
+      "authorUsername": "alice_raven",
+      "authorAvatar": "https://cdn.raven.app/u/alice.png",
+      "text": "pipes | and back\\slashes|friends",
+      "createdAtSec": 1700000000.0,
+      "scope": "friends",
+      "signerPublicKeyB64": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+    },
+    "signer": "alice"
+  },
+  "expected": {
+    "fields": [
+      "POST",
+      "post-002",
+      "alice",
+      "alice_raven",
+      "https://cdn.raven.app/u/alice.png",
+      "pipes | and back\\slashes|friends",
+      "1700000000000",
+      "friends",
+      "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+    ],
+    "signing_bytes_hex": "ff52564d4553483202000900000004504f535400000008706f73742d30303200000005616c6963650000000b616c6963655f726176656e0000002168747470733a2f2f63646e2e726176656e2e6170702f752f616c6963652e706e67000000207069706573207c20616e64206261636b5c736c61736865737c667269656e64730000000d3137303030303030303030303000000007667269656e64730000002c3131715941594b7843726656532f3754795751484f6737686376506170694d6c727749616150634855526f3d",
+    "signature_hex": "86e579af05842b5c63bcae9166f79aeef8bf70c1434a0017ccb2bc6bd7141faaeadc3c620c5118e3008b50cff127e45a63dd722ccb7f522167b9231f32d01f0f",
+    "signature_b64": "huV5rwWEK1xjvK6RZvea7vi/cMFDSgAXzLK8a9cUH6rq3DxiDFEY4wCLUM/xJ+RaY91yLMt/UiFnuSMfMtAfDw=="
+  },
+  "notes": "DRAFT (docs/MESH_PROTOCOL_v2.md): no port ships v2 yet; frozen once v2 is adopted."
+}

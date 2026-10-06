@@ -112,6 +112,45 @@ specified. An endpoint may read the bounded RVNA1 header to test candidate
 session tags; this does not authorize or decrypt the object. Outer device
 authentication and AEAD verification remain mandatory.
 
+### 2.4 Security properties and explicit non-claims
+
+Every message, ACK, route, and mailbox key of a session is a deterministic
+function of `K_root` (§2.1-§2.3 and §6). There is no Diffie-Hellman or KEM
+ratchet inside a session. Consequently:
+
+- **No forward secrecy within a session.** Whoever obtains `K_root`, or the
+  protected session state that holds it, can recompute every past and future
+  `K_msg,i[d]`, `K_ack,i[d]`, `K_route[d]`, route tag, and mailbox tag of that
+  session in both directions and decrypt every captured RVNA1 `0x03` frame of
+  it. Advancing and discarding chain keys does not change this while
+  `K_root` is retained, and the reference endpoint store retains `K_root` for
+  the life of the session (route-tag checks and its local storage key are
+  re-derived from it).
+- **No post-compromise security.** A session never heals. After a compromise
+  of its state, confidentiality returns only with a new PairInit, which
+  contributes a fresh initiator X25519 ephemeral and ML-KEM ciphertext and
+  derives an independent `K_root`.
+- The protection that does exist is between sessions: roots of distinct
+  PairInits are independent, a session accepts traffic only until its signed
+  PairInit `expires_at_ms`, and destroying an expired session's root (plus the
+  prekey private material that produced it, per
+  [`RAVEN_PREKEY_LIFECYCLE_V1.md`](RAVEN_PREKEY_LIFECYCLE_V1.md)) protects
+  that session's traffic against later compromise. Until then, at-rest
+  protection of the session state is the only barrier.
+
+Implementations and product text MUST NOT describe this profile as providing
+per-message forward secrecy or post-compromise security. Those properties
+require a ratcheting successor profile (for example
+[`ATSAM_HYBRID_RATCHET_V2.md`](ATSAM_HYBRID_RATCHET_V2.md)); the KDF above is
+frozen for interoperation and is not altered to approximate them.
+
+The stateless reference helpers that walk a chain from `CK_0`
+(`message_key_at_index`, `ack_key_at_index`, `seal_ack`, `open_ack`) cost one
+HKDF per index step, and `open_ack` reads the index from unauthenticated wire
+bytes. They therefore reject `index > 4096` (the same bound as the portable
+RVNA1 v2 helper) without changing any derivation below it. A stateful receiver
+instead bounds each forward jump relative to its persisted counter.
+
 ## 3. Message-ID text in AEAD associated data
 
 The outer raw 16-byte `message_id` is encoded in ATSAM AAD as exactly 36 ASCII

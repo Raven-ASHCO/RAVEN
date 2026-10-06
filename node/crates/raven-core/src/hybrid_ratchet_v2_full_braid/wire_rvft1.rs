@@ -1,5 +1,10 @@
 //! RVFT1 nested Triple Ratchet state wire codec (design §6.2).
 
+use std::fmt;
+
+use zeroize::Zeroize;
+
+use crate::hybrid_ratchet_v2_full_braid::state_codec::DIR_B2A;
 use crate::hybrid_ratchet_v2_full_braid::wire_util::{
     expect_magic, read_array32, read_u16be, read_u32be, read_u64be, read_u8, reject_trailing,
     write_array32, write_bytes, write_u16be, write_u32be, write_u64be, write_u8, WireResult,
@@ -12,14 +17,17 @@ pub const MAX_SCKA_CHAIN: usize = 8;
 pub const MAX_SCKA_SKIPPED: usize = 256;
 pub const MAX_EC_SKIPPED: usize = 1000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Every chain/message/root/private key below is wiped on drop and redacted
+// from Debug; only public keys, epochs and counters are printed.
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct SckaChainEntry {
     pub epoch: u64,
     pub ck: [u8; 32],
     pub n: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SckaSkippedEntry {
     pub direction: u8,
     pub epoch: u64,
@@ -27,14 +35,63 @@ pub struct SckaSkippedEntry {
     pub mk: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EcSkippedEntry {
     pub dh_pub: [u8; 32],
     pub n: u32,
     pub mk: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for SckaChainEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SckaChainEntry")
+            .field("epoch", &self.epoch)
+            .field("n", &self.n)
+            .field("ck", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Debug for SckaSkippedEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SckaSkippedEntry")
+            .field("direction", &self.direction)
+            .field("epoch", &self.epoch)
+            .field("n", &self.n)
+            .field("mk", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Debug for EcSkippedEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EcSkippedEntry")
+            .field("dh_pub", &self.dh_pub)
+            .field("n", &self.n)
+            .field("mk", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for SckaChainEntry {
+    fn drop(&mut self) {
+        self.ck.zeroize();
+    }
+}
+
+impl Drop for SckaSkippedEntry {
+    fn drop(&mut self) {
+        self.mk.zeroize();
+    }
+}
+
+impl Drop for EcSkippedEntry {
+    fn drop(&mut self) {
+        self.mk.zeroize();
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct Rvft1 {
     pub scka_rk: [u8; 32],
     pub scka_sending_epoch: u64,
@@ -58,6 +115,44 @@ pub struct Rvft1 {
     pub ec_skipped: Vec<EcSkippedEntry>,
 }
 
+impl fmt::Debug for Rvft1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rvft1")
+            .field("scka_sending_epoch", &self.scka_sending_epoch)
+            .field("scka_receiving_epoch", &self.scka_receiving_epoch)
+            .field("scka_send_chain", &self.scka_send_chain)
+            .field("scka_recv_chain", &self.scka_recv_chain)
+            .field("scka_send_pn", &self.scka_send_pn)
+            .field("scka_skipped", &self.scka_skipped)
+            .field("ec_dhs_pub", &self.ec_dhs_pub)
+            .field("ec_dhr_present", &self.ec_dhr_present)
+            .field("ec_dhr_pub", &self.ec_dhr_pub)
+            .field("ec_ck_send_present", &self.ec_ck_send_present)
+            .field("ec_ck_recv_present", &self.ec_ck_recv_present)
+            .field("ec_ns", &self.ec_ns)
+            .field("ec_nr", &self.ec_nr)
+            .field("ec_pn", &self.ec_pn)
+            .field("ec_skipped", &self.ec_skipped)
+            .field("secrets", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for Rvft1 {
+    fn drop(&mut self) {
+        self.scka_rk.zeroize();
+        self.ec_rk.zeroize();
+        self.ec_dhs_priv.zeroize();
+        self.ec_ck_send.zeroize();
+        self.ec_ck_recv.zeroize();
+        // Entries wipe themselves on drop.
+        self.scka_send_chain.clear();
+        self.scka_recv_chain.clear();
+        self.scka_skipped.clear();
+        self.ec_skipped.clear();
+    }
+}
+
 fn validate_scka_chain_ascending(chain: &[SckaChainEntry]) -> WireResult<()> {
     for w in chain.windows(2) {
         if w[0].epoch >= w[1].epoch {
@@ -74,6 +169,12 @@ fn validate_scka_skipped_sorted(skipped: &[SckaSkippedEntry]) -> WireResult<()> 
         if a >= b {
             return Err("rvft1 scka skipped unsorted".into());
         }
+    }
+    // Python `_validate_rvft1`: direction is DIR_A2B or DIR_B2A only. An entry
+    // with any other direction can never match a lookup yet would occupy the
+    // 256-entry cap.
+    if skipped.iter().any(|entry| entry.direction > DIR_B2A) {
+        return Err("rvft1 scka skipped direction".into());
     }
     Ok(())
 }
@@ -419,6 +520,41 @@ mod tests {
             },
         ];
         assert!(encode_rvft1(&tr).is_err());
+    }
+
+    #[test]
+    fn reject_scka_skipped_direction_above_b2a() {
+        let entry = |direction: u8| SckaSkippedEntry {
+            direction,
+            epoch: 1,
+            n: 0,
+            mk: [0xA5; 32],
+        };
+        // Both directions the reference allows still round-trip.
+        for direction in [0u8, 1] {
+            let mut tr = minimal_tr();
+            tr.scka_skipped = vec![entry(direction)];
+            let wire = encode_rvft1(&tr).unwrap();
+            assert_eq!(decode_rvft1(&wire).unwrap(), tr);
+        }
+        // Encode refuses direction 2..=255.
+        for direction in [2u8, 7, 255] {
+            let mut tr = minimal_tr();
+            tr.scka_skipped = vec![entry(direction)];
+            assert!(encode_rvft1(&tr).is_err(), "{direction}");
+        }
+        // Decode refuses a wire whose single entry carries direction 7 (the
+        // byte sits 13 bytes before the unique message key: dir|epoch|n|mk).
+        let mut tr = minimal_tr();
+        tr.scka_skipped = vec![entry(0)];
+        let mut wire = encode_rvft1(&tr).unwrap();
+        let mk_at = wire
+            .windows(32)
+            .position(|window| window == [0xA5; 32])
+            .unwrap();
+        assert_eq!(wire[mk_at - 13], 0);
+        wire[mk_at - 13] = 7;
+        assert!(decode_rvft1(&wire).is_err());
     }
 
     #[test]

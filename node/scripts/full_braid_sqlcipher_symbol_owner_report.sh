@@ -340,7 +340,8 @@ patterns = [
     # dumpbin: External | sqlite3_open_v2
     rf"External\s+\|\s+_?{re.escape(sym)}(?:\s|$)",
     # llvm-pdbutil dump -publics
-    rf"name\s*=\s*`_?{re.escape(sym)}`",
+    # \x60 = backtick: a literal backtick inside this $(...) breaks parsing under macOS bash 3.2.
+    rf"name\s*=\s*\x60_?{re.escape(sym)}\x60",
     rf"\|\s+_?{re.escape(sym)}\s*$",
     # llvm-pdbutil pretty -publics ("  sqlite3_open_v2 [32-bit function]")
     rf"^\s+_?{re.escape(sym)}(?:\s|$)",
@@ -355,7 +356,7 @@ if n == 0:
         parts = line.split()
         if len(parts) < 2:
             continue
-        last = parts[-1].split("@")[0].lstrip("_").strip("`")
+        last = parts[-1].split("@")[0].lstrip("_").strip("\x60")
         kind = parts[-2] if len(parts) >= 2 else ""
         if last == sym and kind not in {"U", "u"}:
             n += 1

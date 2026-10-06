@@ -25,7 +25,10 @@ resolve_destination() {
     echo "platform=iOS Simulator,id=${DEVICE_ID}"
     return
   fi
-  if xcrun simctl list devices available -j | python3 -c '
+  # Capture in a variable, not a fixed /tmp file: another user (or a concurrent
+  # run) could otherwise pre-create/symlink the path or swap the simulator id.
+  local sim_udid
+  if sim_udid="$(xcrun simctl list devices available -j | python3 -c '
 import json, sys
 data = json.load(sys.stdin)["devices"]
 candidates = [
@@ -40,8 +43,8 @@ def version(item):
     raw = item[0].rsplit("iOS-", 1)[-1]
     return tuple(int(part) for part in raw.split("-") if part.isdigit())
 print(max(candidates, key=version)[1]["udid"])
-' > /tmp/raven_lan_kat_sim 2>/dev/null; then
-    echo "platform=iOS Simulator,id=$(cat /tmp/raven_lan_kat_sim)"
+' 2>/dev/null)" && [[ -n "$sim_udid" ]]; then
+    echo "platform=iOS Simulator,id=${sim_udid}"
     return
   fi
   echo "platform=iOS Simulator,name=RAVEN-iPhone-15"

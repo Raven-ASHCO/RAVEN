@@ -40,14 +40,17 @@ impl HybridKeypair {
         let mut x_seed = [0u8; 32];
         rng.fill_bytes(&mut x_seed);
         let sk = StaticSecret::from(x_seed);
+        x_seed.zeroize();
         let x25519_public = PublicKey::from(&sk).to_bytes();
         let x25519_secret = sk.to_bytes();
 
         let mut seed_bytes = [0u8; DK_SEED_LEN];
         rng.fill_bytes(&mut seed_bytes);
-        let seed = Seed::try_from(seed_bytes.as_slice()).expect("seed len");
+        let mut seed = Seed::try_from(seed_bytes.as_slice()).expect("seed len");
         let dk = DecapsulationKey::<MlKem768>::from_seed(seed);
+        seed.as_mut_slice().zeroize();
         let mlkem_seed = seed_bytes;
+        seed_bytes.zeroize();
         let ek_encoded = dk.encapsulation_key().to_bytes();
         let mlkem_ek_bytes = ek_encoded.as_slice().to_vec();
         assert_eq!(mlkem_ek_bytes.len(), EK_LEN);
@@ -110,21 +113,25 @@ pub fn begin_hybrid_initiation<R: RngCore + ?Sized>(
     let mut m = [0u8; 32];
     rng.fill_bytes(&mut m);
     let (ciphertext, mut z_pq) = {
-        let m_arr = match B32::try_from(m.as_slice()) {
+        let mut m_arr = match B32::try_from(m.as_slice()) {
             Ok(value) => value,
             Err(_) => {
                 m.zeroize();
                 return Err("m".into());
             }
         };
-        let (ct, ss) = ek.encapsulate_deterministic(&m_arr);
+        let (ct, mut ss) = ek.encapsulate_deterministic(&m_arr);
+        // Either the coins or the shared key alone recompute Z_PQ.
         m.zeroize();
-        let ciphertext = ct.as_slice().to_vec();
-        if ciphertext.len() != CT_LEN {
-            return Err("ct length".into());
-        }
+        m_arr.as_mut_slice().zeroize();
         let mut z_pq = [0u8; 32];
         z_pq.copy_from_slice(ss.as_slice());
+        ss.as_mut_slice().zeroize();
+        let ciphertext = ct.as_slice().to_vec();
+        if ciphertext.len() != CT_LEN {
+            z_pq.zeroize();
+            return Err("ct length".into());
+        }
         (ciphertext, z_pq)
     };
     let mut z_x = match x25519_shared_checked(our_x_secret, peer_x_public) {
@@ -144,45 +151,6 @@ pub fn begin_hybrid_initiation<R: RngCore + ?Sized>(
     Ok(pending)
 }
 
-/// Initiator: ECDH + ML-KEM.Encap(peer_ek) → (ct_pq, K_root).
-pub fn initiate_hybrid_root<R: RngCore + ?Sized>(
-    rng: &mut R,
-    our_x_secret: &[u8; 32],
-    peer_x_public: &[u8; 32],
-    peer_mlkem_ek: &[u8],
-    transcript_hash: &[u8; 32],
-) -> Result<(Vec<u8>, [u8; 32]), String> {
-    let ek = parse_ek(peer_mlkem_ek)?;
-    let mut m = [0u8; 32];
-    rng.fill_bytes(&mut m);
-    let m_arr = match B32::try_from(m.as_slice()) {
-        Ok(value) => value,
-        Err(_) => {
-            m.zeroize();
-            return Err("m".into());
-        }
-    };
-    let (ct, ss) = ek.encapsulate_deterministic(&m_arr);
-    m.zeroize();
-    let ct_bytes = ct.as_slice().to_vec();
-    if ct_bytes.len() != CT_LEN {
-        return Err("ct length".into());
-    }
-    let mut z_pq = [0u8; 32];
-    z_pq.copy_from_slice(ss.as_slice());
-    let mut z_x = match x25519_shared_checked(our_x_secret, peer_x_public) {
-        Ok(shared) => shared,
-        Err(error) => {
-            z_pq.zeroize();
-            return Err(error);
-        }
-    };
-    let root = derive_root(&z_x, &z_pq, transcript_hash);
-    z_x.zeroize();
-    z_pq.zeroize();
-    Ok((ct_bytes, root))
-}
-
 /// Responder: ECDH + ML-KEM.Decap(ct) → K_root.
 pub fn respond_hybrid_root(
     our_x_secret: &[u8; 32],
@@ -194,12 +162,16 @@ pub fn respond_hybrid_root(
     if ct_pq.len() != CT_LEN {
         return Err("mlkem ct length".into());
     }
-    let seed = Seed::try_from(our_mlkem_seed.as_slice()).map_err(|_| "seed")?;
+    let mut seed = Seed::try_from(our_mlkem_seed.as_slice()).map_err(|_| "seed")?;
     let dk = DecapsulationKey::<MlKem768>::from_seed(seed);
+    // `Seed` is `Copy`; wipe the local copy of the long-term decapsulation seed
+    // (mirrors `HybridKeypair::generate`). `dk` zeroizes itself on drop.
+    seed.as_mut_slice().zeroize();
     let ct = ct_pq.try_into().map_err(|_| "ct array")?;
-    let ss = dk.decapsulate(&ct);
+    let mut ss = dk.decapsulate(&ct);
     let mut z_pq = [0u8; 32];
     z_pq.copy_from_slice(ss.as_slice());
+    ss.as_mut_slice().zeroize();
     let mut z_x = match x25519_shared_checked(our_x_secret, peer_x_public) {
         Ok(shared) => shared,
         Err(error) => {
@@ -213,7 +185,9 @@ pub fn respond_hybrid_root(
     Ok(root)
 }
 
-/// Deterministic encap for KATs (`hazmat` feature).
+/// Deterministic encap for KATs only. Caller-chosen coins make `Z_PQ`
+/// predictable, so this is not part of the default-build API.
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn encapsulate_deterministic(
     peer_mlkem_ek: &[u8],
     m: &[u8; 32],
@@ -243,14 +217,14 @@ mod tests {
         let alice = HybridKeypair::generate(&mut rng);
         let bob = HybridKeypair::generate(&mut rng);
         let th = transcript_hash(b"hybrid-kat");
-        let (ct, root_a) = initiate_hybrid_root(
+        let (ct, root_a) = begin_hybrid_initiation(
             &mut rng,
             &alice.x25519_secret,
             &bob.x25519_public,
             &bob.mlkem_ek_bytes,
-            &th,
         )
-        .unwrap();
+        .unwrap()
+        .finalize(&th);
         let root_b = respond_hybrid_root(
             &bob.x25519_secret,
             &alice.x25519_public,

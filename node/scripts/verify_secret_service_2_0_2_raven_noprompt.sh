@@ -7,6 +7,12 @@ FORK="${RAVEN_SS_FORK_DIR:-$ROOT/node/third_party/secret-service-2.0.2-raven-nop
 EXPECTED_CRATE_SHA="e1da5c423b8783185fd3fecd1c8796c267d2c089d894ce5a93c280a5d3f780a2"
 EXPECTED_LICENSE_APACHE="a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
 EXPECTED_LICENSE_MIT="0d13fdf5615ccc7e7123b58b5c88b0d2bbabe345cd70b94e094ee44034db5be6"
+# SHA-256 of the fork's RAVEN_PATCH_DIGEST file. That file lives INSIDE the fork, so
+# comparing the fork against it proves only self-consistency: a PR that edits a
+# MODIFIED file (e.g. src/session.rs: DH / secret handling) and regenerates the digest
+# would still pass. Pinning the digest file's own hash here makes every legitimate
+# re-freeze an edit of THIS script, which CODEOWNERS routes to crypto/assurance review.
+EXPECTED_PATCH_DIGEST_SHA256="c1381f6acc96fed642e5de9ec08c99f96fbe06246d3db6274c62d55349353bb6"
 CRATE_URL="https://static.crates.io/crates/secret-service/secret-service-2.0.2.crate"
 
 fail() {
@@ -164,6 +170,9 @@ done
   || fail "Apache license mismatch"
 [[ "$(sha256_file "$FORK/LICENSE-MIT")" == "$EXPECTED_LICENSE_MIT" ]] \
   || fail "MIT license mismatch"
+
+[[ "$(sha256_file "$FORK/RAVEN_PATCH_DIGEST")" == "$EXPECTED_PATCH_DIGEST_SHA256" ]] \
+  || fail "RAVEN_PATCH_DIGEST is not the pinned frozen digest (a deliberate re-freeze must update EXPECTED_PATCH_DIGEST_SHA256 in this script)"
 
 GENERATED_DIGEST="$WORK/RAVEN_PATCH_DIGEST.generated"
 : >"$GENERATED_DIGEST"

@@ -1,5 +1,11 @@
 # RAVEN CODEOWNERS — Raven-ASHCO engineering org
 # R3 (crypto/identity): require Code Owner review; no self-merge of own R3 changes (process + enforce_admins).
+#
+# GitHub applies ONLY the LAST pattern that matches a file, and a later, more
+# specific line REPLACES the owners of an earlier one (it does not add to them):
+# list every team that must review on the specific line itself, and put narrow
+# patterns after the broad ones they refine. Owners without write access are
+# silently ignored by GitHub: confirm each team below exists and can push.
 
 *                                                         @Raven-ASHCO/architecture @Raven-ASHCO/release
 
@@ -11,8 +17,9 @@
 
 /protocol/                                                @Raven-ASHCO/protocol @Raven-ASHCO/architecture
 /protocol/ATSAM*                                          @Raven-ASHCO/crypto @Raven-ASHCO/protocol
-/protocol/RAVEN_IDENTITY*                                 @Raven-ASHCO/identity @Raven-ASHCO/protocol
 /protocol/RAVEN_*                                         @Raven-ASHCO/protocol
+# After /protocol/RAVEN_* (it matches the same files, and the last match wins).
+/protocol/RAVEN_IDENTITY*                                 @Raven-ASHCO/identity @Raven-ASHCO/protocol
 
 /shared-vectors/                                          @Raven-ASHCO/protocol @Raven-ASHCO/assurance
 /shared-vectors/**/atsam/**                               @Raven-ASHCO/crypto @Raven-ASHCO/protocol
@@ -27,9 +34,40 @@
 /node/crates/raven-core/src/ble*                          @Raven-ASHCO/transport @Raven-ASHCO/apple
 /node/crates/raven-core/src/bridge*                       @Raven-ASHCO/network @Raven-ASHCO/assurance
 /node/crates/raven-core/src/forward_queue*                @Raven-ASHCO/network @Raven-ASHCO/assurance
+# R3 crypto / identity sources inside raven-core (the generic raven-core line above
+# would otherwise be their only rule). core stays on every line: these replace it.
+/node/crates/raven-core/src/seal.rs                       @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/envelope.rs                   @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/canon.rs                      @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/store_object.rs               @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/lan_noise.rs                  @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/ipc.rs                        @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/identity.rs                   @Raven-ASHCO/identity @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/identity_store.rs             @Raven-ASHCO/identity @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/indexed_session_store.rs      @Raven-ASHCO/identity @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/pair_init*                    @Raven-ASHCO/identity @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/introduction.rs               @Raven-ASHCO/identity @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-core/src/routing_tag.rs                @Raven-ASHCO/identity @Raven-ASHCO/crypto @Raven-ASHCO/core
+/node/crates/raven-fb-ffi/                                @Raven-ASHCO/crypto @Raven-ASHCO/core
 /node/crates/raven-swarm/                                 @Raven-ASHCO/network
 /node/crates/raven-node/                                  @Raven-ASHCO/core @Raven-ASHCO/identity
 /node/crates/ash/                                         @Raven-ASHCO/core
+
+# Supply chain and build inputs. The pins (libsqlite3-sys-raven build.rs SHA-256
+# table, secret-service fork digest) live in the same repo as the bytes they pin,
+# so only review of the pin table and of the verifier scripts keeps them honest.
+/node/Cargo.toml                                          @Raven-ASHCO/release @Raven-ASHCO/assurance
+/node/Cargo.lock                                          @Raven-ASHCO/release @Raven-ASHCO/assurance
+/node/third_party/                                        @Raven-ASHCO/crypto @Raven-ASHCO/assurance @Raven-ASHCO/release
+/node/scripts/                                            @Raven-ASHCO/release @Raven-ASHCO/assurance
+# The provenance verifiers carry the pins (crate / digest SHA-256 constants): a change
+# to them is a change to what "verified" means, so crypto reviews it too.
+/node/scripts/verify_secret_service*.sh                   @Raven-ASHCO/crypto @Raven-ASHCO/assurance @Raven-ASHCO/release
+/node/scripts/secret_service_r0_provenance_selftest.sh    @Raven-ASHCO/crypto @Raven-ASHCO/assurance @Raven-ASHCO/release
+/node/scripts/verify_sqlcipher*.sh                        @Raven-ASHCO/crypto @Raven-ASHCO/assurance @Raven-ASHCO/release
+/node/scripts/regenerate_sqlcipher*.sh                    @Raven-ASHCO/crypto @Raven-ASHCO/assurance @Raven-ASHCO/release
+/node/scripts/sqlcipher_*.sh                              @Raven-ASHCO/crypto @Raven-ASHCO/assurance @Raven-ASHCO/release
+/node/fuzz/                                               @Raven-ASHCO/core @Raven-ASHCO/assurance
 
 /ios-native/                                              @Raven-ASHCO/apple
 /**/Security/**                                           @Raven-ASHCO/apple @Raven-ASHCO/crypto

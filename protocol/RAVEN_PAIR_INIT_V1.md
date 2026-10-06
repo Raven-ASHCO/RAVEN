@@ -122,6 +122,14 @@ key, ML-KEM key, ciphertext, three record digests, nonce, and `init_id` MUST
 not be all zero. X25519 agreement MUST additionally reject a non-contributory
 (all-zero) shared result.
 
+Decoders and verifiers MUST also reject, before any signature check, state
+mutation, journal, or claim, an initiator ephemeral X25519 key in the
+small-order torsion (for example `u = 1`, the two order-8 points, `p - 1`,
+`p`, `p + 1`, and their encodings with bit 255 set). For every clamped
+responder scalar the agreement with such a key is all-zero, so the check is
+exactly "X25519(any fixed scalar, key) is all-zero". A signed PairInit carrying
+one is a hard reject, not a deferred DH failure.
+
 The signature input is exactly:
 
 ```

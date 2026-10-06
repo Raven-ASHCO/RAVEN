@@ -191,7 +191,7 @@ No soak pass-rate numbers are recorded here. In-repo **scripts and docs** that d
 | [`scripts/reliability_matrix_20.sh`](../../../scripts/reliability_matrix_20.sh) | Allows `PASS`, `PASS_SOFTWARE_SUBSTITUTE`, `SKIP` with notes. |
 | [`scripts/nat_docker_sim.sh`](../../../scripts/nat_docker_sim.sh) | Prints `RESULT=SKIP` when Docker is missing/down; `not_claimed=public_CGNAT,DCUtR,AutoNAT`. |
 | [`scripts/soak_mac_lan_pull.sh`](../../../scripts/soak_mac_lan_pull.sh) | Long-running Mac LAN soak; logs `RESULT=PASS` / `RESULT=FAIL` under `.cursor/` (operator machine). **No committed soak log or pass rate in this repo.** |
-| [`node/proof_artifacts/`](../../../node/proof_artifacts/) | Destination for proof-harness runs. **No `proof_artifacts/` tree is committed** (root `.gitignore` has `proof_artifacts/`). |
+| `node/proof_artifacts/` (untracked, gitignored; not a link) | Destination for proof-harness runs. **No `proof_artifacts/` tree is committed** (root `.gitignore` has `proof_artifacts/`). |
 
 Do not invent a soak pass rate from the absence of those artifacts.
 

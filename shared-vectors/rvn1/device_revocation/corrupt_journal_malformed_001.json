@@ -1,0 +1,38 @@
+{
+  "description": "Journal bytes pass the 54-byte floor but fail strict RVDR1 parse (long device_id, short tail) -> reason_code 1 (truncated / not a complete record), same as short bytes",
+  "deterministic": true,
+  "expected": {
+    "must_fail_closed": true,
+    "must_not_clear_without_corrupt_marker": true,
+    "reason": "truncated",
+    "reason_code": 1,
+    "reverify_result": "corrupt",
+    "store": {
+      "claims_wire_hex": [],
+      "corrupt": [
+        {
+          "reason_code": 1,
+          "scope": "rvn1qysluvwl5922yctzd0u9gpr06gn3k7ldfvecule0"
+        }
+      ],
+      "exhausted": [],
+      "forks": [],
+      "generation": 1,
+      "journal": null,
+      "revocation_id_collisions": [],
+      "revocation_store_hash_hex": "8a74dfcf3b172f8bb1c98de2cba01b14c878fc7bb91e1a4933d260274cdf0885",
+      "revoked_targets": []
+    }
+  },
+  "inputs": {
+    "identity_address": "rvn1qysluvwl5922yctzd0u9gpr06gn3k7ldfvecule0",
+    "identity_ed_pub_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "journal_before": {
+      "claim_digest_hex": "a928a4a03629605baf0d2927219a02b5bc0de3380e55f9811880a34f22cdd142",
+      "exact_record_bytes_hex": "5256445231000000010172766e317179736c7576776c353932327963747a643075396770723036676e336b376c6466766563756c653000406464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646411111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100016900000000000000000000000000000000000000000000000000000000000000000000",
+      "kind": "PENDING_REVOKE"
+    }
+  },
+  "name": "Corrupt journal malformed (>= 54 bytes, undecodable)",
+  "protocol_version": "rvn1"
+}

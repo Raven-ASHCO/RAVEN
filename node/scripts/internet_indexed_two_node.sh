@@ -23,14 +23,21 @@ export RAVEN_CHAT_HISTORY_BACKEND=locked-file
 export RAVEN_LAB_TEST_A=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../../scripts/lib/harness_util.sh
+source "$ROOT/../scripts/lib/harness_util.sh"
 BIN="$ROOT/target/debug"
 ASH="$BIN/ash"
 NODE="$BIN/raven-node"
-WORKDIR="${TMPDIR:-/tmp}/raven-inet-indexed-$$"
+# mktemp: 0700 and never pre-existing (a predictable name can be pre-created or
+# symlinked by another user).
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/raven-inet-indexed-XXXXXX")"
 A="$WORKDIR/a"
 B="$WORKDIR/b"
-A_PORT="${A_PORT:-$((20000 + $$ % 500))}"
-B_PORT="${B_PORT:-$((20500 + $$ % 500))}"
+# Listeners bind port 0 and the harness reads the bound address back from the
+# node log, so a busy fixed port can never fail the run. A_PORT/B_PORT/C_PORT
+# stay as optional overrides (default 0 = OS-assigned).
+A_PORT="${A_PORT:-0}"
+B_PORT="${B_PORT:-0}"
 A_PID=""
 B_PID=""
 C_PID=""
@@ -90,7 +97,7 @@ A_PID=$!
 B_PID=$!
 
 for _ in $(seq 1 150); do
-  if [[ -S "$A/raven-node.sock" && -S "$B/raven-node.sock" ]] \
+  if raven_ipc_up "$ASH" "$A" && raven_ipc_up "$ASH" "$B" \
     && grep -q "internet_direct: listen" "$WORKDIR/a.node.log" \
     && grep -q "internet_direct: listen" "$WORKDIR/b.node.log"; then
     break
@@ -102,9 +109,9 @@ for _ in $(seq 1 150); do
   fi
   sleep 0.1
 done
-if [[ ! -S "$A/raven-node.sock" || ! -S "$B/raven-node.sock" ]]; then
+if ! raven_ipc_up "$ASH" "$A" || ! raven_ipc_up "$ASH" "$B"; then
   cat "$WORKDIR/a.node.log" "$WORKDIR/b.node.log" >&2 || true
-  fail "daemons failed to create IPC sockets"
+  fail "daemons did not answer IPC (ash ipc-ping)"
 fi
 "$ASH" --data-dir "$A" ipc-ping >/dev/null
 "$ASH" --data-dir "$B" ipc-ping >/dev/null
@@ -116,7 +123,13 @@ fi
 if ! grep -q "dial≠WAN" "$WORKDIR/a.node.log" || ! grep -q "dial≠WAN" "$WORKDIR/b.node.log"; then
   fail "missing dial≠WAN listen claim marker"
 fi
-echo "A_INET_PORT=$A_PORT B_INET_PORT=$B_PORT"
+A_INET="$(raven_listen_addr "$WORKDIR/a.node.log" internet_direct)"
+B_INET="$(raven_listen_addr "$WORKDIR/b.node.log" internet_direct)"
+if [[ -z "$A_INET" || -z "$B_INET" ]]; then
+  cat "$WORKDIR/a.node.log" "$WORKDIR/b.node.log" >&2 || true
+  fail "could not read the bound internet_direct address from the node logs"
+fi
+echo "A_INET=$A_INET B_INET=$B_INET"
 
 echo "=== contact add (trust only; send uses --carrier internet --peer) ==="
 "$ASH" --data-dir "$A" contact add \
@@ -126,8 +139,8 @@ echo "=== contact add (trust only; send uses --carrier internet --peer) ==="
 
 echo "=== ash send --carrier internet (localhost indexed; not WAN) ==="
 set +e
-printf '%s\n' "hello over internet transport" | "$ASH" --data-dir "$A" send \
-  --peer "127.0.0.1:${B_PORT}" --peer-pub-hex "$B_PUB" --carrier internet \
+printf '%s\n' "hello over internet transport" | raven_timeout 90 "$ASH" --data-dir "$A" send \
+  --peer "$B_INET" --peer-pub-hex "$B_PUB" --carrier internet \
   >"$WORKDIR/a.send.out" 2>"$WORKDIR/a.send.err"
 SEND_RC=$?
 set -e
@@ -154,7 +167,7 @@ echo "INTERNET_INDEXED_LOOPBACK_PASS: 127.0.0.1 indexed delivery (not WAN)"
 
 echo "=== stranger PairInit refused (node C → B internet, no contact on B) ==="
 C="$WORKDIR/c"
-C_PORT="${C_PORT:-$((21000 + $$ % 500))}"
+C_PORT="${C_PORT:-0}"
 mkdir -p "$C"
 "$ASH" --data-dir "$C" init | tee "$WORKDIR/c.init"
 C_ADDR=$(grep '^address=' "$WORKDIR/c.init" | cut -d= -f2)
@@ -167,20 +180,26 @@ test -n "$C_ADDR" && test -n "$C_PUB"
   >"$WORKDIR/c.node.log" 2>&1 &
 C_PID=$!
 for _ in $(seq 1 80); do
-  if [[ -S "$C/raven-node.sock" ]] && grep -q "internet_direct: listen" "$WORKDIR/c.node.log"; then
+  if raven_ipc_up "$ASH" "$C" && grep -q "internet_direct: listen" "$WORKDIR/c.node.log"; then
     break
   fi
   sleep 0.1
 done
-if [[ ! -S "$C/raven-node.sock" ]]; then
+if ! raven_ipc_up "$ASH" "$C"; then
   cat "$WORKDIR/c.node.log" >&2 || true
-  fail "stranger daemon failed to create IPC socket"
+  fail "stranger daemon did not answer IPC (ash ipc-ping)"
 fi
 "$ASH" --data-dir "$C" contact add \
   --address "$B_ADDR" --pub-hex "$B_PUB" --petname "Bob" --tag bob
+# B must be up and listening when the probe arrives; otherwise a failed send
+# could only mean "connection refused", not "B refused the stranger".
+if ! kill -0 "$B_PID" 2>/dev/null; then
+  cat "$WORKDIR/b.node.log" >&2 || true
+  fail "B daemon exited before the stranger probe"
+fi
 set +e
-printf '%s\n' "stranger probe" | "$ASH" --data-dir "$C" send \
-  --peer "127.0.0.1:${B_PORT}" --peer-pub-hex "$B_PUB" --carrier internet \
+printf '%s\n' "stranger probe" | raven_timeout 90 "$ASH" --data-dir "$C" send \
+  --peer "$B_INET" --peer-pub-hex "$B_PUB" --carrier internet \
   >"$WORKDIR/c.send.out" 2>"$WORKDIR/c.send.err"
 C_SEND_RC=$?
 set -e
@@ -191,11 +210,25 @@ fi
 if grep -qi 'delivered' "$WORKDIR/c.send.out" 2>/dev/null; then
   fail "stranger send reported delivered"
 fi
-if ! grep -Eqi 'not a local contact|pair init refused' "$WORKDIR/b.node.log" \
-  && ! grep -Eqi 'not a local contact|pair init refused|failed|error|refused' \
-    "$WORKDIR/c.send.err" "$WORKDIR/c.send.out"; then
+# The refusal must be B's own diagnostic (internet_direct logs the dispatch
+# error "pair init refused: peer is not a local contact" on stderr ->
+# b.node.log). C's generic send error text is not evidence: it also matches
+# connection refused / bind failures where B never evaluated the stranger.
+REFUSED=0
+for _ in $(seq 1 30); do
+  if grep -Eqi 'pair init refused|not a local contact' "$WORKDIR/b.node.log"; then
+    REFUSED=1
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$REFUSED" -ne 1 ]]; then
   cat "$WORKDIR/c.send.out" "$WORKDIR/c.send.err" "$WORKDIR/b.node.log" >&2 || true
-  fail "expected stranger PairInit refusal in logs"
+  fail "expected B to log the stranger PairInit refusal (pair init refused / not a local contact)"
+fi
+if ! kill -0 "$B_PID" 2>/dev/null; then
+  cat "$WORKDIR/b.node.log" >&2 || true
+  fail "B daemon died while refusing the stranger probe"
 fi
 
 echo "INTERNET_INDEXED_TWO_NODE_PASS: localhost/lab indexed delivery over InternetTransport (RIH1)"

@@ -31,6 +31,14 @@ self-attestation pattern used by `RavenAliasRecordV1`
 **Vector:** `shared-vectors/rvn1/capabilities/alice_v1.json` — alice's
 identity claiming `capability_bits = 15` (`0b1111`).
 
+**No bit registry in V1.** V1 freezes only the record bytes. It assigns **no**
+meaning to any `capability_bits` value; `0b1111` in the vector is an opaque
+test value, not four named features. Until a registry exists, no
+implementation can act on a bit, and no shipped code consumes `env_type=4`
+records (the Rust core only checks the vector). The negotiation and
+downgrade properties below are therefore design intent, not a guarantee in
+force in any current build.
+
 > `capability_bits` here is a distinct namespace from
 > `RavenDeviceCertificateV1.capabilities` in
 > [`RAVEN_IDENTITY_V1.md`](RAVEN_IDENTITY_V1.md) §2 — that one is
@@ -47,32 +55,44 @@ The legacy shipping mesh transport advertises a *different*, **unsigned**
 range, including an on-path relay, can observe or alter that read before a
 peer sees it, and neither side can tell.
 
-`RavenProtocolCapabilitiesV1` closes that gap: a peer's claimed capability set
-is cryptographically bound to its identity via the Ed25519 signature. An
-on-path relay or MITM position cannot flip a bit — say, stripping a
-`pqHybridKEM` or `hopAuth`-equivalent bit from an unsigned advertisement to
-force both sides into a weaker negotiated mode — without invalidating the
-signature.
+`RavenProtocolCapabilitiesV1` narrows that gap: a peer's claimed capability
+set is cryptographically bound to its identity via the Ed25519 signature. An
+on-path relay or MITM position cannot flip a bit in a record — say, stripping a
+`pqHybridKEM` or `hopAuth`-equivalent bit to force both sides into a weaker
+negotiated mode — without invalidating the signature. It **can** still
+replay (or selectively withhold) *other* records the identity signed, which
+§3 bounds only partially.
 
-## 3. Downgrade protection
+## 3. Downgrade protection — and its V1 replay window
 
-Because the record is both signed and time-bound (`expires_at_ms`), a
-verifier caches the freshest signed capability set it has seen for a given
-`identity_address` and refuses to silently accept a "downgrade" (fewer bits)
-claim unless that claim is itself freshly signed and unexpired. An attacker
-cannot replay an old, validly-signed, lower-capability record to force a
-downgrade once its `expires_at_ms` has passed.
+The record is signed and time-bound (`expires_at_ms`), but it has **no
+sequence number**. What V1 can and cannot guarantee:
 
-**Scope note:** unlike `RavenAliasRecordV1`, this record carries no explicit
-monotonic `sequence` field — freshness relies on `expires_at_ms` alone. If a
-verifier receives two differently-signed capability records for the same
-identity with *overlapping* validity windows, V1 does not specify a
-tie-breaking rule for that case (there is no sequence number to break the
-tie). Implementers SHOULD handle it conservatively — negotiate to the
-intersection of the two claimed bit sets — until a later protocol version
-adds an explicit sequence field. This is a deliberate scope-out, not an
-oversight: it is not backed by a vector because V1 does not define the
-behavior.
+- **Guaranteed:** a record cannot be altered (bit-flip) without breaking the
+  signature, and a record is dead once its `expires_at_ms` has passed.
+- **Not guaranteed — replay window:** any older record the identity signed
+  that is *still unexpired* is indistinguishable from a current one. An
+  attacker who captured such a lower-capability record can present it to a
+  verifier that has not yet seen the newer one, forcing a downgrade until the
+  old record's `expires_at_ms`. The window is the full remaining lifetime of
+  every record the identity ever issued, so issuers SHOULD keep
+  `expires_at_ms` short (and never extend a lower-capability record's
+  lifetime past a higher one's).
+
+**Choosing between records (normative for V1).** A verifier caches, per
+`identity_address`, the valid record with the **latest `expires_at_ms`**, and
+replaces it only with a valid record whose `expires_at_ms` is strictly later.
+A record with an earlier or equal `expires_at_ms` never replaces the cached
+one, whatever its bits, and two different records with equal
+`expires_at_ms` are a conflict to surface, not to merge. Verifiers MUST NOT
+"negotiate to the intersection" of overlapping records: the intersection is
+exactly the downgrade an attacker obtains by replaying an old record next to
+the current one. (Issuers therefore MUST give each new record a later
+`expires_at_ms` than any record it supersedes.)
+
+This is a documented scope limit, not a closed defense. A later version must
+add an explicit monotonic `sequence` (as `RavenAliasRecordV1` has) and a bit
+registry before capability negotiation is used for any security decision.
 
 ## 4. Mapping to legacy RUM v2 capability bits — known platform drift
 
@@ -108,4 +128,5 @@ MUST additionally bind it by checking `address.encode(signer_pub) ==
 identity_address` before honouring the advertised capabilities (§1). Vectors:
 `shared-vectors/rvn1/capabilities/alice_v1.json` and the negative
 `shared-vectors/rvn1/negative/capabilities_tampered_bits.json` (a post-sign
-bit flip must fail verification — the downgrade defense).
+bit flip must fail verification — the tamper defense; replay of an older
+unexpired record is out of scope for V1, §3).
