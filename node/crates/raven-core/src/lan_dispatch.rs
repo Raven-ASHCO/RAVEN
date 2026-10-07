@@ -1209,6 +1209,15 @@ pub fn maintain_lan_durable_state(data_dir: &Path) -> Result<(), String> {
     prune_lan_durable_state(data_dir, now_ms())
 }
 
+/// Expiry-only pass for raven-node's periodic service prune: destroys expired
+/// sessions (protected `K_root`, outbox envelopes and inbox rows, after the
+/// inbox is archived to ChatHistory), expired prekey claims and orphan
+/// pair-response files. Unlike [`maintain_lan_durable_state`] it leaves the
+/// outbound stage alone, so it is safe while `ash` sends are in flight.
+pub fn prune_expired_lan_durable_state(data_dir: &Path) -> Result<(), String> {
+    prune_lan_durable_state(data_dir, now_ms())
+}
+
 fn build_pair_response(
     init: &PairInit,
     root: &[u8; 32],
@@ -1316,10 +1325,11 @@ fn handle_pair_init(
         .map_err(|e| e.to_string())?;
     let (claim_id, sid, root) = match &mut outcome {
         PrekeyClaimOutcome::Accepted(claim) | PrekeyClaimOutcome::DuplicatePending(claim) => {
+            // Stays `Zeroizing`: wiped on every return path below.
             let root = claim
                 .take_provisional_root()
                 .ok_or_else(|| "pair init claim missing root".to_string())?;
-            (claim.claim_id(), claim.session_id(), *root)
+            (claim.claim_id(), claim.session_id(), root)
         }
         PrekeyClaimOutcome::DuplicateCompleted { .. } => {
             return replay_cached_pair_response(data_dir, &init, &identity.public_key_bytes());
@@ -1330,7 +1340,7 @@ fn handle_pair_init(
     };
 
     let key = sessions
-        .create_verified_pair_init_session(&init, &trust, now, LocalRole::Responder, root)
+        .create_verified_pair_init_session(&init, &trust, now, LocalRole::Responder, *root)
         .map_err(|e| e.redacted_display())?;
     let response = build_pair_response(&init, &root, identity, now)?;
     let mut rng = OsRng;
@@ -1805,6 +1815,18 @@ pub fn seal_app_payload_under_session(
     }
 }
 
+/// Lifetime of the sessions this node initiates. The indexed-session profile
+/// has no forward secrecy inside a session (ATSAM_INDEXED_SESSION_PROFILE_V1
+/// §2.4): whoever obtains a session's state reads all of it, in both
+/// directions. A session is therefore kept short and replaced by a fresh
+/// PairInit once it expires (owner decision 2026-10-07,
+/// docs/WAIVER_LAN_DIRECT_INDEXED_SESSION_2026-10-07.md). Responders still
+/// accept up to `prekey_lifecycle::MAX_PAIR_INIT_LIFETIME_MS` from older peers.
+pub const LAN_SESSION_LIFETIME_MS: u64 = 24 * 60 * 60 * 1_000;
+// A responder refuses PairInits longer than this; never initiate one it would refuse.
+const _: () =
+    assert!(LAN_SESSION_LIFETIME_MS <= crate::prekey_lifecycle::MAX_PAIR_INIT_LIFETIME_MS);
+
 /// Build a signed PairInit and persist the initiator provisional session.
 pub fn create_initiator_pair_init(
     data_dir: &Path,
@@ -1883,17 +1905,18 @@ pub fn create_initiator_pair_init(
         responder_mlkem768_ek: peer.prekey.mlkem768_ek.clone(),
         mlkem768_ciphertext: ciphertext,
         created_at_ms,
-        expires_at_ms: created_at_ms.saturating_add(7 * 24 * 3600 * 1000),
+        expires_at_ms: created_at_ms.saturating_add(LAN_SESSION_LIFETIME_MS),
         signature: [0u8; 64],
     };
     let signing = init_signing_bytes(&init).map_err(|e| format!("{e:?}"))?;
     init.signature = id.sign(&signing);
     eph.x25519_secret = [0u8; 32];
     let digest = transcript_hash(&init).map_err(|e| format!("{e:?}"))?;
+    // `root` is `Zeroizing`: wiped on every return path below.
     let (_ct, root) = pending.finalize(&digest);
     let mut store = IndexedSessionStore::open(data_dir).map_err(|e| e.redacted_display())?;
     let record_key = store
-        .create_verified_pair_init_session(&init, &trust, now, LocalRole::Initiator, root)
+        .create_verified_pair_init_session(&init, &trust, now, LocalRole::Initiator, *root)
         .map_err(|e| e.redacted_display())?;
     Ok((init, record_key))
 }
@@ -2046,6 +2069,84 @@ mod tests {
             )
             .unwrap();
         queued.unwrap()
+    }
+
+    /// Sessions this node initiates last `LAN_SESSION_LIFETIME_MS` (24 h), not
+    /// the 7-day maximum a responder accepts: the profile has no forward secrecy
+    /// inside a session, so a short session bounds what a stolen state reveals.
+    #[test]
+    fn initiated_sessions_last_one_day() {
+        let alice = Identity::from_seed(&[0xd5; 32]);
+        let bob = Identity::from_seed(&[0xd6; 32]);
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        publish_and_install(a_dir.path(), &alice);
+        publish_and_install(b_dir.path(), &bob);
+        let b_bundle = local_bundle(b_dir.path(), &bob).unwrap();
+        write_contact(a_dir.path(), &b_bundle.cert.device_ed_pub, "Bob");
+        cache_peer_bundle(a_dir.path(), &b_bundle).unwrap();
+        let (init, key) = create_initiator_pair_init(a_dir.path(), &alice, &b_bundle).unwrap();
+        assert_eq!(LAN_SESSION_LIFETIME_MS, 24 * 60 * 60 * 1_000);
+        assert_eq!(
+            init.expires_at_ms - init.created_at_ms,
+            LAN_SESSION_LIFETIME_MS
+        );
+        let mut store = IndexedSessionStore::open(a_dir.path()).unwrap();
+        assert_eq!(store.session_expires_at(&key).unwrap(), init.expires_at_ms);
+    }
+
+    /// One prune pass (what raven-node's periodic `durable_prune` runs) destroys
+    /// an expired session's protected root, not only its metadata, and keeps
+    /// a session that has not expired yet.
+    #[test]
+    fn one_prune_pass_destroys_an_expired_sessions_protected_root() {
+        let alice = Identity::from_seed(&[0xd1; 32]);
+        let bob = Identity::from_seed(&[0xd2; 32]);
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        publish_and_install(a_dir.path(), &alice);
+        publish_and_install(b_dir.path(), &bob);
+        let b_bundle = local_bundle(b_dir.path(), &bob).unwrap();
+        write_contact(a_dir.path(), &b_bundle.cert.device_ed_pub, "Bob");
+        cache_peer_bundle(a_dir.path(), &b_bundle).unwrap();
+        let (init, key) = create_initiator_pair_init(a_dir.path(), &alice, &b_bundle).unwrap();
+
+        let record_keys = || {
+            IndexedSessionStore::open(a_dir.path())
+                .unwrap()
+                .list_record_keys()
+                .unwrap()
+        };
+        // Under the lab locked-file backend each protected root is one file.
+        let locked_file = ["RAVEN_SESSION_BACKEND", "RAVEN_IDENTITY_BACKEND"]
+            .iter()
+            .any(|k| std::env::var_os(k).is_some_and(|v| v == "locked-file"));
+        let secrets = a_dir.path().join("indexed-session-secrets");
+        let protected_roots = || {
+            std::fs::read_dir(&secrets)
+                .map(|dir| {
+                    dir.flatten()
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(record_keys(), vec![key]);
+        if locked_file {
+            assert_eq!(protected_roots(), 1);
+        }
+
+        prune_lan_durable_state(a_dir.path(), init.expires_at_ms - 1).unwrap();
+        assert_eq!(record_keys().len(), 1, "a live session must be kept");
+        if locked_file {
+            assert_eq!(protected_roots(), 1);
+        }
+
+        prune_lan_durable_state(a_dir.path(), init.expires_at_ms).unwrap();
+        assert!(record_keys().is_empty());
+        if locked_file {
+            assert_eq!(protected_roots(), 0, "expired K_root left in the store");
+        }
     }
 
     /// Two peers that say hello at the same moment each run a PairInit and so

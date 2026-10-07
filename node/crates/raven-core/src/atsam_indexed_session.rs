@@ -1,8 +1,15 @@
 //! ATSAM Indexed Session Profile V1 byte-exact reference primitives.
 //!
-//! This is deliberately **not** wired into `raven-node`, endpoint routing, or
-//! the shipping RVNA1 classifier.  A future signed, versioned PairInit must
-//! negotiate and transcript-bind [`PROFILE_ID`] before production activation.
+//! These are live: through `indexed_session_store` and `lan_dispatch` they
+//! seal and open the RVNA1 proto `0x03` messages and ACKs of the LAN-direct
+//! slice, which raven-node's listener and `ash` run in default builds
+//! (`lan_gate::LAN_DIRECT_PRODUCTION_ENABLED` is `true`). The internet-direct
+//! slice uses the same path behind its own gate
+//! (`internet_gate::INTERNET_DIRECT_PRODUCTION_ENABLED`, `false`). The generic
+//! [`PRODUCTION_ENABLED`] tripwire below stays `false`, and the shipping
+//! RVNA1 classifier (`seal::classify_sealed_body`) still does not treat proto
+//! `0x03` as a known class. A future signed, versioned PairInit must negotiate
+//! and transcript-bind [`PROFILE_ID`] before generic production activation.
 //! Protocol byte `0x03` avoids silently reinterpreting existing RVNA1 v2.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -295,7 +302,8 @@ pub fn route_direction_key(root: &[u8; 32], direction: Direction) -> [u8; 32] {
     info.extend_from_slice(LABEL_ROUTE_DIRECTION);
     info.push(0);
     info.push(direction as u8);
-    hkdf32(&route_master_key(root), &info)
+    let master = Zeroizing::new(route_master_key(root));
+    hkdf32(&*master, &info)
 }
 
 pub fn route_coordinates(
@@ -320,11 +328,8 @@ pub fn derive_route_tag(
     direction: Direction,
 ) -> Result<[u8; 16], IndexedSessionError> {
     let (epoch, counter) = route_coordinates(created_at_ms, index, env_type, direction)?;
-    Ok(routing_tag::derive(
-        &route_direction_key(root, direction),
-        epoch,
-        counter,
-    ))
+    let key = Zeroizing::new(route_direction_key(root, direction));
+    Ok(routing_tag::derive(&*key, epoch, counter))
 }
 
 pub fn mailbox_coordinates(unix_ms: u64, direction: Direction) -> (u64, u64) {
@@ -337,7 +342,8 @@ pub fn derive_mailbox_tags(
     direction: Direction,
 ) -> ([u8; 16], [u8; 16]) {
     let (day_epoch, slot) = mailbox_coordinates(unix_ms, direction);
-    let mailbox = mailbox_tag(&route_direction_key(root, direction), day_epoch, slot);
+    let key = Zeroizing::new(route_direction_key(root, direction));
+    let mailbox = mailbox_tag(&*key, day_epoch, slot);
     let store = store_tag_from_mailbox(&mailbox);
     (mailbox, store)
 }

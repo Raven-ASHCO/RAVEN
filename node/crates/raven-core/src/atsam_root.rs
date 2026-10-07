@@ -39,8 +39,10 @@ pub fn derive_root(z_x: &[u8; 32], z_pq: &[u8; 32], transcript_hash: &[u8; 32]) 
     okm
 }
 
-/// X25519 ECDH → Z_X. Caller supplies Z_PQ (zeros for classical-only KAT).
-pub fn x25519_shared(secret: &[u8; 32], peer_public: &[u8; 32]) -> [u8; 32] {
+/// Unchecked X25519 ECDH → Z_X (all-zero for a low-order peer key). Crate
+/// private: the KATs and the two checked wrappers below use it; everything
+/// else goes through [`x25519_shared_checked`].
+pub(crate) fn x25519_shared(secret: &[u8; 32], peer_public: &[u8; 32]) -> [u8; 32] {
     let sk = StaticSecret::from(*secret);
     let pk = PublicKey::from(*peer_public);
     sk.diffie_hellman(&pk).to_bytes()

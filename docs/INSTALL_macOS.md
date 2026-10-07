@@ -137,7 +137,7 @@ Raven keeps four kinds of secrets in the login Keychain. The service name is wha
    launchctl kickstart -k "gui/$(id -u)/com.raven.raven-node"   # restart the agent so it runs the signed file
    ```
 
-   (`codesign` may ask once to use the certificate's key; choose Always Allow.) Signing sticks to the file, so repeat it whenever the files that run are replaced: the installer copies freshly built, unsigned files over the installed ones every time it runs, and a rebuild replaces the ones in `target`.
+   (`codesign` asks to use the certificate's private key: choose **Allow**, not *Always Allow*. If `codesign` may use that key without asking, any program running as you can sign itself as Raven and then read Raven's Keychain items without a dialog; with *Allow* you confirm each signing run.) Signing sticks to the file, so repeat it whenever the files that run are replaced: the installer copies freshly built, unsigned files over the installed ones every time it runs, and a rebuild replaces the ones in `target`.
 3. Run `ash` once, let the service start (or restart it as above) and answer the dialogs with **Always Allow**. Items that already exist keep trusting the old identity, so each one asks once more; after that, rebuilds you sign again should stop asking. If a dialog keeps coming back, the `codesign -d -r-` line above shows whether the file that runs really carries the certificate.
 
 **SSH sessions have no dialog.** Over SSH macOS cannot show the window, so a command that needs an answer waits or fails. Run it once on the Mac itself (Terminal app or Screen Sharing), answer the dialog there, then use SSH.

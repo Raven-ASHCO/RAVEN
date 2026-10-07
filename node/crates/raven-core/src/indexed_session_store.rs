@@ -48,7 +48,7 @@ use rand::{CryptoRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::ack::Ack;
 use crate::atsam_indexed_session::{
@@ -1723,23 +1723,23 @@ impl IndexedSessionStore {
         binding: IndexedSessionBinding,
         root: [u8; 32],
     ) -> Result<(), IndexedSessionStoreError> {
-        self.create_trusted_session(binding, root)
+        let root = Zeroizing::new(root);
+        self.create_trusted_session(binding, &root)
     }
 
     fn create_trusted_session(
         &mut self,
         binding: IndexedSessionBinding,
-        mut root: [u8; 32],
+        root: &[u8; 32],
     ) -> Result<(), IndexedSessionStoreError> {
-        let result = self.create_session_inner(binding, &root);
-        root.zeroize();
-        result
+        self.create_session_inner(binding, root)
     }
 
     /// Verifies the signed PairInit and its exact trust records, derives all
     /// public record identifiers through the frozen PairInit module, and then
-    /// persists the supplied already-derived provisional root. Networking is
-    /// still deliberately not wired to this API.
+    /// persists the supplied already-derived provisional root. Live: the
+    /// LAN-direct PairInit initiator and responder (`lan_dispatch`) create
+    /// their sessions through it in default builds.
     pub fn create_verified_pair_init_session(
         &mut self,
         init: &PairInit,
@@ -1748,6 +1748,8 @@ impl IndexedSessionStore {
         local_role: LocalRole,
         root: [u8; 32],
     ) -> Result<IndexedSessionRecordKey, IndexedSessionStoreError> {
+        // Wiped on every return path, including a refused PairInit.
+        let root = Zeroizing::new(root);
         verify_init(init, trust, now_ms)?;
         let key = IndexedSessionRecordKey {
             profile_id: PROFILE_ID.to_vec(),
@@ -1773,7 +1775,7 @@ impl IndexedSessionStore {
             lifecycle: SessionLifecycle::Provisional,
             response_hash: None,
         };
-        self.create_trusted_session(binding, root)?;
+        self.create_trusted_session(binding, &root)?;
         Ok(key)
     }
 
@@ -2684,8 +2686,10 @@ impl IndexedSessionStore {
         })
     }
 
-    /// Executes the production-disabled endpoint acceptance transaction from
-    /// `ATSAM_ENDPOINT_TRANSACTION_V1.md`. No live transport calls this API.
+    /// Executes the endpoint acceptance transaction from
+    /// `ATSAM_ENDPOINT_TRANSACTION_V1.md`. Live: `lan_dispatch` calls it for
+    /// every inbound LAN-direct message in default builds (the generic
+    /// [`INDEXED_SESSION_STORE_PRODUCTION_ENABLED`] tripwire stays `false`).
     #[allow(clippy::too_many_arguments)]
     pub fn accept_message_envelope(
         &mut self,
@@ -2749,7 +2753,7 @@ impl IndexedSessionStore {
             direction,
         )
         .map_err(|_| IndexedSessionStoreError::RouteTagMismatch)?;
-        if env.routing_tag != expected_route {
+        if !route_tag_eq(&env.routing_tag, &expected_route) {
             return Err(IndexedSessionStoreError::RouteTagMismatch);
         }
         if before_session_start(now_ms, state.binding.created_at_ms)
@@ -3889,7 +3893,7 @@ impl IndexedSessionStore {
             direction,
         )
         .map_err(|_| IndexedSessionStoreError::RouteTagMismatch)?;
-        if env.routing_tag != expected_route {
+        if !route_tag_eq(&env.routing_tag, &expected_route) {
             return Err(IndexedSessionStoreError::RouteTagMismatch);
         }
         if before_session_start(now_ms, state.binding.created_at_ms)
@@ -4297,6 +4301,17 @@ pub fn endpoint_device_hint(device_ed25519: &[u8; 32]) -> u64 {
     hasher.update(device_ed25519);
     let digest = hasher.finalize();
     u64::from_be_bytes(digest[..8].try_into().expect("fixed SHA-256 prefix"))
+}
+
+/// Constant-time route-tag equality. The expected tag is derived from the
+/// session root, so an early-exit comparison would leak through timing how
+/// many leading bytes of an attacker-chosen tag already match.
+fn route_tag_eq(received: &[u8; 16], expected: &[u8; 16]) -> bool {
+    let mut diff = 0u8;
+    for (a, b) in received.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 fn local_device_for_binding(binding: &IndexedSessionBinding) -> &[u8; 32] {
@@ -4845,7 +4860,7 @@ fn insert_pending_outbound(
     .map_err(|_| IndexedSessionStoreError::OutboundBindingMismatch)?;
     if !envelope.verify(local_device_for_binding(binding))
         || envelope.dest_device_hint != endpoint_device_hint(remote_device_for_binding(binding))
-        || envelope.routing_tag != expected_route
+        || !route_tag_eq(&envelope.routing_tag, &expected_route)
         || before_session_start(envelope.created_at, binding.created_at_ms)
         || envelope.expires_at > binding.expires_at_ms
     {
@@ -5015,7 +5030,7 @@ fn validate_committed_outbound(
     };
     if envelope.flags != OUTBOUND_FLAGS
         || envelope.message_id != row.message_id
-        || envelope.routing_tag != expected_route
+        || !route_tag_eq(&envelope.routing_tag, &expected_route)
         || envelope.dest_device_hint
             != endpoint_device_hint(remote_device_for_binding(&state.binding))
         || before_session_start(envelope.created_at, state.binding.created_at_ms)
@@ -6911,6 +6926,20 @@ mod tests {
     /// early error, a changed number of protected writes) fails the test with
     /// a message instead of hanging `cargo test` forever.
     const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn route_tag_comparison_checks_every_bit() {
+        let tag: [u8; 16] = std::array::from_fn(|i| (i as u8).wrapping_mul(37) ^ 0xA5);
+        assert!(route_tag_eq(&tag, &tag));
+        for byte in 0..16 {
+            for bit in 0..8 {
+                let mut other = tag;
+                other[byte] ^= 1 << bit;
+                assert!(!route_tag_eq(&other, &tag), "byte {byte} bit {bit}");
+                assert!(!route_tag_eq(&tag, &other), "byte {byte} bit {bit}");
+            }
+        }
+    }
 
     /// Single-use start barrier whose `wait` panics on timeout.
     struct TimedBarrier {

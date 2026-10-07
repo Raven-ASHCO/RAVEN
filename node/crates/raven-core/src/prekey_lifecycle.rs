@@ -31,8 +31,11 @@ use crate::pair_init::{
 };
 use crate::prekey_bundle::{PrekeyBundle, PrekeyStore, MLKEM768_EK_LEN};
 
-/// No live endpoint may instantiate this actor until the remaining PairInit
-/// carrier, cross-language transition, and review gates are complete.
+/// Generic production tripwire; stays `false` until the remaining PairInit
+/// carrier, cross-language transition, and review gates are complete. It is
+/// not consulted by [`PrekeyLifecycleActor::open`]: the LAN-direct slice
+/// (`lan_dispatch`, raven-node's listener preflight and periodic prune)
+/// already opens the actor in default builds under its own gate.
 pub const PREKEY_LIFECYCLE_PRODUCTION_ENABLED: bool = false;
 
 pub fn live_enabled() -> bool {
@@ -1652,7 +1655,8 @@ fn prepare_claim(
             handoff_deadline_ms,
             retain_until_ms,
             state: ClaimState::PendingHandoff,
-            provisional_root: Some(root),
+            // The claim keeps its own copy; the local `root` is wiped on drop.
+            provisional_root: Some(*root),
             initiator_address: value.initiator_address.clone(),
         }),
         one_time_reused,
@@ -2200,7 +2204,7 @@ mod tests {
             &transcript_hash(&pair).unwrap(),
         )
         .unwrap();
-        assert_eq!(*first_root, expected);
+        assert_eq!(*first_root, *expected);
         let mut duplicate = take_claim(
             fixture
                 .actor
@@ -2210,7 +2214,7 @@ mod tests {
         assert_eq!(duplicate.claim_id(), first.claim_id());
         assert_eq!(
             duplicate.take_provisional_root().map(|root| *root),
-            Some(expected)
+            Some(*expected)
         );
         let status = fixture.actor.status().unwrap();
         assert_eq!(status.accepted_claims, 1);

@@ -387,6 +387,48 @@ async fn serve_listener(
     .await
 }
 
+/// How often the service prunes expired durable LAN state. Listener start-up
+/// and each new PairInit prune too, but a node that keeps running and never
+/// pairs again must still destroy an expired session's `K_root`, outbox
+/// envelopes and inbox rows.
+pub(crate) const DURABLE_PRUNE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// A prune that keeps failing does so every interval: log it once an hour.
+static PRUNE_LOG: netutil::LogLimiter = netutil::LogLimiter::new(Duration::from_secs(3600));
+
+/// Run `pass` once at start and then every `interval`, for ever. Each pass
+/// runs on the blocking pool and takes and releases its SQLite / keystore
+/// locks itself, so nothing is held across an await. A failed or panicking
+/// pass is logged (rate limited) and the next tick simply tries again.
+async fn run_periodic<F>(name: &'static str, interval: Duration, pass: F) -> Infallible
+where
+    F: Fn() -> Result<(), String> + Send + Sync + 'static,
+{
+    let pass = Arc::new(pass);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        // The first tick completes at once: the pass at start.
+        ticker.tick().await;
+        let p = Arc::clone(&pass);
+        let outcome = match tokio::task::spawn_blocking(move || p()).await {
+            Ok(result) => result,
+            Err(e) => Err(format!("pass ended abnormally: {e}")),
+        };
+        if let Err(e) = outcome {
+            netutil::log_limited(&PRUNE_LOG, &format!("{name} failed"), e);
+        }
+    }
+}
+
+/// The service's periodic expiry prune (supervised in `main`).
+pub async fn run_durable_prune(data_dir: PathBuf) -> Result<(), String> {
+    match run_periodic("durable_prune", DURABLE_PRUNE_INTERVAL, move || {
+        raven_core::lan_dispatch::prune_expired_lan_durable_state(&data_dir)
+    })
+    .await {}
+}
+
 /// Send `frames` and collect the replies into `progress`. Ends as soon as
 /// every frame that gets a reply has had it; a peer that closes without
 /// replying is an error rather than an empty success.
@@ -506,6 +548,30 @@ mod tests {
     use crate::netutil::{Admission, ReplyWaits};
     use raven_core::envelope::{EnvType, Envelope};
     use tokio::net::TcpStream;
+
+    /// The service prunes once at start and then every interval; a pass that
+    /// fails or panics is only logged and the next tick runs again.
+    #[tokio::test(start_paused = true)]
+    async fn periodic_prune_runs_at_start_then_every_interval_despite_failures() {
+        use std::sync::atomic::AtomicUsize;
+        let passes = Arc::new(AtomicUsize::new(0));
+        let p = Arc::clone(&passes);
+        let task = tokio::spawn(run_periodic(
+            "test_prune",
+            DURABLE_PRUNE_INTERVAL,
+            move || match p.fetch_add(1, Ordering::SeqCst) {
+                0 => Err("store busy".into()),
+                1 => panic!("prune bug (test)"),
+                _ => Ok(()),
+            },
+        ));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(passes.load(Ordering::SeqCst), 1, "one pass at start");
+        tokio::time::sleep(DURABLE_PRUNE_INTERVAL * 3).await;
+        assert_eq!(passes.load(Ordering::SeqCst), 4);
+        assert!(!task.is_finished());
+        task.abort();
+    }
 
     #[test]
     fn preflight_fails_without_identity() {

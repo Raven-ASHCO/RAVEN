@@ -78,7 +78,7 @@ pub use atsam_aead::{build_aad_v1, build_aad_v2, seal_rvna1_v2, unseal_rvna1_v2}
 pub use atsam_mlkem::{
     begin_hybrid_initiation, respond_hybrid_root, HybridKeypair, PendingHybridInitiation,
 };
-pub use atsam_root::{derive_root, transcript_hash, x25519_shared, x25519_shared_checked};
+pub use atsam_root::{derive_root, transcript_hash, x25519_shared_checked};
 pub use ble_adapter::{
     ble_frame_decode, ble_frame_encode, select_ble_adapter, select_ble_adapter_from_env,
     validate_opaque_rvn1, BleAdapterKind,
