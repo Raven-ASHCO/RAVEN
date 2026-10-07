@@ -28,6 +28,16 @@ decision, and `now_ms`. Processing order is mandatory:
    index. Reject every other protocol/suite for this profile.
 4. Resolve exactly one session whose expected inbound direction, device hint,
    and derived route tag match. Tag matching is only candidate selection.
+   Session-specific lifetime checks run only after this selection, against the
+   selected session, with the start-bound skew tolerance of
+   [`RAVEN_PAIR_INIT_V1.md`](RAVEN_PAIR_INIT_V1.md) §1: neither `now_ms` nor
+   the envelope `created_at` may precede the session start (its signed PairInit
+   `created_at_ms`) by more than `MAX_PEER_CLOCK_SKEW_MS` (300000 ms), while
+   `now_ms < session expires_at_ms` and envelope
+   `expires_at <= session expires_at_ms` stay exact. A lifetime check placed
+   before selection would refuse a valid envelope sealed under another live
+   session with the same peer (for example the older of two crossed sessions).
+   Outbound sealing applies the same session-window rule.
 5. Require a currently accepted, non-revoked sender device certificate and
    verify the outer Ed25519 signature with that exact device key.
 6. Compute the immutable object digest over the canonical signing bytes and

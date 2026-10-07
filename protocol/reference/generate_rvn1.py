@@ -12,6 +12,7 @@ from raven_protocol import (
     device_cert,
     device_revocation,
     device_revocation_conformance as rev_conf,
+    ed25519_strict,
     envelope,
     fingerprint,
     indexed_session,
@@ -429,6 +430,41 @@ def main():
         {"packed_hex": envelope.pack(expired).hex(), "validation_clock_ms": EPOCH_MS,
          "signer_ed_public_hex": ALICE_ED_PUB.hex()},
         {"unpack_result": "accept", "relay_action": "drop", "drop_reason": "expired"}))
+
+    # Ed25519 weak-key forgery (2026-10-07). A = R = the identity encoding and
+    # s = 0 satisfy the cofactorless check [s]B = R + [k]A for EVERY message,
+    # and plain OpenSSL verification accepts it. Every Raven verifier MUST
+    # reject it (small-order A / R blocklist, canonical s).
+    weak_identity = bytes([1]) + bytes(31)
+    weak_signature = weak_identity + bytes(32)
+    forged_envelope = build_message_envelope()
+    forged_envelope.sender_authentication = weak_signature
+    forgery_messages = [
+        b"",
+        b"rvn1 weak-key forgery",
+        envelope.signing_bytes(forged_envelope),
+    ]
+    for message in forgery_messages:
+        assert not ed25519_strict.verify(weak_identity, weak_signature, message)
+    assert not envelope.verify(forged_envelope, weak_identity)
+    write(out, "negative/ed25519_weak_key_forgery_001.json", vec(
+        "Ed25519 weak-key forgery (A = R = identity, s = 0) must be rejected",
+        "public key A and signature R are both the identity encoding 01 00..00 "
+        "(order 1) and s = 0, so the cofactorless equation holds for every message "
+        "and plain OpenSSL verification accepts it; strict verification (reject a "
+        "small-order A or R by the 7-entry blocklist compared with the sign bit "
+        "masked, reject s >= L) MUST reject it for every message, including the "
+        "signing bytes of a real envelope claiming this key as its signer",
+        {"public_key_hex": weak_identity.hex(),
+         "signature_hex": weak_signature.hex(),
+         "messages_hex": [m.hex() for m in forgery_messages],
+         "envelope_packed_hex": envelope.pack(forged_envelope).hex(),
+         "small_order_encodings_hex": [e.hex() for e in ed25519_strict.SMALL_ORDER_ENCODINGS]},
+        {"verify_result": "reject",
+         "envelope_unpack_result": "accept",
+         "envelope_verify_result": "reject",
+         "small_order_rule": "reject a public key or R whose encoding, with bit 255 "
+                             "masked, equals any small_order_encodings_hex entry"}))
 
     # --- Portable ATSAM / interim KATs (no ML-KEM; label agreement only) ---
     local_pub = bytes([0x01] * 32)
@@ -862,6 +898,195 @@ def main():
             "input": {"pair_init_wire_hex": wire.hex()},
             "expected": {"decode_result": "reject", "rust_error": err},
         })
+
+    # 2026-10-07 negatives. Small-order initiator ephemeral (an order-8 X25519
+    # point), re-signed with the KAT initiator device key so that the signature
+    # verifies and ONLY the RAVEN_PAIR_INIT_V1 section 3 structural rule fails.
+    small_order_u = bytes.fromhex(
+        "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"
+    )
+    assert not pair_init.is_contributory_x25519(small_order_u)
+    eph_offset = 12 + pair_init.PROFILE_LEN + 2 * pair_init.ADDRESS_LEN + 16 + 32 + 2 * 32
+    assert pi_wire[eph_offset:eph_offset + 32] == pair.initiator_ephemeral_x25519_pub
+    so_prefix = patched(eph_offset, small_order_u)[:pair_init.INIT_SIGNED_PREFIX_LEN]
+    so_signing = pair_init.INIT_SIGNING_DOMAIN + so_prefix
+    so_wire = so_prefix + alice_device_private.sign(so_signing)
+    assert ed25519_strict.verify(alice_device_ed, so_wire[-64:], so_signing)
+    try:
+        pair_init.decode_init(so_wire)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("small-order ephemeral accepted by the reference decoder")
+    write(out, "atsam/negative/pair_init_v1_small_order_ephemeral_001.json", {
+        "id": "pair_init_v1_small_order_ephemeral_001",
+        "description": (
+            "PairInit V1 decode must reject: initiator ephemeral X25519 key is a "
+            "small-order (order-8) point. Re-signed with the KAT initiator device "
+            "key, so the initiator signature VERIFIES and only the section 3 "
+            "structural small-order rule fails; reject before any signature check, "
+            "state mutation, journal, or claim"
+        ),
+        "protocol_version": "rvn1",
+        "deterministic": True,
+        "production_enabled": pair_init.PRODUCTION_ENABLED,
+        "source_vector": "atsam/pair_init_v1_001.json",
+        "input": {
+            "pair_init_wire_hex": so_wire.hex(),
+            "initiator_device_ed_pub_hex": alice_device_ed.hex(),
+            "initiator_ephemeral_x25519_pub_hex": small_order_u.hex(),
+            "initiator_ephemeral_offset": eph_offset,
+        },
+        "expected": {
+            "decode_result": "reject",
+            "rust_error": "NonContributoryKey",
+            "initiator_signature_valid": True,
+        },
+    })
+
+    # PairInit V1 / PairResponse clock-skew boundaries (RAVEN_PAIR_INIT_V1
+    # sections 1 and 5): start bounds tolerate MAX_PEER_CLOCK_SKEW_MS, expiry
+    # bounds are exact.
+    skew = pair_init.MAX_PEER_CLOCK_SKEW_MS
+
+    def cert_fields(cert, identity_pub):
+        return {
+            "user_ed_pub_hex": identity_pub.hex(),
+            "device_ed_pub_hex": cert.device_ed_pub.hex(),
+            "device_x_pub_hex": cert.device_x_pub.hex(),
+            "device_id": cert.device_id,
+            "not_before_ms": cert.not_before,
+            "not_after_ms": cert.not_after,
+            "capabilities": cert.capabilities,
+            "signature_hex": cert.signature.hex(),
+        }
+
+    def prekey_fields(bundle):
+        return {
+            "identity_ed25519_pub_hex": bundle.identity_ed25519_pub.hex(),
+            "device_id": bundle.device_id,
+            "x25519_pub_hex": bundle.x25519_pub.hex(),
+            "signed_prekey_id": bundle.signed_prekey_id,
+            "one_time_prekey_id": bundle.one_time_prekey_id,
+            "one_time_x25519_pub_hex": bundle.one_time_x25519_pub.hex(),
+            "created_at_ms": bundle.created_at_ms,
+            "expires_at_ms": bundle.expires_at_ms,
+            "signature_hex": bundle.signature.hex(),
+        }
+
+    def trust_window(bundle):
+        return (
+            max(alice_cert.not_before, bob_cert.not_before, bundle.created_at_ms),
+            min(alice_cert.not_after, bob_cert.not_after, bundle.expires_at_ms),
+        )
+
+    def init_case(label, init_value, bundle, now_ms, rust_error=None):
+        not_before, not_after = trust_window(bundle)
+        accepted = pair_init.verify_init(
+            init_value,
+            ALICE_ED_PUB,
+            BOB_ED_PUB,
+            expected_initiator_device_ed_pub=alice_device_ed,
+            expected_responder_device_ed_pub=bob_device_ed,
+            expected_responder_signed_x25519_pub=bob_signed_x,
+            expected_responder_one_time_x25519_pub=bob_one_time_x,
+            expected_initiator_device_cert_hash=alice_cert_hash,
+            expected_responder_device_cert_hash=bob_cert_hash,
+            expected_responder_prekey_bundle_hash=pair_init.prekey_bundle_hash(
+                prekey.signing_bytes(bundle), bundle.signature
+            ),
+            expected_signed_prekey_id=bundle.signed_prekey_id,
+            expected_one_time_prekey_id=bundle.one_time_prekey_id,
+            expected_responder_mlkem768_ek=mlkem_ek,
+            expected_trust_not_before_ms=not_before,
+            expected_trust_not_after_ms=not_after,
+            now_ms=now_ms,
+        )
+        assert accepted == (rust_error is None), label
+        assert prekey.verify(bundle, now_ms), label
+        case = {
+            "label": label,
+            "pair_init_wire_hex": pair_init.encode_init(init_value).hex(),
+            "responder_prekey": prekey_fields(bundle),
+            "trust_not_before_ms": not_before,
+            "trust_not_after_ms": not_after,
+            "now_ms": now_ms,
+            "result": "accept" if accepted else "reject",
+        }
+        if rust_error is not None:
+            case["rust_error"] = rust_error
+        return case
+
+    def skewed_trust_init(prekey_created_ms):
+        bundle = prekey.PrekeyBundle(**{**bob_prekey.__dict__, "created_at_ms": prekey_created_ms})
+        bundle.signature = Ed25519PrivateKey.from_private_bytes(BOB_ED_PRIV).sign(
+            prekey.signing_bytes(bundle)
+        )
+        value = pair_init.PairInit(**{
+            **pair.__dict__,
+            "responder_prekey_bundle_hash": pair_init.prekey_bundle_hash(
+                prekey.signing_bytes(bundle), bundle.signature
+            ),
+        })
+        value.signature = alice_device_private.sign(pair_init.init_signing_bytes(value))
+        return value, bundle
+
+    created, expires = pair.created_at_ms, pair.expires_at_ms
+    trust_accept, trust_accept_bundle = skewed_trust_init(created + skew)
+    trust_reject, trust_reject_bundle = skewed_trust_init(created + skew + 1)
+    init_cases = [
+        init_case("created_at_ms = now_ms + skew (verifier clock behind)",
+                  pair, bob_prekey, created - skew),
+        init_case("created_at_ms = now_ms + skew + 1",
+                  pair, bob_prekey, created - skew - 1, "NotCurrentlyValid"),
+        init_case("expiry exact: now_ms = expires_at_ms - 1", pair, bob_prekey, expires - 1),
+        init_case("expiry exact: now_ms = expires_at_ms",
+                  pair, bob_prekey, expires, "NotCurrentlyValid"),
+        init_case("trust start: created_at_ms = trust_not_before_ms - skew",
+                  trust_accept, trust_accept_bundle, created + skew + 1),
+        init_case("trust start: created_at_ms = trust_not_before_ms - skew - 1",
+                  trust_reject, trust_reject_bundle, created + skew + 1,
+                  "TrustWindowMismatch"),
+    ]
+    response_cases = []
+    for label, now_ms, rust_error in (
+        ("response created_at_ms = now_ms + skew", response.created_at_ms - skew, None),
+        ("response created_at_ms = now_ms + skew + 1",
+         response.created_at_ms - skew - 1, "ConfirmationMismatch"),
+        ("response expiry exact: now_ms = expires_at_ms - 1", response.expires_at_ms - 1, None),
+        ("response expiry exact: now_ms = expires_at_ms",
+         response.expires_at_ms, "ConfirmationMismatch"),
+    ):
+        accepted = pair_init.verify_response(response, pair, provisional_root, now_ms=now_ms)
+        assert accepted == (rust_error is None), label
+        case = {"label": label, "now_ms": now_ms, "result": "accept" if accepted else "reject"}
+        if rust_error is not None:
+            case["rust_error"] = rust_error
+        response_cases.append(case)
+    write(out, "atsam/pair_init_v1_clock_skew_001.json", {
+        "id": "pair_init_v1_clock_skew_001",
+        "description": (
+            "PairInit V1 / PairResponse clock-skew boundaries: START bounds (signed "
+            "creation vs the verifier clock, and vs the trust-window start) tolerate "
+            "exactly max_peer_clock_skew_ms; expiry bounds are exact. Trust-start "
+            "cases re-sign the responder prekey bundle (Bob identity key) and the "
+            "PairInit (KAT initiator device key); certificates are those of the "
+            "source vector"
+        ),
+        "protocol_version": "rvn1",
+        "deterministic": True,
+        "production_enabled": pair_init.PRODUCTION_ENABLED,
+        "source_vector": "atsam/pair_init_v1_001.json",
+        "input": {
+            "max_peer_clock_skew_ms": skew,
+            "initiator_device_cert": cert_fields(alice_cert, ALICE_ED_PUB),
+            "responder_device_cert": cert_fields(bob_cert, BOB_ED_PUB),
+            "responder_mlkem768_ek_hex": mlkem_ek.hex(),
+            "provisional_k_root_hex": provisional_root.hex(),
+            "pair_response_wire_hex": pair_init.encode_response(response).hex(),
+        },
+        "expected": {"init_cases": init_cases, "response_cases": response_cases},
+    })
 
     # Root HKDF (Z_X||Z_PQ + transcript) — matches raven-core::atsam_root / ATSAMRootDerivation
     z_x = bytes([0x11] * 32)

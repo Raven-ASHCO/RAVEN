@@ -196,3 +196,46 @@ def test_candidate_fail_and_crash_order():
     crash = _load("tr_crash_ack_cas_001.json")
     assert crash["steps"][2]["action"] == "write_PENDING_ACK_SEND"
     assert crash["steps"][3]["requires"] == "PENDING_ACK_SEND"
+
+
+def test_pair_init_v2_structural_hard_rejects_match_v1():
+    import copy
+
+    import pytest
+
+    from raven_protocol import pair_init
+
+    vector = json.loads((VEC / "pair_init_v2_001.json").read_text())
+    wire = bytes.fromhex(vector["expected"]["pair_init_wire_hex"])
+    offsets = vector["expected"]["offsets"]
+    base = piv2.decode_init(wire)
+    low_order = [
+        bytes(32),
+        bytes([1]) + bytes(31),
+        bytes.fromhex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+        bytes.fromhex("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+        bytes.fromhex("ec" + "ff" * 30 + "7f"),
+        bytes.fromhex("ed" + "ff" * 30 + "7f"),
+        bytes.fromhex("ee" + "ff" * 30 + "7f"),
+    ]
+    mutations = [("initiator_ephemeral_x25519_pub", point) for point in low_order]
+    mutations += [
+        ("responder_mlkem768_ek", bytes(pair_init.MLKEM768_EK_LEN)),
+        ("mlkem768_ciphertext", bytes(pair_init.MLKEM768_CT_LEN)),
+        ("init_id", bytes(16)),
+        ("pairing_nonce", bytes(32)),
+        ("initiator_device_ed_pub", bytes(32)),
+        ("responder_device_ed_pub", bytes(32)),
+        ("initiator_device_cert_hash", bytes(32)),
+        ("responder_device_cert_hash", bytes(32)),
+        ("responder_prekey_bundle_hash", bytes(32)),
+    ]
+    for field_name, replacement in mutations:
+        hostile = copy.copy(base)
+        setattr(hostile, field_name, replacement)
+        with pytest.raises(ValueError):
+            piv2.init_signing_bytes(hostile)
+        offset = offsets[field_name]
+        tampered = wire[:offset] + replacement + wire[offset + len(replacement):]
+        with pytest.raises(ValueError):
+            piv2.decode_init(tampered)

@@ -138,6 +138,15 @@ ratchet inside a session. Consequently:
   that session's traffic against later compromise. Until then, at-rest
   protection of the session state is the only barrier.
 
+**Session lifetime (informative).** Because the exposure above spans the whole
+session, initiators SHOULD keep sessions short. This implementation initiates
+sessions whose signed PairInit lifetime is 24 hours
+(`lan_dispatch::LAN_SESSION_LIFETIME_MS`); as responder it still accepts the
+7-day PairInit maximum of
+[`RAVEN_PREKEY_LIFECYCLE_V1.md`](RAVEN_PREKEY_LIFECYCLE_V1.md) §4 from other
+initiators. A short lifetime bounds, but does not remove, the in-session
+exposure.
+
 Implementations and product text MUST NOT describe this profile as providing
 per-message forward secrecy or post-compromise security. Those properties
 require a ratcheting successor profile (for example
@@ -269,7 +278,13 @@ satisfied. PairInit V1
 negotiates this profile context in pure codec/KDF vectors but is itself
 production disabled.
 In particular, RVNA1 `0x03` is intentionally absent from live endpoint and
-relay classifiers today.
+relay classifiers today, with one scoped exception: the owner waiver
+[`WAIVER-LAN-DIRECT-2026-10-07`](../docs/WAIVER_LAN_DIRECT_INDEXED_SESSION_2026-10-07.md) keeps the LAN-direct slice (PairInit V1 /
+PairResponse over Noise XX between two `raven-node` services, contacts only,
+RVNA1 `0x03` messages and sealed ACKs) enabled in default and release builds.
+The waiver does not satisfy the gates above, and every other carrier, relay,
+mailbox, and store path for this profile stays disabled. It MUST NOT be
+described as Session V2.
 
 Deterministic fixtures:
 

@@ -1,8 +1,7 @@
 # raven_protocol/envelope.py
 import hashlib, struct
 from dataclasses import dataclass
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.exceptions import InvalidSignature
+from . import ed25519_strict
 
 MAGIC = b"RVN1"
 VERSION = 1
@@ -70,8 +69,7 @@ def signing_bytes(e: Envelope) -> bytes:
 
 def verify(e: Envelope, signer_ed_pub: bytes) -> bool:
     try:
-        Ed25519PublicKey.from_public_bytes(signer_ed_pub).verify(
-            e.sender_authentication, signing_bytes(e))
-        return True
-    except (InvalidSignature, ValueError):
+        return ed25519_strict.verify(
+            signer_ed_pub, e.sender_authentication, signing_bytes(e))
+    except ValueError:
         return False

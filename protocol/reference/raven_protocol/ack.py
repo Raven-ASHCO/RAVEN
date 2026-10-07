@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from ._canon import u64
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.exceptions import InvalidSignature
+from . import ed25519_strict
 
 @dataclass
 class Ack:
@@ -21,7 +20,6 @@ def signing_bytes(a: Ack) -> bytes:
 
 def verify(a: Ack, sig: bytes, signer_ed_pub: bytes) -> bool:
     try:
-        Ed25519PublicKey.from_public_bytes(signer_ed_pub).verify(sig, signing_bytes(a))
-        return True
-    except (InvalidSignature, ValueError):
+        return ed25519_strict.verify(signer_ed_pub, sig, signing_bytes(a))
+    except ValueError:
         return False

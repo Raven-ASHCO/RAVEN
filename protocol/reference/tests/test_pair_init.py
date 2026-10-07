@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from raven_protocol import pair_init
+from raven_protocol import device_cert, ed25519_strict, pair_init, prekey
 
 
 VECTOR = (
@@ -215,3 +215,155 @@ def test_low_order_initiator_ephemeral_is_rejected(kat, decoded):
         with pytest.raises(ValueError):
             pair_init.init_signing_bytes(hostile)
         assert not pair_init.verify_init(hostile, **_verify_args(kat, hostile))
+
+
+SKEW = pair_init.MAX_PEER_CLOCK_SKEW_MS
+RVN1 = Path(__file__).resolve().parents[3] / "shared-vectors" / "rvn1"
+
+
+def test_clock_skew_constant_matches_rust_bound():
+    # Rust: prekey_lifecycle::MAX_PREKEY_FUTURE_SKEW_MS = 5 * 60 * 1_000.
+    assert SKEW == 300_000
+
+
+def test_verify_init_start_bound_tolerates_exactly_the_skew(kat, decoded):
+    args = _verify_args(kat, decoded)
+    created = decoded.created_at_ms
+    for now_ms, accepted in (
+        (created - SKEW, True),
+        (created - SKEW - 1, False),
+        (decoded.expires_at_ms - 1, True),
+        (decoded.expires_at_ms, False),  # expiry stays exact
+    ):
+        assert pair_init.verify_init(decoded, **{**args, "now_ms": now_ms}) is accepted, now_ms
+
+
+def test_verify_init_trust_window_start_tolerates_exactly_the_skew(kat, decoded):
+    args = _verify_args(kat, decoded)
+    created = decoded.created_at_ms
+    for not_before, accepted in ((created + SKEW, True), (created + SKEW + 1, False)):
+        assert pair_init.verify_init(
+            decoded, **{**args, "expected_trust_not_before_ms": not_before}
+        ) is accepted, not_before
+    # The trust-window end is exact.
+    expires = decoded.expires_at_ms
+    for not_after, accepted in ((expires, True), (expires - 1, False)):
+        assert pair_init.verify_init(
+            decoded, **{**args, "expected_trust_not_after_ms": not_after}
+        ) is accepted, not_after
+
+
+def test_verify_response_start_bound_tolerates_exactly_the_skew(kat, decoded):
+    expected = kat["expected"]
+    root = bytes.fromhex(expected["provisional_k_root_hex"])
+    response = pair_init.decode_response(bytes.fromhex(expected["pair_response_wire_hex"]))
+    for now_ms, accepted in (
+        (response.created_at_ms - SKEW, True),
+        (response.created_at_ms - SKEW - 1, False),
+        (response.expires_at_ms - 1, True),
+        (response.expires_at_ms, False),
+    ):
+        assert pair_init.verify_response(response, decoded, root, now_ms=now_ms) is accepted
+
+
+def test_shared_clock_skew_vector(kat):
+    vector = json.loads((RVN1 / "atsam" / "pair_init_v1_clock_skew_001.json").read_text())
+    inputs = vector["input"]
+    assert inputs["max_peer_clock_skew_ms"] == SKEW
+    alice_cert = inputs["initiator_device_cert"]
+    bob_cert = inputs["responder_device_cert"]
+    certs = {}
+    for name, fields in (("initiator", alice_cert), ("responder", bob_cert)):
+        cert = device_cert.DeviceCert(
+            device_ed_pub=bytes.fromhex(fields["device_ed_pub_hex"]),
+            device_x_pub=bytes.fromhex(fields["device_x_pub_hex"]),
+            device_id=fields["device_id"],
+            not_before=fields["not_before_ms"],
+            not_after=fields["not_after_ms"],
+            capabilities=fields["capabilities"],
+            signature=bytes.fromhex(fields["signature_hex"]),
+        )
+        identity = bytes.fromhex(fields["user_ed_pub_hex"])
+        assert device_cert.verify(cert, identity)
+        certs[name] = (cert, identity)
+        assert pair_init.device_certificate_hash(
+            identity, device_cert.signing_bytes(cert), cert.signature
+        ).hex() == kat["expected"][f"{name}_device_cert_hash_hex"]
+    ek = bytes.fromhex(inputs["responder_mlkem768_ek_hex"])
+    seen = {"accept": 0, "reject": 0}
+    for case in vector["expected"]["init_cases"]:
+        value = pair_init.decode_init(bytes.fromhex(case["pair_init_wire_hex"]))
+        fields = case["responder_prekey"]
+        bundle = prekey.PrekeyBundle(
+            identity_ed25519_pub=bytes.fromhex(fields["identity_ed25519_pub_hex"]),
+            device_id=fields["device_id"],
+            x25519_pub=bytes.fromhex(fields["x25519_pub_hex"]),
+            mlkem768_ek=ek,
+            signed_prekey_id=fields["signed_prekey_id"],
+            one_time_prekey_id=fields["one_time_prekey_id"],
+            one_time_x25519_pub=bytes.fromhex(fields["one_time_x25519_pub_hex"]),
+            created_at_ms=fields["created_at_ms"],
+            expires_at_ms=fields["expires_at_ms"],
+            signature=bytes.fromhex(fields["signature_hex"]),
+        )
+        assert prekey.verify(bundle, case["now_ms"]), case["label"]
+        initiator, responder = certs["initiator"], certs["responder"]
+        assert case["trust_not_before_ms"] == max(
+            initiator[0].not_before, responder[0].not_before, bundle.created_at_ms
+        )
+        assert case["trust_not_after_ms"] == min(
+            initiator[0].not_after, responder[0].not_after, bundle.expires_at_ms
+        )
+        accepted = pair_init.verify_init(
+            value,
+            initiator[1],
+            responder[1],
+            expected_initiator_device_ed_pub=initiator[0].device_ed_pub,
+            expected_responder_device_ed_pub=responder[0].device_ed_pub,
+            expected_responder_signed_x25519_pub=bundle.x25519_pub,
+            expected_responder_one_time_x25519_pub=bundle.one_time_x25519_pub,
+            expected_initiator_device_cert_hash=pair_init.device_certificate_hash(
+                initiator[1], device_cert.signing_bytes(initiator[0]), initiator[0].signature
+            ),
+            expected_responder_device_cert_hash=pair_init.device_certificate_hash(
+                responder[1], device_cert.signing_bytes(responder[0]), responder[0].signature
+            ),
+            expected_responder_prekey_bundle_hash=pair_init.prekey_bundle_hash(
+                prekey.signing_bytes(bundle), bundle.signature
+            ),
+            expected_signed_prekey_id=bundle.signed_prekey_id,
+            expected_one_time_prekey_id=bundle.one_time_prekey_id,
+            expected_responder_mlkem768_ek=ek,
+            expected_trust_not_before_ms=case["trust_not_before_ms"],
+            expected_trust_not_after_ms=case["trust_not_after_ms"],
+            now_ms=case["now_ms"],
+        )
+        assert accepted is (case["result"] == "accept"), case["label"]
+        seen[case["result"]] += 1
+    assert seen == {"accept": 3, "reject": 3}
+    source = pair_init.decode_init(bytes.fromhex(kat["expected"]["pair_init_wire_hex"]))
+    root = bytes.fromhex(inputs["provisional_k_root_hex"])
+    response = pair_init.decode_response(bytes.fromhex(inputs["pair_response_wire_hex"]))
+    for case in vector["expected"]["response_cases"]:
+        assert pair_init.verify_response(
+            response, source, root, now_ms=case["now_ms"]
+        ) is (case["result"] == "accept"), case["label"]
+
+
+def test_shared_small_order_ephemeral_vector_fails_only_the_structural_rule():
+    vector = json.loads(
+        (RVN1 / "atsam" / "negative" / "pair_init_v1_small_order_ephemeral_001.json").read_text()
+    )
+    inputs = vector["input"]
+    wire = bytes.fromhex(inputs["pair_init_wire_hex"])
+    offset = inputs["initiator_ephemeral_offset"]
+    point = bytes.fromhex(inputs["initiator_ephemeral_x25519_pub_hex"])
+    assert wire[offset : offset + 32] == point
+    assert not pair_init.is_contributory_x25519(point)
+    signing = pair_init.INIT_SIGNING_DOMAIN + wire[: pair_init.INIT_SIGNED_PREFIX_LEN]
+    assert vector["expected"]["initiator_signature_valid"] is True
+    assert ed25519_strict.verify(
+        bytes.fromhex(inputs["initiator_device_ed_pub_hex"]), wire[-64:], signing
+    )
+    with pytest.raises(ValueError, match="low-order"):
+        pair_init.decode_init(wire)

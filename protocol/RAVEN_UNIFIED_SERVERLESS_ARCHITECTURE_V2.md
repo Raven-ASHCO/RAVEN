@@ -317,6 +317,17 @@ No Release / production live flag for Endpoint, LAN secure path, BLE mesh forwar
 
 Automated approval alone MUST NOT activate radio, NAT, relay, DCUtR, or mailbox production paths.
 
+**Recorded owner exception (2026-10-07).** The owner waiver
+[`WAIVER-LAN-DIRECT-2026-10-07`](../docs/WAIVER_LAN_DIRECT_INDEXED_SESSION_2026-10-07.md) (approver, date, scope, residual risks,
+review-by date and withdrawal recorded there) waives holds 2, 3, 4 and 5 for
+the LAN-direct indexed-session slice only: LAN direct TCP between two
+`raven-node` services, Noise XX bound to the Raven identity, PairInit V1 /
+PairResponse from local contacts, `ATSAM/indexed-session/v1` with RVNA1 `0x03`
+messages and sealed ACKs. Hold 1 is not waived. Internet dial, relay, DCUtR,
+mailbox, BLE mesh forwarding, bridge delivery, the Hybrid Ratchet v2 / Full
+Braid lab and PairInit V2 remain held, and the slice MUST NOT be described as
+Session V2.
+
 ### 9.2 Architecture exit criteria
 
 | ID | Criterion |
@@ -393,7 +404,7 @@ Physical radio testing **before** Foundation automated exit (§10.1) remains out
 | Wire objects | RVN1 envelopes remain until a companion introduces a new version byte + vector tree |
 | Hop-mutable V1 fields | `hop_limit` / `replication_budget` mutation on the envelope is **not** V2-conformant; V2 moves such state to hop-local carrier metadata while preserving inner `endpoint_object_bytes` |
 | PairInit V1 | Stay parseable; Session V2 negotiation MUST be explicit (profile id / suite), not silent upgrade |
-| Indexed-session v1 | No Release enablement; lab only |
+| Indexed-session v1 | No Release enablement; lab only — except the LAN-direct slice under the recorded owner waiver [`WAIVER-LAN-DIRECT-2026-10-07`](../docs/WAIVER_LAN_DIRECT_INDEXED_SESSION_2026-10-07.md) (§9.1), which is not Session V2 |
 | Transport Interface V1 | Semantic parent; V2 Carrier API is the conformance target — legacy adapters behind migration gates |
 | MPC / raw LAN fallbacks | Deprecated for V2 canonical path; MUST NOT be default |
 | Flags | New V2 live flags default **off**; enabling requires §9 including physical map §9.3 |

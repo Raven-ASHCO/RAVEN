@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from ._canon import lp, u64
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.exceptions import InvalidSignature
+from . import ed25519_strict
 
 @dataclass
 class DeviceCert:
@@ -15,7 +14,6 @@ def signing_bytes(c: DeviceCert) -> bytes:
 
 def verify(c: DeviceCert, user_identity_ed_pub: bytes) -> bool:
     try:
-        Ed25519PublicKey.from_public_bytes(user_identity_ed_pub).verify(c.signature, signing_bytes(c))
-        return True
-    except (InvalidSignature, ValueError):
+        return ed25519_strict.verify(user_identity_ed_pub, c.signature, signing_bytes(c))
+    except ValueError:
         return False

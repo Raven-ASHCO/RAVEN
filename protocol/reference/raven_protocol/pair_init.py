@@ -10,14 +10,12 @@ from dataclasses import dataclass, field
 import hashlib
 import hmac
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
 )
 
-from . import address, indexed_session
+from . import address, ed25519_strict, indexed_session
 
 
 VERSION = 1
@@ -45,6 +43,11 @@ MLKEM768_CT_LEN = 1088
 SIGNATURE_LEN = 64
 ADDRESS_LEN = 44
 PROFILE_LEN = len(PROFILE_ID)
+# Bounded peer clock skew (RAVEN_PAIR_INIT_V1.md §1, §5; Rust
+# `prekey_lifecycle::MAX_PREKEY_FUTURE_SKEW_MS`). It relaxes only START bounds
+# (signed creation instants compared with the verifier's clock or with the
+# other peer's trust records); every expiry bound stays exact.
+MAX_PEER_CLOCK_SKEW_MS = 300_000
 
 INIT_SIGNED_PREFIX_LEN = (
     8 + 1 + 1 + 1 + 1 + PROFILE_LEN + ADDRESS_LEN * 2 + INIT_ID_LEN
@@ -424,17 +427,19 @@ def verify_init(
         if value.responder_mlkem768_ek != _require_bytes(expected_responder_mlkem768_ek, MLKEM768_EK_LEN, "expected_responder_mlkem768_ek"):
             return False
         if (
-            value.created_at_ms < expected_trust_not_before_ms
+            value.created_at_ms + MAX_PEER_CLOCK_SKEW_MS < expected_trust_not_before_ms
             or value.expires_at_ms > expected_trust_not_after_ms
         ):
             return False
-        if not value.created_at_ms <= now_ms < value.expires_at_ms:
+        if (
+            value.created_at_ms > now_ms + MAX_PEER_CLOCK_SKEW_MS
+            or now_ms >= value.expires_at_ms
+        ):
             return False
-        Ed25519PublicKey.from_public_bytes(value.initiator_device_ed_pub).verify(
-            value.signature, init_signing_bytes(value)
+        return ed25519_strict.verify(
+            value.initiator_device_ed_pub, value.signature, init_signing_bytes(value)
         )
-        return True
-    except (InvalidSignature, ValueError):
+    except ValueError:
         return False
 
 
@@ -551,15 +556,17 @@ def verify_response(
             or value.expires_at_ms > accepted_init.expires_at_ms
         ):
             return False
-        if not value.created_at_ms <= now_ms < value.expires_at_ms:
+        if (
+            value.created_at_ms > now_ms + MAX_PEER_CLOCK_SKEW_MS
+            or now_ms >= value.expires_at_ms
+        ):
             return False
         if not hmac.compare_digest(
             value.confirmation_tag, confirmation_tag(root, digest)
         ):
             return False
-        Ed25519PublicKey.from_public_bytes(value.responder_device_ed_pub).verify(
-            value.signature, response_signing_bytes(value)
+        return ed25519_strict.verify(
+            value.responder_device_ed_pub, value.signature, response_signing_bytes(value)
         )
-        return True
-    except (InvalidSignature, ValueError):
+    except ValueError:
         return False

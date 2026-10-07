@@ -11,10 +11,9 @@ from dataclasses import dataclass, field
 import hashlib
 import hmac
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
+from . import ed25519_strict
 from .pair_init_v2 import hkdf_sha256
 
 PROFILE = b"ATSAM/hybrid-ratchet/v2"
@@ -278,11 +277,8 @@ def sign_ack(ack: AckV2, device_ed_priv: bytes) -> AckV2:
 
 def verify_ack(ack: AckV2, device_ed_pub: bytes) -> bool:
     try:
-        Ed25519PublicKey.from_public_bytes(device_ed_pub).verify(
-            ack.signature, ack_signing_bytes(ack)
-        )
-        return True
-    except (InvalidSignature, ValueError):
+        return ed25519_strict.verify(device_ed_pub, ack.signature, ack_signing_bytes(ack))
+    except ValueError:
         return False
 
 

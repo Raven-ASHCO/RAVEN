@@ -47,7 +47,15 @@ key material.
 
 1. Length / version / field bounds (including `device_id` ≤ 64 UTF-8 bytes;
    a verifier MUST reject a longer id even under a valid signature)  
-2. `expires_at_ms > now` (clock skew tolerance ±5 min)  
+2. Time window with a 5-minute (`300000` ms) clock-skew tolerance on BOTH
+   bounds, both inclusive: reject `expires_at_ms <= created_at_ms` as
+   `PREKEY_EXPIRED`; reject `now_ms + 300000 < created_at_ms` as
+   `PREKEY_NOT_YET_VALID`; reject `now_ms > expires_at_ms + 300000` as
+   `PREKEY_EXPIRED`. The bundle is therefore valid exactly for
+   `created_at_ms - 300000 <= now_ms <= expires_at_ms + 300000` (Rust
+   `PrekeyBundle::verify`; `clock_cases` in `bundle_signing_00{1,2}.json`).
+   This bundle-level grace does not extend a PairInit's own exact expiry
+   ([`RAVEN_PAIR_INIT_V1.md`](RAVEN_PAIR_INIT_V1.md) §1).  
 3. Signature verify against `identity_ed25519_pub`  
 4. Reject if `mlkem768_ek` length ≠ 1184 or is all zero
 5. Reject otp fields inconsistent with `one_time_prekey_id`  

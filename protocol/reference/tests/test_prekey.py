@@ -70,3 +70,61 @@ def test_device_id_is_bounded_to_64_utf8_bytes():
         raise AssertionError("oversized device_id was accepted")
     value.signature = bytes(64)
     assert not prekey.verify(value)
+
+
+def _signing_kat(case_id):
+    import json
+    from pathlib import Path
+
+    vector = json.loads(
+        (Path(__file__).resolve().parents[3] / "shared-vectors" / "rvn1" / "prekey"
+         / f"{case_id}.json").read_text()
+    )
+    inputs = vector["inputs"]
+    otp = inputs["one_time_x25519_pub_hex"]
+    value = prekey.PrekeyBundle(
+        identity_ed25519_pub=bytes.fromhex(inputs["identity_ed25519_pub_hex"]),
+        device_id=inputs["device_id"],
+        x25519_pub=bytes.fromhex(inputs["x25519_pub_hex"]),
+        mlkem768_ek=bytes.fromhex(inputs["mlkem768_ek_hex"]),
+        signed_prekey_id=inputs["signed_prekey_id"],
+        one_time_prekey_id=inputs["one_time_prekey_id"],
+        one_time_x25519_pub=None if otp is None else bytes.fromhex(otp),
+        created_at_ms=inputs["created_at_ms"],
+        expires_at_ms=inputs["expires_at_ms"],
+        signature=bytes.fromhex(vector["expected"]["signature_hex"]),
+    )
+    return value, vector["expected"]["clock_cases"]
+
+
+def test_prekey_time_window_matches_shared_clock_cases():
+    for case_id in ("bundle_signing_001", "bundle_signing_002"):
+        value, cases = _signing_kat(case_id)
+        assert prekey.verify(value)  # legacy call: signature and structure only
+        assert prekey.verify(value, value.created_at_ms)
+        for case in cases:
+            accepted = case["result"] == "accept"
+            assert prekey.verify(value, case["now_ms"]) is accepted, (case_id, case)
+            assert prekey.check_time(value, case["now_ms"]) == case.get("error"), case
+
+
+def test_prekey_time_window_bounds_are_inclusive_and_require_ordered_window():
+    value, _ = _signing_kat("bundle_signing_002")
+    skew = prekey.CLOCK_SKEW_MS
+    assert skew == 300_000
+    assert prekey.check_time(value, value.created_at_ms - skew) is None
+    assert prekey.check_time(value, value.created_at_ms - skew - 1) == "PREKEY_NOT_YET_VALID"
+    assert prekey.check_time(value, value.expires_at_ms + skew) is None
+    assert prekey.check_time(value, value.expires_at_ms + skew + 1) == "PREKEY_EXPIRED"
+    inverted = prekey.PrekeyBundle(**{**value.__dict__})
+    inverted.expires_at_ms = inverted.created_at_ms
+    assert prekey.check_time(inverted, inverted.created_at_ms) == "PREKEY_EXPIRED"
+
+
+def test_all_zero_mlkem_key_is_rejected_even_when_signed():
+    value = bundle()
+    value.mlkem768_ek = bytes(prekey.MLKEM768_EK_LEN)
+    value.signature = Ed25519PrivateKey.from_private_bytes(ALICE_ED_PRIV).sign(
+        prekey.signing_bytes(value)
+    )
+    assert not prekey.verify(value)

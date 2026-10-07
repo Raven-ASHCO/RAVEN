@@ -5,14 +5,11 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ._canon import lp, u64
 from . import address as raven_address
+from . import ed25519_strict
 from .pair_init import device_certificate_hash
 
 MAGIC = b"RVDR1\0\0\0"
@@ -204,11 +201,8 @@ def verify(r: DeviceRevocationV1, identity_ed_pub: bytes) -> bool:
     if raven_address.encode(identity_ed_pub) != r.identity_address:
         return False
     try:
-        Ed25519PublicKey.from_public_bytes(identity_ed_pub).verify(
-            r.signature, signing_bytes(r)
-        )
-        return True
-    except (InvalidSignature, ValueError):
+        return ed25519_strict.verify(identity_ed_pub, r.signature, signing_bytes(r))
+    except ValueError:
         return False
 
 

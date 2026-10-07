@@ -4,7 +4,7 @@
 **Establishment:** **PairInit V2** / **PairResponse V2** (new wire; not PairInit V1)  
 **Ratchet construction (normative):** Signal **Triple Ratchet** = EC **Double Ratchet** + **Sparse Post-Quantum Ratchet (SPQR)** over **ML-KEM Braid (SCKA)**; hybrid message key via `KDF_HYBRID(ec_mk, pq_mk)`  
 **Suite (draft):** `0x01` = X25519 + ML-KEM-768 (FIPS 203) + HKDF-SHA256 / HMAC-SHA256 (as in Signal KDF recommendations) + ChaCha20-Poly1305 + Ed25519 (classical auth)  
-**Document revision:** **10** (Full Braid lab §5.2: single-seal confirm AD, reject-vs-terminal, replay window; SCKA KDF byte tables; `pair_init_v2_002`)  
+**Document revision:** **11** (2026-10-07 clarifications: V2 signature domains + PairResponse V2 table §0.4, OTP/DK retention per prekey lifecycle §3.3, known vector/spec discrepancies §13.1; no wire change)  
 **Status:** **REQUIRED / NOT YET APPROVED** — draft companion under [`RAVEN_UNIFIED_SERVERLESS_ARCHITECTURE_V2.md`](RAVEN_UNIFIED_SERVERLESS_ARCHITECTURE_V2.md)  
 **Approval prerequisites:** Umbrella **Approved** (met) + [`RAVEN_DEVICE_REVOCATION_V1.md`](RAVEN_DEVICE_REVOCATION_V1.md) **APPROVED** (met)  
 **Production:** disabled
@@ -71,6 +71,43 @@ Alice MAY seal application message 0 under Triple Ratchet state after local init
 `Z_X` MAY use Bob’s OTP X25519 when present (else SPK) for PairInit agreement only. Initial EC ratchet key remains **SPK** (§3.3).
 
 Order: encapsulate → build/sign PairInit V2 → hash → expand. No substitute-transcript API.
+
+### 0.4 Signature domains, PairResponse V2 wire and trust-record digests
+
+Exactly what `protocol/reference/raven_protocol/pair_init_v2.py` computes. `pair_init_v2_001` pins both signing inputs (`pair_init_signing_bytes_hex`, `pair_response_signing_bytes_hex`); the `pair_init_v2_001` and `pair_init_v2_002` wires verify under them. All integers are unsigned big-endian.
+
+```text
+PairInit V2 signature input     = "rvn1/pair-init-v2"     || PairInitV2[0 .. 2723]
+    # 2787-byte wire; 64-byte signature at 2723 by the initiator device key (offset 171)
+PairResponse V2 signature input = "rvn1/pair-response-v2" || PairResponseV2[0 .. 163]
+    # 227-byte wire; 64-byte signature at 163 by the responder device key (offset 83)
+```
+
+**PairResponse V2 wire (exactly 227 bytes):**
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 8 | magic `RVPR2\0\0\0` |
+| 8 | 1 | version = `0x02` |
+| 9 | 1 | suite = `0x01` |
+| 10 | 1 | role = responder = `0x01` |
+| 11 | 1 | profile length = `23` |
+| 12 | 23 | ASCII `ATSAM/hybrid-ratchet/v2` |
+| 35 | 16 | exact accepted `init_id` |
+| 51 | 32 | exact accepted `init_hash_v2` |
+| 83 | 32 | responder device Ed25519 public key |
+| 115 | 8 | response `created_at_ms` |
+| 123 | 8 | response `expires_at_ms` |
+| 131 | 32 | `confirmation_tag` (§3.3, under `K_confirm`) |
+| 163 | 64 | responder-device Ed25519 signature |
+
+**Trust-record digests:** V2 reuses the V1 labels unchanged, exactly as in [`RAVEN_PAIR_INIT_V1.md`](RAVEN_PAIR_INIT_V1.md) §2 (`pair_init_v2.py` imports `device_certificate_hash` / `prekey_bundle_hash` from `pair_init.py`; pinned by `pair_init_v2_002` `initiator_device_cert_hash_hex` / `responder_device_cert_hash_hex` / `responder_prekey_bundle_hash_hex`). There are no V2-specific digest labels.
+
+```text
+device_cert_hash   = SHA-256("rvn1/pair-devcert" || identity_ed25519_pub(32)
+                             || RavenDeviceCertificateV1.signing_bytes || certificate_signature(64))
+prekey_bundle_hash = SHA-256("rvn1/pair-prekey" || RavenPrekeyBundleV1.signing_bytes || prekey_signature(64))
+```
 
 ---
 
@@ -178,12 +215,14 @@ Contact delete/block/revoke → fail-closed for send/receive/PairInit/ACK on tha
 
 **EC initial ratchet key (Signal-aligned):** Bob’s **signed X25519 prekey (SPK)** is always the initial EC Double Ratchet public/keypair (`bob_dh_public_key` / `bob_dh_key_pair`). This matches Signal PQXDH→Double Ratchet integration (`SPKB` → initial ratchet key).
 
-**OTP role:** If a one-time X25519 prekey is present, it MAY contribute to PairInit `Z_X` / `IKM_pair` only. It MUST NOT be the initial EC ratchet key. OTP private material is consumed under prekey lifecycle after authenticated claim (§3.2.1); it is not retained as `DHs`.
+**OTP role:** If a one-time X25519 prekey is present, it MAY contribute to PairInit `Z_X` / `IKM_pair` only. It MUST NOT be the initial EC ratchet key and is never retained as `DHs`. OTP private material is **not** consumed or destroyed at first claim: per [`RAVEN_PREKEY_LIFECYCLE_V1.md`](RAVEN_PREKEY_LIFECYCLE_V1.md) §4/§6 it is retained exactly as long as its generation's signed-prekey material (bundle expiry + 7-day grace, extended only by a pending handoff), and a distinct valid PairInit reusing the same OTP is accepted as a distinct claim, root and session (§3.5 item 5). OTPs therefore add no forward secrecy beyond the signed prekey; immediate OTP destruction requires a versioned change (lifecycle §6).
+
+**ML-KEM decapsulation key:** the generation's ML-KEM-768 decapsulation seed is likewise retained under the same lifecycle bound and decapsulates `ct_PQ` for every PairInit accepted against that generation (each accepted PairInit yields its own `Z_PQ`; §3.5 forbids re-decapsulating an exact duplicate for a new root). It is not a single-use key.
 
 | Role | EC init | Private material retained |
 |------|---------|---------------------------|
 | **Alice** | `RatchetInitAliceTR(..., bob_dh_public_key = SPK_B)` | Alice’s EC ratchet private `DHs`; SPQR Alice state; not Bob’s OTP |
-| **Bob** | `RatchetInitBobTR(..., bob_dh_key_pair = SPK_B keypair)` | SPK private until later DH ratchet replaces `DHs`; PairInit ML-KEM DK used once for `Z_PQ`; SPQR Bob state |
+| **Bob** | `RatchetInitBobTR(..., bob_dh_key_pair = SPK_B keypair)` | SPK private until later DH ratchet replaces `DHs`; generation ML-KEM DK seed (prekey lifecycle, not ratchet state) yields `Z_PQ` for every PairInit accepted against that generation, destroyed only per lifecycle §6; SPQR Bob state |
 
 Normative Triple Ratchet init (**role-specific SCKA**, Signal §5.4 — not a role-neutral `RatchetInitSCKA`):
 
@@ -206,7 +245,7 @@ Implementations that call a single role-neutral SCKA init are **non-conformant**
 
 **Message 0 (Alice):** encrypted with `RatchetEncryptTR` on `PROVISIONAL_TR` after Alice-init. Header carries Alice’s EC ratchet public and SPQR/SCKA send chunks per ML-KEM Braid. Plaintext is application (or padding); it is **not** PairResponse.
 
-**PairResponse V2:** key confirmation only (not Delivered). Uses `K_confirm`:
+**PairResponse V2:** key confirmation only (not Delivered). Exact 227-byte wire and signature input: §0.4. Uses `K_confirm`:
 
 ```text
 confirmation_tag = HMAC-SHA256(
@@ -409,7 +448,7 @@ KDF_CK(ck) -> (ck', mk):
 
 ### 6.3 SPQR / SCKA KDFs (Signal §5 / §7.2)
 
-Use Signal’s `KDF_SCKA_INIT`, `KDF_SCKA_RK`, `KDF_SCKA_CK` with `SPQR_PROTOCOL_INFO` and recommended salts/lengths from Double Ratchet Rev 4 §7.2. Vector suite MUST pin every byte; ports match vectors, not prose memory. The exact instantiation (pinned by `tr_scka_init_001`, `tr_braid_epoch_001`, `full_braid_*`):
+Use Signal’s `KDF_SCKA_INIT`, `KDF_SCKA_RK`, `KDF_SCKA_CK` with `SPQR_PROTOCOL_INFO` and recommended salts/lengths from Double Ratchet Rev 4 §7.2. Vector suite MUST pin every byte; ports match vectors, not prose memory. The exact instantiation (pinned by `tr_scka_init_001`, `tr_braid_epoch_001`, `full_braid_*`; frozen pre–Full Braid stub deviations: §13.1):
 
 ```text
 KDF_SCKA_INIT(SK_scka) -> (RK, CK_A2B, CK_B2A):
@@ -806,6 +845,26 @@ Reference: `protocol/reference/raven_protocol/{pair_init_v2,hybrid_ratchet_v2,hy
 
 Negatives: PairInit V1 as V2; mutate-on-bad-header; role-neutral SCKA init; OTP claim before auth; ACK-of-ACK intent; CAS-before-seal Materialized-without-bytes; dual ACK materialize; route from evolving RK; poll-only yesterday; advance day cursor mid-page; drop ACK on transport success; AckV2 layout-only “verify”; delivery downgrade.
 
+### 13.1 Known vector/spec discrepancies (informative)
+
+The vectors below are frozen and are **not** changed. Ports MUST match them byte-for-byte for interop; the prose of this document states the intended construction. Each item is resolved only by a versioned vector revision.
+
+- **(a) `tr_hybrid_aead_001` skips `KDF_SCKA_CK`.** Its `inputs.scka_mk_hex` is Alice's raw SCKA send chain key (`tr_scka_init_001` `expected.alice.ck_send_hex` = `CK_A2B`), fed directly to `KDF_HYBRID`; §6.3 requires `scka_mk` = `KDF_SCKA_CK(CK).mk` = HMAC-SHA256(CK, 0x01). `tr_candidate_fail_001` / `tr_tamper_candidate_001` take that derived key/nonce as input. `tr_combo_multi_001` applies `KDF_SCKA_CK` as §6.3 requires (but see (b)).
+- **(b) Raw ML-KEM shared secret as epoch secret.** `tr_braid_epoch_001` (injected `ss_epoch1_hex` / `ss_epoch2_hex`), `tr_braid_kem_chunk_001` (KAT `z_pq_hex` of `mlkem768_hybrid_kat_001`) and the SCKA epochs of `tr_combo_multi_001` (`ss_scka1_hex` / `ss_scka2_hex`) use `ss` directly as the `KDF_SCKA_RK` IKM; §6.3 specifies `epoch_secret = KDF_OK(ss, epoch)`, which only the Full Braid lab (`full_braid_*`) applies. The `KDF_SCKA_RK` construction itself (salt = rk, info = `SPQR_PROTOCOL_INFO`, L = 64) matches §6.3.
+- **(c) CT1/CT2 split.** `tr_braid_kem_chunk_001` cuts the whole 1088-byte ML-KEM-768 ciphertext into 42-byte chunks (`chunk_size` = 42, `chunk_count` = 26): indices 0–24 are typed `Ct1` (bytes 0–1049) and index 25 is typed `Ct2` (the last 38 bytes). §5.1 has `Ct1` = chunks of the 960-byte CT1 and `Ct2` = chunks of the 128-byte CT2, so index 22 straddles the CT1/CT2 boundary and CT2 bytes 960–1049 travel as `Ct1`.
+- **(d) RVBC1 `binding_digest_sha256` is defined only in the Python reference, not in §5.1.** Neither form covers magic or `plen`; `session_id` comes from session context, not the wire. The two forms differ by the direction byte and are not interchangeable:
+
+  ```text
+  # pre–Full Braid codec: hybrid_ratchet_v2_tr.py:braid_binding (tr_braid_kem_chunk_001, tr_braid_codec_negatives_001)
+  binding_digest_sha256 = SHA-256("ATSAM/v2/braid-chunk" || u64be(epoch) || u8(type) || u32be(index)
+                                  || payload || session_id(32))
+  # Full Braid lab: full_braid_digest.py:binding_digest (full_braid_digests_001, full_braid_*)
+  binding_digest_sha256 = SHA-256("ATSAM/v2/braid-chunk" || u8(direction) || u64be(epoch) || u8(type)
+                                  || u32be(index) || payload || session_id(32))
+  ```
+
+- **(e) `tr_ackv2_001` binds the wrong device.** The AckV2 is signed by Bob's responder device (`inputs.signer_device_ed_pub_hex`) and acknowledges Alice's message 0 (`inputs.acked_endpoint_object_hex` = `tr_hybrid_aead_001` header ‖ ciphertext, direction 0), so Bob signs it as the recipient of the acked message. Its `recipient_device_cert_hash` (plaintext offset 69, 32 bytes) carries Alice's **initiator** device-cert hash (`pair_init_v2_001` PairInit offset 331). Per §7.4 with §11.2 step 5 / §11.3 step 4, the recipient device binding is the acked message's intended recipient, i.e. the ACK-signing device: Bob's responder device-cert hash (PairInit offset 363).
+
 ---
 
 ## 14. Formal / differential verification
@@ -848,7 +907,7 @@ Companion APPROVED + umbrella §9–§10 for carriers; lab indexed/A2 not rebran
 | Field | Value |
 |-------|-------|
 | Created | 2026-08-16 |
-| Revision | **10** (Full Braid lab rules §5.2; SCKA KDF byte tables §6.3; exact stub AAD/AckV2 layouts; `pair_init_v2_002`). Rev 9: bidirectional payload rules; empty-type `chunk_index=0`; `EK_VECTOR_SIZE=1152` vs FIPS EK 1184 |
+| Revision | **11** (2026-10-07 owner-approved clarifications, no wire change: §0.4 V2 signature domains, PairResponse V2 table, reused V1 digest labels; §3.3 OTP / ML-KEM DK retention per prekey lifecycle §4/§6; §13.1 known vector/spec discrepancies). Rev 10: Full Braid lab rules §5.2; SCKA KDF byte tables §6.3; exact stub AAD/AckV2 layouts; `pair_init_v2_002`. Rev 9: bidirectional payload rules; empty-type `chunk_index=0`; `EK_VECTOR_SIZE=1152` vs FIPS EK 1184 |
 | Status | **REQUIRED / NOT YET APPROVED** |
 | Next | Full Signal Braid incremental Encaps1/Encaps2 + erasure coding; durable restart evidence; independent review; then human APPROVED |
 | Explicitly not next | Production flags; PairInit V1 reinterpret; marking APPROVED before Remaining §13 items close |
