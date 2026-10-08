@@ -16,6 +16,13 @@
 //! connections never touch the identity lock / secret store, the pre-auth
 //! handshake has its own deadline, and all SQLite / file work runs on the
 //! blocking pool.
+//!
+//! **One implementation, two links ([`RavenLink`]).** The p2p carrier (P3,
+//! `crate::p2p`) runs this exact link inside a libp2p `/raven/link/1.0.0`
+//! stream: the same XX, RIH1 identity bind, contact gate (verified contacts
+//! only, stranger timing parity), RLB1 exchange and `dispatch_frame`, with
+//! its own Noise prologue `raven/p2p-link/v1` ([`P2P_LINK`]) so a raw-TCP
+//! transcript and a libp2p one can never complete against each other.
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -25,9 +32,9 @@ use std::time::Duration;
 
 use raven_core::identity::Identity;
 use raven_core::internet::{
-    build_noise_initiator, build_noise_responder, frame as pack_inet_frame, pack_hello,
-    unpack_verify_hello, HelloBinding, HelloRole, CAP_INTERNET, HELLO_WIRE_LEN, MAX_FRAME_BYTES,
-    MAX_PAYLOAD_BYTES,
+    frame as pack_inet_frame, pack_hello, unpack_verify_hello, HelloBinding, HelloRole,
+    CAP_INTERNET, HELLO_WIRE_LEN, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, NOISE_PROLOGUE,
+    P2P_LINK_PROLOGUE,
 };
 use raven_core::internet_direct_live_enabled;
 use raven_core::lan_dispatch::{
@@ -35,10 +42,12 @@ use raven_core::lan_dispatch::{
     remember_ephemeral_peer, rlb1_matches_noise_identity,
 };
 use raven_core::lan_noise::{
-    derive_noise_static, get_remote_static, handshake_hash, handshake_read, handshake_write,
-    into_transport, noise_static_public, transport_decrypt, transport_encrypt, NoiseTransport,
+    build_initiator_with_prologue, build_responder_with_prologue, derive_noise_static,
+    get_remote_static, handshake_hash, handshake_read, handshake_write, into_transport,
+    noise_static_public, transport_decrypt, transport_encrypt, NoiseTransport,
 };
 use raven_core::load_identity_required;
+use raven_core::OutboxCarrier;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -56,7 +65,48 @@ pub(crate) const HOLD: &str = "INTERNET_DIRECT_HOLD: indexed InternetTransport i
     (debug RAVEN_LAB_TEST_A=1); INTERNET_DIRECT_PRODUCTION_ENABLED=false; \
     localhost ≠ WAN Proven";
 
-async fn blocking<T, F>(work: F) -> Result<T, String>
+/// One flavour of the Raven Noise link. Everything but the prologue, the
+/// carrier (contact gate, outbox labels) and the gate is shared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RavenLink {
+    /// Noise prologue (domain separation between links).
+    pub prologue: &'static [u8],
+    /// The carrier the contact gate and the outbox use.
+    pub carrier: OutboxCarrier,
+    /// Log prefix of inbound failures (`<name> inbound …`).
+    pub name: &'static str,
+    /// Prefix of dial error codes (`<wire>_DIAL_…`).
+    pub wire: &'static str,
+}
+
+/// Internet direct: raw TCP, prologue `raven/internet/v1`.
+pub(crate) const INTERNET_LINK: RavenLink = RavenLink {
+    prologue: NOISE_PROLOGUE,
+    carrier: OutboxCarrier::Internet,
+    name: "internet_direct",
+    wire: "INTERNET",
+};
+
+/// The p2p carrier: inside a libp2p stream, prologue `raven/p2p-link/v1`.
+pub(crate) const P2P_LINK: RavenLink = RavenLink {
+    prologue: P2P_LINK_PROLOGUE,
+    carrier: OutboxCarrier::P2p,
+    name: "p2p",
+    wire: "P2P",
+};
+
+impl RavenLink {
+    /// This link's gate: the Internet direct flag, or the p2p flag.
+    pub(crate) fn require_live(&self) -> Result<(), String> {
+        match self.carrier {
+            OutboxCarrier::P2p if raven_core::p2p_live_enabled() => Ok(()),
+            OutboxCarrier::P2p => Err(raven_core::P2P_HOLD.into()),
+            _ => require_live(),
+        }
+    }
+}
+
+pub(crate) async fn blocking<T, F>(work: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
@@ -86,7 +136,7 @@ impl Drop for ListenerGuard {
     }
 }
 
-fn parse_pub_hex(s: &str) -> Result<[u8; 32], String> {
+pub(crate) fn parse_pub_hex(s: &str) -> Result<[u8; 32], String> {
     let h = s.trim().to_lowercase();
     if h.len() != 32 * 2 {
         return Err("expected_pub_hex must be 64 hex chars".into());
@@ -204,16 +254,28 @@ fn verify_peer_hello(raw: &[u8], peer: &HelloBinding) -> Result<[u8; 32], String
     Ok(pk)
 }
 
+/// [`initiator_session_on`] for Internet direct.
+#[cfg(test)]
+async fn initiator_session<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    identity: &Identity,
+    expected: &[u8; 32],
+) -> Result<([u8; 32], NoiseTransport), String> {
+    initiator_session_on(INTERNET_LINK, stream, identity, expected).await
+}
+
 /// Dialer side: XX, then exchange hellos bound to this handshake. Returns the
 /// peer's authenticated Ed25519 key (must equal `expected`) and the transport.
-async fn initiator_session<S: AsyncRead + AsyncWrite + Unpin>(
+pub(crate) async fn initiator_session_on<S: AsyncRead + AsyncWrite + Unpin>(
+    link: RavenLink,
     stream: &mut S,
     identity: &Identity,
     expected: &[u8; 32],
 ) -> Result<([u8; 32], NoiseTransport), String> {
     let secret = derive_noise_static(identity).map_err(|e| e.to_string())?;
     let local_static = noise_static_public(&secret);
-    let mut hs = build_noise_initiator(&secret).map_err(|e| e.to_string())?;
+    let mut hs =
+        build_initiator_with_prologue(&secret, link.prologue).map_err(|e| e.to_string())?;
     drop(secret);
     let m1 = handshake_write(&mut hs, &[]).map_err(|e| e.to_string())?;
     write_raw(stream, &m1).await?;
@@ -257,12 +319,14 @@ async fn initiator_session<S: AsyncRead + AsyncWrite + Unpin>(
 /// the caller decides first whether the dialer may learn who we are
 /// ([`raven_core::lan_dispatch::link_peer_admission`]).
 async fn responder_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    link: RavenLink,
     stream: &mut S,
     identity: &Identity,
 ) -> Result<([u8; 32], NoiseTransport, Vec<u8>), String> {
     let secret = derive_noise_static(identity).map_err(|e| e.to_string())?;
     let local_static = noise_static_public(&secret);
-    let mut hs = build_noise_responder(&secret).map_err(|e| e.to_string())?;
+    let mut hs =
+        build_responder_with_prologue(&secret, link.prologue).map_err(|e| e.to_string())?;
     drop(secret);
     let m1 = read_raw(stream).await?;
     handshake_read(&mut hs, &m1).map_err(|e| e.to_string())?;
@@ -293,7 +357,7 @@ async fn responder_session<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     identity: &Identity,
 ) -> Result<([u8; 32], NoiseTransport), String> {
-    let (pk, mut t, ours) = responder_handshake(stream, identity).await?;
+    let (pk, mut t, ours) = responder_handshake(INTERNET_LINK, stream, identity).await?;
     write_inet_frame(stream, &mut t, &ours).await?;
     Ok((pk, t))
 }
@@ -307,10 +371,25 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     slot: &mut AdmissionSlot,
 ) -> Result<(), String> {
     require_live()?;
-    serve_inbound(data_dir, identity, stream, limits, slot).await
+    serve_inbound_on(INTERNET_LINK, data_dir, identity, stream, limits, slot).await
 }
 
+/// [`serve_inbound_on`] for Internet direct.
+#[cfg(test)]
 async fn serve_inbound<S: AsyncRead + AsyncWrite + Unpin>(
+    data_dir: PathBuf,
+    identity: Arc<Identity>,
+    stream: S,
+    limits: InboundLimits,
+    slot: &mut AdmissionSlot,
+) -> Result<(), String> {
+    serve_inbound_on(INTERNET_LINK, data_dir, identity, stream, limits, slot).await
+}
+
+/// Serve one inbound Raven link of `link`'s flavour (the caller checked the
+/// gate): handshake, contact gate, RLB1, then frames until the peer is done.
+pub(crate) async fn serve_inbound_on<S: AsyncRead + AsyncWrite + Unpin>(
+    link: RavenLink,
     data_dir: PathBuf,
     identity: Arc<Identity>,
     mut stream: S,
@@ -324,34 +403,28 @@ async fn serve_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     // blocking work below deliberately does not, so the contact check's time
     // is added back to it.
     let mut deadline = tokio::time::Instant::now() + limits.handshake_deadline;
-    let (remote_ed, mut transport, our_hello) = match tokio::time::timeout_at(
-        deadline,
-        responder_handshake(&mut stream, &identity),
-    )
-    .await
-    {
-        Ok(done) => done?,
-        Err(_) => return Err(HANDSHAKE_TIMEOUT.into()),
-    };
+    let (remote_ed, mut transport, our_hello) =
+        match tokio::time::timeout_at(deadline, responder_handshake(link, &mut stream, &identity))
+            .await
+        {
+            Ok(done) => done?,
+            Err(_) => return Err(HANDSHAKE_TIMEOUT.into()),
+        };
     // Contact gate before anything identifying leaves this node: a stranger
     // (or a blocked key) that completed XX gets the connection closed and
     // nothing else, not our hello (Raven identity) and not our RLB1
     // (certificate + prekey bundle). An Internet scanner cannot map IP → ID.
-    // Internet also needs a *verified* (pinned) contact (owner decision
-    // 2026-10-08): an unverified one is treated exactly like a stranger, and
-    // every refusal does the same work (one read of each file), so its timing
-    // does not tell a scanner whether a key is a contact.
+    // Internet and p2p also need a *verified* (pinned) contact (owner
+    // decision 2026-10-08): an unverified one is treated exactly like a
+    // stranger, and every refusal does the same work (one read of each file),
+    // so its timing does not tell a scanner whether a key is a contact.
     let gate_started = tokio::time::Instant::now();
     {
         let dd = data_dir.clone();
+        let carrier = link.carrier;
         blocking(move || {
-            raven_core::lan_dispatch::link_admission(
-                &dd,
-                &remote_ed,
-                raven_core::OutboxCarrier::Internet,
-                None,
-            )
-            .map_err(String::from)
+            raven_core::lan_dispatch::link_admission(&dd, &remote_ed, carrier, None)
+                .map_err(String::from)
         })
         .await?;
     }
@@ -397,7 +470,10 @@ async fn serve_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     let mut frames_seen = 0u32;
     loop {
         if started.elapsed() > limits.lifetime {
-            return Err("internet connection lifetime exceeded".into());
+            return Err(format!(
+                "{} connection lifetime exceeded",
+                link.wire.to_ascii_lowercase()
+            ));
         }
         let frame = match read_inet_frame(&mut stream, &mut transport).await {
             Ok(f) => f,
@@ -405,7 +481,7 @@ async fn serve_inbound<S: AsyncRead + AsyncWrite + Unpin>(
             // went quiet: normal ends, not events worth a log line.
             Err(e) if e == PEER_CLOSED || e == READ_TIMEOUT => break,
             Err(e) => {
-                netutil::log_inbound_failure("internet_direct inbound read", e);
+                netutil::log_inbound_failure(&format!("{} inbound read", link.name), e);
                 break;
             }
         };
@@ -439,9 +515,9 @@ async fn serve_inbound<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Blocking: loads the identity (the listener keeps it for its lifetime) and
-/// readies durable state.
-fn preflight_internet_ready(data_dir: &Path) -> Result<Identity, String> {
-    require_live()?;
+/// readies durable state. Shared by the Internet listener and the p2p host.
+pub(crate) fn preflight_link_ready(link: RavenLink, data_dir: &Path) -> Result<Identity, String> {
+    link.require_live()?;
     let identity = load_identity_required(data_dir).map_err(|e| e.to_string())?;
     raven_core::ensure_local_prekey(data_dir, &identity)?;
     let _ = raven_core::IndexedSessionStore::open(data_dir).map_err(|e| e.redacted_display())?;
@@ -468,7 +544,7 @@ async fn run_listener_with_limits(
                 netutil::with_slow_notice(
                     "internet_direct",
                     "local state preflight (identity, sessions, outbound stage)",
-                    blocking(move || preflight_internet_ready(&dd)),
+                    blocking(move || preflight_link_ready(INTERNET_LINK, &dd)),
                 )
                 .await
             }
@@ -548,6 +624,39 @@ async fn dial_session(
     frames: &[Vec<u8>],
     progress: &mut DialProgress,
 ) -> Result<(), String> {
+    dial_session_on(
+        INTERNET_LINK,
+        data_dir,
+        || async move {
+            netutil::connect_dial(internet_dial, CONNECT_TIMEOUT, CONNECT_BUDGET)
+                .await
+                .map(|(stream, _addr)| stream)
+                .map_err(|e| format!("internet connect: {e}"))
+        },
+        expected,
+        frames,
+        progress,
+    )
+    .await
+}
+
+/// The dialer half of a Raven link of `link`'s flavour over the streams
+/// `connect` opens (a TCP connection, or a libp2p stream): handshake (retried
+/// on a fresh stream while the peer sheds load), RLB1 exchange with the
+/// identity checks, then `frames` and their replies into `progress`.
+pub(crate) async fn dial_session_on<S, C, CFut>(
+    link: RavenLink,
+    data_dir: &Path,
+    mut connect: C,
+    expected: &[u8; 32],
+    frames: &[Vec<u8>],
+    progress: &mut DialProgress,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: FnMut() -> CFut,
+    CFut: std::future::Future<Output = Result<S, String>>,
+{
     progress.stage = "loading the local identity";
     let (identity, local) = {
         let dd = data_dir.to_path_buf();
@@ -561,13 +670,13 @@ async fn dial_session(
     progress.stage = "connecting and in the Noise handshake";
     let (mut stream, (remote_ed, mut transport)) = {
         let identity = &identity;
-        netutil::with_handshake_retries(move || async move {
-            let (mut stream, _addr) =
-                netutil::connect_dial(internet_dial, CONNECT_TIMEOUT, CONNECT_BUDGET)
-                    .await
-                    .map_err(|e| format!("internet connect: {e}"))?;
-            let session = initiator_session(&mut stream, identity, expected).await?;
-            Ok((stream, session))
+        netutil::with_handshake_retries(|| {
+            let opened = connect();
+            async move {
+                let mut stream = opened.await?;
+                let session = initiator_session_on(link, &mut stream, identity, expected).await?;
+                Ok((stream, session))
+            }
         })
         .await?
     };
@@ -780,7 +889,7 @@ mod tests {
             );
 
         let m_secret = derive_noise_static(&mallory()).unwrap();
-        let mut hs = build_noise_initiator(&m_secret).unwrap();
+        let mut hs = build_initiator_with_prologue(&m_secret, NOISE_PROLOGUE).unwrap();
         write_raw(&mut attacker, &handshake_write(&mut hs, &[]).unwrap())
             .await
             .unwrap();

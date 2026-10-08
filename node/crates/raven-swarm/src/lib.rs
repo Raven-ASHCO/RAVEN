@@ -8,6 +8,13 @@
 //! enforces ping-based liveness and per-source-address connection caps itself,
 //! because libp2p only reports the former and counts only the latter globally.
 
+/// The libp2p crate this library is built on, for callers (raven-node) that
+/// drive a swarm from [`host`] without a second, possibly mismatched,
+/// dependency on it.
+pub use libp2p;
+#[cfg(feature = "p2p-host")]
+pub use libp2p_stream;
+
 pub mod liveness {
     //! Liveness policy shared by every Raven swarm binary.
     //!
@@ -924,8 +931,19 @@ pub mod ip_limits {
     }
 }
 
+pub mod kad_node;
+
 #[cfg(feature = "experimental-offline-mailbox")]
 pub mod mailbox;
 
-#[cfg(feature = "experimental-nat-connectivity")]
+/// NAT traversal building blocks (relay client, DCUtR, AutoNAT v2, operator
+/// relay addresses and reservations). Compiled for the separate experiment
+/// binary (`experimental-nat-connectivity`) and for the P3 host (`p2p-host`,
+/// enabled by raven-node only); neither is in this crate's default features.
+#[cfg(any(feature = "experimental-nat-connectivity", feature = "p2p-host"))]
 pub mod connectivity;
+
+/// The P3 libp2p host: endpoint (relay client, DCUtR, AutoNAT v2 client,
+/// Identify, Ping, limits, `/raven/link/1.0.0` streams) and relay server.
+#[cfg(feature = "p2p-host")]
+pub mod host;

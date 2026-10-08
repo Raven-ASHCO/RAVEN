@@ -145,11 +145,15 @@ pub const INTERNET_DIRECT_HOLD: &str =
      (debug RAVEN_LAB_TEST_A=1); INTERNET_DIRECT_PRODUCTION_ENABLED=false; \
      localhost ≠ WAN Proven";
 
-/// Carrier for one indexed send. `Internet` is lab-only (not WAN Proven).
+/// Carrier for one indexed send. `Internet` and `P2p` are lab-only (not WAN
+/// Proven).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DialCarrier {
     Lan,
     Internet,
+    /// The libp2p carrier (P3): the dial is a p2p dial string such as
+    /// `/p2p/<PeerId>` (raven-node dials the contact's addresses).
+    P2p,
 }
 
 impl DialCarrier {
@@ -162,19 +166,55 @@ impl DialCarrier {
         match self {
             Self::Lan => OutboxCarrier::Lan,
             Self::Internet => OutboxCarrier::Internet,
+            Self::P2p => OutboxCarrier::P2p,
+        }
+    }
+
+    /// Is `dial` a dial string this carrier can use (never the "local
+    /// listen" placeholder)?
+    pub(crate) fn plausible(self, dial: &str) -> bool {
+        raven_core::outbox::plausible_route(&raven_core::OutboxRoute {
+            carrier: self.outbox(),
+            dial: dial.to_string(),
+        })
+    }
+
+    /// This carrier's gate refusal, when its gate is closed.
+    pub(crate) fn hold(self) -> Option<&'static str> {
+        match self {
+            Self::Lan => None,
+            Self::Internet if !raven_core::internet_direct_live_enabled() => {
+                Some(INTERNET_DIRECT_HOLD)
+            }
+            Self::P2p if !raven_core::p2p_live_enabled() => Some(raven_core::P2P_HOLD),
+            _ => None,
         }
     }
 }
 
-/// Refusal for an Internet send to a contact that is not verified (owner
-/// decision 2026-10-08: Internet delivery only for pinned contacts). Nothing
-/// was dialled.
-pub(crate) fn unverified_internet_text(who: &str, verify_cmd: &str, pin_cmd: &str) -> String {
+/// Refusal for an Internet or p2p send to a contact that is not verified
+/// (owner decision 2026-10-08: delivery beyond the LAN only for pinned
+/// contacts). Nothing was dialled. `carrier`: `Internet` or `p2p`.
+pub(crate) fn unverified_carrier_text(
+    who: &str,
+    carrier: &str,
+    verify_cmd: &str,
+    pin_cmd: &str,
+) -> String {
     format!(
-        "NOT SENT: {who} is not verified: Internet delivery needs the fingerprint checked \
+        "NOT SENT: {who} is not verified: {carrier} delivery needs the fingerprint checked \
          first. Compare it with {who} by phone or in person (run: {verify_cmd}), then pin it: \
          {pin_cmd}. Nothing was dialled. ({CONTACT_NOT_VERIFIED})"
     )
+}
+
+/// The word for `carrier` in user sentences.
+pub(crate) fn carrier_word(carrier: DialCarrier) -> &'static str {
+    match carrier {
+        DialCarrier::Lan => "LAN",
+        DialCarrier::Internet => "Internet",
+        DialCarrier::P2p => "p2p",
+    }
 }
 
 fn ensure_local_device_cert(
@@ -249,10 +289,16 @@ fn ipc_carrier_dial_within(
     if dial.trim().is_empty()
         || dial.eq_ignore_ascii_case("local-listen")
         || dial.eq_ignore_ascii_case("local")
+        || (carrier == DialCarrier::P2p && !carrier.plausible(dial))
     {
         return Err(format!(
-            "valid {} host:port required (LocalListenQueue is disabled)",
-            carrier.label()
+            "valid {} {} required (LocalListenQueue is disabled)",
+            carrier.label(),
+            if carrier == DialCarrier::P2p {
+                "/p2p/<PeerId> address"
+            } else {
+                "host:port"
+            }
         ));
     }
     let frames_b64 = frames
@@ -269,6 +315,12 @@ fn ipc_carrier_dial_within(
         DialCarrier::Internet => IpcRequest::InternetDial {
             v: IPC_VERSION,
             internet_dial: dial.to_string(),
+            expected_pub_hex: expected_pub_hex.to_string(),
+            frames_b64,
+        },
+        DialCarrier::P2p => IpcRequest::P2pDial {
+            v: IPC_VERSION,
+            multiaddr: dial.to_string(),
             expected_pub_hex: expected_pub_hex.to_string(),
             frames_b64,
         },
@@ -302,21 +354,18 @@ fn ipc_carrier_dial_within(
                 })
                 .collect()
         }
-        Ok(IpcResponse::InternetDialResult { frames_b64, .. })
-            if carrier == DialCarrier::Internet =>
-        {
-            frames_b64
-                .iter()
-                .map(|s| {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(s.trim())
-                        .or_else(|_| {
-                            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim())
-                        })
-                        .map_err(|e| e.to_string())
-                })
-                .collect()
-        }
+        Ok(
+            IpcResponse::InternetDialResult { frames_b64, .. }
+            | IpcResponse::P2pDialResult { frames_b64, .. },
+        ) if carrier != DialCarrier::Lan => frames_b64
+            .iter()
+            .map(|s| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(s.trim())
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim()))
+                    .map_err(|e| e.to_string())
+            })
+            .collect(),
         Ok(IpcResponse::Error { code, message, .. }) => Err(format!("ipc {code}: {message}")),
         Ok(other) => Err(format!("unexpected ipc: {other:?}")),
         Err(e) => Err(e),
@@ -429,11 +478,18 @@ pub fn run_pair_init_and_send_routes(
         .first()
         .ok_or_else(|| "no host:port to dial — refusing LocalListenQueue fallback".to_string())?;
     for route in routes {
-        if route.carrier == DialCarrier::Internet && !raven_core::internet_direct_live_enabled() {
-            return Err(INTERNET_DIRECT_HOLD.into());
+        if let Some(hold) = route.carrier.hold() {
+            return Err(hold.into());
         }
         let peer = route.dial.as_str();
-        if !peer.contains(':')
+        if route.carrier == DialCarrier::P2p {
+            if !route.carrier.plausible(peer) {
+                return Err(format!(
+                    "valid {} /p2p/<PeerId> address required",
+                    route.carrier.label()
+                ));
+            }
+        } else if !peer.contains(':')
             || peer.eq_ignore_ascii_case("local-listen")
             || peer.eq_ignore_ascii_case("local")
         {
@@ -444,22 +500,24 @@ pub fn run_pair_init_and_send_routes(
         }
     }
     let peer_pub = parse_pub_hex(peer_pub_hex)?;
-    // Internet delivery only for a verified (pinned) contact: refuse before
-    // anything is dialled (`--peer … --carrier internet` included).
-    if routes.iter().any(|r| r.carrier == DialCarrier::Internet)
-        && !raven_core::carrier_allowed_for_contact(
-            OutboxCarrier::Internet,
-            raven_core::contact_is_pinned(data_dir, &peer_pub)?,
-        )
-    {
-        return Err(unverified_internet_text(
-            &ctx.display_name(),
-            &format!(
-                "raven contact verify --address {}",
-                raven_core::encode_address(&peer_pub)
-            ),
-            &pin_command_hint(&peer_pub),
-        ));
+    // Internet and p2p delivery only for a verified (pinned) contact: refuse
+    // before anything is dialled (`--peer … --carrier internet` included).
+    if let Some(route) = routes.iter().find(|r| r.carrier != DialCarrier::Lan) {
+        let pinned = raven_core::contact_is_pinned(data_dir, &peer_pub)?;
+        if routes.iter().any(|r| {
+            r.carrier != DialCarrier::Lan
+                && !raven_core::carrier_allowed_for_contact(r.carrier.outbox(), pinned)
+        }) {
+            return Err(unverified_carrier_text(
+                &ctx.display_name(),
+                carrier_word(route.carrier),
+                &format!(
+                    "raven contact verify --address {}",
+                    raven_core::encode_address(&peer_pub)
+                ),
+                &pin_command_hint(&peer_pub),
+            ));
+        }
     }
     ensure_lab_local_material(data_dir, id)?;
     let (local_cert, registry) = ensure_local_device_cert(data_dir, id)?;
@@ -685,10 +743,18 @@ impl<'a> OutboxHandoff<'a> {
         choice: Option<CarrierChoice>,
     ) -> Self {
         let has = |c: DialCarrier| routes.iter().any(|r| r.carrier == c);
-        let derived = match (has(DialCarrier::Lan), has(DialCarrier::Internet)) {
-            (true, true) => CarrierChoice::Auto,
-            (false, true) => CarrierChoice::Internet,
-            _ => CarrierChoice::Lan,
+        let kinds = [DialCarrier::Lan, DialCarrier::Internet, DialCarrier::P2p]
+            .into_iter()
+            .filter(|c| has(*c))
+            .count();
+        let derived = if kinds > 1 {
+            CarrierChoice::Auto
+        } else if has(DialCarrier::Internet) {
+            CarrierChoice::Internet
+        } else if has(DialCarrier::P2p) {
+            CarrierChoice::P2p
+        } else {
+            CarrierChoice::Lan
         };
         Self {
             data_dir,

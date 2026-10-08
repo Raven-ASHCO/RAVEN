@@ -177,6 +177,13 @@ fn handle_req(req: IpcRequest, data_dir: &Path, forward: &Option<ForwardQueue>) 
             if crate::internet_direct::listener_is_up() {
                 caps.push("internet_direct".into());
             }
+            let p2p = crate::p2p::status_snapshot();
+            if let Some(info) = p2p.as_ref().filter(|i| i.up) {
+                caps.push("p2p".into());
+                if info.relay.is_some() {
+                    caps.push("p2p_relay".into());
+                }
+            }
             let pending = match forward {
                 Some(q) => {
                     if !crate::bridge_degraded() {
@@ -204,6 +211,7 @@ fn handle_req(req: IpcRequest, data_dir: &Path, forward: &Option<ForwardQueue>) 
                 relay: policy.relay,
                 forward_pending: pending,
                 capabilities: caps,
+                p2p,
             }
         }
         IpcRequest::SetPolicy {
@@ -479,6 +487,11 @@ fn handle_req(req: IpcRequest, data_dir: &Path, forward: &Option<ForwardQueue>) 
             code: "INTERNAL".into(),
             message: "InternetDial must be handled asynchronously".into(),
         },
+        IpcRequest::P2pDial { v, .. } => IpcResponse::Error {
+            v,
+            code: "INTERNAL".into(),
+            message: "P2pDial must be handled asynchronously".into(),
+        },
     }
 }
 
@@ -641,6 +654,53 @@ async fn handle_internet_dial(data_dir: &Path, req: IpcRequest) -> IpcResponse {
     }
 }
 
+async fn handle_p2p_dial(data_dir: &Path, req: IpcRequest) -> IpcResponse {
+    let IpcRequest::P2pDial {
+        v,
+        multiaddr,
+        expected_pub_hex,
+        frames_b64,
+    } = req
+    else {
+        return IpcResponse::Error {
+            v: IPC_VERSION,
+            code: "INTERNAL".into(),
+            message: "not P2pDial".into(),
+        };
+    };
+    let mut frames = Vec::new();
+    for item in frames_b64 {
+        match base64_decode(&item) {
+            Ok(b) => frames.push(b),
+            Err(e) => {
+                return IpcResponse::Error {
+                    v,
+                    code: "IPC_BAD_B64".into(),
+                    message: e,
+                };
+            }
+        }
+    }
+    // Same rules as the outbox: gate, verified contacts only (`p2p::dial`).
+    let work = crate::p2p::dial(data_dir, &multiaddr, &expected_pub_hex, &frames);
+    match tokio::time::timeout(INTERNET_DIAL_TIMEOUT, work).await {
+        Ok(Ok(replies)) => IpcResponse::P2pDialResult {
+            v,
+            frames_b64: replies.iter().map(|f| b64_encode(f)).collect(),
+        },
+        Ok(Err(e)) => IpcResponse::Error {
+            v,
+            code: "P2P_DIAL".into(),
+            message: e,
+        },
+        Err(_) => IpcResponse::Error {
+            v,
+            code: "P2P_DIAL_TIMEOUT".into(),
+            message: "p2p dial exceeded 45s".into(),
+        },
+    }
+}
+
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD
@@ -659,6 +719,7 @@ async fn dispatch(
         Ok(IpcRequest::Ping { v }) => IpcResponse::Pong { v },
         Ok(req @ IpcRequest::LanDial { .. }) => handle_lan_dial(data_dir, req).await,
         Ok(req @ IpcRequest::InternetDial { .. }) => handle_internet_dial(data_dir, req).await,
+        Ok(req @ IpcRequest::P2pDial { .. }) => handle_p2p_dial(data_dir, req).await,
         Ok(req) => {
             let dd = data_dir.clone();
             let fq = forward.clone();

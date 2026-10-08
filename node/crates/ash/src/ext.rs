@@ -922,6 +922,11 @@ struct LocalContactRow {
     /// `Contact` writes it only when set; so does this row).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     internet_dial: String,
+    /// The p2p route (P3), kept the same way.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    p2p: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    p2p_via: Vec<String>,
 }
 
 fn load_local_contacts(data_dir: &Path) -> Result<Vec<LocalContactRow>, String> {
@@ -1077,6 +1082,8 @@ fn device_sync_import_apply(data_dir: &Path, id: &Identity, wire: &[u8]) -> Resu
             pinned: sc.pinned,
             lan_dial: String::new(),
             internet_dial: String::new(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
         });
         added += 1;
     }
@@ -2320,27 +2327,39 @@ fn deliver_routes(
         );
     };
     for route in routes {
-        if !looks_like_host_port(&route.dial) {
+        let plausible = if route.carrier == DialCarrier::P2p {
+            route.carrier.plausible(&route.dial)
+        } else {
+            looks_like_host_port(&route.dial)
+        };
+        if !plausible {
             return Err(format!(
-                "valid {} host:port required — refusing LocalListenQueue / 127.0.0.1:0 fallback",
-                route.carrier.label()
+                "valid {} {} required — refusing LocalListenQueue / 127.0.0.1:0 fallback",
+                route.carrier.label(),
+                if route.carrier == DialCarrier::P2p {
+                    "/p2p/<PeerId> address"
+                } else {
+                    "host:port"
+                }
             ));
         }
-        // The Internet carrier has its own (stricter) gate than LAN: refuse here,
-        // before ensure_mac_lan_daemon changes this machine's listening state.
-        if route.carrier == DialCarrier::Internet && !raven_core::internet_direct_live_enabled() {
-            return Err(super::pair_init_lab::INTERNET_DIRECT_HOLD.into());
+        // The Internet and p2p carriers have their own (stricter) gates than
+        // LAN: refuse here, before ensure_mac_lan_daemon changes this
+        // machine's listening state.
+        if let Some(hold) = route.carrier.hold() {
+            return Err(hold.into());
         }
         // And only for a verified (pinned) contact: refused before anything
         // starts or is dialled.
-        if route.carrier == DialCarrier::Internet
+        if route.carrier != DialCarrier::Lan
             && !raven_core::carrier_allowed_for_contact(
-                raven_core::OutboxCarrier::Internet,
+                route.carrier.outbox(),
                 raven_core::contact_is_pinned(data_dir, &peer_pub)?,
             )
         {
-            return Err(super::pair_init_lab::unverified_internet_text(
+            return Err(super::pair_init_lab::unverified_carrier_text(
                 &ctx.who(),
+                super::pair_init_lab::carrier_word(route.carrier),
                 &format!(
                     "raven contact verify --address {}",
                     encode_address(&peer_pub)
@@ -6465,6 +6484,7 @@ mod chat_ux_tests {
                 relay: false,
                 forward_pending: 0,
                 capabilities: caps.iter().map(|c| c.to_string()).collect(),
+                p2p: None,
             })
         };
         assert_eq!(

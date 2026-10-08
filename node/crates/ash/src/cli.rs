@@ -28,6 +28,7 @@ macro_rules! println {
 
 mod ext;
 mod ipc_client;
+mod p2p_cli;
 mod pair_init_lab;
 mod trace_delivery;
 
@@ -331,6 +332,12 @@ enum Commands {
         /// With --card: the LAN address friends on your network dial.
         #[arg(long, value_name = "HOST:PORT", requires = "card")]
         lan: Option<String>,
+        /// With --card: a relay you reserve on (its multiaddr ending in
+        /// /p2p/<relay PeerId>), or your own direct libp2p address (repeatable,
+        /// at most 2). Adds p2p=<your PeerId> and via= (a raven-card/2); without
+        /// it the relays of `raven node p2p on` are used when p2p is on.
+        #[arg(long, value_name = "MULTIADDR", requires = "card")]
+        via: Vec<String>,
     },
     /// Send one message to a contact (the text comes from stdin).
     ///
@@ -361,10 +368,12 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         chat: bool,
         /// How to reach the contact: `auto` (default: their saved LAN address
-        /// first, then their saved Internet address), `lan` or `internet`.
-        /// Internet direct needs INTERNET_DIRECT_PRODUCTION_ENABLED (or the
-        /// debug lab unlock); with --peer, `auto` means LAN.
-        #[arg(long, default_value = "auto", value_name = "auto|lan|internet")]
+        /// first, then their Internet address, then p2p), `lan`, `internet` or
+        /// `p2p` (libp2p: direct, then through a relay, hole punching where the
+        /// NATs allow). Internet direct and p2p need their production flags (or
+        /// the debug lab unlock) and a verified contact; with --peer, `auto`
+        /// means LAN.
+        #[arg(long, default_value = "auto", value_name = "auto|lan|internet|p2p")]
         carrier: String,
     },
     /// Show the messages you received.
@@ -430,6 +439,16 @@ enum Commands {
     Alias {
         #[command(subcommand)]
         cmd: AliasCommands,
+    },
+    /// Relay for your friends (p2p, off by default): who may use this node or a
+    /// dedicated relay folder (`--data-dir`) as their relay.
+    ///
+    ///   raven relay allow @bob          raven relay deny @bob
+    ///
+    ///   raven relay status              raven relay card --host 203.0.113.7
+    Relay {
+        #[command(subcommand)]
+        cmd: RelayCommands,
     },
     /// Advanced: manage the signed key bundle a friend needs to start a chat with you.
     Prekey {
@@ -659,11 +678,13 @@ Interactive (recommended for first-timers):
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
-    /// Set or clear a contact's saved addresses (LAN and Internet); keeps petname, tag and pin.
+    /// Set or clear a contact's saved addresses (LAN, Internet, p2p); keeps petname, tag and pin.
     ///
     ///   raven contact set-addr @bob --internet 203.0.113.7:7422
     ///
     ///   raven contact set-addr Bob --lan 192.168.1.31:7420 --clear internet
+    ///
+    ///   raven contact set-addr @bob --p2p 12D3KooW… --via /ip4/198.51.100.7/tcp/7423/p2p/12D3KooW…
     ///
     /// An address is only a way to reach someone: who they are is their pinned
     /// key, which RAVEN checks on every connection.
@@ -683,8 +704,17 @@ Interactive (recommended for first-timers):
         /// 203.0.113.7:7422 (7422 is RAVEN's Internet direct port).
         #[arg(long, value_name = "HOST:PORT", alias = "internet-dial")]
         internet: Option<String>,
-        /// Remove a saved address: `lan` or `internet` (repeatable).
-        #[arg(long, value_name = "lan|internet")]
+        /// p2p route: the contact's libp2p PeerId (12D3KooW…, the p2p= of
+        /// their card). A changed PeerId drops the old --via addresses.
+        #[arg(long, value_name = "PEER_ID")]
+        p2p: Option<String>,
+        /// A relay the contact reserves on (multiaddr ending in /p2p/<relay
+        /// PeerId>), or their own direct libp2p address (repeatable, at most 2;
+        /// replaces the saved ones).
+        #[arg(long, value_name = "MULTIADDR")]
+        via: Vec<String>,
+        /// Remove a saved address: `lan`, `internet` or `p2p` (repeatable).
+        #[arg(long, value_name = "lan|internet|p2p")]
         clear: Vec<String>,
     },
     /// Change the saved LAN dial (host:port) of one contact; keeps petname, tag and pin.
@@ -765,6 +795,28 @@ enum NodeCommands {
     Internet {
         #[command(subcommand)]
         state: InternetState,
+    },
+    /// Reach and be reached through libp2p: relays and hole punching (off by default).
+    ///
+    ///   raven node p2p on --relay /ip4/198.51.100.7/tcp/7423/p2p/12D3KooW…
+    ///
+    ///   raven node p2p on --relay @friend     (a friend whose node relays)
+    ///
+    ///   raven node p2p off
+    ///
+    /// Saved in node_policy.json; raven-node applies it when it (re)starts.
+    /// Only your verified contacts get a Raven link, but the relays you use
+    /// learn your PeerId, your IP and when you talk.
+    P2p {
+        #[command(subcommand)]
+        state: P2pState,
+    },
+    /// Let raven-node open its p2p port on your router (UPnP / NAT-PMP).
+    ///
+    /// `raven node p2p on` asks once on a terminal; this changes the answer.
+    Upnp {
+        #[command(subcommand)]
+        state: OnOff,
     },
     /// Add a custom bootstrap multiaddr (or --manual peer).
     AddBootstrap {
@@ -894,6 +946,60 @@ enum OnOff {
 }
 
 #[derive(Subcommand, Debug, Clone)]
+enum P2pState {
+    /// Run raven-node's libp2p host (P3) after its next restart.
+    On {
+        /// A port (every interface, IPv4 + IPv6, TCP + QUIC), IP:PORT, or
+        /// `relay` (no listening port: reached only through your relays).
+        #[arg(long, default_value = "7423", value_name = "PORT|IP:PORT|relay")]
+        listen: String,
+        /// A relay to keep a reservation on: its multiaddr (a friend's `raven
+        /// relay card` line without `via=`) or @contact (their card's own
+        /// address). Repeatable, at most 2; replaces the saved ones.
+        #[arg(long, value_name = "MULTIADDR|@CONTACT")]
+        relay: Vec<String>,
+        /// Map the port on your router (UPnP / NAT-PMP) without asking.
+        #[arg(long, default_value_t = false, conflicts_with = "no_upnp")]
+        upnp: bool,
+        /// Never map the port on your router, without asking.
+        #[arg(long, default_value_t = false)]
+        no_upnp: bool,
+    },
+    /// Stop the libp2p host (after the next restart).
+    Off,
+}
+
+#[derive(Subcommand, Debug)]
+enum RelayCommands {
+    /// Let a friend reserve on this relay: a contact (@tag; its card's p2p=
+    /// PeerId), a PeerId, or --card with their card line.
+    Allow {
+        who: Option<String>,
+        #[arg(long, value_name = "CARD|FILE")]
+        card: Option<String>,
+        /// Your own note for this entry (never sent anywhere).
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// Stop letting a friend reserve (a running relay drops them in seconds).
+    Deny { who: String },
+    /// Who may reserve here, and what the relay is doing (counts only).
+    Status,
+    /// Print the via= line(s) friends need to use this relay.
+    Card {
+        /// The address friends reach this relay at: a public IP, an IPv6
+        /// address or a DNS name (default: the relay's listen addresses).
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long, default_value_t = raven_core::p2p_route::DEFAULT_P2P_PORT)]
+        port: u16,
+        /// Also print the QUIC (UDP) address.
+        #[arg(long, default_value_t = false)]
+        quic: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
 enum InternetState {
     /// Listen for Internet direct connections from your contacts.
     On {
@@ -936,6 +1042,16 @@ struct Contact {
     /// while empty, so a book without Internet routes stays byte-identical.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     internet_dial: String,
+    /// Optional p2p route (P3): the contact's libp2p PeerId (a card's `p2p=`,
+    /// `raven contact set-addr --p2p`). A reachability hint only, never
+    /// identity: every p2p link runs the Raven link inside and proves the
+    /// pinned `pub_hex`. Omitted from the file while empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    p2p: String,
+    /// At most two relay (or direct) multiaddrs for that PeerId (a card's
+    /// `via=`); see [`raven_core::p2p_route::parse_via`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    p2p_via: Vec<String>,
 }
 
 impl Contact {
@@ -1116,7 +1232,27 @@ fn public_whoami_card(id: &Identity) -> serde_json::Value {
 /// fields instead of guessing.
 const CARD_PREFIX: &str = "raven-card/1";
 /// Longest card line accepted (a v1 card with both routes is ~250 bytes).
-const CARD_MAX_LEN: usize = 1024;
+/// Longest field values a card can hold (each validated like a contact
+/// route): an address (44 characters today), a fingerprint (14), a LAN or
+/// Internet dial ([`MAX_DIAL_TEXT`]), a PeerId (52) and two `via=` multiaddrs.
+const CARD_ADDRESS_MAX: usize = 64;
+const CARD_FINGERPRINT_MAX: usize = 16;
+/// The longest card a valid set of fields gives, so `raven whoami --card`
+/// can never print a card `raven contact add --card` refuses.
+const CARD_MAX_LEN: usize = CARD_PREFIX_V2.len()
+    + " address=".len()
+    + CARD_ADDRESS_MAX
+    + " pub_hex=".len()
+    + 64
+    + " fingerprint=".len()
+    + CARD_FINGERPRINT_MAX
+    + " inet=".len()
+    + MAX_DIAL_TEXT
+    + " lan=".len()
+    + MAX_DIAL_TEXT
+    + " p2p=".len()
+    + 52
+    + raven_core::p2p_route::MAX_VIA * (" via=".len() + raven_core::p2p_route::MAX_MULTIADDR_CHARS);
 /// Largest card file `contact add --card <file>` reads.
 const CARD_FILE_MAX_BYTES: u64 = 4096;
 
@@ -1132,14 +1268,61 @@ struct ContactCard {
     internet: String,
     /// LAN route, or empty.
     lan: String,
+    /// The p2p route of a `raven-card/2`, if any.
+    p2p: Option<P2pRoute>,
+}
+
+/// A validated p2p route: a canonical PeerId and at most two canonical
+/// `via=` multiaddrs (relays, or direct addresses naming the PeerId itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct P2pRoute {
+    peer_id: String,
+    via: Vec<String>,
+}
+
+impl P2pRoute {
+    fn parse(peer_id: &str, via: &[&str]) -> Result<Self, String> {
+        let peer_id = raven_core::p2p_route::normalize_peer_id(peer_id)?;
+        if via.len() > raven_core::p2p_route::MAX_VIA {
+            return Err(format!(
+                "at most {} via addresses",
+                raven_core::p2p_route::MAX_VIA
+            ));
+        }
+        let mut out = Vec::new();
+        for v in via {
+            let v = raven_core::p2p_route::parse_via(v)?;
+            if out.contains(&v.text) {
+                return Err("the same via address appears twice".into());
+            }
+            out.push(v.text);
+        }
+        Ok(Self { peer_id, via: out })
+    }
+}
+
+/// The card version with p2p fields (`p2p=`, `via=`); a card without them
+/// stays `raven-card/1`, so older readers keep reading it.
+const CARD_PREFIX_V2: &str = "raven-card/2";
+
+/// [`format_card_with`] without a p2p route (`raven-card/1`).
+#[cfg(test)]
+fn format_card(id: &Identity, internet: &str, lan: &str) -> String {
+    format_card_with(id, internet, lan, None)
 }
 
 /// One copy-pasteable line: `raven-card/1 address=… pub_hex=… fingerprint=…
-/// [inet=host:port] [lan=host:port]`. Never a seed or private key.
-fn format_card(id: &Identity, internet: &str, lan: &str) -> String {
+/// [inet=host:port] [lan=host:port]`, or with a p2p route `raven-card/2 …
+/// p2p=<PeerId> [via=<multiaddr>]…`. Never a seed or private key.
+fn format_card_with(id: &Identity, internet: &str, lan: &str, p2p: Option<&P2pRoute>) -> String {
     let pub_bytes = id.public_key_bytes();
     let mut card = format!(
-        "{CARD_PREFIX} address={} pub_hex={} fingerprint={}",
+        "{} address={} pub_hex={} fingerprint={}",
+        if p2p.is_some() {
+            CARD_PREFIX_V2
+        } else {
+            CARD_PREFIX
+        },
         id.address(),
         hex::encode(pub_bytes),
         device_fingerprint_v1(&pub_bytes)
@@ -1149,6 +1332,12 @@ fn format_card(id: &Identity, internet: &str, lan: &str) -> String {
     }
     if !lan.is_empty() {
         card.push_str(&format!(" lan={lan}"));
+    }
+    if let Some(r) = p2p {
+        card.push_str(&format!(" p2p={}", r.peer_id));
+        for v in &r.via {
+            card.push_str(&format!(" via={v}"));
+        }
     }
     card
 }
@@ -1164,13 +1353,15 @@ fn parse_card(line: &str) -> Result<ContactCard, String> {
         ));
     }
     let mut tokens = line.split(' ').filter(|t| !t.is_empty());
-    match tokens.next() {
-        Some(CARD_PREFIX) => {}
+    let v2 = match tokens.next() {
+        Some(CARD_PREFIX) => false,
+        Some(CARD_PREFIX_V2) => true,
         Some(t) if t.starts_with("raven-card/") => {
             return Err(format!(
-            "card version \"{}\" is not supported: this raven reads {CARD_PREFIX} (update raven)",
-            sanitize_terminal_line(t)
-        ))
+                "card version \"{}\" is not supported: this raven reads {CARD_PREFIX} and \
+                 {CARD_PREFIX_V2} (update raven)",
+                sanitize_terminal_line(t)
+            ))
         }
         _ => {
             return Err(format!(
@@ -1178,8 +1369,9 @@ fn parse_card(line: &str) -> Result<ContactCard, String> {
                  line `raven whoami --card` prints)"
             ))
         }
-    }
+    };
     let mut fields: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    let mut via: Vec<&str> = Vec::new();
     for token in tokens {
         let (key, value) = token
             .split_once('=')
@@ -1190,12 +1382,20 @@ fn parse_card(line: &str) -> Result<ContactCard, String> {
                     sanitize_terminal_line(token)
                 )
             })?;
-        if !matches!(key, "address" | "pub_hex" | "fingerprint" | "inet" | "lan") {
+        let known = matches!(key, "address" | "pub_hex" | "fingerprint" | "inet" | "lan")
+            || (v2 && matches!(key, "p2p" | "via"));
+        if !known {
             return Err(format!(
                 "card field \"{}\" is unknown to this raven (it reads address, pub_hex, \
-                 fingerprint, inet, lan): refusing the card",
-                sanitize_terminal_line(key)
+                 fingerprint, inet, lan{}): refusing the card",
+                sanitize_terminal_line(key),
+                if v2 { ", p2p, via" } else { "" }
             ));
+        }
+        if key == "via" {
+            // The one repeatable field (at most MAX_VIA, checked below).
+            via.push(value);
+            continue;
         }
         if fields.insert(key, value).is_some() {
             return Err(format!(
@@ -1231,18 +1431,52 @@ fn parse_card(line: &str) -> Result<ContactCard, String> {
         Some(v) => parse_lan_dial(v).map_err(|e| format!("card lan: {e}"))?,
         None => String::new(),
     };
+    let p2p = match fields.get("p2p") {
+        Some(peer) => Some(P2pRoute::parse(peer, &via).map_err(|e| format!("card p2p: {e}"))?),
+        None if !via.is_empty() => return Err("card via= needs a p2p= PeerId".into()),
+        None if v2 => return Err(format!("a {CARD_PREFIX_V2} card needs a p2p= PeerId")),
+        None => None,
+    };
     Ok(ContactCard {
         address,
         pub_hex: hex::encode(ed),
         fingerprint,
         internet,
         lan,
+        p2p,
     })
+}
+
+/// The p2p part of this profile's card: its own PeerId, with `via` (or, when
+/// none is given, the relays node_policy.json reserves on), whenever `via`
+/// was given or p2p is turned on (`raven node p2p on`). `None`: a v1 card.
+fn own_card_p2p(
+    id: &Identity,
+    via: &[String],
+    policy: &NodePolicy,
+) -> Result<Option<P2pRoute>, String> {
+    if via.is_empty() && policy.p2p_listen.trim().is_empty() {
+        return Ok(None);
+    }
+    let via: Vec<&str> = if via.is_empty() {
+        policy.p2p_relays.iter().map(String::as_str).collect()
+    } else {
+        via.iter().map(String::as_str).collect()
+    };
+    P2pRoute::parse(&raven_core::p2p_route::local_peer_id(id), &via)
+        .map(Some)
+        .map_err(|e| format!("--via: {e}"))
 }
 
 /// `raven whoami --card`: exactly one line on stdout (scripts pipe it into a
 /// file or a chat); the addresses are validated like contact routes first.
-fn cmd_whoami_card(id: &Identity, inet: Option<&str>, lan: Option<&str>) -> Result<(), String> {
+fn cmd_whoami_card(
+    data_dir: &Path,
+    id: &Identity,
+    inet: Option<&str>,
+    lan: Option<&str>,
+    via: &[String],
+) -> Result<(), String> {
     let inet = inet
         .map(|v| parse_internet_dial(v).map_err(|e| format!("--inet: {e}")))
         .transpose()?
@@ -1251,7 +1485,38 @@ fn cmd_whoami_card(id: &Identity, inet: Option<&str>, lan: Option<&str>) -> Resu
         .map(|v| parse_lan_dial(v).map_err(|e| format!("--lan: {e}")))
         .transpose()?
         .unwrap_or_default();
-    println!("{}", format_card(id, &inet, &lan));
+    // Without --via the card follows what the running raven-node does (an
+    // installer flag beats node_policy.json); with no service answering, the
+    // policy. An unreadable policy only matters then.
+    let policy = if via.is_empty() {
+        let daemon = ipc_client::ipc_request_timeout(
+            data_dir,
+            &IpcRequest::Status { v: IPC_VERSION },
+            Duration::from_millis(1500),
+        );
+        match p2p_cli::service_p2p(&daemon) {
+            Some(info) => NodePolicy {
+                p2p_listen: info.listen_setting.clone(),
+                p2p_relays: info.relays.clone(),
+                ..NodePolicy::default()
+            },
+            None => try_load_policy(data_dir).unwrap_or_default(),
+        }
+    } else {
+        NodePolicy::default()
+    };
+    let p2p = own_card_p2p(id, via, &policy)?;
+    let card = format_card_with(id, &inet, &lan, p2p.as_ref());
+    // Cannot happen with validated fields; never print a card `contact add`
+    // would refuse.
+    if card.len() > CARD_MAX_LEN {
+        return Err(format!(
+            "this card would be {} characters, more than the {CARD_MAX_LEN} a card may have: \
+             use shorter addresses",
+            card.len()
+        ));
+    }
+    println!("{card}");
     if io::stderr().is_terminal() {
         eprintln!(
             "{C_DIM}Send this line to your friend; they run: raven contact add --card '<line>' \
@@ -2284,9 +2549,13 @@ const DEFAULT_LAN_PORT: u16 = 7420;
 /// Env overrides for peer LAN dial (checked in order). Matches RAVEN_* convention.
 const ENV_PEER_LAN_DIAL: &[&str] = &["RAVEN_PEER", "ASH_LAN_DIAL"];
 
+/// Longest `host:port` text accepted for a LAN or Internet route (the
+/// outbox's own bound, `raven_core::outbox::plausible_dial`).
+const MAX_DIAL_TEXT: usize = 300;
+
 fn looks_like_lan_dial(s: &str) -> bool {
     let t = s.trim();
-    if t.is_empty() || t.contains(' ') {
+    if t.is_empty() || t.contains(' ') || t.len() > MAX_DIAL_TEXT {
         return false;
     }
     // host:port — avoid treating rvn1… as dial
@@ -3733,7 +4002,7 @@ fn add_contact(
     lan_dial: &str,
 ) -> Result<(), String> {
     add_contact_with_routes(
-        data_dir, address, pub_hex, petname, public_tag, verify_fp, lan_dial, "",
+        data_dir, address, pub_hex, petname, public_tag, verify_fp, lan_dial, "", None,
     )
 }
 
@@ -3750,6 +4019,7 @@ fn add_contact_with_routes(
     verify_fp: Option<&str>,
     lan_dial: &str,
     internet_dial: &str,
+    p2p: Option<&P2pRoute>,
 ) -> Result<(), String> {
     let new_inet = if internet_dial.trim().is_empty() {
         None
@@ -3948,8 +4218,26 @@ fn add_contact_with_routes(
         pinned: pin || prior_pinned,
         lan_dial: dial,
         internet_dial: inet,
+        // A card's p2p route replaces the old one; none keeps it.
+        p2p: p2p.map_or_else(
+            || prior.as_ref().map(|c| c.p2p.clone()).unwrap_or_default(),
+            |r| r.peer_id.clone(),
+        ),
+        p2p_via: p2p.map_or_else(
+            || {
+                prior
+                    .as_ref()
+                    .map(|c| c.p2p_via.clone())
+                    .unwrap_or_default()
+            },
+            |r| r.via.clone(),
+        ),
     });
     save_contacts(data_dir, &contacts)?;
+    if p2p.is_some() {
+        // New p2p hints: the outbox plans from the book again.
+        forget_outbox_routes(data_dir, &hex::encode(ed));
+    }
     let saved = contacts.last().unwrap();
     let label = saved.primary_label();
     let named = !saved.petname.trim().is_empty();
@@ -3977,6 +4265,16 @@ fn add_contact_with_routes(
         println!(
             "{C_DIM}internet{C_RESET}    {}",
             sanitize_terminal_line(&saved.internet_dial)
+        );
+    }
+    if !saved.p2p.is_empty() {
+        println!(
+            "{C_DIM}p2p{C_RESET}         {}{}",
+            sanitize_terminal_line(&saved.p2p),
+            match saved.p2p_via.len() {
+                0 => String::new(),
+                n => format!(" (via {n} address{})", if n == 1 { "" } else { "es" }),
+            }
         );
     }
     println!("{C_DIM}fingerprint{C_RESET} {fp}");
@@ -4695,27 +4993,78 @@ struct RouteEdit {
     /// `Some("")`: clear; `Some(v)`: set to the validated `v`; `None`: keep.
     lan: Option<String>,
     internet: Option<String>,
+    /// `None`: keep the p2p route.
+    p2p: Option<P2pEdit>,
 }
 
+/// A change to the p2p route (validated).
+#[derive(Debug, PartialEq, Eq)]
+enum P2pEdit {
+    Clear,
+    /// `peer_id: None`: keep the PeerId (`--via` alone); `via: None`: keep
+    /// the addresses unless the PeerId changes.
+    Set {
+        peer_id: Option<String>,
+        via: Option<Vec<String>>,
+    },
+}
+
+/// [`parse_route_edit_with`] without p2p flags.
+#[cfg(test)]
 fn parse_route_edit(
     lan: Option<&str>,
     internet: Option<&str>,
     clear: &[String],
 ) -> Result<RouteEdit, String> {
+    parse_route_edit_with(lan, internet, None, &[], clear)
+}
+
+fn parse_route_edit_with(
+    lan: Option<&str>,
+    internet: Option<&str>,
+    p2p: Option<&str>,
+    via: &[String],
+    clear: &[String],
+) -> Result<RouteEdit, String> {
     let mut edit = RouteEdit::default();
     let mut clear_lan = false;
     let mut clear_inet = false;
+    let mut clear_p2p = false;
     for kind in clear {
         match kind.trim().to_ascii_lowercase().as_str() {
             "lan" => clear_lan = true,
             "internet" | "inet" => clear_inet = true,
+            "p2p" => clear_p2p = true,
             other => {
                 return Err(format!(
-                    "--clear takes lan or internet, not \"{}\"",
+                    "--clear takes lan, internet or p2p, not \"{}\"",
                     sanitize_terminal_line(other)
                 ))
             }
         }
+    }
+    if clear_p2p && (p2p.is_some() || !via.is_empty()) {
+        return Err("--p2p / --via and --clear p2p contradict each other: give one".into());
+    }
+    if clear_p2p {
+        edit.p2p = Some(P2pEdit::Clear);
+    } else if p2p.is_some() || !via.is_empty() {
+        let peer_id = p2p
+            .map(|p| raven_core::p2p_route::normalize_peer_id(p).map_err(|e| format!("--p2p: {e}")))
+            .transpose()?;
+        let via = if via.is_empty() {
+            None
+        } else {
+            let refs: Vec<&str> = via.iter().map(String::as_str).collect();
+            // Validated against a placeholder PeerId: only the via part counts.
+            let probe = raven_core::p2p_route::local_peer_id(&Identity::from_seed(&[0; 32]));
+            Some(
+                P2pRoute::parse(peer_id.as_deref().unwrap_or(&probe), &refs)
+                    .map_err(|e| format!("--via: {e}"))?
+                    .via,
+            )
+        };
+        edit.p2p = Some(P2pEdit::Set { peer_id, via });
     }
     if clear_lan && lan.is_some() {
         return Err("--lan and --clear lan contradict each other: give one".into());
@@ -4735,8 +5084,8 @@ fn parse_route_edit(
     }
     if edit == RouteEdit::default() {
         return Err(
-            "nothing to change: pass --lan HOST:PORT, --internet HOST:PORT or --clear \
-             lan|internet"
+            "nothing to change: pass --lan HOST:PORT, --internet HOST:PORT, --p2p PEER_ID \
+             [--via MULTIADDR] or --clear lan|internet|p2p"
                 .into(),
         );
     }
@@ -4789,9 +5138,8 @@ fn forget_outbox_routes(data_dir: &Path, pub_hex: &str) {
     }
 }
 
-/// `raven contact set-addr`: set or clear one contact's LAN and Internet
-/// routes in place (petname, tag and pin are untouched). Every value is checked
-/// before the book is read, so a typo changes nothing.
+/// [`cmd_contact_set_routes`] without p2p flags.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn cmd_contact_set_addr(
     data_dir: &Path,
@@ -4803,7 +5151,37 @@ fn cmd_contact_set_addr(
     internet: Option<&str>,
     clear: &[String],
 ) -> Result<(), String> {
-    let edit = parse_route_edit(lan, internet, clear)?;
+    cmd_contact_set_routes(
+        data_dir,
+        selector,
+        tag,
+        petname,
+        address,
+        lan,
+        internet,
+        None,
+        &[],
+        clear,
+    )
+}
+
+/// `raven contact set-addr`: set or clear one contact's LAN, Internet and p2p
+/// routes in place (petname, tag and pin are untouched). Every value is checked
+/// before the book is read, so a typo changes nothing.
+#[allow(clippy::too_many_arguments)]
+fn cmd_contact_set_routes(
+    data_dir: &Path,
+    selector: Option<&str>,
+    tag: Option<&str>,
+    petname: Option<&str>,
+    address: Option<&str>,
+    lan: Option<&str>,
+    internet: Option<&str>,
+    p2p: Option<&str>,
+    via: &[String],
+    clear: &[String],
+) -> Result<(), String> {
+    let edit = parse_route_edit_with(lan, internet, p2p, via, clear)?;
     let mut contacts = load_contacts(data_dir)?;
     let target = select_contact_for_edit(&contacts, selector, tag, petname, address)?;
     let row = contacts
@@ -4816,7 +5194,35 @@ fn cmd_contact_set_addr(
     if let Some(v) = &edit.internet {
         row.internet_dial = v.clone();
     }
+    match &edit.p2p {
+        None => {}
+        Some(P2pEdit::Clear) => {
+            row.p2p.clear();
+            row.p2p_via.clear();
+        }
+        Some(P2pEdit::Set { peer_id, via }) => {
+            match peer_id {
+                Some(p) if *p != row.p2p => {
+                    row.p2p = p.clone();
+                    row.p2p_via.clear();
+                }
+                Some(_) => {}
+                None if row.p2p.is_empty() => {
+                    return Err(format!(
+                        "{} has no p2p PeerId yet: give it with --p2p 12D3KooW… (the p2p= of \
+                         their card) along with --via",
+                        target.primary_label()
+                    ));
+                }
+                None => {}
+            }
+            if let Some(v) = via {
+                row.p2p_via = v.clone();
+            }
+        }
+    }
     let (lan_now, inet_now) = (row.lan_dial.clone(), row.internet_dial.clone());
+    let (p2p_now, via_now) = (row.p2p.clone(), row.p2p_via.clone());
     save_contacts(data_dir, &contacts)?;
     forget_outbox_routes(data_dir, &target.pub_hex);
     let show = |v: &str| {
@@ -4832,7 +5238,13 @@ fn cmd_contact_set_addr(
     );
     println!("{C_DIM}lan_dial{C_RESET}    {}", show(&lan_now));
     println!("{C_DIM}internet{C_RESET}    {}", show(&inet_now));
-    if !inet_now.is_empty() && !target.pinned {
+    if edit.p2p.is_some() || !p2p_now.is_empty() {
+        println!("{C_DIM}p2p{C_RESET}         {}", show(&p2p_now));
+        for v in &via_now {
+            println!("{C_DIM}  via{C_RESET}       {}", show(v));
+        }
+    }
+    if (!inet_now.is_empty() || !p2p_now.is_empty()) && !target.pinned {
         println!(
             "{C_DIM}note: an address is only a way to reach them; RAVEN still checks their key \
              on every connection. Compare fingerprints and pin them (contact add --verify-fp) \
@@ -5190,6 +5602,7 @@ fn cmd_status(data_dir: &Path) -> Result<(), String> {
             raven_core::internet_direct_live_enabled(),
         ),
     );
+    p2p_cli::print_status_rows(&daemon, &policy);
     kv("forward_q", &forward_queue_line(&queue));
 
     let qpath = data_dir.join("queue.db");
@@ -5888,6 +6301,11 @@ fn set_addr_hint(c: &Contact, flag: &str) -> String {
 /// The refusal for an Internet send to a contact that is not verified, with the
 /// two commands that fix it (show the fingerprint; pin it by adding again).
 fn unverified_contact_text(c: &Contact) -> String {
+    unverified_contact_text_for(c, "Internet")
+}
+
+/// [`unverified_contact_text`] for `carrier` (`Internet` or `p2p`).
+fn unverified_contact_text_for(c: &Contact, carrier: &str) -> String {
     let (who, verify) = match c.tag_subtitle() {
         Some(tag) => (
             tag.clone(),
@@ -5905,27 +6323,72 @@ fn unverified_contact_text(c: &Contact) -> String {
         Ok(key) => pair_init_lab::pin_command_hint(&key),
         Err(_) => "raven contact add … --verify-fp <the fingerprint they read out>".into(),
     };
-    pair_init_lab::unverified_internet_text(&who, &verify, &pin)
+    pair_init_lab::unverified_carrier_text(&who, carrier, &verify, &pin)
 }
 
-/// The routes `choice` allows for contact `c`, LAN first (transports design
-/// §2.3). `env` is the `RAVEN_PEER` / `ASH_LAN_DIAL` LAN dial; `internet_live`
-/// is the Internet direct gate. `auto` never plans a held carrier, and a LAN-only
-/// contact gets exactly the LAN send it always got.
+fn p2p_route(peer_id: &str) -> pair_init_lab::DialRoute {
+    pair_init_lab::DialRoute {
+        carrier: pair_init_lab::DialCarrier::P2p,
+        dial: raven_core::p2p_route::peer_route(peer_id),
+    }
+}
+
+/// [`plan_contact_routes_with`] with the p2p gate closed.
+#[cfg(test)]
 fn plan_contact_routes(
     c: &Contact,
     choice: CarrierChoice,
     env: Option<String>,
     internet_live: bool,
 ) -> Result<(Vec<pair_init_lab::DialRoute>, Option<String>), String> {
+    plan_contact_routes_with(c, choice, env, internet_live, false)
+}
+
+/// The routes `choice` allows for contact `c`, in plan order (transports
+/// design §2.3): LAN, Internet direct, p2p. `env` is the `RAVEN_PEER` /
+/// `ASH_LAN_DIAL` LAN dial; `internet_live` / `p2p_live` are the carrier gates.
+/// `auto` never plans a held carrier, and a LAN-only contact gets exactly the
+/// LAN send it always got. Internet and p2p only for a verified contact.
+fn plan_contact_routes_with(
+    c: &Contact,
+    choice: CarrierChoice,
+    env: Option<String>,
+    internet_live: bool,
+    p2p_live: bool,
+) -> Result<(Vec<pair_init_lab::DialRoute>, Option<String>), String> {
     let inet = parse_internet_dial(&c.internet_dial).ok();
-    let want_lan = choice != CarrierChoice::Internet;
+    let p2p = raven_core::p2p_route::normalize_peer_id(&c.p2p).ok();
+    // p2p first decided, then planned last: an `auto` send whose only other
+    // address is held still has its p2p route.
+    let p2p_unverified = p2p_live
+        && !raven_core::carrier_allowed_for_contact(raven_core::OutboxCarrier::P2p, c.pinned);
+    let p2p_planned = match (&p2p, choice) {
+        (None, CarrierChoice::P2p) => {
+            return Err(format!(
+                "contact {} has no p2p route saved; save one with: {}",
+                c.primary_label(),
+                set_addr_hint(c, "--p2p PEER_ID --via MULTIADDR").replace(" HOST:PORT", "")
+            ));
+        }
+        (Some(_), CarrierChoice::P2p) if p2p_unverified => {
+            return Err(unverified_contact_text_for(c, "p2p"));
+        }
+        // `--carrier p2p` while held still plans it: the send path then
+        // refuses with P2P_HOLD before any daemon is started.
+        (Some(peer), CarrierChoice::P2p) => Some(p2p_route(peer)),
+        (Some(peer), CarrierChoice::Auto) if p2p_live && !p2p_unverified => Some(p2p_route(peer)),
+        _ => None,
+    };
+    // Another saved route (even one this send cannot use) means a missing
+    // LAN address is not the error to report.
+    let others = inet.is_some() || p2p.is_some();
+    let want_lan = matches!(choice, CarrierChoice::Auto | CarrierChoice::Lan);
     let lan_possible = resolve_lan_peer_parts(&c.lan_dial, env.as_deref()).is_some();
     let mut routes = Vec::new();
     let mut env_lan = None;
     // The LAN line ("LAN dial … (saved · Bob)") and the "no LAN address" hint are
     // printed only when LAN is what this send relies on.
-    if want_lan && (lan_possible || inet.is_none() || choice == CarrierChoice::Lan) {
+    if want_lan && (lan_possible || !others || choice == CarrierChoice::Lan) {
         match resolve_or_reuse_lan_dial_with(c, env) {
             Some((ResolvedLanPeer::Dial(dial), from_env)) => {
                 if from_env {
@@ -5933,7 +6396,7 @@ fn plan_contact_routes(
                 }
                 routes.push(lan_route(&dial));
             }
-            None if choice == CarrierChoice::Lan || inet.is_none() => {
+            None if choice == CarrierChoice::Lan || !others => {
                 return Err(format!(
                     "contact {} has no reachable lan_dial — set host:port (not LocalListenQueue)",
                     c.primary_label()
@@ -5942,7 +6405,7 @@ fn plan_contact_routes(
             None => {}
         }
     }
-    if choice != CarrierChoice::Lan {
+    if matches!(choice, CarrierChoice::Auto | CarrierChoice::Internet) {
         // Internet delivery only for a verified (pinned) contact (owner
         // decision 2026-10-08); LAN stays open to every contact. Decided where
         // Internet would really be tried (the gate is open): `auto` then keeps
@@ -5952,15 +6415,16 @@ fn plan_contact_routes(
                 raven_core::OutboxCarrier::Internet,
                 c.pinned,
             );
+        let nothing_else = routes.is_empty() && p2p_planned.is_none();
         match inet {
-            Some(_) if unverified && (routes.is_empty() || choice == CarrierChoice::Internet) => {
+            Some(_) if unverified && (nothing_else || choice == CarrierChoice::Internet) => {
                 return Err(unverified_contact_text(c));
             }
             Some(_) if unverified => {}
             Some(addr) if internet_live || choice == CarrierChoice::Internet => {
                 routes.push(internet_route(&addr));
             }
-            Some(_) if routes.is_empty() => {
+            Some(_) if nothing_else => {
                 return Err(format!(
                     "{} — {} has only an Internet address saved; to reach them on your network \
                      save a LAN one: {}",
@@ -5979,6 +6443,22 @@ fn plan_contact_routes(
             }
             None => {}
         }
+    }
+    if let Some(route) = p2p_planned {
+        routes.push(route);
+    } else if routes.is_empty() && choice == CarrierChoice::Auto && p2p.is_some() {
+        // Only a p2p route, and it cannot be used: say why.
+        return Err(if p2p_unverified {
+            unverified_contact_text_for(c, "p2p")
+        } else {
+            format!(
+                "{} — {} has only a p2p route saved; to reach them on your network save a LAN \
+                 one: {}",
+                raven_core::P2P_HOLD,
+                c.primary_label(),
+                set_addr_hint(c, "--lan")
+            )
+        });
     }
     Ok((routes, env_lan))
 }
@@ -6005,11 +6485,12 @@ fn resolve_send_target(
             ));
         }
         let c = hits[0];
-        let (routes, env_lan_dial) = plan_contact_routes(
+        let (routes, env_lan_dial) = plan_contact_routes_with(
             c,
             choice,
             env_peer_lan_dial(),
             raven_core::internet_direct_live_enabled(),
+            raven_core::p2p_live_enabled(),
         )?;
         return Ok(SendTarget {
             routes,
@@ -6022,6 +6503,13 @@ fn resolve_send_target(
         return Err("send requires --contact @tag or --peer host:port plus --peer-pub-hex".into());
     }
     // An explicit --peer is a LAN dial unless `--carrier internet` says otherwise.
+    if choice == CarrierChoice::P2p {
+        return Err(
+            "send --carrier p2p needs --contact (the p2p route is saved with the contact: \
+             raven contact set-addr NAME --p2p PEER_ID --via MULTIADDR)"
+                .into(),
+        );
+    }
     let route = if choice == CarrierChoice::Internet {
         internet_route(peer)
     } else {
@@ -6177,10 +6665,12 @@ fn format_inbox_row(
 /// What `raven send --carrier` asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CarrierChoice {
-    /// The contact's saved LAN route first, then its Internet route.
+    /// The contact's saved LAN route first, then Internet, then p2p.
     Auto,
     Lan,
     Internet,
+    /// The libp2p carrier only (direct, then via a relay; P3).
+    P2p,
 }
 
 fn parse_send_carrier(s: &str) -> Result<CarrierChoice, String> {
@@ -6188,8 +6678,9 @@ fn parse_send_carrier(s: &str) -> Result<CarrierChoice, String> {
         "auto" | "" => Ok(CarrierChoice::Auto),
         "lan" => Ok(CarrierChoice::Lan),
         "internet" => Ok(CarrierChoice::Internet),
+        "p2p" => Ok(CarrierChoice::P2p),
         other => Err(format!(
-            "unknown --carrier {} (auto | lan | internet)",
+            "unknown --carrier {} (auto | lan | internet | p2p)",
             sanitize_terminal_line(other)
         )),
     }
@@ -6217,29 +6708,35 @@ fn run_send(
         )
         .map(|()| only.clone()),
         // `--peer … --carrier internet`: the lab Internet path as before.
-        [only] if choice == CarrierChoice::Internet => ext::run_send_secure_on(
-            data_dir,
-            &id,
-            &only.dial,
-            &target.pub_hex,
-            &target.listen,
-            text,
-            "",
-            "",
-            only.carrier,
-        )
-        .map(|()| only.clone()),
+        [only]
+            if choice == CarrierChoice::Internet
+                && only.carrier != pair_init_lab::DialCarrier::P2p =>
+        {
+            ext::run_send_secure_on(
+                data_dir,
+                &id,
+                &only.dial,
+                &target.pub_hex,
+                &target.listen,
+                text,
+                "",
+                "",
+                only.carrier,
+            )
+            .map(|()| only.clone())
+        }
         routes => ext::run_send_secure_routes(
             data_dir,
             &id,
             routes,
             &target.pub_hex,
             text,
-            choice == CarrierChoice::Internet,
+            matches!(choice, CarrierChoice::Internet | CarrierChoice::P2p),
             match choice {
                 CarrierChoice::Auto => raven_core::outbox::CarrierChoice::Auto,
                 CarrierChoice::Lan => raven_core::outbox::CarrierChoice::Lan,
                 CarrierChoice::Internet => raven_core::outbox::CarrierChoice::Internet,
+                CarrierChoice::P2p => raven_core::outbox::CarrierChoice::P2p,
             },
         ),
     }
@@ -6265,9 +6762,9 @@ fn cmd_send_cli(
     };
     let no_target = contact.trim().is_empty() && peer.trim().is_empty();
     if chat {
-        if carrier == CarrierChoice::Internet {
+        if matches!(carrier, CarrierChoice::Internet | CarrierChoice::P2p) {
             eprintln!(
-                "ash send --chat --carrier internet is not in this slice: live chat uses the \
+                "ash send --chat --carrier internet|p2p is not in this slice: live chat uses the \
                  contact's LAN address (send single messages over the Internet with \
                  `raven send --contact NAME`)"
             );
@@ -6332,9 +6829,10 @@ fn cmd_send_cli(
     if no_target && stdin_is_tty() {
         // The guided picker only speaks LAN: an explicit `--carrier internet`
         // must not silently end up there (lab evidence on the wrong carrier).
-        if carrier == CarrierChoice::Internet {
+        if matches!(carrier, CarrierChoice::Internet | CarrierChoice::P2p) {
             eprintln!(
-                "ash send --carrier internet requires --contact @tag or --peer host:port plus --peer-pub-hex"
+                "ash send --carrier internet|p2p requires --contact @tag (or, for internet, \
+                 --peer host:port plus --peer-pub-hex)"
             );
             std::process::exit(1);
         }
@@ -6862,10 +7360,17 @@ pub fn run() {
             card,
             inet,
             lan,
+            via,
         }) => match try_load_identity(&data_dir) {
             Ok(Some(id)) => {
                 if card {
-                    exit_on_err(cmd_whoami_card(&id, inet.as_deref(), lan.as_deref()));
+                    exit_on_err(cmd_whoami_card(
+                        &data_dir,
+                        &id,
+                        inet.as_deref(),
+                        lan.as_deref(),
+                        &via,
+                    ));
                 } else if json {
                     println!("{}", public_whoami_card(&id));
                 } else {
@@ -6939,6 +7444,26 @@ pub fn run() {
                 InternetState::On { listen } => cmd_node_internet(&data_dir, Some(&listen)),
                 InternetState::Off => cmd_node_internet(&data_dir, None),
             }),
+            NodeCommands::P2p { state } => exit_on_err(match state {
+                P2pState::On {
+                    listen,
+                    relay,
+                    upnp,
+                    no_upnp,
+                } => p2p_cli::cmd_node_p2p(
+                    &data_dir,
+                    Some(p2p_cli::P2pOnArgs {
+                        listen,
+                        relay,
+                        upnp: (upnp || no_upnp).then_some(upnp),
+                    }),
+                ),
+                P2pState::Off => p2p_cli::cmd_node_p2p(&data_dir, None),
+            }),
+            NodeCommands::Upnp { state } => exit_on_err(p2p_cli::cmd_node_upnp(
+                &data_dir,
+                matches!(state, OnOff::On),
+            )),
             NodeCommands::AddBootstrap { multiaddr, manual } => {
                 ext::cmd_bootstrap_add(&data_dir, &multiaddr, manual)
             }
@@ -6948,6 +7473,16 @@ pub fn run() {
                 ext::cmd_bootstrap_init(&data_dir, no_raven_defaults)
             }
         },
+        Some(Commands::Relay { cmd }) => exit_on_err(match cmd {
+            RelayCommands::Allow { who, card, label } => {
+                p2p_cli::cmd_relay_allow(&data_dir, who.as_deref(), card.as_deref(), &label)
+            }
+            RelayCommands::Deny { who } => p2p_cli::cmd_relay_deny(&data_dir, &who),
+            RelayCommands::Status => p2p_cli::cmd_relay_status(&data_dir),
+            RelayCommands::Card { host, port, quic } => {
+                p2p_cli::cmd_relay_card(&data_dir, host.as_deref(), port, quic)
+            }
+        }),
         Some(Commands::Alias { cmd }) => match cmd {
             AliasCommands::Publish {
                 alias,
@@ -7082,6 +7617,7 @@ pub fn run() {
                         "{C_DIM}card read: key and address match; its addresses are only hints for reaching them{C_RESET}"
                     );
                 }
+                let p2p = card.as_ref().and_then(|c| c.p2p.clone());
                 if let Err(e) = add_contact_with_routes(
                     &data_dir,
                     &address,
@@ -7091,6 +7627,7 @@ pub fn run() {
                     verify_fp.as_deref(),
                     &lan_dial,
                     &internet_dial,
+                    p2p.as_ref(),
                 ) {
                     eprintln!("{}", sanitize_terminal_line(&e));
                     std::process::exit(1);
@@ -7152,8 +7689,10 @@ pub fn run() {
                 address,
                 lan,
                 internet,
+                p2p,
+                via,
                 clear,
-            } => exit_on_err(cmd_contact_set_addr(
+            } => exit_on_err(cmd_contact_set_routes(
                 &data_dir,
                 selector.as_deref(),
                 tag.as_deref(),
@@ -7161,6 +7700,8 @@ pub fn run() {
                 address.as_deref(),
                 lan.as_deref(),
                 internet.as_deref(),
+                p2p.as_deref(),
+                &via,
                 &clear,
             )),
             ContactCommands::SetDial {
@@ -7794,6 +8335,7 @@ fn cmd_doctor(data_dir: &Path, require_ready: bool) {
                 relay,
                 forward_pending,
                 capabilities,
+                ..
             }) => {
                 println!(
                     "  ipc_status: ok v={v} bridge={bridge} store={store} relay={relay} forward_pending={forward_pending} caps={}",
@@ -8192,6 +8734,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             relay: false,
             forward_pending: 0,
             capabilities: vec!["ipc".into()],
+            p2p: None,
         })
     }
 
@@ -8944,6 +9487,8 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             pinned: false,
             lan_dial: String::new(),
             internet_dial: String::new(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
         };
         let book = vec![
             row(&a, "Ahmad (Berlin)", "ahmad"),
@@ -9002,6 +9547,8 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             pinned: true,
             lan_dial: String::new(),
             internet_dial: String::new(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
         }];
         let mid = [0xabu8; 16];
         let forged =
@@ -9254,6 +9801,8 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             pinned: false,
             lan_dial: String::new(),
             internet_dial: String::new(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
         }
     }
 
@@ -9265,6 +9814,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             relay: false,
             forward_pending: 0,
             capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            p2p: None,
         })
     }
 
@@ -9570,6 +10120,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             endpoint: true,
             auto_policy: true,
             internet_listen: String::new(),
+            ..NodePolicy::default()
         };
         save_policy(dir.path(), &p).unwrap();
         set_node_flag(dir.path(), "bridge", true);
@@ -9918,6 +10469,8 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             pinned,
             lan_dial: String::new(),
             internet_dial: String::new(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
         };
         let book = vec![mk("Alice", &a, false), mk("Bobby", &b, true)];
         let mid = [0xabu8; 16];
@@ -9999,6 +10552,8 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
                     pinned: false,
                     lan_dial: String::new(),
                     internet_dial: String::new(),
+                    p2p: String::new(),
+                    p2p_via: Vec::new(),
                 }
             })
             .collect()
@@ -10076,6 +10631,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             relay: false,
             forward_pending: 0,
             capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            p2p: None,
         })
     }
 
@@ -10294,7 +10850,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             .contains("nothing to change"));
         assert!(parse_route_edit(None, None, &["wifi".into()])
             .unwrap_err()
-            .contains("lan or internet"));
+            .contains("lan, internet or p2p"));
         assert!(
             parse_route_edit(Some("10.0.0.1:7420"), None, &["lan".into()])
                 .unwrap_err()
@@ -10445,8 +11001,13 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
         let cases: Vec<(String, &str)> = vec![
             ("hello".into(), "must start with raven-card/1"),
             (
-                card.replace("raven-card/1", "raven-card/2"),
+                card.replace("raven-card/1", "raven-card/3"),
                 "not supported",
+            ),
+            // A v2 card must carry its p2p route.
+            (
+                card.replace("raven-card/1", "raven-card/2"),
+                "needs a p2p= PeerId",
             ),
             (swap_addr, "does not belong"),
             (
@@ -10487,6 +11048,252 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
         }
     }
 
+    /// P3 cards: `raven-card/2` adds `p2p=` and at most two `via=`; a card
+    /// without them stays `raven-card/1`; the grammar is strict, and a v1 card
+    /// cannot smuggle p2p fields in.
+    #[test]
+    fn p2p_cards_round_trip_and_parse_strictly() {
+        let a = ident(0x0c);
+        let peer = raven_core::p2p_route::local_peer_id(&a);
+        let relay = raven_core::p2p_route::local_peer_id(&ident(0x0d));
+        let via1 = format!("/ip4/198.51.100.7/tcp/7423/p2p/{relay}");
+        let via2 = format!("/ip4/203.0.113.9/udp/7423/quic-v1/p2p/{peer}");
+        let route = P2pRoute::parse(&peer, &[&via1, &via2]).unwrap();
+        let card = format_card_with(&a, "", "", Some(&route));
+        assert!(card.starts_with("raven-card/2 address=rvn1"), "{card}");
+        assert!(
+            card.contains(&format!(" p2p={peer} via={via1} via={via2}")),
+            "{card}"
+        );
+        let parsed = parse_card(&card).unwrap();
+        assert_eq!(parsed.p2p, Some(route.clone()));
+        assert_eq!(parse_card(&format_card(&a, "", "")).unwrap().p2p, None);
+        // The policy decides when no --via is given; without p2p the card is v1.
+        let mut policy = NodePolicy::default();
+        assert_eq!(own_card_p2p(&a, &[], &policy).unwrap(), None);
+        policy.p2p_listen = "7423".into();
+        policy.p2p_relays = vec![via1.clone()];
+        let own = own_card_p2p(&a, &[], &policy).unwrap().unwrap();
+        assert_eq!(own.peer_id, peer);
+        assert_eq!(own.via, vec![via1.clone()]);
+        assert!(own_card_p2p(&a, &["/ip4/1.2.3.4/tcp/1".into()], &NodePolicy::default()).is_err());
+        let v1 = format_card(&a, "", "");
+        let one = format_card_with(&a, "", "", Some(&P2pRoute::parse(&peer, &[&via1]).unwrap()));
+        let cases: Vec<(String, &str)> = vec![
+            (format!("{v1} p2p={peer}"), "unknown"),
+            (format!("{one} via={via1}"), "appears twice"),
+            (
+                format!("{card} via=/ip4/1.1.1.1/tcp/1/p2p/{relay}"),
+                "at most 2",
+            ),
+            (
+                card.replace(&format!(" p2p={peer}"), ""),
+                "needs a p2p= PeerId",
+            ),
+            (card.replace(&peer, "12D3KooWnotapeer"), "card p2p"),
+            (
+                card.replace(&via1, &format!("{via1}/p2p-circuit/p2p/{peer}")),
+                "circuit",
+            ),
+            (
+                card.replace(&via1, "/ip4/198.51.100.7/tcp/7423"),
+                "card p2p",
+            ),
+            (format!("{card} p2p={relay}"), "twice"),
+        ];
+        for (text, want) in cases {
+            let err = parse_card(&text).unwrap_err();
+            assert!(err.contains(want), "{text:?}: {err}");
+        }
+    }
+
+    /// Review item 12: the longest card valid fields give is accepted by
+    /// `contact add --card` (its limit is computed from the field maxima).
+    #[test]
+    fn the_longest_valid_card_round_trips() {
+        let a = ident(0x0e);
+        let peer = raven_core::p2p_route::local_peer_id(&a);
+        let relay = raven_core::p2p_route::local_peer_id(&ident(0x0f));
+        let name = |len: usize| -> String {
+            // Labels of at most 63 characters, joined by dots, `len` in all.
+            let mut out = String::new();
+            while out.len() < len {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                let take = (len - out.len()).min(63);
+                out.push_str(&"a".repeat(take));
+            }
+            out
+        };
+        // A DNS name has at most 253 characters.
+        let inet = format!("{}:65535", name(253));
+        assert_eq!(parse_internet_dial(&inet).unwrap(), inet);
+        assert!(parse_internet_dial(&format!("{}:65535", name(254))).is_err());
+        let lan = format!("{}:65535", name(MAX_DIAL_TEXT - 6));
+        assert_eq!(parse_lan_dial(&lan).unwrap(), lan);
+        assert!(parse_lan_dial(&format!("{}:65535", name(MAX_DIAL_TEXT - 5))).is_err());
+        let via = |who: &str| {
+            let fixed = "/dns4/".len() + "/tcp/65535/p2p/".len() + who.len();
+            format!(
+                "/dns4/{}/tcp/65535/p2p/{who}",
+                name(raven_core::p2p_route::MAX_MULTIADDR_CHARS - fixed)
+            )
+        };
+        let (v1, v2) = (via(&relay), via(&peer));
+        assert_eq!(v1.len(), raven_core::p2p_route::MAX_MULTIADDR_CHARS);
+        let route = P2pRoute::parse(&peer, &[&v1, &v2]).unwrap();
+        let card = format_card_with(&a, &inet, &lan, Some(&route));
+        assert!(
+            card.len() > 1024,
+            "longer than the old limit: {}",
+            card.len()
+        );
+        assert!(
+            card.len() <= CARD_MAX_LEN,
+            "{} > {CARD_MAX_LEN}",
+            card.len()
+        );
+        let parsed = parse_card(&card).unwrap();
+        assert_eq!(parsed.p2p, Some(route));
+        assert_eq!(parsed.lan, lan);
+        assert_eq!(parsed.internet, inet);
+        assert!(a.address().len() <= CARD_ADDRESS_MAX);
+        assert!(device_fingerprint_v1(&a.public_key_bytes()).len() <= CARD_FINGERPRINT_MAX);
+    }
+
+    #[test]
+    fn set_addr_sets_and_clears_the_p2p_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let bob = ident(0x3b);
+        save_contacts(
+            dir.path(),
+            &[Contact {
+                petname: "Bob".into(),
+                public_tag: "bob".into(),
+                alias: "bob".into(),
+                address: bob.address(),
+                pub_hex: hex::encode(bob.public_key_bytes()),
+                pinned: true,
+                lan_dial: String::new(),
+                internet_dial: String::new(),
+                p2p: String::new(),
+                p2p_via: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let peer = raven_core::p2p_route::local_peer_id(&bob);
+        let relay = raven_core::p2p_route::local_peer_id(&ident(0x3c));
+        let via = format!("/ip4/198.51.100.7/tcp/7423/p2p/{relay}");
+        let set = |p2p: Option<&str>, via: &[String], clear: &[String]| {
+            cmd_contact_set_routes(
+                dir.path(),
+                Some("@bob"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                p2p,
+                via,
+                clear,
+            )
+        };
+        // --via alone needs a PeerId first.
+        assert!(set(None, std::slice::from_ref(&via), &[])
+            .unwrap_err()
+            .contains("has no p2p PeerId"));
+        set(Some(&peer), std::slice::from_ref(&via), &[]).unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert_eq!(book[0].p2p, peer);
+        assert_eq!(book[0].p2p_via, vec![via.clone()]);
+        // A new PeerId drops the old addresses; --via alone replaces them.
+        let other = raven_core::p2p_route::local_peer_id(&ident(0x3d));
+        set(Some(&other), &[], &[]).unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert!(book[0].p2p == other && book[0].p2p_via.is_empty());
+        set(None, std::slice::from_ref(&via), &[]).unwrap();
+        assert_eq!(
+            load_contacts(dir.path()).unwrap()[0].p2p_via,
+            vec![via.clone()]
+        );
+        // --clear p2p clears both; contradictions and junk change nothing.
+        assert!(set(Some(&peer), &[], &["p2p".into()]).is_err());
+        assert!(set(Some("12D3KooWnope"), &[], &[]).is_err());
+        assert!(set(None, &["/ip4/1.2.3.4/tcp/1".into()], &[]).is_err());
+        set(None, &[], &["p2p".into()]).unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert!(book[0].p2p.is_empty() && book[0].p2p_via.is_empty());
+        assert!(book[0].pinned, "the pin is kept");
+        // The file keeps no empty p2p keys (older readers see the same rows).
+        let raw = std::fs::read_to_string(dir.path().join("contacts.json")).unwrap();
+        assert!(!raw.contains("p2p"), "{raw}");
+    }
+
+    #[test]
+    fn auto_plans_p2p_last_for_verified_contacts_and_p2p_alone_on_request() {
+        let peer = raven_core::p2p_route::local_peer_id(&ident(0x4a));
+        let mut c = contact_with("192.168.1.20:7420", "203.0.113.7:7422");
+        c.p2p = peer.clone();
+        let names = |routes: Vec<pair_init_lab::DialRoute>| -> Vec<String> {
+            routes
+                .into_iter()
+                .map(|r| format!("{}={}", r.carrier.label(), r.dial))
+                .collect()
+        };
+        let plan = |c: &Contact, choice, inet: bool, p2p: bool| {
+            plan_contact_routes_with(c, choice, None, inet, p2p).map(|(r, _)| names(r))
+        };
+        assert_eq!(
+            plan(&c, CarrierChoice::Auto, true, true).unwrap(),
+            vec![
+                "lan_dial=192.168.1.20:7420".to_string(),
+                "internet_dial=203.0.113.7:7422".into(),
+                format!("p2p_dial=/p2p/{peer}")
+            ]
+        );
+        // The p2p gate closed: auto leaves it out; --carrier p2p still plans
+        // it (the send path then refuses with P2P_HOLD).
+        assert_eq!(plan(&c, CarrierChoice::Auto, true, false).unwrap().len(), 2);
+        assert_eq!(
+            plan(&c, CarrierChoice::P2p, true, false).unwrap(),
+            vec![format!("p2p_dial=/p2p/{peer}")]
+        );
+        // A p2p-only contact: auto is p2p.
+        let mut only = contact_with("", "");
+        only.p2p = peer.clone();
+        assert_eq!(
+            plan(&only, CarrierChoice::Auto, false, true).unwrap(),
+            vec![format!("p2p_dial=/p2p/{peer}")]
+        );
+        assert!(plan(&only, CarrierChoice::Auto, false, false)
+            .unwrap_err()
+            .starts_with("P2P_HOLD"));
+        // Unverified: refused for p2p, LAN kept for auto.
+        only.pinned = false;
+        assert!(plan(&only, CarrierChoice::P2p, false, true)
+            .unwrap_err()
+            .contains("p2p delivery needs the fingerprint checked"));
+        assert!(plan(&only, CarrierChoice::Auto, false, true)
+            .unwrap_err()
+            .contains("CONTACT_NOT_VERIFIED"));
+        c.pinned = false;
+        assert_eq!(
+            plan(&c, CarrierChoice::Auto, false, true).unwrap(),
+            vec!["lan_dial=192.168.1.20:7420".to_string()]
+        );
+        // No p2p route saved.
+        assert!(plan(
+            &contact_with("192.168.1.20:7420", ""),
+            CarrierChoice::P2p,
+            false,
+            true
+        )
+        .unwrap_err()
+        .contains("no p2p route saved"));
+        assert_eq!(parse_send_carrier("P2P").unwrap(), CarrierChoice::P2p);
+    }
+
     #[test]
     fn card_arg_reads_text_or_one_line_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -10523,6 +11330,8 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             pinned: true,
             lan_dial: lan.into(),
             internet_dial: inet.into(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
         }
     }
 
@@ -10660,6 +11469,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
                 relay: false,
                 forward_pending: 0,
                 capabilities: caps.iter().map(|c| c.to_string()).collect(),
+                p2p: None,
             })
         };
         let up = internet_reach_row(&status(&["ipc", "internet_direct"]), "", true);

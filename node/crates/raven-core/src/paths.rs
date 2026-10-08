@@ -157,7 +157,9 @@ fn reject_unresolved_dir(dir: &Path) -> Result<(), String> {
 }
 
 /// Create the Raven data directory (and any missing parents) owner-only
-/// (0700) on Unix, and strip group/other access from an existing one.
+/// (0700) on Unix, and strip group/other access from an existing one. On
+/// Windows the same with a protected DACL that allows only the current user
+/// (inherited by everything created inside; see `win_acl`).
 ///
 /// Only for the data directory itself (and directories Raven owns inside it);
 /// never for caller-chosen locations such as export destinations or a
@@ -184,14 +186,24 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        create_dirs_owner_only(dir)?;
+        let metadata = std::fs::metadata(dir).map_err(|e| e.to_string())?;
+        if !metadata.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        crate::win_acl::restrict_path(dir, crate::win_acl::Kind::Dir)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())
     }
 }
 
 /// Create missing parents of a private file owner-only, without touching the
-/// mode of directories that already exist (they may be user-chosen).
+/// mode (or, on Windows, the ACL) of directories that already exist (they may
+/// be user-chosen).
 fn create_private_parents(parent: &Path) -> Result<(), String> {
     reject_unresolved_dir(parent)?;
     #[cfg(unix)]
@@ -203,13 +215,57 @@ fn create_private_parents(parent: &Path) -> Result<(), String> {
             .create(parent)
             .map_err(|e| e.to_string())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        create_dirs_owner_only(parent)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())
     }
 }
 
-#[cfg(unix)]
+/// Windows `DirBuilder::mode(0o700).recursive(true)`: create `dir` and its
+/// missing parents, then give each directory this call created (outermost
+/// first) the owner-only DACL. Directories that already existed are left
+/// alone. A new directory is empty until its DACL is set.
+#[cfg(windows)]
+fn create_dirs_owner_only(dir: &Path) -> Result<(), String> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(dir);
+    while let Some(p) = cursor.filter(|p| !p.as_os_str().is_empty()) {
+        if p.exists() {
+            break;
+        }
+        missing.push(p.to_path_buf());
+        cursor = p.parent();
+    }
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    for created in missing.iter().rev() {
+        crate::win_acl::restrict_path(created, crate::win_acl::Kind::Dir)?;
+    }
+    Ok(())
+}
+
+/// Non-Unix: create `path` exclusively. On Windows it is opened unshared and
+/// gets the owner-only DACL before the caller writes anything.
+#[cfg(not(unix))]
+fn open_new_private(path: &Path) -> Result<std::fs::File, String> {
+    #[cfg(windows)]
+    {
+        crate::win_acl::create_new_owner_only(path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
@@ -223,7 +279,10 @@ fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
 /// break whatever else lives there). The database plus any existing `-wal` /
 /// `-shm` / `-journal` sidecars become 0600 on Unix, and the database file is
 /// created 0600 *before* SQLite opens it, so SQLite (which gives new sidecars
-/// the database file's mode) never creates world-readable files.
+/// the database file's mode) never creates world-readable files. On Windows
+/// the database and its existing sidecars get the owner-only file DACL; a
+/// sidecar SQLite creates later inherits its directory's ACL (owner-only in
+/// the data dir and in any parent created here).
 ///
 /// A database that lives directly in the Raven data dir uses
 /// [`prepare_private_data_dir_sqlite_file`], which also locks the directory.
@@ -282,7 +341,43 @@ fn restrict_private_sqlite_files(path: &Path) -> Result<(), String> {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Owner-only before SQLite opens it; a concurrent creator
+                // wins the race, and its file is restricted below.
+                if let Err(e) = open_new_private(path) {
+                    if std::fs::symlink_metadata(path).is_err() {
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let candidate = sqlite_sidecar(path, suffix);
+            let metadata = match std::fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.to_string()),
+            };
+            if !metadata.file_type().is_file() {
+                return Err(format!(
+                    "{} is not a regular file; refusing to open private database",
+                    candidate.display()
+                ));
+            }
+            if let Err(e) = crate::win_acl::restrict_path(&candidate, crate::win_acl::Kind::File) {
+                // A sidecar SQLite removed concurrently needs no ACL.
+                if std::fs::symlink_metadata(&candidate).is_ok() {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = path;
     Ok(())
 }
@@ -376,8 +471,10 @@ pub fn sync_dir_best_effort(dir: &Path) {
 }
 
 /// Atomically replace `path` (temp + rename) with owner-only mode on Unix.
-/// On Windows the temp file is created exclusively, synced, then renamed over
-/// the destination (MoveFileEx REPLACE_EXISTING) — never a torn partial write.
+/// On Windows the temp file is created exclusively and unshared, gets the
+/// owner-only DACL before anything is written, is synced, then renamed over
+/// the destination (MoveFileEx REPLACE_EXISTING; the DACL moves with it) —
+/// never a torn partial write.
 pub fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -417,11 +514,7 @@ pub fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<(), String> 
     {
         use std::io::Write;
         let write = (|| -> Result<(), String> {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| e.to_string())?;
+            let mut f = open_new_private(&tmp)?;
             f.write_all(contents).map_err(|e| e.to_string())?;
             f.sync_all().map_err(|e| e.to_string())?;
             Ok(())
@@ -438,9 +531,10 @@ pub fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<(), String> 
     }
 }
 
-/// Create `path` exclusively with owner-only mode on Unix. Fails when the file
-/// already exists. First-install writes of secret material must use this —
-/// never a replace-capable write.
+/// Create `path` exclusively with owner-only mode on Unix (the owner-only DACL
+/// on Windows, set before anything is written). Fails when the file already
+/// exists. First-install writes of secret material must use this — never a
+/// replace-capable write.
 pub fn create_new_private(path: &Path, contents: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -472,16 +566,15 @@ pub fn create_new_private(path: &Path, contents: &[u8]) -> Result<(), String> {
     #[cfg(not(unix))]
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|e| e.to_string())?;
-        if let Err(e) = (|| -> Result<(), String> {
+        let mut f = open_new_private(path)?;
+        let written = (|| -> Result<(), String> {
             f.write_all(contents).map_err(|e| e.to_string())?;
             f.sync_all().map_err(|e| e.to_string())?;
             Ok(())
-        })() {
+        })();
+        // Closed first: an unshared handle would block the removal.
+        drop(f);
+        if let Err(e) = written {
             let _ = std::fs::remove_file(path);
             return Err(e);
         }

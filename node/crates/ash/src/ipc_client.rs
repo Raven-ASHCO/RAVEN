@@ -369,6 +369,7 @@ pub(crate) mod test_support {
                         relay: false,
                         forward_pending: 0,
                         capabilities: capabilities(),
+                        p2p: None,
                     },
                     _ => IpcResponse::Pong { v: IPC_VERSION },
                 };

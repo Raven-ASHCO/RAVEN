@@ -10,6 +10,8 @@ mod internet_direct;
 mod ipc_server;
 mod lan_direct;
 mod outbox;
+mod p2p;
+mod relay;
 
 #[cfg(any(unix, windows))]
 use std::convert::Infallible;
@@ -1843,8 +1845,65 @@ enum Commands {
         /// off. Needs INTERNET_DIRECT_PRODUCTION_ENABLED (or the debug lab unlock).
         #[arg(long)]
         internet_listen: Option<String>,
+        /// libp2p carrier (P3): a port (every interface, IPv4 + IPv6, TCP +
+        /// QUIC; default port 7423 with `on`), IP:PORT, `relay` (no listening
+        /// port: reached only through your relays) or `off`. Opt-in: without
+        /// this flag RAVEN_P2P_LISTEN, then node_policy.json (`raven node p2p
+        /// on`) decide. Needs P2P_PRODUCTION_ENABLED (or the debug lab unlock).
+        #[arg(long, value_name = "PORT|IP:PORT|relay|off")]
+        p2p_listen: Option<String>,
+        /// A relay to keep a reservation on: its multiaddr ending in
+        /// /p2p/<relay PeerId> (repeatable, at most 2; else RAVEN_P2P_RELAYS,
+        /// comma separated, then node_policy.json). None is compiled in.
+        #[arg(long, value_name = "MULTIADDR")]
+        p2p_relay: Vec<String>,
+        /// Also relay for the PeerIds in this profile's relay_allow.json
+        /// (`raven relay allow`), or RAVEN_P2P_RELAY=1. The relay PeerId is
+        /// then YOUR PeerId: everyone who uses the relay learns it.
+        #[arg(long, default_value_t = false)]
+        relay: bool,
+        /// With --relay: serve anyone, not just the allow-list (stricter
+        /// limits). Think twice: strangers then relay through your host.
+        #[arg(long, default_value_t = false, requires = "relay")]
+        relay_open: bool,
         #[arg(long, default_value_t = 0)]
         timeout_secs: u64,
+    },
+    /// Dedicated Circuit Relay v2 relay for friends (P3). Holds no Raven
+    /// identity: only its libp2p key (relay_key.ed25519) in --data-dir, which
+    /// must be a folder of its own. Only PeerIds in relay_allow.json may
+    /// reserve (`raven --data-dir <dir> relay allow …`). Needs
+    /// P2P_PRODUCTION_ENABLED (or the debug lab unlock).
+    Relay {
+        /// The relay's own folder (not a Raven profile).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Port (every interface, IPv4 + IPv6, TCP + QUIC) or IP:PORT.
+        #[arg(long, default_value = "7423", value_name = "PORT|IP:PORT")]
+        listen: String,
+        /// Serve anyone, not just the allow-list (stricter limits).
+        #[arg(long, default_value_t = false)]
+        open: bool,
+        /// Also answer AutoNAT v2 reachability probes (it then learns the
+        /// addresses it is asked to probe).
+        #[arg(long, default_value_t = false)]
+        autonat_server: bool,
+        /// A public address to name in reservations besides the listeners,
+        /// e.g. /ip4/203.0.113.7/tcp/7423 or /dns4/relay.example.com/tcp/7423.
+        #[arg(long, value_name = "MULTIADDR")]
+        external: Vec<String>,
+        /// Limits (each is capped at its hard maximum; see `raven relay status`).
+        #[arg(long)]
+        max_reservations: Option<usize>,
+        #[arg(long)]
+        max_circuits: Option<usize>,
+        /// Bytes one circuit may carry (both directions).
+        #[arg(long)]
+        circuit_bytes: Option<u64>,
+        #[arg(long)]
+        circuit_secs: Option<u64>,
+        #[arg(long)]
+        reservation_secs: Option<u64>,
     },
     /// Report BLE adapter selection (mock vs platform). Safe fields only.
     BleStatus,
@@ -1864,6 +1923,7 @@ impl Commands {
             | Commands::Flush { data_dir, .. } => Some(data_dir),
             #[cfg(any(unix, windows))]
             Commands::Ipc { data_dir, .. } | Commands::Service { data_dir, .. } => Some(data_dir),
+            Commands::Relay { data_dir, .. } => Some(data_dir),
             Commands::BleStatus => None,
         }
     }
@@ -2938,6 +2998,146 @@ fn service_internet_listen(
         .map_err(|e| format!("{source}: {e}"))
 }
 
+/// The service's p2p host settings and where the listen setting came from,
+/// highest first: `--p2p-listen` (an explicit empty value or `off` is off),
+/// `RAVEN_P2P_LISTEN` (likewise), then `p2p_listen` in node_policy.json
+/// (`raven node p2p on`). Unset everywhere is off: libp2p exposure is opt-in,
+/// like Internet direct. Relays: `--p2p-relay` (any), else `RAVEN_P2P_RELAYS`
+/// (comma separated), else the policy's; at most two, each a strict
+/// `/…/p2p/<relay PeerId>` multiaddr (a bad one is an error: no host at all).
+/// The relay role: `--relay` or `RAVEN_P2P_RELAY=1`.
+#[derive(Debug, PartialEq, Eq)]
+enum P2pDecision {
+    /// p2p is off; the source of the (empty / `off`) setting.
+    Off(&'static str),
+    On(p2p::P2pConfig, &'static str),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn service_p2p_config(
+    flag: Option<&str>,
+    env: Option<&str>,
+    flag_relays: &[String],
+    env_relays: Option<&str>,
+    relay_flag: bool,
+    env_relay: Option<&str>,
+    relay_open: bool,
+    policy: impl FnOnce() -> Result<raven_core::NodePolicy, String>,
+) -> Result<P2pDecision, String> {
+    use raven_core::p2p_route::{normalize_p2p_listen, parse_via, MAX_VIA};
+    // Read once; an unreadable policy only matters where its values are used
+    // (then: no host, fail closed), and UPnP then stays off.
+    let policy = policy();
+    let policy_ref = || policy.as_ref().map_err(|e| e.clone());
+    let (raw, source) = match (flag, env) {
+        (Some(f), _) => (f.to_string(), "--p2p-listen"),
+        (None, Some(e)) => (e.to_string(), "RAVEN_P2P_LISTEN"),
+        (None, None) => (policy_ref()?.p2p_listen.clone(), "node_policy.json"),
+    };
+    let Some(listen) = normalize_p2p_listen(&raw).map_err(|e| format!("{source}: {e}"))? else {
+        return Ok(P2pDecision::Off(source));
+    };
+    let (relays, relay_source): (Vec<String>, &str) = if !flag_relays.is_empty() {
+        (flag_relays.to_vec(), "--p2p-relay")
+    } else if let Some(env) = env_relays.filter(|e| !e.trim().is_empty()) {
+        (
+            env.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
+            "RAVEN_P2P_RELAYS",
+        )
+    } else {
+        (policy_ref()?.p2p_relays.clone(), "node_policy.json")
+    };
+    if relays.len() > MAX_VIA {
+        return Err(format!(
+            "{relay_source}: at most {MAX_VIA} relays (got {})",
+            relays.len()
+        ));
+    }
+    let relays = relays
+        .iter()
+        .map(|r| parse_via(r).map_err(|e| format!("{relay_source}: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let relay_role = relay_flag || env_relay.is_some_and(|v| v.trim() == "1");
+    let upnp = policy.as_ref().ok().and_then(|p| p.upnp);
+    Ok(P2pDecision::On(
+        p2p::P2pConfig {
+            listen,
+            relays,
+            relay_server: relay_role.then_some(relay_open),
+            upnp,
+        },
+        source,
+    ))
+}
+
+/// `raven-node relay` limit flags (each optional; capped by the hard max).
+#[derive(Debug, Default, Clone, Copy)]
+struct RelayLimitArgs {
+    max_reservations: Option<usize>,
+    max_circuits: Option<usize>,
+    circuit_bytes: Option<u64>,
+    circuit_secs: Option<u64>,
+    reservation_secs: Option<u64>,
+}
+
+/// The validated `raven-node relay` settings: `--open` picks the stricter
+/// defaults, then each flag overrides one limit (refused above its hard
+/// maximum: never silently clamped).
+fn relay_command(
+    data_dir: PathBuf,
+    listen: &str,
+    open: bool,
+    autonat_server: bool,
+    external: &[String],
+    args: RelayLimitArgs,
+) -> Result<relay::RelayCmd, String> {
+    use raven_swarm::host::RelayLimits;
+    let listen = raven_core::p2p_route::normalize_p2p_listen(listen)
+        .map_err(|e| format!("--listen: {e}"))?
+        .filter(|l| *l != raven_core::p2p_route::P2pListen::RelayOnly)
+        .ok_or("--listen needs a port or IP:PORT")?;
+    let mut limits = if open {
+        RelayLimits::open()
+    } else {
+        RelayLimits::friends()
+    };
+    if let Some(n) = args.max_reservations {
+        limits.max_reservations = n;
+    }
+    if let Some(n) = args.max_circuits {
+        limits.max_circuits = n;
+    }
+    if let Some(n) = args.circuit_bytes {
+        limits.max_circuit_bytes = n;
+    }
+    if let Some(n) = args.circuit_secs {
+        limits.max_circuit_duration = Duration::from_secs(n);
+    }
+    if let Some(n) = args.reservation_secs {
+        limits.reservation_duration = Duration::from_secs(n);
+    }
+    limits.validate().map_err(|e| e.to_string())?;
+    let external = external
+        .iter()
+        .map(|e| {
+            e.parse::<raven_swarm::libp2p::Multiaddr>()
+                .map_err(|err| format!("--external {e}: {err}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(relay::RelayCmd {
+        data_dir,
+        listen,
+        open,
+        autonat_server,
+        limits,
+        external,
+    })
+}
+
 /// Why `service` is stopping.
 #[cfg(any(unix, windows))]
 #[derive(Debug, PartialEq, Eq)]
@@ -2948,6 +3148,9 @@ enum ServiceEnd {
     SupervisorDied(&'static str),
     /// `--timeout-secs` elapsed (lab / CI runs).
     TimedOut,
+    /// Asked to stop (SIGTERM / SIGINT, Ctrl-C on Windows): a normal stop or
+    /// restart by launchd, systemd or the user.
+    Stopped,
 }
 
 #[cfg(any(unix, windows))]
@@ -2956,7 +3159,36 @@ impl ServiceEnd {
     fn exit_code(&self) -> i32 {
         match self {
             Self::IpcStopped | Self::SupervisorDied(_) => 1,
-            Self::TimedOut => 0,
+            Self::TimedOut | Self::Stopped => 0,
+        }
+    }
+}
+
+/// Resolves when the service is asked to stop: SIGTERM or SIGINT on Unix,
+/// Ctrl-C / console close on Windows. Never resolves when the handler cannot
+/// be installed (the default action then stops the process as before).
+#[cfg(any(unix, windows))]
+async fn stop_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(mut term), Ok(mut int)) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+            }
+            _ => std::future::pending::<()>().await,
+        }
+    }
+    #[cfg(windows)]
+    {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -2964,10 +3196,12 @@ impl ServiceEnd {
 /// Wait until the service has to stop. Transport failures never get here:
 /// their supervisors absorb them.
 #[cfg(any(unix, windows))]
+#[allow(clippy::too_many_arguments)]
 async fn wait_service_end(
     ipc: &mut JoinHandle<()>,
     lan: &mut JoinHandle<Infallible>,
     inet: &mut JoinHandle<Infallible>,
+    p2p: &mut JoinHandle<Infallible>,
     bridge: &mut JoinHandle<Infallible>,
     prune: &mut JoinHandle<Infallible>,
     outbox: &mut JoinHandle<Infallible>,
@@ -2994,6 +3228,10 @@ async fn wait_service_end(
             eprintln!("internet_direct supervisor ended: {r:?}");
             ServiceEnd::SupervisorDied("internet_direct")
         }
+        r = &mut *p2p => {
+            eprintln!("p2p supervisor ended: {r:?}");
+            ServiceEnd::SupervisorDied("p2p")
+        }
         r = &mut *bridge => {
             eprintln!("bridge supervisor ended: {r:?}");
             ServiceEnd::SupervisorDied("bridge")
@@ -3009,6 +3247,10 @@ async fn wait_service_end(
         _ = timer => {
             eprintln!("raven-node: service timeout");
             ServiceEnd::TimedOut
+        }
+        _ = stop_requested() => {
+            eprintln!("raven-node: stop requested; shutting down");
+            ServiceEnd::Stopped
         }
     }
 }
@@ -3416,6 +3658,10 @@ async fn main() {
             lan_listen,
             ble_listen,
             internet_listen,
+            p2p_listen,
+            p2p_relay,
+            relay,
+            relay_open,
             timeout_secs,
         } => {
             #[cfg(unix)]
@@ -3491,6 +3737,57 @@ async fn main() {
                     tokio::spawn(std::future::pending::<Infallible>())
                 }
             };
+            // The libp2p carrier (P3): opt-in like Internet direct, and held
+            // (nothing built, nothing listens or dials) while its gate is closed.
+            let p2p_config = service_p2p_config(
+                p2p_listen.as_deref(),
+                std::env::var("RAVEN_P2P_LISTEN").ok().as_deref(),
+                &p2p_relay,
+                std::env::var("RAVEN_P2P_RELAYS").ok().as_deref(),
+                relay,
+                std::env::var("RAVEN_P2P_RELAY").ok().as_deref(),
+                relay_open,
+                || {
+                    raven_core::node_policy::try_load_policy(&data_dir)
+                        .map_err(|e| format!("node_policy.json unreadable ({e}): no libp2p host"))
+                },
+            );
+            // IPC Status reports this decision (and its source) even while no
+            // host runs, so `raven status` and `raven whoami --card` follow
+            // what the service does, installer flags included.
+            let mut p2p_task = match p2p_config {
+                Ok(P2pDecision::Off(source)) => {
+                    p2p::publish_service_config(p2p::ServiceP2p::Off { source });
+                    tokio::spawn(std::future::pending::<Infallible>())
+                }
+                Ok(P2pDecision::On(config, source)) if !raven_core::p2p_live_enabled() => {
+                    p2p::publish_service_config(p2p::ServiceP2p::Held {
+                        config: &config,
+                        source,
+                    });
+                    eprintln!(
+                        "p2p failed: {} (the p2p setting from {source} stays closed)",
+                        raven_core::P2P_HOLD
+                    );
+                    tokio::spawn(std::future::pending::<Infallible>())
+                }
+                Ok(P2pDecision::On(config, source)) => {
+                    p2p::publish_service_config(p2p::ServiceP2p::Configured {
+                        config: &config,
+                        source,
+                    });
+                    eprintln!("raven-node p2p: configured ({source})");
+                    let data_p2p = data_dir.clone();
+                    tokio::spawn(supervise("p2p", None, move || {
+                        p2p::run_host(data_p2p.clone(), config.clone(), source.to_string())
+                    }))
+                }
+                Err(e) => {
+                    p2p::publish_service_config(p2p::ServiceP2p::Error);
+                    eprintln!("p2p failed: {e}");
+                    tokio::spawn(std::future::pending::<Infallible>())
+                }
+            };
             // Expired sessions (protected K_root, outbox envelopes, inbox
             // rows) are destroyed on a timer, not only when a listener starts
             // or the next PairInit arrives.
@@ -3524,19 +3821,60 @@ async fn main() {
                 &mut ipc_task,
                 &mut lan_task,
                 &mut inet_task,
+                &mut p2p_task,
                 &mut bridge_task,
                 &mut prune_task,
                 &mut outbox_task,
                 timeout,
             )
             .await;
+            // A clean libp2p shutdown first: its connections are closed (QUIC
+            // sends its close frame), so a relay frees our reservation at
+            // once and a restart is not refused while it still holds it.
+            p2p::shutdown(p2p::SHUTDOWN_DRAIN + Duration::from_millis(500)).await;
             ipc_task.abort();
             lan_task.abort();
             inet_task.abort();
+            p2p_task.abort();
             bridge_task.abort();
             prune_task.abort();
             outbox_task.abort();
             std::process::exit(end.exit_code());
+        }
+        Commands::Relay {
+            data_dir,
+            listen,
+            open,
+            autonat_server,
+            external,
+            max_reservations,
+            max_circuits,
+            circuit_bytes,
+            circuit_secs,
+            reservation_secs,
+        } => {
+            let cmd = relay_command(
+                data_dir,
+                &listen,
+                open,
+                autonat_server,
+                &external,
+                RelayLimitArgs {
+                    max_reservations,
+                    max_circuits,
+                    circuit_bytes,
+                    circuit_secs,
+                    reservation_secs,
+                },
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("relay: {e}");
+                std::process::exit(2);
+            });
+            if let Err(e) = relay::run_relay(cmd).await {
+                eprintln!("relay failed: {e}");
+                std::process::exit(1);
+            }
         }
         Commands::BleStatus => {
             let kind = raven_core::ble_adapter::select_ble_adapter_from_env();
@@ -3568,6 +3906,284 @@ async fn main() {
 mod lifecycle_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    fn relay_via(seed: u8) -> String {
+        let peer = raven_core::p2p_route::local_peer_id(&Identity::from_seed(&[seed; 32]));
+        format!("/ip4/198.51.100.{seed}/tcp/7423/p2p/{peer}")
+    }
+
+    /// P3: the libp2p host is opt-in like Internet direct (flag, then env, then
+    /// node_policy.json), relays are strict and at most two, the relay role
+    /// needs `--relay` or RAVEN_P2P_RELAY=1, and UPnP comes from the policy.
+    #[test]
+    fn p2p_is_opt_in_strict_and_the_flag_wins() {
+        use raven_core::p2p_route::P2pListen;
+        let policy = |listen: &str, relays: Vec<String>, upnp: Option<bool>| {
+            let p = raven_core::NodePolicy {
+                p2p_listen: listen.into(),
+                p2p_relays: relays,
+                upnp,
+                ..raven_core::NodePolicy::default()
+            };
+            move || Ok(p.clone())
+        };
+        type Got = Result<Option<(p2p::P2pConfig, &'static str)>, String>;
+        fn cfg(
+            flag: Option<&str>,
+            env: Option<&str>,
+            flag_relays: &[String],
+            env_relays: Option<&str>,
+            relay: bool,
+            env_relay: Option<&str>,
+            p: impl FnOnce() -> Result<raven_core::NodePolicy, String>,
+        ) -> Got {
+            service_p2p_config(
+                flag,
+                env,
+                flag_relays,
+                env_relays,
+                relay,
+                env_relay,
+                false,
+                p,
+            )
+            .map(|d| match d {
+                P2pDecision::Off(_) => None,
+                P2pDecision::On(c, source) => Some((c, source)),
+            })
+        }
+        // Nothing configured anywhere: no host at all.
+        assert_eq!(
+            cfg(None, None, &[], None, false, None, policy("", vec![], None)).unwrap(),
+            None
+        );
+        // The policy (`raven node p2p on`), with its relays and UPnP choice.
+        let (c, source) = cfg(
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+            policy("7423", vec![relay_via(1)], Some(true)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source, "node_policy.json");
+        assert_eq!(c.listen, P2pListen::All(7423));
+        assert_eq!(c.relays.len(), 1);
+        assert_eq!(c.upnp, Some(true));
+        assert_eq!(c.relay_server, None);
+        // The env beats the policy, the flag beats both; empty or off is off.
+        let (c, source) = cfg(
+            None,
+            Some("relay"),
+            &[],
+            None,
+            false,
+            None,
+            policy("7423", vec![], None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (c.listen, source),
+            (P2pListen::RelayOnly, "RAVEN_P2P_LISTEN")
+        );
+        assert_eq!(
+            cfg(
+                Some("off"),
+                Some("7423"),
+                &[],
+                None,
+                false,
+                None,
+                policy("7423", vec![], None)
+            )
+            .unwrap(),
+            None
+        );
+        // "Off" says where it came from: `raven status` shows that the running
+        // service has p2p off because of a flag or env var (review item 8).
+        for (flag, env, listen, source) in [
+            (Some("off"), Some("7423"), "7423", "--p2p-listen"),
+            (None, Some("off"), "7423", "RAVEN_P2P_LISTEN"),
+            (None, None, "", "node_policy.json"),
+        ] {
+            assert_eq!(
+                service_p2p_config(
+                    flag,
+                    env,
+                    &[],
+                    None,
+                    false,
+                    None,
+                    false,
+                    policy(listen, vec![], None)
+                )
+                .unwrap(),
+                P2pDecision::Off(source)
+            );
+        }
+        // Relays: flag, then RAVEN_P2P_RELAYS (comma separated), then policy.
+        let env = format!("{} , {}", relay_via(2), relay_via(3));
+        let (c, _) = cfg(
+            Some("127.0.0.1:0"),
+            None,
+            &[],
+            Some(&env),
+            false,
+            None,
+            policy("", vec![relay_via(1)], None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.relays.len(), 2);
+        let flag = vec![relay_via(4)];
+        let (c, _) = cfg(
+            Some("7423"),
+            None,
+            &flag,
+            Some(&env),
+            true,
+            None,
+            policy("", vec![], None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.relays.len(), 1);
+        assert_eq!(c.relay_server, Some(false), "--relay");
+        let (c, _) = cfg(
+            Some("7423"),
+            None,
+            &[],
+            None,
+            false,
+            Some("1"),
+            policy("", vec![], None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.relay_server, Some(false), "RAVEN_P2P_RELAY=1");
+        // Junk or too many relays: no host (fail closed), with the source named.
+        let three = vec![relay_via(1), relay_via(2), relay_via(3)];
+        assert!(cfg(
+            Some("7423"),
+            None,
+            &three,
+            None,
+            false,
+            None,
+            policy("", vec![], None)
+        )
+        .unwrap_err()
+        .starts_with("--p2p-relay: at most 2"));
+        let bad = vec!["/ip4/198.51.100.1/tcp/7423".to_string()];
+        assert!(cfg(
+            Some("7423"),
+            None,
+            &bad,
+            None,
+            false,
+            None,
+            policy("", vec![], None)
+        )
+        .is_err());
+        assert!(cfg(
+            Some("example.com:7423"),
+            None,
+            &[],
+            None,
+            false,
+            None,
+            policy("", vec![], None)
+        )
+        .unwrap_err()
+        .starts_with("--p2p-listen: "));
+        // An unreadable policy: off when it is needed, irrelevant when not.
+        let broken = || Err("node_policy.json unreadable".to_string());
+        assert!(cfg(None, None, &[], None, false, None, broken).is_err());
+        let (c, _) = cfg(Some("7423"), None, &flag, None, false, None, broken)
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.upnp, None, "UPnP stays off");
+    }
+
+    #[test]
+    fn relay_limits_flags_are_validated_never_clamped() {
+        let dir = PathBuf::from("relay-dir");
+        let ok = relay_command(
+            dir.clone(),
+            "7423",
+            false,
+            false,
+            &[],
+            RelayLimitArgs::default(),
+        )
+        .unwrap();
+        assert_eq!(ok.limits, raven_swarm::host::RelayLimits::friends());
+        let open = relay_command(
+            dir.clone(),
+            "7423",
+            true,
+            false,
+            &[],
+            RelayLimitArgs::default(),
+        )
+        .unwrap();
+        assert_eq!(open.limits, raven_swarm::host::RelayLimits::open());
+        let tuned = relay_command(
+            dir.clone(),
+            "127.0.0.1:0",
+            false,
+            true,
+            &["/ip4/203.0.113.7/tcp/7423".to_string()],
+            RelayLimitArgs {
+                max_reservations: Some(10),
+                circuit_bytes: Some(1 << 20),
+                circuit_secs: Some(60),
+                ..RelayLimitArgs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tuned.limits.max_reservations, 10);
+        assert_eq!(tuned.limits.max_circuit_bytes, 1 << 20);
+        assert_eq!(tuned.external.len(), 1);
+        for args in [
+            RelayLimitArgs {
+                circuit_bytes: Some(17 << 20),
+                ..RelayLimitArgs::default()
+            },
+            RelayLimitArgs {
+                max_circuits: Some(0),
+                ..RelayLimitArgs::default()
+            },
+            RelayLimitArgs {
+                reservation_secs: Some(3 * 3600),
+                ..RelayLimitArgs::default()
+            },
+        ] {
+            assert!(relay_command(dir.clone(), "7423", false, false, &[], args).is_err());
+        }
+        assert!(relay_command(
+            dir.clone(),
+            "relay",
+            false,
+            false,
+            &[],
+            RelayLimitArgs::default()
+        )
+        .is_err());
+        assert!(relay_command(
+            dir,
+            "7423",
+            false,
+            false,
+            &["not a multiaddr".into()],
+            RelayLimitArgs::default()
+        )
+        .is_err());
+    }
 
     #[test]
     fn internet_listen_is_opt_in_and_the_flag_wins() {
@@ -3764,6 +4380,7 @@ mod lifecycle_tests {
             counting_failures(attempts.clone(), "bind: address in use"),
         ));
         let mut inet = tokio::spawn(std::future::pending::<Infallible>());
+        let mut p2p = tokio::spawn(std::future::pending::<Infallible>());
         let mut bridge = tokio::spawn(std::future::pending::<Infallible>());
         let mut prune = tokio::spawn(std::future::pending::<Infallible>());
         let mut outbox = tokio::spawn(std::future::pending::<Infallible>());
@@ -3773,6 +4390,7 @@ mod lifecycle_tests {
                 &mut ipc,
                 &mut lan,
                 &mut inet,
+                &mut p2p,
                 &mut bridge,
                 &mut prune,
                 &mut outbox,
@@ -3789,6 +4407,7 @@ mod lifecycle_tests {
         assert!(!ipc.is_finished(), "IPC untouched by the listener failure");
         ipc.abort();
         inet.abort();
+        p2p.abort();
         bridge.abort();
         prune.abort();
         outbox.abort();
@@ -3848,6 +4467,7 @@ mod lifecycle_tests {
             std::future::pending::<Result<(), String>>().await
         }));
         let mut inet = tokio::spawn(std::future::pending::<Infallible>());
+        let mut p2p = tokio::spawn(std::future::pending::<Infallible>());
         let mut bridge = tokio::spawn(std::future::pending::<Infallible>());
         let mut prune = tokio::spawn(std::future::pending::<Infallible>());
         let mut outbox = tokio::spawn(std::future::pending::<Infallible>());
@@ -3855,6 +4475,7 @@ mod lifecycle_tests {
             &mut ipc,
             &mut lan,
             &mut inet,
+            &mut p2p,
             &mut bridge,
             &mut prune,
             &mut outbox,
@@ -3866,6 +4487,7 @@ mod lifecycle_tests {
         ipc.abort();
         lan.abort();
         inet.abort();
+        p2p.abort();
         bridge.abort();
         prune.abort();
         outbox.abort();
@@ -3879,6 +4501,7 @@ mod lifecycle_tests {
         let mut ipc = tokio::spawn(async {});
         let mut lan = tokio::spawn(std::future::pending::<Infallible>());
         let mut inet = tokio::spawn(std::future::pending::<Infallible>());
+        let mut p2p = tokio::spawn(std::future::pending::<Infallible>());
         let mut bridge = tokio::spawn(std::future::pending::<Infallible>());
         let mut prune = tokio::spawn(std::future::pending::<Infallible>());
         let mut outbox = tokio::spawn(std::future::pending::<Infallible>());
@@ -3886,6 +4509,7 @@ mod lifecycle_tests {
             &mut ipc,
             &mut lan,
             &mut inet,
+            &mut p2p,
             &mut bridge,
             &mut prune,
             &mut outbox,
@@ -3897,6 +4521,7 @@ mod lifecycle_tests {
         assert_eq!(ServiceEnd::SupervisorDied("bridge").exit_code(), 1);
         lan.abort();
         inet.abort();
+        p2p.abort();
         bridge.abort();
         prune.abort();
         outbox.abort();
@@ -3911,6 +4536,7 @@ mod lifecycle_tests {
         let mut ipc = tokio::spawn(std::future::pending::<()>());
         let mut lan = tokio::spawn(std::future::pending::<Infallible>());
         let mut inet = tokio::spawn(std::future::pending::<Infallible>());
+        let mut p2p = tokio::spawn(std::future::pending::<Infallible>());
         let mut bridge = tokio::spawn(std::future::pending::<Infallible>());
         let mut prune = tokio::spawn(std::future::pending::<Infallible>());
         let mut outbox: JoinHandle<Infallible> =
@@ -3919,6 +4545,7 @@ mod lifecycle_tests {
             &mut ipc,
             &mut lan,
             &mut inet,
+            &mut p2p,
             &mut bridge,
             &mut prune,
             &mut outbox,
@@ -3930,6 +4557,7 @@ mod lifecycle_tests {
         ipc.abort();
         lan.abort();
         inet.abort();
+        p2p.abort();
         bridge.abort();
         prune.abort();
     }

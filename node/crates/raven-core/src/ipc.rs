@@ -57,6 +57,18 @@ pub enum IpcRequest {
         expected_pub_hex: String,
         frames_b64: Vec<String>,
     },
+    /// Dial a peer over the libp2p carrier (P3: direct, then a Circuit Relay
+    /// v2 circuit, DCUtR upgrade by libp2p) and run the Raven Noise link
+    /// (`raven/p2p-link/v1` + RIH1 bind) inside a `/raven/link/1.0.0` stream.
+    /// `multiaddr` ends in the target's `/p2p/<PeerId>`: `/p2p/<PeerId>` alone
+    /// means "every address the contact book has". Verified contacts only.
+    /// Lab-only until P2P_PRODUCTION_ENABLED. Not a WAN claim.
+    P2pDial {
+        v: u16,
+        multiaddr: String,
+        expected_pub_hex: String,
+        frames_b64: Vec<String>,
+    },
     /// Wake the background outbox worker (`raven-node service`): retry the
     /// staged objects to one peer (64 hex Ed25519), or to every peer, now.
     /// Carries no content; answered `Accepted`. A daemon without a worker (or
@@ -86,6 +98,76 @@ pub enum IpcRequest {
 
 /// Hard cap on `OutboxList` rows.
 pub const MAX_OUTBOX_LIST: u16 = 200;
+
+/// The libp2p host as `Status` reports it (P3). Public facts about this node
+/// only: its own PeerId and listen addresses, counts and states; never a
+/// peer's address, a message id or content.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct P2pStatusInfo {
+    /// The host is running (listening, or at least dialling out).
+    pub up: bool,
+    /// This node's libp2p PeerId (the `p2p=` of its card).
+    pub peer_id: String,
+    /// The addresses the host listens on (and any UPnP / relay addresses).
+    pub listen_addrs: Vec<String>,
+    /// AutoNAT v2 reachability hint: `public`, `private` or `unknown`.
+    pub nat: String,
+    /// Configured relays (`/…/p2p/<relay>`) that hold an active reservation.
+    pub reservations: Vec<String>,
+    /// How many relays are configured (at most 2).
+    pub relays_configured: u32,
+    /// UPnP / NAT-PMP: `unset` (never asked: off), `off`, `on` (trying),
+    /// `mapped <port>` or `failed`.
+    pub upnp: String,
+    /// Present while this node also relays for others (`service --relay`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayCounts>,
+    /// The p2p listen setting the service runs with (`7423`, `relay`,
+    /// `IP:PORT`; empty: p2p is off), whatever its `source`. Reported even
+    /// while the host is held or not up, so `raven status` and `raven whoami
+    /// --card` follow what the service really does (an installer flag beats
+    /// node_policy.json).
+    #[serde(default)]
+    pub listen_setting: String,
+    /// Where it came from: `--p2p-listen`, `RAVEN_P2P_LISTEN` or
+    /// `node_policy.json`.
+    #[serde(default)]
+    pub source: String,
+    /// The relays the service keeps (or tries to keep) a reservation on.
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// `service --relay` (or `RAVEN_P2P_RELAY=1`) is set.
+    #[serde(default)]
+    pub relay_role: bool,
+    /// The p2p gate is closed in this build (`P2P_HOLD`): nothing runs.
+    #[serde(default)]
+    pub held: bool,
+    /// The p2p settings could not be used (bad value, unreadable policy):
+    /// no host. Fixed text, no addresses.
+    #[serde(default)]
+    pub config_error: String,
+    /// Listen addresses that could not be opened yet (a busy port) and are
+    /// retried.
+    #[serde(default)]
+    pub listen_retrying: u32,
+}
+
+/// What a relay reports about itself: counts only (NAT spec §5), shared by
+/// `service --relay` (IPC `Status`) and `raven-node relay` (relay_status.json).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayCounts {
+    /// `--open`: anyone may reserve (stricter limits).
+    pub open: bool,
+    /// PeerIds on the allow-list (0 with `open`).
+    pub allowed_peers: u32,
+    /// The allow-list could not be read: nobody may reserve (fail closed).
+    #[serde(default)]
+    pub allow_list_unreadable: bool,
+    pub reservations: u32,
+    pub circuits: u32,
+    pub reservations_refused: u64,
+    pub circuits_refused: u64,
+}
 
 /// One outbound object as the outbox sees it. Identifiers, states and counts
 /// only: no plaintext, preview or ciphertext ever travels in it.
@@ -124,6 +206,10 @@ pub enum IpcResponse {
         relay: bool,
         forward_pending: u64,
         capabilities: Vec<String>,
+        /// The libp2p host (P3): `nat`, `reservations`, `listen_addrs`, …
+        /// Absent from older daemons and while the host does not run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        p2p: Option<P2pStatusInfo>,
     },
     Accepted {
         v: u16,
@@ -133,6 +219,10 @@ pub enum IpcResponse {
         frames_b64: Vec<String>,
     },
     InternetDialResult {
+        v: u16,
+        frames_b64: Vec<String>,
+    },
+    P2pDialResult {
         v: u16,
         frames_b64: Vec<String>,
     },
@@ -226,6 +316,7 @@ pub fn decode_request_checked(frame: &[u8]) -> Result<IpcRequest, IpcDecodeError
         | IpcRequest::SealUnderSession { v, .. }
         | IpcRequest::LanDial { v, .. }
         | IpcRequest::InternetDial { v, .. }
+        | IpcRequest::P2pDial { v, .. }
         | IpcRequest::OutboxKick { v, .. }
         | IpcRequest::OutboxStatus { v, .. }
         | IpcRequest::OutboxList { v, .. } => {
@@ -497,7 +588,7 @@ pub fn verify_named_pipe_server_is_current_user(
 }
 
 #[cfg(windows)]
-mod win_pipe {
+pub(crate) mod win_pipe {
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
@@ -553,7 +644,7 @@ mod win_pipe {
         Ok(out)
     }
 
-    pub(super) fn current_user_sid() -> Result<String, String> {
+    pub(crate) fn current_user_sid() -> Result<String, String> {
         unsafe {
             let mut token: HANDLE = std::ptr::null_mut();
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
@@ -704,6 +795,63 @@ mod tests {
         let raw = std::str::from_utf8(&f[4..]).unwrap().to_ascii_lowercase();
         for bad in ["seed", "private_key", "plaintext", "recovery"] {
             assert!(!raw.contains(bad), "{bad} leaked into InternetDial JSON");
+        }
+    }
+
+    #[test]
+    fn roundtrip_p2p_dial_and_status_have_no_secret_fields() {
+        let req = IpcRequest::P2pDial {
+            v: IPC_VERSION,
+            multiaddr: "/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".into(),
+            expected_pub_hex: "ab".repeat(32),
+            frames_b64: vec!["QUJD".into()],
+        };
+        let f = encode_request(&req).unwrap();
+        assert_eq!(decode_request(&f).unwrap(), req);
+        let raw = std::str::from_utf8(&f[4..]).unwrap();
+        assert!(raw.contains("\"op\":\"p2p_dial\""), "{raw}");
+        assert_json_has_no_secret_tokens(raw);
+        let resp = IpcResponse::P2pDialResult {
+            v: IPC_VERSION,
+            frames_b64: vec!["ZGVm".into()],
+        };
+        assert_eq!(
+            decode_response(&encode_response(&resp).unwrap()).unwrap(),
+            resp
+        );
+        let status = IpcResponse::Status {
+            v: IPC_VERSION,
+            bridge: true,
+            store: true,
+            relay: false,
+            forward_pending: 0,
+            capabilities: vec!["ipc".into(), "p2p".into()],
+            p2p: Some(P2pStatusInfo {
+                up: true,
+                peer_id: "12D3KooW".into(),
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/7423".into()],
+                nat: "private".into(),
+                reservations: vec!["/ip4/203.0.113.7/tcp/7423/p2p/x".into()],
+                relays_configured: 1,
+                upnp: "unset".into(),
+                relay: Some(RelayCounts::default()),
+                listen_setting: "7423".into(),
+                source: "--p2p-listen".into(),
+                relays: vec!["/ip4/203.0.113.7/tcp/7423/p2p/x".into()],
+                relay_role: true,
+                ..P2pStatusInfo::default()
+            }),
+        };
+        let f = encode_response(&status).unwrap();
+        assert_json_has_no_secret_tokens(std::str::from_utf8(&f[4..]).unwrap());
+        assert_eq!(decode_response(&f).unwrap(), status);
+        // An older daemon's Status (no p2p) still decodes.
+        let old = br#"{"ok":"status","v":1,"bridge":true,"store":true,"relay":false,"forward_pending":0,"capabilities":["ipc"]}"#;
+        let mut frame = (old.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(old);
+        match decode_response(&frame).unwrap() {
+            IpcResponse::Status { p2p, .. } => assert_eq!(p2p, None),
+            other => panic!("{other:?}"),
         }
     }
 
@@ -1036,6 +1184,7 @@ mod tests {
             relay: false,
             forward_pending: 0,
             capabilities: vec!["ipc".into()],
+            p2p: None,
         };
         let rf = encode_request(&req).unwrap();
         let sf = encode_response(&resp).unwrap();
@@ -1095,6 +1244,7 @@ mod tests {
                 relay: false,
                 forward_pending: 0,
                 capabilities: vec!["ipc".into()],
+                p2p: None,
             },
             IpcResponse::Accepted { v: IPC_VERSION },
             IpcResponse::LanDialResult {

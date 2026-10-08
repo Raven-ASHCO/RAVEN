@@ -27,6 +27,25 @@ pub struct NodePolicy {
     /// empty, so older files and older readers are unaffected.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub internet_listen: String,
+    /// libp2p listen setting (`raven node p2p on|off`, P3): a port (every
+    /// interface, IPv4 and IPv6, TCP and QUIC) or `IP:PORT`, see
+    /// [`crate::p2p_route::normalize_p2p_listen`]. Empty = off, the default.
+    /// Read only when the service starts without `--p2p-listen` /
+    /// `RAVEN_P2P_LISTEN`. Omitted from the file while empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub p2p_listen: String,
+    /// Relays (`/…/p2p/<relay PeerId>` multiaddrs, at most
+    /// [`crate::p2p_route::MAX_VIA`]) this node keeps a reservation on. No
+    /// relay is compiled in: they come only from here, `--p2p-relay` or
+    /// `RAVEN_P2P_RELAYS`. Omitted from the file while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub p2p_relays: Vec<String>,
+    /// UPnP / NAT-PMP router port mapping for the p2p port (owner decision
+    /// Q8: "ask once at setup"). `None` = never asked (behaves as off: no
+    /// mapping is attempted), `Some(true)` = on, `Some(false)` = off. Omitted
+    /// from the file while unset, so older files and readers are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upnp: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -45,6 +64,9 @@ impl Default for NodePolicy {
             endpoint: true,
             auto_policy: true,
             internet_listen: String::new(),
+            p2p_listen: String::new(),
+            p2p_relays: Vec::new(),
+            upnp: None,
         }
     }
 }
@@ -53,7 +75,8 @@ impl NodePolicy {
     /// Applied when `node_policy.json` exists but cannot be read or parsed:
     /// offer no services to other peers (bridge / store / relay off) and drop
     /// the AUTO marker so nothing re-enables them implicitly. The node stays
-    /// the user's own chat endpoint, and opens no Internet listener.
+    /// the user's own chat endpoint, and opens no Internet or libp2p listener
+    /// and maps no router port.
     pub fn fail_closed() -> Self {
         Self {
             bridge: false,
@@ -62,6 +85,9 @@ impl NodePolicy {
             endpoint: true,
             auto_policy: false,
             internet_listen: String::new(),
+            p2p_listen: String::new(),
+            p2p_relays: Vec::new(),
+            upnp: None,
         }
     }
 }
@@ -290,6 +316,43 @@ mod tests {
         save_policy(dir.path(), &on).unwrap();
         assert_eq!(try_load_policy(dir.path()).unwrap(), on);
         assert!(NodePolicy::fail_closed().internet_listen.is_empty());
+    }
+
+    #[test]
+    fn p2p_settings_are_opt_in_and_upnp_has_three_states() {
+        let dir = tempdir().unwrap();
+        // Older files load with p2p off and UPnP never asked.
+        std::fs::write(
+            policy_path(dir.path()),
+            r#"{"bridge":true,"store":true,"relay":false,"endpoint":true,"auto_policy":true}"#,
+        )
+        .unwrap();
+        let loaded = try_load_policy(dir.path()).unwrap();
+        assert_eq!(loaded, NodePolicy::default());
+        assert!(loaded.p2p_listen.is_empty() && loaded.p2p_relays.is_empty());
+        assert_eq!(loaded.upnp, None);
+        // Unset values are not written at all.
+        save_policy(dir.path(), &NodePolicy::default()).unwrap();
+        let raw = std::fs::read_to_string(policy_path(dir.path())).unwrap();
+        for key in ["p2p_listen", "p2p_relays", "upnp"] {
+            assert!(!raw.contains(key), "{raw}");
+        }
+        // unset -> on -> off round-trips through node_policy.json.
+        for upnp in [Some(true), Some(false), None] {
+            let p = NodePolicy {
+                p2p_listen: "7423".into(),
+                p2p_relays: vec!["/ip4/203.0.113.7/tcp/7423/p2p/x".into()],
+                upnp,
+                ..NodePolicy::default()
+            };
+            save_policy(dir.path(), &p).unwrap();
+            assert_eq!(try_load_policy(dir.path()).unwrap(), p);
+        }
+        let fc = NodePolicy::fail_closed();
+        assert!(fc.p2p_listen.is_empty() && fc.p2p_relays.is_empty() && fc.upnp.is_none());
+        // A wrong type is a corrupt file (fail closed), not "unset".
+        std::fs::write(policy_path(dir.path()), r#"{"upnp":"yes"}"#).unwrap();
+        assert!(try_load_policy(dir.path()).is_err());
     }
 
     #[test]

@@ -1,4 +1,5 @@
-# Raven serverless lab CI — ML-KEM incremental, Full Braid Slice 2, Task 0A*.
+# Raven serverless lab CI — ML-KEM incremental, Full Braid Slice 2, Task 0A*,
+# C7 netns NAT simulation (libp2p relay + DCUtR).
 # Fail-closed without opt-in. NOT B1 required checks. Split from
 # raven-serverless.yml so a lab failure cannot fail the product workflow.
 name: Raven Serverless Lab
@@ -532,3 +533,62 @@ jobs:
           diff -u \
             target/libcrux-portable/mlkem768-encaps1-state.hex \
             target/libcrux-neon/mlkem768-encaps1-state.hex
+
+  # C7 (transports design §6.4): libp2p relay + DCUtR through simulated NATs in
+  # Linux network namespaces (relay R in "pub", two nft-masquerade routers, one
+  # raven-node service behind each). "cone" (plain masquerade) must deliver both
+  # ways over --carrier p2p and log the DCUtR upgrade; "symmetric"
+  # (masquerade random,fully-random) must deliver over the relay. Debug build +
+  # RAVEN_LAB_TEST_A=1 while P2P_PRODUCTION_ENABLED=false. A software substitute:
+  # it does not replace physical rows R7b / R8 (docs/NAT_SOFTWARE_SIM.md).
+  # Lab, not a product check (it lives here, not in raven-serverless.yml):
+  # independent of every other job, and advisory (continue-on-error) until it
+  # has run green on the hosted image. Hosted runners have passwordless sudo.
+  nat-sim-linux:
+    name: NAT simulation (netns, DCUtR cone + symmetric)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: node
+          prefix-key: nat-sim-linux
+      # Built as the runner user; the script itself never runs cargo (and refuses
+      # a release build path: the lab unlock only works in debug builds).
+      - name: Debug build (locked)
+        run: cargo build --locked -p ash -p raven-node
+      - name: Install nftables + iproute2 if missing
+        run: |
+          set -euo pipefail
+          if ! command -v nft >/dev/null 2>&1 || ! command -v ip >/dev/null 2>&1; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends nftables iproute2
+          fi
+          nft --version
+          ip -V
+      - name: netns NAT DCUtR test (cone + symmetric)
+        run: |
+          set -euo pipefail
+          sudo -E env "PATH=$PATH" RAVEN_NETNS_ALLOW_SUDO=1 \
+            RAVEN_NETNS_TMP="$RUNNER_TEMP/netns-nat" \
+            bash scripts/netns_nat_dcutr.sh
+      # The run dirs are root-owned (0700); only their logs/ subdirs are uploaded
+      # (public keys, cards, counts-only service logs; no key files).
+      - name: Make the run logs readable for upload
+        if: failure()
+        run: sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/netns-nat" || true
+      - name: Upload netns run logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nat-sim-linux-logs
+          path: ${{ runner.temp }}/netns-nat/*/logs/
+          if-no-files-found: warn

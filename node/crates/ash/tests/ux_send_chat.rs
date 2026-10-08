@@ -719,6 +719,7 @@ fn serve_one(
             relay: false,
             forward_pending: 0,
             capabilities: vec!["ipc".into(), "lan_direct".into()],
+            p2p: None,
         },
         Ok(IpcRequest::LanDial { frames_b64, .. }) => match mode.load(Ordering::SeqCst) {
             DOWN => error(REFUSED),

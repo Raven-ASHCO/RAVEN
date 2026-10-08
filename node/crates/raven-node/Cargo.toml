@@ -22,6 +22,11 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [dependencies]
 raven-core = { workspace = true }
+# The P3 libp2p carrier and relay role (`p2p-host`): compiled in, held at
+# runtime by raven_core::p2p_live_enabled (P2P_PRODUCTION_ENABLED=false).
+raven-swarm = { path = "../raven-swarm", features = ["p2p-host"] }
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["compat"] }
 tokio = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }

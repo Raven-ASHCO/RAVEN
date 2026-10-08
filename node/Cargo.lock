@@ -2376,6 +2376,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p-stream"
+version = "0.4.0-alpha"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d6bd8025c80205ec2810cfb28b02f362ab48a01bee32c50ab5f12761e033464"
+dependencies = [
+ "futures",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "rand 0.8.7",
+ "tracing",
+]
+
+[[package]]
 name = "libp2p-swarm"
 version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3540,14 +3554,17 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
+ "futures",
  "hex",
  "libc",
  "rand 0.8.7",
  "raven-core",
+ "raven-swarm",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "windows-sys 0.59.0",
 ]
 
@@ -3564,6 +3581,7 @@ dependencies = [
  "futures",
  "hex",
  "libp2p",
+ "libp2p-stream",
  "rand 0.8.7",
  "raven-core",
  "sha2 0.10.9",
@@ -4336,6 +4354,7 @@ checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "libc",
  "pin-project-lite",

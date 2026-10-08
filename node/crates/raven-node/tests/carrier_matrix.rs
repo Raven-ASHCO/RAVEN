@@ -31,6 +31,20 @@
 //!   exact staged bytes with no new `raven send`: `raven outbox status` and the
 //!   history say delivered, and B's inbox holds the message exactly once.
 //!
+//! - **C6 forced relay (P3):** a dedicated relay R (`raven-node relay`, no
+//!   Raven identity) whose allow-list holds A and B; A and B run the service
+//!   with the libp2p host on and no listening port at all (`--p2p-listen
+//!   relay`), so they are reachable ONLY through their reservations on R, and
+//!   they reach R through a recording TCP proxy in this test. They pin each
+//!   other from `raven-card/2` cards (`p2p=` + `via=`), and A→B (`--carrier
+//!   p2p`) and B→A (`auto`) are delivered over the circuit, each exactly once.
+//!   Everything the proxy saw (all relayed bytes) holds no PairInit or RLB1
+//!   magic, no message text and no Raven identity bytes. A stranger S with
+//!   B's card cannot reserve on R (it is not on the allow-list) and is refused
+//!   by B before B identifies itself; a contact A added without pinning it is
+//!   refused by A too (p2p is for verified contacts only). Runs under the
+//!   debug lab unlock while `P2P_PRODUCTION_ENABLED` is false.
+//!
 //! Internet direct is for verified (pinned) contacts only (owner decision
 //! 2026-10-08): C2 also checks that an unverified contact is refused on send
 //! (nothing dialled) and by the listener (treated like a stranger).
@@ -172,6 +186,9 @@ impl Profile {
             "RAVEN_DATA_DIR",
             "ASH_DATA_DIR",
             "RAVEN_INTERNET_LISTEN",
+            "RAVEN_P2P_LISTEN",
+            "RAVEN_P2P_RELAYS",
+            "RAVEN_P2P_RELAY",
             "RAVEN_PEER",
             "ASH_LAN_DIAL",
             "RAVEN_VERBOSE",
@@ -318,6 +335,111 @@ impl Profile {
             service.log.text()
         );
         service
+    }
+
+    /// [`Self::start_service`] with the libp2p host on, no listening port
+    /// (`--p2p-listen relay`) and a reservation on `relay_via`, waited for.
+    fn start_service_p2p(&self, relay_via: &str) -> Service {
+        self.start_service_p2p_with(relay_via, true)
+    }
+
+    fn start_service_p2p_with(&self, relay_via: &str, wait_reservation: bool) -> Service {
+        let mut cmd = Command::new(NODE);
+        self.env(&mut cmd);
+        cmd.arg("service").arg("--data-dir").arg(&self.dir).args([
+            "--lan-listen",
+            "127.0.0.1:0",
+            "--ble-listen",
+            "127.0.0.1:0",
+            "--p2p-listen",
+            "relay",
+            "--p2p-relay",
+            relay_via,
+        ]);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn raven-node service");
+        let log = Arc::new(Log::default());
+        log.follow(child.stderr.take().unwrap());
+        let service = Service {
+            child,
+            log,
+            lan_dial: String::new(),
+            internet_dial: String::new(),
+        };
+        let up = service
+            .log
+            .wait_for(READY_TIMEOUT, |l| l.contains("raven-node p2p: host up"));
+        let ipc = service
+            .log
+            .wait_for(READY_TIMEOUT, |l| l.contains("raven-node ipc: listening"));
+        if up.is_none() || ipc.is_none() {
+            panic!(
+                "{} p2p service did not come up within {READY_TIMEOUT:?}:\n{}",
+                self.name,
+                service.log.text()
+            );
+        }
+        if wait_reservation {
+            let reserved = service.log.wait_for(READY_TIMEOUT, |l| {
+                l.contains("raven-node p2p: reservation accepted")
+            });
+            assert!(
+                reserved.is_some(),
+                "{} got no reservation on the relay:\n{}",
+                self.name,
+                service.log.text()
+            );
+        }
+        let ping = self.raven(&["ipc-ping"], None);
+        assert!(ping.ok, "{} ipc-ping failed:\n{}", self.name, ping.all());
+        service
+    }
+
+    /// This profile's `raven-card/2` line naming `relay_via`.
+    fn p2p_card(&self, relay_via: &str) -> String {
+        let card = self.raven(&["whoami", "--card", "--via", relay_via], None);
+        assert!(
+            card.ok,
+            "{} whoami --card --via:\n{}",
+            self.name,
+            card.all()
+        );
+        let line = card.stdout.trim().to_string();
+        assert_eq!(card.stdout.trim_end().lines().count(), 1, "{}", card.stdout);
+        assert!(line.starts_with("raven-card/2 "), "{line}");
+        assert!(
+            line.contains(" p2p=12D3KooW") && line.contains(" via=/"),
+            "{line}"
+        );
+        line
+    }
+
+    /// Pin `card` (verified fingerprint) as `tag`.
+    fn add_card(&self, card: &str, tag: &str, fingerprint: &str) {
+        let out = self.raven(
+            &[
+                "contact",
+                "add",
+                "--card",
+                card,
+                "--petname",
+                tag,
+                "--tag",
+                tag,
+                "--verify-fp",
+                fingerprint,
+            ],
+            None,
+        );
+        assert!(
+            out.ok,
+            "{} contact add --card {tag}:\n{}",
+            self.name,
+            out.all()
+        );
+        assert!(out.stdout.contains("pinned      yes"), "{}", out.all());
     }
 
     fn add_contact(&self, other: &Profile, tag: &str, lan_dial: &str) {
@@ -960,4 +1082,425 @@ fn c4_outbox_delivers_after_a_restart_without_a_new_send() {
     // The next send needs nothing from the outbox and is delivered as usual.
     assert_delivered("a→b after c4", &a.send("bob", "c4 after the restart"));
     assert_eq!(b.inbox().matches(text).count(), 1, "still exactly once");
+}
+
+/// The p2p lab unlock is needed only while the P3 flag is off.
+fn p2p_lab_unlock() -> bool {
+    !raven_core::P2P_PRODUCTION_ENABLED
+}
+
+/// One running `raven-node relay`; killed when dropped.
+struct Relay {
+    child: Child,
+    log: Arc<Log>,
+    dir: PathBuf,
+    /// `/ip4/127.0.0.1/tcp/<port>/p2p/<relay PeerId>`.
+    via: String,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Relay {
+    fn start(root: &Path) -> Self {
+        let dir = root.join("relay");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cmd = Command::new(NODE);
+        for k in ["RAVEN_LAB_TEST_A", "RAVEN_DATA_DIR", "ASH_DATA_DIR"] {
+            cmd.env_remove(k);
+        }
+        if p2p_lab_unlock() {
+            cmd.env("RAVEN_LAB_TEST_A", "1");
+        }
+        // Proof that the relay needs no keystore: no identity backend at all.
+        cmd.env_remove("RAVEN_IDENTITY_BACKEND")
+            .env("NO_COLOR", "1")
+            .arg("relay")
+            .arg("--data-dir")
+            .arg(&dir)
+            .args(["--listen", "127.0.0.1:0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn raven-node relay");
+        let log = Arc::new(Log::default());
+        log.follow(child.stderr.take().unwrap());
+        let up = log.wait_for(READY_TIMEOUT, |l| l.contains("raven-node relay: up"));
+        assert!(up.is_some(), "relay did not come up:\n{}", log.text());
+        let mut relay = Relay {
+            child,
+            log,
+            dir,
+            via: String::new(),
+        };
+        let status = relay.wait_status(|s| {
+            s["listen_addrs"].as_array().is_some_and(|a| {
+                a.iter()
+                    .any(|x| x.as_str().is_some_and(|t| t.contains("/tcp/")))
+            })
+        });
+        let tcp = status["listen_addrs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .find(|t| t.contains("/tcp/"))
+            .unwrap()
+            .to_string();
+        relay.via = format!("{tcp}/p2p/{}", status["peer_id"].as_str().unwrap());
+        relay
+    }
+
+    /// The relay's status file once `pred` holds (it is rewritten every 2 s).
+    fn wait_status(&self, pred: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            let raw =
+                std::fs::read_to_string(self.dir.join("relay_status.json")).unwrap_or_default();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if pred(&v) {
+                    return v;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "relay status never matched:\n{raw}\n{}",
+                self.log.text()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// `raven --data-dir <relay dir> relay allow --card <card>`.
+    fn allow(&self, as_profile: &Profile, card: &str) {
+        let mut cmd = Command::new(raven_bin());
+        as_profile.env(&mut cmd);
+        cmd.arg("--data-dir")
+            .arg(&self.dir)
+            .args(["relay", "allow", "--card", card]);
+        let out = run_bounded(cmd, None, COMMAND_TIMEOUT, "relay allow");
+        assert!(out.ok, "relay allow:\n{}", out.all());
+    }
+}
+
+/// A TCP proxy in front of one address that records every byte it relays,
+/// both directions (capped), for the C6 capture check.
+struct RecordingProxy {
+    addr: std::net::SocketAddr,
+    seen: Arc<Mutex<Vec<u8>>>,
+}
+
+const PROXY_RECORD_CAP: usize = 64 << 20;
+
+impl RecordingProxy {
+    fn start(target: std::net::SocketAddr) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(client) = client else { continue };
+                let Ok(upstream) = std::net::TcpStream::connect(target) else {
+                    continue;
+                };
+                let (Ok(client2), Ok(upstream2)) = (client.try_clone(), upstream.try_clone())
+                else {
+                    continue;
+                };
+                for (mut from, mut to) in [(client2, upstream2), (upstream, client)] {
+                    let record = Arc::clone(&record);
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 16 << 10];
+                        loop {
+                            match from.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    {
+                                        let mut seen = record.lock().unwrap();
+                                        if seen.len() + n <= PROXY_RECORD_CAP {
+                                            seen.extend_from_slice(&buf[..n]);
+                                        }
+                                    }
+                                    if to.write_all(&buf[..n]).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            }
+        });
+        RecordingProxy { addr, seen }
+    }
+
+    fn recorded(&self) -> Vec<u8> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// C6: A and B reachable only through a relay they reserve on; delivery both
+/// ways over the circuit; strangers, unpinned contacts and peers that are not
+/// on the relay's allow-list are refused (transports design §6.4 C6, P3).
+#[test]
+#[ignore = "multi-process harness: cargo build -p ash first, then run with --ignored"]
+fn c6_forced_relay_both_ways_and_strangers_are_refused() {
+    if !lab_ready() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let relay = Relay::start(root.path());
+    assert!(
+        !relay.dir.join("identity.seed").exists() && !relay.dir.join("identity.backend").exists(),
+        "the relay must hold no Raven identity"
+    );
+    assert!(relay.dir.join("relay_key.ed25519").is_file());
+    // A and B reach R through a recording proxy: every relayed byte is seen.
+    let (r_tcp, r_peer) = relay.via.split_once("/p2p/").unwrap();
+    let r_port: u16 = r_tcp.rsplit('/').next().unwrap().parse().unwrap();
+    let proxy = RecordingProxy::start(std::net::SocketAddr::from(([127, 0, 0, 1], r_port)));
+    let via = format!("/ip4/127.0.0.1/tcp/{}/p2p/{r_peer}", proxy.addr.port());
+    let a = Profile::create_with(root.path(), "pa", p2p_lab_unlock());
+    let b = Profile::create_with(root.path(), "pb", p2p_lab_unlock());
+    let a_card = a.p2p_card(&via);
+    let b_card = b.p2p_card(&via);
+    relay.allow(&a, &a_card);
+    relay.allow(&b, &b_card);
+    // The relay re-reads its allow-list on its own (no restart).
+    relay.wait_status(|s| s["counts"]["allowed_peers"].as_u64() == Some(2));
+    let a_svc = a.start_service_p2p(&via);
+    let b_svc = b.start_service_p2p(&via);
+    relay.wait_status(|s| s["counts"]["reservations"].as_u64() == Some(2));
+    for (name, svc) in [("a", &a_svc), ("b", &b_svc)] {
+        assert!(
+            !svc.log.text().contains("12D3KooW"),
+            "{name}'s log names a PeerId:\n{}",
+            svc.log.text()
+        );
+    }
+    let status = a.raven(&["status"], None);
+    let row = status
+        .stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("p2p "))
+        .unwrap_or_else(|| panic!("no p2p row in status:\n{}", status.stdout));
+    assert!(
+        row.contains("YES") && row.contains("reservations 1/1"),
+        "{row}"
+    );
+    // No listening port: the only addresses are circuits through the relay.
+    let listen = status
+        .stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("p2p_listen "))
+        .unwrap_or_else(|| panic!("no p2p_listen row:\n{}", status.stdout));
+    assert!(
+        listen
+            .split_whitespace()
+            .skip(1)
+            .all(|a| a.trim_end_matches(',').contains("/p2p-circuit/")),
+        "{listen}"
+    );
+
+    // Each pins the other from the card: p2p= and via= only, no LAN or
+    // Internet route, so every send below rides the relay.
+    a.add_card(&b_card, "bob", &b.fingerprint);
+    b.add_card(&a_card, "alice", &a.fingerprint);
+    let a_book = std::fs::read_to_string(a.dir.join("contacts.json")).unwrap();
+    assert!(
+        a_book.contains("\"p2p\": \"12D3KooW") && a_book.contains("\"lan_dial\": \"\""),
+        "{a_book}"
+    );
+
+    let text_ab = "c6 hello over the relay from a";
+    let sent = a.raven_with(
+        &["send", "--contact", "@bob", "--carrier", "p2p"],
+        Some(&format!("{text_ab}\n")),
+        &[("RAVEN_VERBOSE", "1")],
+    );
+    assert_delivered("a→b (p2p)", &sent);
+    assert!(
+        sent.stdout.contains("carrier=p2p_dial"),
+        "verbose send must name the carrier:\n{}",
+        sent.all()
+    );
+    assert_eq!(b.inbox().matches(text_ab).count(), 1, "exactly once on b");
+
+    // The other way with the default carrier: auto plans p2p last, and it is
+    // the only route this contact has.
+    let text_ba = "c6 hello over the relay from b";
+    let sent = b.raven_with(
+        &["send", "--contact", "@alice"],
+        Some(&format!("{text_ba}\n")),
+        &[("RAVEN_VERBOSE", "1")],
+    );
+    assert_delivered("b→a (auto → p2p)", &sent);
+    assert!(sent.stdout.contains("carrier=p2p_dial"), "{}", sent.all());
+    assert_eq!(a.inbox().matches(text_ba).count(), 1, "exactly once on a");
+    for (who, p) in [("a", &a), ("b", &b)] {
+        let list = p.raven(&["outbox", "list"], None);
+        assert!(
+            list.ok && list.stdout.contains("Nothing waiting"),
+            "{who}: nothing left to retry:\n{}",
+            list.all()
+        );
+    }
+    let counts = relay.wait_status(|s| s["counts"]["reservations"].as_u64() == Some(2));
+    let raw = counts.to_string();
+    assert!(
+        !raw.contains(&a.pub_hex) && !raw.contains(&b.pub_hex) && !raw.contains(text_ab),
+        "the relay status holds counts only: {raw}"
+    );
+    assert!(
+        !relay.log.text().contains(&a_card[..40]) && !relay.log.text().contains("c6 hello"),
+        "{}",
+        relay.log.text()
+    );
+    // ── Capture: what the relay's network path carried ────────────────────
+    // Pairing (PairInit), both RLB1 offers, both messages and their ACKs all
+    // crossed the proxy; inside libp2p Noise and the Raven link none of it
+    // may be readable, nor may either side's Raven identity.
+    let seen = proxy.recorded();
+    assert!(seen.len() > 8 << 10, "the proxy saw {} bytes", seen.len());
+    let id_bytes = |hex_key: &str| hex::decode(hex_key).unwrap();
+    for (what, needle) in [
+        ("PairInit magic", b"RVPI1".to_vec()),
+        ("PairResponse magic", b"RVPR1".to_vec()),
+        ("RLB1 magic", b"RLB1".to_vec()),
+        ("RIH1 hello magic", b"RIH1".to_vec()),
+        ("message text a→b", text_ab.as_bytes().to_vec()),
+        ("message text b→a", text_ba.as_bytes().to_vec()),
+        ("a's identity key", id_bytes(&a.pub_hex)),
+        ("b's identity key", id_bytes(&b.pub_hex)),
+        ("a's key in hex", a.pub_hex.as_bytes().to_vec()),
+        ("a's Raven address", a.address.as_bytes().to_vec()),
+        ("b's Raven address", b.address.as_bytes().to_vec()),
+    ] {
+        assert!(
+            !contains(&seen, &needle),
+            "the relay path carried {what} in clear"
+        );
+    }
+
+    // ── A peer that is not on the relay's allow-list cannot reserve ───────
+    let s = Profile::create_with(root.path(), "ps", p2p_lab_unlock());
+    let refused_before = relay.wait_status(|_| true)["counts"]["reservations_refused"]
+        .as_u64()
+        .unwrap_or(0);
+    let s_svc = s.start_service_p2p_with(&via, false);
+    relay.wait_status(|st| {
+        st["counts"]["reservations_refused"]
+            .as_u64()
+            .is_some_and(|n| n > refused_before)
+    });
+    assert!(
+        !s_svc.log.text().contains("reservation accepted"),
+        "a peer off the allow-list got a reservation:\n{}",
+        s_svc.log.text()
+    );
+    assert_eq!(
+        relay.wait_status(|_| true)["counts"]["reservations"].as_u64(),
+        Some(2),
+        "still only A and B"
+    );
+
+    // ── Stranger: S holds B's card (verified), B does not know S ─────────
+    s.add_card(&b_card, "bob", &b.fingerprint);
+    let refused = s.raven(
+        &["send", "--contact", "@bob", "--carrier", "p2p"],
+        Some("c6 stranger probe\n"),
+    );
+    assert!(!refused.ok, "stranger send succeeded:\n{}", refused.all());
+    assert!(
+        refused.all().contains("LINK_NOT_ACCEPTED"),
+        "the stranger must see only the fixed refusal:\n{}",
+        refused.all()
+    );
+    let reason = b_svc
+        .log
+        .wait_for(LOG_TIMEOUT, |l| {
+            l.contains("p2p inbound") && l.contains("not a local contact")
+        })
+        .unwrap_or_else(|| panic!("b did not log the refusal:\n{}", b_svc.log.text()));
+    assert!(
+        !reason.contains(&s.pub_hex) && !reason.contains(&s.address),
+        "the refusal log names the stranger: {reason}"
+    );
+    let cache = std::fs::read_to_string(s.dir.join("peer_device_certs.json")).unwrap_or_default();
+    assert!(
+        !cache.contains(&b.pub_hex),
+        "the stranger received b's certificate:\n{cache}"
+    );
+    assert!(!b.inbox().contains("c6 stranger probe"));
+
+    // ── Unpinned: A adds S (from S's card) but never verifies it ──────────
+    // Against A, not B: peer-caused refusals are logged once per 10 s per
+    // process, and A has logged none yet, so no wait is needed.
+    let s_card = s.p2p_card(&via);
+    let added = a.raven(
+        &[
+            "contact",
+            "add",
+            "--card",
+            &s_card,
+            "--petname",
+            "sam",
+            "--tag",
+            "sam",
+        ],
+        None,
+    );
+    assert!(added.ok, "a contact add s:\n{}", added.all());
+    assert!(added.stdout.contains("pinned      no"), "{}", added.all());
+    s.add_card(&a_card, "alice", &a.fingerprint);
+    let refused = s.raven(
+        &["send", "--contact", "@alice", "--carrier", "p2p"],
+        Some("c6 unverified probe\n"),
+    );
+    assert!(!refused.ok, "unverified send succeeded:\n{}", refused.all());
+    assert!(
+        refused.all().contains("LINK_NOT_ACCEPTED"),
+        "{}",
+        refused.all()
+    );
+    let reason = a_svc
+        .log
+        .wait_for(LOG_TIMEOUT, |l| {
+            l.contains("p2p inbound") && l.contains("not verified")
+        })
+        .unwrap_or_else(|| panic!("a did not log the refusal:\n{}", a_svc.log.text()));
+    assert!(
+        !reason.contains(&s.pub_hex) && !reason.contains(&s.address),
+        "the refusal log names the contact: {reason}"
+    );
+    assert!(!a.inbox().contains("c6 unverified probe"));
+    // And A's own p2p send to the unpinned S is refused before anything is
+    // dialled, although S's card gave A a p2p route.
+    let unverified = a.raven(
+        &["send", "--contact", "@sam", "--carrier", "p2p"],
+        Some("c6 must wait for verification\n"),
+    );
+    assert!(!unverified.ok, "{}", unverified.all());
+    assert!(
+        unverified.all().contains("CONTACT_NOT_VERIFIED")
+            && unverified.all().contains("Nothing was dialled"),
+        "{}",
+        unverified.all()
+    );
+
+    // A still gets through after the refusals.
+    let again = a.send("bob", "c6 after the stranger");
+    assert_delivered("a→b after the stranger", &again);
+    assert_eq!(b.inbox().matches("c6 after the stranger").count(), 1);
+    drop(s_svc);
 }

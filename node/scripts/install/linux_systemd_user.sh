@@ -11,6 +11,16 @@
 # 0.0.0.0:7422` turns it on later (applied when the service restarts). Opening
 # the port in a firewall stays your decision; the installer only prints the rule.
 #
+# libp2p (relay + hole punching, TCP and UDP 7423) is opt-in the same way:
+#   RAVEN_P2P_LISTEN=7423 bash node/scripts/install/linux_systemd_user.sh
+# (a port = every interface, IPv4 + IPv6; IP:PORT = that address only; off =
+# off even if `raven node p2p on` saved it). RAVEN_P2P_RELAYS=<multiaddr>[,<multiaddr>]
+# (at most 2, each ending in /p2p/<relay PeerId>) keeps a reservation on those
+# relays; RAVEN_P2P_RELAY=1 also relays for the PeerIds in relay_allow.json;
+# RAVEN_UPNP=1|0 saves the router port-mapping choice (`raven node upnp on|off`).
+# With RAVEN_UPNP unset, an interactive install that turns p2p listen on asks
+# once (Enter = no); a non-interactive one never asks and leaves it unset (off).
+#
 # Lifetime: a `systemd --user` manager is torn down when the user's last
 # session ends, so on a headless / SSH-managed host (Raspberry Pi bridge node)
 # the daemon would stop at logout and not start at boot. Lingering fixes that
@@ -55,6 +65,43 @@ if [[ -n "$INTERNET_LISTEN" && ! "$INTERNET_LISTEN" =~ ^[][0-9A-Za-z.:]+$ ]]; th
   echo "RAVEN_INTERNET_LISTEN must look like 0.0.0.0:7422 or [::]:7422" >&2
   exit 1
 fi
+# libp2p settings: empty = no flag (node_policy.json decides, as today).
+P2P_LISTEN="${RAVEN_P2P_LISTEN:-}"
+P2P_RELAYS="${RAVEN_P2P_RELAYS:-}"
+P2P_RELAY="${RAVEN_P2P_RELAY:-}"
+UPNP="${RAVEN_UPNP:-}"
+# PORT / IP:PORT / [IPv6]:PORT / on / off characters only; raven-node validates the rest.
+if [[ -n "$P2P_LISTEN" && ! "$P2P_LISTEN" =~ ^[][0-9A-Za-z.:]+$ ]]; then
+  echo "RAVEN_P2P_LISTEN must look like 7423, 0.0.0.0:7423, [::]:7423 or off" >&2
+  exit 1
+fi
+# Comma separated relay multiaddrs (spaces around commas are ignored).
+P2P_RELAY_LIST=()
+P2P_RELAYS_REST="${P2P_RELAYS},"
+while [[ -n "$P2P_RELAYS" && -n "$P2P_RELAYS_REST" ]]; do
+  P2P_RELAY_ENTRY="${P2P_RELAYS_REST%%,*}"
+  P2P_RELAYS_REST="${P2P_RELAYS_REST#*,}"
+  P2P_RELAY_ENTRY="${P2P_RELAY_ENTRY#"${P2P_RELAY_ENTRY%%[![:space:]]*}"}"
+  P2P_RELAY_ENTRY="${P2P_RELAY_ENTRY%"${P2P_RELAY_ENTRY##*[![:space:]]}"}"
+  [[ -n "$P2P_RELAY_ENTRY" ]] || continue
+  if [[ ! "$P2P_RELAY_ENTRY" =~ ^/[0-9A-Za-z./:_-]+$ || "$P2P_RELAY_ENTRY" != */p2p/?* ]]; then
+    echo "RAVEN_P2P_RELAYS entries must look like /ip4/203.0.113.7/tcp/7423/p2p/<relay PeerId>" >&2
+    exit 1
+  fi
+  P2P_RELAY_LIST+=("$P2P_RELAY_ENTRY")
+done
+if [[ ${#P2P_RELAY_LIST[@]} -gt 2 ]]; then
+  echo "RAVEN_P2P_RELAYS takes at most 2 relays" >&2
+  exit 1
+fi
+case "$P2P_RELAY" in
+  ""|0|1) ;;
+  *) echo "RAVEN_P2P_RELAY must be 1 (serve as a relay for relay_allow.json) or 0" >&2; exit 1 ;;
+esac
+case "$UPNP" in
+  ""|0|1) ;;
+  *) echo "RAVEN_UPNP must be 1 (map the p2p port on the router) or 0" >&2; exit 1 ;;
+esac
 PASSPHRASE_FILE="${RAVEN_KEYSTORE_PASSPHRASE_FILE:-}"
 if [[ -n "${RAVEN_KEYSTORE_PASSPHRASE:-}" ]]; then
   echo "RAVEN_KEYSTORE_PASSPHRASE is refused: put the passphrase in a 0600 file and set RAVEN_KEYSTORE_PASSPHRASE_FILE" >&2
@@ -78,6 +125,49 @@ if [[ -n "$PASSPHRASE_FILE" ]]; then
     *) echo "RAVEN_KEYSTORE_PASSPHRASE_FILE must be mode 0600 or 0400 (chmod 600 $PASSPHRASE_FILE)" >&2; exit 1 ;;
   esac
 fi
+# True when this install turns the libp2p listener on (set and not "off").
+p2p_listen_requested() {
+  [[ -n "$P2P_LISTEN" ]] || return 1
+  case "$P2P_LISTEN" in
+    [Oo][Ff][Ff]) return 1 ;;
+  esac
+  return 0
+}
+# The libp2p port of RAVEN_P2P_LISTEN: "[v6]:port", "v4:port", a bare port or
+# "on" (the default port); empty for "relay" (no listening port) and off.
+P2P_PORT=""
+if p2p_listen_requested; then
+  case "$P2P_LISTEN" in
+    [Rr][Ee][Ll][Aa][Yy]) P2P_PORT="" ;;
+    \[*\]:*) P2P_PORT="${P2P_LISTEN##*:}" ;;
+    *:*:*) P2P_PORT=7423 ;;
+    *:*) P2P_PORT="${P2P_LISTEN##*:}" ;;
+    *[!0-9]*) P2P_PORT=7423 ;;
+    *) P2P_PORT="$P2P_LISTEN" ;;
+  esac
+fi
+# UPnP / NAT-PMP (owner decision Q8, "ask once at setup"): RAVEN_UPNP decides.
+# Unset: an interactive install (stdin is a terminal) that opens a p2p port
+# asks the same one-time question as `raven node p2p on`, unless node_policy.json
+# already holds an answer ("upnp": true|false). Enter or EOF = no. Asked before
+# the build so nobody waits for cargo to answer it; saved after install below.
+UPNP_MODE=""
+case "$UPNP" in
+  1) UPNP_MODE=on ;;
+  0) UPNP_MODE=off ;;
+  *)
+    if [[ -n "$P2P_PORT" && -t 0 ]] \
+      && ! grep -Eq '"upnp"[[:space:]]*:[[:space:]]*(true|false)' "$DATA_DIR/node_policy.json" 2>/dev/null; then
+      printf '%s ' "Open TCP/UDP ${P2P_PORT} on your router automatically (UPnP/NAT-PMP) so friends can reach this node and it can relay for them? [y/N]" >&2
+      UPNP_ANSWER=""
+      read -r UPNP_ANSWER || UPNP_ANSWER=""
+      case "$UPNP_ANSWER" in
+        [Yy]|[Yy][Ee][Ss]) UPNP_MODE=on ;;
+        *) UPNP_MODE=off ;;
+      esac
+    fi
+    ;;
+esac
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/raven-node.service"
 
@@ -105,6 +195,22 @@ sd_quote() {
 internet_listen_args() {
   [[ -n "$INTERNET_LISTEN" ]] || return 0
   printf ' --internet-listen %s' "$(sd_quote "$INTERNET_LISTEN")"
+}
+# libp2p flags: only the ones asked for (none = the unit stays as before).
+p2p_args() {
+  local r
+  if [[ -n "$P2P_LISTEN" ]]; then
+    printf ' --p2p-listen %s' "$(sd_quote "$P2P_LISTEN")"
+  fi
+  if [[ ${#P2P_RELAY_LIST[@]} -gt 0 ]]; then
+    for r in "${P2P_RELAY_LIST[@]}"; do
+      printf ' --p2p-relay %s' "$(sd_quote "$r")"
+    done
+  fi
+  if [[ "$P2P_RELAY" == "1" ]]; then
+    printf ' --relay'
+  fi
+  return 0
 }
 # Passphrase vault: hand the service the passphrase *file* (never its contents).
 keystore_unit_lines() {
@@ -137,7 +243,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$(sd_quote "${BIN_DIR}/raven-node") service --data-dir $(sd_quote "${DATA_DIR}") --lan-listen $(sd_quote "${LAN_LISTEN}") --ble-listen 127.0.0.1:7421$(internet_listen_args) --timeout-secs 0
+ExecStart=$(sd_quote "${BIN_DIR}/raven-node") service --data-dir $(sd_quote "${DATA_DIR}") --lan-listen $(sd_quote "${LAN_LISTEN}") --ble-listen 127.0.0.1:7421$(internet_listen_args)$(p2p_args) --timeout-secs 0
 Restart=on-failure
 RestartSec=3
 # Sandboxing that works in a --user manager without a mount namespace (the
@@ -165,6 +271,33 @@ if [[ "$(cat "${DATA_DIR}/keystore.backend" 2>/dev/null || true)" == "passphrase
   echo "NOTE: this profile's keys are in a passphrase vault, but the service was given no passphrase file."
   echo "  The service will fail to start until you re-run this installer with"
   echo "  RAVEN_KEYSTORE_PASSPHRASE_FILE=<file holding the passphrase, chmod 600> (see docs/INSTALL_Linux.md)."
+fi
+# The same p2p settings go into node_policy.json too, so `raven whoami --card`
+# and `raven status` agree with the unit even while it is not running (its
+# flags above still decide while it runs). stdin is /dev/null: never asks.
+if [[ -n "$P2P_LISTEN" ]]; then
+  if p2p_listen_requested; then
+    P2P_SAVE_ARGS=(node p2p on --listen "$P2P_LISTEN")
+    if [[ ${#P2P_RELAY_LIST[@]} -gt 0 ]]; then
+      for r in "${P2P_RELAY_LIST[@]}"; do
+        P2P_SAVE_ARGS+=(--relay "$r")
+      done
+    fi
+  else
+    P2P_SAVE_ARGS=(node p2p off)
+  fi
+  if ! "${BIN_DIR}/raven" --data-dir "${DATA_DIR}" "${P2P_SAVE_ARGS[@]}" </dev/null >/dev/null; then
+    echo "WARN: could not save the p2p settings in node_policy.json (the unit still uses its flags); run '${BIN_DIR}/raven --data-dir ${DATA_DIR} ${P2P_SAVE_ARGS[*]}'"
+  fi
+fi
+# Saved in node_policy.json before the (re)start below, which applies it.
+UPNP_SAVED=""
+if [[ -n "$UPNP_MODE" ]]; then
+  if "${BIN_DIR}/raven" --data-dir "${DATA_DIR}" node upnp "$UPNP_MODE"; then
+    UPNP_SAVED="$UPNP_MODE"
+  else
+    echo "WARN: could not save the UPnP choice; run '${BIN_DIR}/raven --data-dir ${DATA_DIR} node upnp ${UPNP_MODE}' and restart the unit"
+  fi
 fi
 # `enable --now` is a no-op for an already-active unit, which would keep the
 # previous binary running after an upgrade; `restart` also starts an inactive unit.
@@ -209,4 +342,30 @@ if [[ -n "$INTERNET_LISTEN" ]]; then
 else
   echo "Internet listen: off (opt-in: re-run with RAVEN_INTERNET_LISTEN=0.0.0.0:7422, or 'raven node internet on' and restart the unit)"
 fi
+if p2p_listen_requested && [[ -z "$P2P_PORT" ]]; then
+  echo "p2p listen: relay (no listening port: contacts reach this node only through its relays, RAVEN_P2P_RELAYS)"
+elif p2p_listen_requested; then
+  echo "p2p listen: ${P2P_LISTEN} (libp2p TCP+UDP ${P2P_PORT}; only your contacts get a Raven link; anyone can see that the port is open)"
+  echo "  Allow it yourself if you want it reachable: ufw allow ${P2P_PORT}/tcp; ufw allow ${P2P_PORT}/udp (or firewalld / nftables / your cloud security group),"
+  echo "  and forward TCP+UDP ${P2P_PORT} on your router if this host is behind NAT (or RAVEN_UPNP=1); without that a relay (RAVEN_P2P_RELAYS) still lets contacts reach you."
+  echo "  A build with p2p off (P2P_PRODUCTION_ENABLED=false) never listens and logs P2P_HOLD; check: raven status (p2p row)."
+elif [[ -n "$P2P_LISTEN" ]]; then
+  echo "p2p listen: off (RAVEN_P2P_LISTEN=${P2P_LISTEN} overrides 'raven node p2p on')"
+else
+  echo "p2p listen: off (opt-in: re-run with RAVEN_P2P_LISTEN=7423, or 'raven node p2p on' and restart the unit)"
+fi
+if [[ ${#P2P_RELAY_LIST[@]} -gt 0 ]]; then
+  echo "p2p relays: ${P2P_RELAY_LIST[*]} (a reservation is kept on each; a relay sees both PeerIds and IPs of every circuit, never your messages)"
+fi
+if [[ "$P2P_RELAY" == "1" ]]; then
+  echo "relay: on for the PeerIds in ${DATA_DIR}/relay_allow.json (add a friend with 'raven relay allow @friend')"
+  echo "  Its relay PeerId is your own libp2p PeerId (the one in your card): friends who use it can link it to your card."
+fi
+if { [[ ${#P2P_RELAY_LIST[@]} -gt 0 ]] || [[ "$P2P_RELAY" == "1" ]]; } && ! p2p_listen_requested; then
+  echo "NOTE: relays and RAVEN_P2P_RELAY=1 take effect only while p2p listen is on (RAVEN_P2P_LISTEN=7423 or 'raven node p2p on')."
+fi
+case "$UPNP_SAVED" in
+  on) echo "UPnP: on (raven-node asks the router to map TCP/UDP ${P2P_PORT:-of the p2p port, when one is open}; it logs only the mapped port and success or failure)" ;;
+  off) echo "UPnP: off ('raven node upnp on' changes it; applied when the unit restarts)" ;;
+esac
 echo "export PATH=\"${BIN_DIR}:\$PATH\""

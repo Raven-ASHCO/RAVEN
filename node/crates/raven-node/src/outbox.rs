@@ -58,8 +58,8 @@ use raven_core::outbox::{
     abandon_undelivered_to_peer, accept_sealed_ack, ack_frames, clear_object_routes,
     contact_admission, give_up_outbound, localize_lan_route, object_route_records,
     outbound_already_delivered, peer_lineage_denied, plan_object_routes, record_outbound_delivered,
-    retry_delay, send_lock_busy, AckRejected, CarrierChoice, ContactAdmission, ContactRoutes,
-    GiveUp, ObjectRoutes, OutboxCarrier, OutboxRoute, PeerSendLock, RouteRefusal,
+    retry_delay, send_lock_busy, AckRejected, CarrierChoice, CarrierGates, ContactAdmission,
+    ContactRoutes, GiveUp, ObjectRoutes, OutboxCarrier, OutboxRoute, PeerSendLock, RouteRefusal,
     CONTACT_NOT_VERIFIED, HISTORY_EXPIRED, HISTORY_FAILED, LOCALIZE_RESOLVE_TIMEOUT, RETRY_BASE,
 };
 use raven_core::paths::PRIMARY_DEVICE_ID;
@@ -131,6 +131,8 @@ pub(crate) mod code {
     pub const SUPERSEDED: &str = "SUPERSEDED";
     pub const EXPIRED: &str = "EXPIRED";
     pub const INTERNET_HOLD: &str = "INTERNET_HOLD";
+    pub const P2P_HOLD: &str = "P2P_HOLD";
+    pub const P2P_NOT_RUNNING: &str = "P2P_NOT_RUNNING";
     pub const LINK_NOT_ACCEPTED: &str = "LINK_NOT_ACCEPTED";
     pub const PEER_REFUSED: &str = "PEER_REFUSED";
     pub const WRONG_IDENTITY: &str = "WRONG_IDENTITY";
@@ -1006,6 +1008,9 @@ impl Dialer for NetDialer {
                         )
                         .await
                     }
+                    OutboxCarrier::P2p => {
+                        crate::p2p::dial(data_dir, &route.dial, expected_pub_hex, frames).await
+                    }
                 }
             };
             tokio::time::timeout(DIAL_DEADLINE, work)
@@ -1026,6 +1031,8 @@ pub(crate) struct AttemptCtx {
     pub(crate) lan_live: fn() -> bool,
     /// The Internet direct gate, read at every attempt.
     pub(crate) internet_live: fn() -> bool,
+    /// The p2p gate (`p2p_live_enabled`), read at every attempt.
+    pub(crate) p2p_live: fn() -> bool,
 }
 
 /// Map dial error text to a stable code (no addresses, no ids).
@@ -1034,6 +1041,10 @@ pub(crate) fn dial_error_code(detail: &str) -> &'static str {
     let has = |needles: &[&str]| needles.iter().any(|n| l.contains(n));
     if has(&["internet_direct_hold"]) {
         code::INTERNET_HOLD
+    } else if has(&["p2p_hold"]) {
+        code::P2P_HOLD
+    } else if has(&["p2p_not_running"]) {
+        code::P2P_NOT_RUNNING
     } else if has(&["contact_not_verified"]) {
         CONTACT_NOT_VERIFIED
     } else if has(&["link_not_accepted"]) {
@@ -1216,7 +1227,11 @@ fn attempt_peer_inner(
     // Plans (no lock, no store writes): records, gates, trust, localization.
     let records: BTreeMap<[u8; 16], ObjectRoutes> =
         object_route_records(data_dir, wall).unwrap_or_default();
-    let (lan_live, internet_live) = ((ctx.lan_live)(), (ctx.internet_live)());
+    let gates = CarrierGates {
+        lan: (ctx.lan_live)(),
+        internet: (ctx.internet_live)(),
+        p2p: (ctx.p2p_live)(),
+    };
     let mut localized: HashMap<OutboxRoute, Result<OutboxRoute, RouteRefusal>> = HashMap::new();
     let mut localize = |route: &OutboxRoute, pinned: bool| {
         localized
@@ -1233,7 +1248,7 @@ fn attempt_peer_inner(
                 routes: Vec::new(),
                 expires_at_ms: u64::MAX,
             };
-            plan_object_routes(Some(&any), c, lan_live, internet_live)
+            plan_object_routes(Some(&any), c, gates)
                 .routes
                 .into_iter()
                 .filter_map(|r| localize(&r, c.pinned).ok().map(|d| (r, d)))
@@ -1427,12 +1442,7 @@ fn attempt_peer_inner(
         let routes: Vec<(OutboxRoute, OutboxRoute)> = if row.kind == EndpointOutboundKind::Ack {
             ack_routes.clone()
         } else {
-            let plan = plan_object_routes(
-                records.get(&row.message_id),
-                &contact,
-                lan_live,
-                internet_live,
-            );
+            let plan = plan_object_routes(records.get(&row.message_id), &contact, gates);
             let mut unlocal = false;
             let mut unresolved = false;
             let routes: Vec<(OutboxRoute, OutboxRoute)> = plan
@@ -2044,6 +2054,7 @@ pub async fn run_worker(data_dir: PathBuf) -> Result<(), String> {
         }),
         lan_live: raven_core::lan_direct_live_enabled,
         internet_live: raven_core::internet_direct_live_enabled,
+        p2p_live: raven_core::p2p_live_enabled,
     });
     run_loop(ctx).await
 }
@@ -2335,6 +2346,7 @@ mod tests {
                 dialer: self.net.clone(),
                 lan_live,
                 internet_live,
+                p2p_live: off,
             }
         }
 

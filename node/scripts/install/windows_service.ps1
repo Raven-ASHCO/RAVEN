@@ -6,6 +6,13 @@
 #   -InternetListen 0.0.0.0:7422, a bare IP gets port 7422). Without it,
 #   `raven node internet on --listen 0.0.0.0:7422` turns it on later (applied at the next
 #   task start). The installer never changes the firewall: it prints the rule to run elevated.
+# -P2pListen: libp2p (relay + hole punching, TCP and UDP 7423) is opt-in the same way (default:
+#   no flag; pass e.g. -P2pListen 7423 = every interface, IPv4 + IPv6; IP:PORT = that address
+#   only; off = off even if `raven node p2p on` saved it). -P2pRelays <multiaddr>[,<multiaddr>]
+#   (at most 2, each ending in /p2p/<relay PeerId>) keeps a reservation on those relays;
+#   -P2pRelay also relays for the PeerIds in relay_allow.json; -Upnp 1|0 saves the router
+#   port-mapping choice (`raven node upnp on|off`). Without -Upnp, an interactive install that
+#   turns -P2pListen on asks once (Enter = no); a non-interactive one never asks (stays unset).
 # -TaskName / -NoStart: CI hooks (register a uniquely named task without launching the daemon).
 # Re-running is the upgrade path: the running daemon is stopped before its binaries are
 # replaced and the task is re-registered with the current settings.
@@ -31,6 +38,11 @@ param(
     [string]$BinDir = $(Join-Path $env:LOCALAPPDATA "RavenNode"),
     [string]$LanListen = "127.0.0.1:7420",
     [string]$InternetListen = "",
+    [string]$P2pListen = "",
+    # -P2pRelays a,b (an array) and -P2pRelays "a,b" (one comma separated string) both work.
+    [string[]]$P2pRelays = @(),
+    [switch]$P2pRelay,
+    [string]$Upnp = "",
     [string]$TaskName = "RavenNodeBridge",
     [switch]$SkipScheduledTask,
     [switch]$NoStart
@@ -42,6 +54,40 @@ $ErrorActionPreference = "Stop"
 if ($InternetListen -and ($InternetListen -notmatch '^[\[\]0-9A-Za-z.:]+$')) {
     throw "-InternetListen must look like 0.0.0.0:7422 or [::]:7422"
 }
+# libp2p settings: empty = no flag (node_policy.json decides, as today). PORT / IP:PORT /
+# [IPv6]:PORT / on / off characters only; raven-node validates the rest.
+if ($P2pListen -and ($P2pListen -notmatch '^[\[\]0-9A-Za-z.:]+$')) {
+    throw "-P2pListen must look like 7423, 0.0.0.0:7423, [::]:7423 or off"
+}
+$p2pListenOn = [bool]$P2pListen -and ($P2pListen -ne "off")
+# The libp2p port of -P2pListen: "[v6]:port", "v4:port", a bare port or "on" (the default
+# port); empty for "relay" (no listening port) and off.
+$p2pPort = ""
+if ($p2pListenOn -and ($P2pListen -ne "relay")) {
+    $p2pPort = "7423"
+    if (($P2pListen -match '^\[[^\]]*\]:(\d+)$') -or ($P2pListen -match '^[^:\[\]]+:(\d+)$')) {
+        $p2pPort = $Matches[1]
+    } elseif ($P2pListen -match '^\d+$') {
+        $p2pPort = $P2pListen
+    }
+}
+$p2pRelayList = @()
+foreach ($item in $P2pRelays) {
+    foreach ($entry in ([string]$item -split ',')) {
+        $entry = $entry.Trim()
+        if (-not $entry) { continue }
+        if (($entry -notmatch '^/[0-9A-Za-z./:_-]+$') -or ($entry -notlike '*/p2p/?*')) {
+            throw "-P2pRelays entries must look like /ip4/203.0.113.7/tcp/7423/p2p/<relay PeerId>"
+        }
+        $p2pRelayList += $entry
+    }
+}
+if ($p2pRelayList.Count -gt 2) {
+    throw "-P2pRelays takes at most 2 relays"
+}
+if ($Upnp -and ($Upnp -notmatch '^[01]$')) {
+    throw "-Upnp must be 1 (map the p2p port on the router) or 0"
+}
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
@@ -49,6 +95,37 @@ New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 # Task Scheduler runs with another working directory: register absolute paths only.
 $DataDir = (Resolve-Path -LiteralPath $DataDir).Path
 $BinDir = (Resolve-Path -LiteralPath $BinDir).Path
+
+# UPnP / NAT-PMP (owner decision Q8, "ask once at setup"): -Upnp decides. Without it, an
+# interactive install (console input not redirected) that opens a p2p port asks the same
+# one-time question as `raven node p2p on`, unless node_policy.json already holds an answer
+# ("upnp": true|false). Enter = no. A host that cannot prompt leaves it unset. Asked before
+# the build so nobody waits for cargo to answer it; saved after install below.
+$upnpMode = ""
+if ($Upnp -eq "1") {
+    $upnpMode = "on"
+} elseif ($Upnp -eq "0") {
+    $upnpMode = "off"
+} elseif ($p2pPort -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+    $policyPath = Join-Path $DataDir "node_policy.json"
+    $upnpAnswered = $false
+    if (Test-Path -LiteralPath $policyPath) {
+        $policyText = [string](Get-Content -Raw -LiteralPath $policyPath -ErrorAction SilentlyContinue)
+        $upnpAnswered = $policyText -match '"upnp"\s*:\s*(true|false)'
+    }
+    if (-not $upnpAnswered) {
+        $asked = $true
+        $answer = $null
+        try {
+            $answer = Read-Host "Open TCP/UDP $p2pPort on your router automatically (UPnP/NAT-PMP) so friends can reach this node and it can relay for them? [y/N]"
+        } catch {
+            $asked = $false
+        }
+        if ($asked) {
+            if ([string]$answer -match '^\s*(y|yes)\s*$') { $upnpMode = "on" } else { $upnpMode = "off" }
+        }
+    }
+}
 
 Push-Location $Root
 # --locked: build exactly the audited Cargo.lock.
@@ -93,6 +170,44 @@ $serviceArgs = "service --data-dir `"$DataDir`" --lan-listen $LanListen --ble-li
 if ($InternetListen) {
     $serviceArgs = "$serviceArgs --internet-listen $InternetListen"
 }
+# libp2p flags: only the ones asked for (none = the task's arguments stay as before).
+if ($P2pListen) {
+    $serviceArgs = "$serviceArgs --p2p-listen $P2pListen"
+}
+foreach ($relayAddr in $p2pRelayList) {
+    $serviceArgs = "$serviceArgs --p2p-relay $relayAddr"
+}
+if ($P2pRelay) {
+    $serviceArgs = "$serviceArgs --relay"
+}
+
+$ravenExe = Join-Path $BinDir "raven.exe"
+# The same p2p settings go into node_policy.json too, so `raven whoami --card` and
+# `raven status` agree with the task even while it is not running (its arguments above still
+# decide while it runs). Input comes from a pipe: it never asks.
+if ($P2pListen) {
+    if ($p2pListenOn) {
+        $p2pSaveArgs = @("node", "p2p", "on", "--listen", $P2pListen)
+        foreach ($relayAddr in $p2pRelayList) { $p2pSaveArgs += @("--relay", $relayAddr) }
+    } else {
+        $p2pSaveArgs = @("node", "p2p", "off")
+    }
+    $null | & $ravenExe --data-dir $DataDir @p2pSaveArgs | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "WARN: could not save the p2p settings in node_policy.json (the task still uses its arguments); run '$ravenExe --data-dir `"$DataDir`" $($p2pSaveArgs -join ' ')'"
+    }
+}
+
+# Saved in node_policy.json before the task (re)starts below, which applies it.
+$upnpSaved = ""
+if ($upnpMode) {
+    & $ravenExe --data-dir $DataDir node upnp $upnpMode
+    if ($LASTEXITCODE -eq 0) {
+        $upnpSaved = $upnpMode
+    } else {
+        Write-Host "WARN: could not save the UPnP choice; run '$ravenExe --data-dir `"$DataDir`" node upnp $upnpMode' and restart the task"
+    }
+}
 
 if ($SkipScheduledTask) {
     Write-Host "SkipScheduledTask: binaries copied; logon task not registered"
@@ -136,6 +251,37 @@ if ($InternetListen) {
     Write-Host "A build with Internet direct off (INTERNET_DIRECT_PRODUCTION_ENABLED=false) keeps the port closed and logs INTERNET_DIRECT_HOLD; check: raven.exe status (internet row)."
 } else {
     Write-Host "internet-listen=off (opt-in: re-run with -InternetListen 0.0.0.0:7422, or run 'raven node internet on' and restart the task)"
+}
+if ($p2pListenOn -and -not $p2pPort) {
+    Write-Host "p2p-listen=relay (no listening port: contacts reach this node only through its relays, -P2pRelays)"
+} elseif ($p2pListenOn) {
+    Write-Host "p2p-listen=$P2pListen (libp2p TCP+UDP $p2pPort; only your contacts get a Raven link; anyone can see that the port is open)"
+    Write-Host "To let contacts reach it, run in an ELEVATED PowerShell yourself (Private profile only, never Public):"
+    Write-Host "  New-NetFirewallRule -DisplayName `"Raven node p2p`" -Direction Inbound -Program `"$exe`" -Protocol TCP -LocalPort $p2pPort -Profile Private"
+    Write-Host "  New-NetFirewallRule -DisplayName `"Raven node p2p`" -Direction Inbound -Program `"$exe`" -Protocol UDP -LocalPort $p2pPort -Profile Private"
+    Write-Host "and forward TCP+UDP $p2pPort on your router if this PC is behind NAT (or -Upnp 1); without that a relay (-P2pRelays) still lets contacts reach you. Outbound needs no rule."
+    Write-Host "A build with p2p off (P2P_PRODUCTION_ENABLED=false) never listens and logs P2P_HOLD; check: raven.exe status (p2p row)."
+} elseif ($P2pListen) {
+    Write-Host "p2p-listen=off (-P2pListen $P2pListen overrides 'raven node p2p on')"
+} else {
+    Write-Host "p2p-listen=off (opt-in: re-run with -P2pListen 7423, or run 'raven node p2p on' and restart the task)"
+}
+if ($p2pRelayList.Count -gt 0) {
+    Write-Host "p2p-relays=$($p2pRelayList -join ',') (a reservation is kept on each; a relay sees both PeerIds and IPs of every circuit, never your messages)"
+}
+if ($P2pRelay) {
+    Write-Host "relay=on for the PeerIds in $(Join-Path $DataDir 'relay_allow.json') (add a friend with 'raven relay allow @friend')"
+    Write-Host "  Its relay PeerId is your own libp2p PeerId (the one in your card): friends who use it can link it to your card."
+    Write-Host "  The logon task runs only while you are logged in, so this PC is a poor always-on relay."
+}
+if ((($p2pRelayList.Count -gt 0) -or $P2pRelay) -and -not $p2pListenOn) {
+    Write-Host "NOTE: -P2pRelays and -P2pRelay take effect only while p2p listen is on (-P2pListen 7423 or 'raven node p2p on')."
+}
+if ($upnpSaved -eq "on") {
+    $upnpPortText = if ($p2pPort) { $p2pPort } else { "of the p2p port, when one is open" }
+    Write-Host "upnp=on (raven-node asks the router to map TCP/UDP $upnpPortText; it logs only the mapped port and success or failure)"
+} elseif ($upnpSaved -eq "off") {
+    Write-Host "upnp=off ('raven node upnp on' changes it; applied when the task restarts)"
 }
 Write-Host "bin-dir=$BinDir (raven.exe / ash.exe)"
 $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value

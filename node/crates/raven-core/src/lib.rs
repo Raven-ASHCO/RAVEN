@@ -61,6 +61,8 @@ pub mod mlkem768_incremental;
 pub mod nearby;
 pub mod node_policy;
 pub mod outbox;
+pub mod p2p_gate;
+pub mod p2p_route;
 pub mod pair_init;
 pub mod pair_init_lan_oob;
 pub mod paths;
@@ -69,12 +71,16 @@ pub mod prekey_lifecycle;
 pub mod profile_record;
 pub mod queue;
 pub mod records;
+pub mod relay_allow;
 pub mod routing_tag;
 pub mod sanitize;
 pub mod seal;
 pub mod store_object;
 pub mod transport;
 pub mod vectors;
+/// Owner-only DACLs behind the private file helpers in [`paths`] (Windows).
+#[cfg(windows)]
+mod win_acl;
 
 pub use address::{decode_address, encode_address, from_display, to_display};
 pub use alias_record::{normalize_alias, AliasClaimStore, AliasPublishQuota, AliasRecord};
@@ -177,6 +183,7 @@ pub use outbox::{
     carrier_allowed_for_contact, contact_is_pinned, envelope_expires_at, OutboxCarrier,
     OutboxRoute, PeerSendLock, CONTACT_NOT_VERIFIED, ENVELOPE_VALIDITY_MS,
 };
+pub use p2p_gate::{p2p_live_enabled, P2P_HOLD, P2P_PRODUCTION_ENABLED};
 pub use pair_init::{
     confirmation_tag, decode_init, decode_response as decode_pair_response,
     derive_provisional_root, device_certificate_hash, encode_init,

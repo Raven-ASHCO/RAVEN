@@ -1,9 +1,13 @@
 //! Bounded, experimental NAT traversal composition for Raven.
 //!
-//! This module is not part of default builds. Enabling the Cargo feature only
-//! makes the reusable profile available; the companion binary also requires a
-//! separate runtime acknowledgement. It never contains a bootstrap, relay, or
-//! AutoNAT server address.
+//! This module is not part of this crate's default build. Enabling
+//! `experimental-nat-connectivity` makes the reusable profile available to the
+//! companion binary, which also requires a separate runtime acknowledgement.
+//! The P3 host (`p2p-host`, enabled by raven-node only) reuses the operator
+//! relay-address rules and [`ReservationKeeper`] from here; it never builds
+//! [`build_connectivity_swarm`]. Nothing here contains a bootstrap, relay, or
+//! AutoNAT server address, and [`PRODUCTION_NAT_CONNECTIVITY_ENABLED`] stays
+//! false (the P3 carrier has its own gate, `raven_core::p2p_live_enabled`).
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -486,16 +490,19 @@ impl OperatorDials {
 }
 
 /// Relay is client-only and AutoNAT is the v2 client behaviour. There is no
-/// relay service or AutoNAT server in this profile.
+/// relay service or AutoNAT server in this profile. `limits` and `ip_limits`
+/// come first: the derive asks the fields in order and stops at the first
+/// denial, so DCUtR (which records every direct connection it is shown) never
+/// sees a connection the limits deny (that record would never be closed).
 #[derive(NetworkBehaviour)]
 pub struct RavenConnectivityBehaviour {
+    limits: connection_limits::Behaviour,
+    ip_limits: IpLimits,
     pub relay: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub auto_nat: autonat::v2::client::Behaviour,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
-    limits: connection_limits::Behaviour,
-    ip_limits: IpLimits,
 }
 
 /// Compose direct TCP and QUIC transports with the relay client transport.
@@ -536,13 +543,13 @@ pub fn build_connectivity_swarm(
                 .with_timeout(behaviour_profile.ping_timeout);
 
             RavenConnectivityBehaviour {
+                limits: behaviour_profile.connections.into_behaviour(),
+                ip_limits: behaviour_profile.connections.into_ip_limits(),
                 relay,
                 dcutr: dcutr::Behaviour::new(local_peer_id),
                 auto_nat: autonat::v2::client::Behaviour::new(OsRng, auto_nat_config),
                 identify: identify::Behaviour::new(identify_config),
                 ping: ping::Behaviour::new(ping_config),
-                limits: behaviour_profile.connections.into_behaviour(),
-                ip_limits: behaviour_profile.connections.into_ip_limits(),
             }
         })?
         .with_swarm_config(move |config| {

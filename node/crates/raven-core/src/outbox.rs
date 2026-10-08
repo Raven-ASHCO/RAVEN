@@ -450,14 +450,18 @@ pub fn record_inbound_ack_delivery(
 
 // ── Routes the worker may use ────────────────────────────────────────────────
 
-/// A carrier the outbox may retry on. Both are endpoint-authenticated Raven
-/// Noise links that terminate at the intended contact, so both are
-/// confidential to the endpoint (PairInit V1 §7).
+/// A carrier the outbox may retry on, in plan order (transports design
+/// §2.3). All three are endpoint-authenticated Raven Noise links that
+/// terminate at the intended contact, so all are confidential to the endpoint
+/// (PairInit V1 §7): `P2p` runs the same Raven Noise link (prologue
+/// `raven/p2p-link/v1`) inside a libp2p stream, so a relay on a circuit sees
+/// only libp2p-Noise(Raven-Noise(...)) (`OPAQUE_CIRCUIT`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboxCarrier {
     Lan,
     Internet,
+    P2p,
 }
 
 impl OutboxCarrier {
@@ -466,6 +470,7 @@ impl OutboxCarrier {
         match self {
             Self::Lan => "lan_dial",
             Self::Internet => "internet_dial",
+            Self::P2p => "p2p_dial",
         }
     }
 
@@ -473,7 +478,7 @@ impl OutboxCarrier {
     /// ends at the intended contact (transports design §3.3) say yes.
     pub fn confidential_to_endpoint(self) -> bool {
         match self {
-            Self::Lan | Self::Internet => true,
+            Self::Lan | Self::Internet | Self::P2p => true,
         }
     }
 }
@@ -486,6 +491,7 @@ pub enum CarrierChoice {
     Auto,
     Lan,
     Internet,
+    P2p,
 }
 
 impl CarrierChoice {
@@ -494,12 +500,15 @@ impl CarrierChoice {
             Self::Auto => true,
             Self::Lan => carrier == OutboxCarrier::Lan,
             Self::Internet => carrier == OutboxCarrier::Internet,
+            Self::P2p => carrier == OutboxCarrier::P2p,
         }
     }
 }
 
-/// One way to reach a peer: a carrier and its `host:port`. A reachability hint
-/// only: every link still proves the pinned key.
+/// One way to reach a peer: a carrier and its dial string (`host:port` for
+/// LAN and Internet, a p2p dial such as `/p2p/<PeerId>` for p2p, see
+/// [`crate::p2p_route::parse_p2p_dial`]). A reachability hint only: every
+/// link still proves the pinned key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OutboxRoute {
     pub carrier: OutboxCarrier,
@@ -513,7 +522,8 @@ pub struct OutboxRoute {
 pub const OUTBOX_ROUTES_FILE: &str = "outbox_routes.json";
 const OUTBOX_ROUTES_LOCK: &str = ".outbox_routes.lock.sqlite";
 const MAX_ROUTE_OBJECTS: usize = 256;
-const MAX_ROUTES_PER_OBJECT: usize = 4;
+/// LAN, Internet and p2p, a few addresses each.
+const MAX_ROUTES_PER_OBJECT: usize = 6;
 const MAX_DIAL_CHARS: usize = 300;
 
 /// The record of one queued object.
@@ -550,6 +560,15 @@ pub fn plausible_dial(dial: &str) -> bool {
         return false;
     };
     !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0)
+}
+
+/// [`plausible_dial`] for LAN and Internet routes; a strict
+/// [`crate::p2p_route::parse_p2p_dial`] for p2p ones.
+pub fn plausible_route(route: &OutboxRoute) -> bool {
+    match route.carrier {
+        OutboxCarrier::Lan | OutboxCarrier::Internet => plausible_dial(&route.dial),
+        OutboxCarrier::P2p => crate::p2p_route::parse_p2p_dial(&route.dial).is_ok(),
+    }
 }
 
 fn load_route_file(data_dir: &Path) -> Result<RouteFile, String> {
@@ -613,7 +632,7 @@ pub fn record_object_routes(
     }
     let routes: Vec<OutboxRoute> = routes
         .iter()
-        .filter(|r| plausible_dial(&r.dial) && choice.allows(r.carrier))
+        .filter(|r| plausible_route(r) && choice.allows(r.carrier))
         .take(MAX_ROUTES_PER_OBJECT)
         .map(|r| OutboxRoute {
             carrier: r.carrier,
@@ -679,14 +698,15 @@ pub const CONTACT_NOT_VERIFIED: &str = "CONTACT_NOT_VERIFIED";
 
 /// May a contact use `carrier`? Owner decision 2026-10-08 (transports design
 /// risk 5, Q15): unverified contacts are LAN only (and only at local-network
-/// addresses, [`localize_lan_route`]); Internet delivery (and later p2p, mesh
-/// and mailbox) is only for a **verified** contact, one whose fingerprint was
-/// confirmed out of band (`pinned`: `--verify-fp` or the interactive verify).
-/// The one rule `raven send`, the outbox worker and the listeners apply.
+/// addresses, [`localize_lan_route`]); Internet direct and p2p delivery (and
+/// later mesh and mailbox) are only for a **verified** contact, one whose
+/// fingerprint was confirmed out of band (`pinned`: `--verify-fp` or the
+/// interactive verify). The one rule `raven send`, the outbox worker, the IPC
+/// dial ops and the listeners / p2p responder apply.
 pub fn carrier_allowed_for_contact(carrier: OutboxCarrier, pinned: bool) -> bool {
     match carrier {
         OutboxCarrier::Lan => true,
-        OutboxCarrier::Internet => pinned,
+        OutboxCarrier::Internet | OutboxCarrier::P2p => pinned,
     }
 }
 
@@ -790,11 +810,14 @@ pub fn localize_lan_route(
 }
 
 /// What the local contact book says about one key: its saved routes (LAN
-/// first) and whether it is verified.
+/// first, then Internet, then p2p) and whether it is verified.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContactRoutes {
     pub routes: Vec<OutboxRoute>,
     pub pinned: bool,
+    /// The contact's libp2p PeerId and `via=` addresses, when it has them:
+    /// what a `/p2p/<PeerId>` route dials (hints only, never identity).
+    pub p2p: Option<crate::p2p_route::ContactP2p>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -807,6 +830,12 @@ struct ContactRouteRow {
     lan_dial: String,
     #[serde(default)]
     internet_dial: String,
+    /// libp2p PeerId (`raven contact set-addr --p2p`, a card's `p2p=`).
+    #[serde(default)]
+    p2p: String,
+    /// Relay (or direct) multiaddrs for it (a card's `via=`).
+    #[serde(default)]
+    p2p_via: Vec<String>,
 }
 
 /// The contact whose key is `peer_device`, or `None` when there is none. An
@@ -832,6 +861,7 @@ pub fn contact_routes(
         let entry = found.get_or_insert_with(|| ContactRoutes {
             routes: Vec::new(),
             pinned: true,
+            p2p: None,
         });
         // Several rows for one key (an old book): verified only if all are.
         entry.pinned &= row.pinned;
@@ -844,6 +874,16 @@ pub fn contact_routes(
                     carrier,
                     dial: dial.trim().to_string(),
                 });
+            }
+        }
+        // One p2p route per PeerId: the dialer tries its addresses in order.
+        if entry.p2p.is_none() {
+            if let Some(p2p) = crate::p2p_route::ContactP2p::from_fields(&row.p2p, &row.p2p_via) {
+                entry.routes.push(OutboxRoute {
+                    carrier: OutboxCarrier::P2p,
+                    dial: crate::p2p_route::peer_route(&p2p.peer_id),
+                });
+                entry.p2p = Some(p2p);
             }
         }
     }
@@ -899,31 +939,48 @@ pub struct RoutePlan {
     pub unverified_withheld: bool,
 }
 
+/// Which carrier gates are open, read once per attempt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CarrierGates {
+    /// `lan_direct_live_enabled`.
+    pub lan: bool,
+    /// `internet_direct_live_enabled`.
+    pub internet: bool,
+    /// `p2p_live_enabled`.
+    pub p2p: bool,
+}
+
+impl CarrierGates {
+    pub fn allows(self, carrier: OutboxCarrier) -> bool {
+        match carrier {
+            OutboxCarrier::Lan => self.lan,
+            OutboxCarrier::Internet => self.internet,
+            OutboxCarrier::P2p => self.p2p,
+        }
+    }
+}
+
 /// The routes the worker tries for one object, in order:
 /// - the carriers its send allowed (`record.choice`; with no record, the
 ///   narrowest plan: LAN only), each only while its gate is open
-///   (`lan_live`: `lan_direct_live_enabled`, `internet_live`:
-///   `internet_direct_live_enabled`), and Internet only for a verified contact;
-/// - the contact's **current** addresses first, then the ones the send used
-///   (an address changed since the send is still found, the new one first).
+///   ([`CarrierGates`]), and Internet and p2p only for a verified contact;
+/// - the contact's **current** addresses first (LAN, Internet, p2p: the plan
+///   order of transports design §2.3), then the ones the send used (an
+///   address changed since the send is still found, the new one first).
 ///
-/// Nothing at all is planned when both gates are off. LAN routes of an
+/// Nothing at all is planned when every gate is off. LAN routes of an
 /// unverified contact must still pass [`localize_lan_route`] at dial time.
 pub fn plan_object_routes(
     record: Option<&ObjectRoutes>,
     contact: &ContactRoutes,
-    lan_live: bool,
-    internet_live: bool,
+    gates: CarrierGates,
 ) -> RoutePlan {
     let choice = record.map_or(CarrierChoice::Lan, |r| r.choice);
-    let gate = |c: OutboxCarrier| match c {
-        OutboxCarrier::Lan => lan_live,
-        OutboxCarrier::Internet => internet_live,
-    };
     let recorded: &[OutboxRoute] = record.map_or(&[], |r| r.routes.as_slice());
     let mut plan = RoutePlan::default();
     for route in contact.routes.iter().chain(recorded.iter()) {
-        if !choice.allows(route.carrier) || !gate(route.carrier) || !plausible_dial(&route.dial) {
+        if !choice.allows(route.carrier) || !gates.allows(route.carrier) || !plausible_route(route)
+        {
             continue;
         }
         if !carrier_allowed_for_contact(route.carrier, contact.pinned) {
@@ -1034,6 +1091,15 @@ mod tests {
         ContactRoutes {
             routes: routes.to_vec(),
             pinned,
+            p2p: None,
+        }
+    }
+
+    fn gates(lan: bool, internet: bool) -> CarrierGates {
+        CarrierGates {
+            lan,
+            internet,
+            p2p: false,
         }
     }
 
@@ -1052,7 +1118,7 @@ mod tests {
         lan_live: bool,
         internet_live: bool,
     ) -> Vec<OutboxRoute> {
-        plan_object_routes(rec, c, lan_live, internet_live).routes
+        plan_object_routes(rec, c, gates(lan_live, internet_live)).routes
     }
 
     #[test]
@@ -1120,22 +1186,128 @@ mod tests {
         assert!(carrier_allowed_for_contact(OutboxCarrier::Internet, true));
         let auto = record(CarrierChoice::Auto, &[]);
         let unpinned = contact(&[lan("10.0.0.2:7420"), inet("203.0.113.7:7422")], false);
-        let p = plan_object_routes(Some(&auto), &unpinned, true, true);
+        let p = plan_object_routes(Some(&auto), &unpinned, gates(true, true));
         assert_eq!(p.routes, vec![lan("10.0.0.2:7420")]);
         assert!(p.unverified_withheld);
         let only_inet = contact(&[inet("[::1]:7422")], false);
-        let p = plan_object_routes(Some(&auto), &only_inet, true, true);
+        let p = plan_object_routes(Some(&auto), &only_inet, gates(true, true));
         assert!(p.routes.is_empty() && p.unverified_withheld);
         // The gate decides first: with it off nothing was withheld for trust.
-        let p = plan_object_routes(Some(&auto), &only_inet, true, false);
+        let p = plan_object_routes(Some(&auto), &only_inet, gates(true, false));
         assert!(p.routes.is_empty() && !p.unverified_withheld);
         let p = plan_object_routes(
             Some(&auto),
             &contact(&[inet("[::1]:7422")], true),
-            true,
-            true,
+            gates(true, true),
         );
         assert_eq!(p.routes, vec![inet("[::1]:7422")]);
+    }
+
+    /// P3: p2p is for verified contacts only, behind its own gate, planned
+    /// after LAN and Internet; `--carrier p2p` stays p2p-only; PairInit may
+    /// ride it (the Raven Noise link ends at the contact).
+    #[test]
+    fn p2p_is_planned_last_for_verified_contacts_behind_its_gate() {
+        assert!(!carrier_allowed_for_contact(OutboxCarrier::P2p, false));
+        assert!(carrier_allowed_for_contact(OutboxCarrier::P2p, true));
+        assert!(OutboxCarrier::P2p.confidential_to_endpoint());
+        assert_eq!(OutboxCarrier::P2p.label(), "p2p_dial");
+        let peer = crate::p2p_route::local_peer_id(&crate::Identity::from_seed(&[9; 32]));
+        let p2p = OutboxRoute {
+            carrier: OutboxCarrier::P2p,
+            dial: crate::p2p_route::peer_route(&peer),
+        };
+        let all = CarrierGates {
+            lan: true,
+            internet: true,
+            p2p: true,
+        };
+        let pinned = contact(
+            &[lan("10.0.0.9:7420"), inet("203.0.113.7:7422"), p2p.clone()],
+            true,
+        );
+        let auto = record(CarrierChoice::Auto, &[]);
+        assert_eq!(
+            plan_object_routes(Some(&auto), &pinned, all).routes,
+            vec![lan("10.0.0.9:7420"), inet("203.0.113.7:7422"), p2p.clone()]
+        );
+        // The p2p gate off: nothing p2p, and nothing "withheld" for trust.
+        let no_p2p = CarrierGates { p2p: false, ..all };
+        let p = plan_object_routes(
+            Some(&auto),
+            &contact(std::slice::from_ref(&p2p), true),
+            no_p2p,
+        );
+        assert!(p.routes.is_empty() && !p.unverified_withheld);
+        // Unverified: withheld, LAN kept.
+        let unpinned = contact(&[lan("10.0.0.9:7420"), p2p.clone()], false);
+        let p = plan_object_routes(Some(&auto), &unpinned, all);
+        assert_eq!(p.routes, vec![lan("10.0.0.9:7420")]);
+        assert!(p.unverified_withheld);
+        // `--carrier p2p` never widens to LAN or Internet.
+        let only = record(CarrierChoice::P2p, &[p2p.clone(), lan("10.0.0.2:7420")]);
+        assert_eq!(
+            plan_object_routes(Some(&only), &pinned, all).routes,
+            vec![p2p.clone()]
+        );
+        assert!(CarrierChoice::P2p.allows(OutboxCarrier::P2p));
+        assert!(!CarrierChoice::P2p.allows(OutboxCarrier::Internet));
+        // Junk p2p dials are never planned or recorded.
+        let junk = OutboxRoute {
+            carrier: OutboxCarrier::P2p,
+            dial: "203.0.113.7:7423".into(),
+        };
+        assert!(!plausible_route(&junk));
+        assert!(plausible_route(&p2p));
+        let p = plan_object_routes(
+            Some(&record(CarrierChoice::P2p, &[junk])),
+            &contact(&[], true),
+            all,
+        );
+        assert!(p.routes.is_empty());
+    }
+
+    #[test]
+    fn contact_book_p2p_fields_become_one_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [5u8; 32];
+        let peer = crate::p2p_route::local_peer_id(&crate::Identity::from_seed(&[5; 32]));
+        let relay = crate::p2p_route::local_peer_id(&crate::Identity::from_seed(&[6; 32]));
+        let via = format!("/ip4/198.51.100.1/tcp/7423/p2p/{relay}");
+        std::fs::write(
+            dir.path().join("contacts.json"),
+            format!(
+                r#"[{{"pub_hex":"{}","pinned":true,"lan_dial":"10.0.0.2:7420","p2p":"{peer}",
+                    "p2p_via":["{via}","not a multiaddr"]}}]"#,
+                hex::encode(key)
+            ),
+        )
+        .unwrap();
+        let c = contact_routes(dir.path(), &key).unwrap().unwrap();
+        assert_eq!(
+            c.routes,
+            vec![
+                lan("10.0.0.2:7420"),
+                OutboxRoute {
+                    carrier: OutboxCarrier::P2p,
+                    dial: format!("/p2p/{peer}"),
+                }
+            ]
+        );
+        let p2p = c.p2p.unwrap();
+        assert_eq!(p2p.peer_id, peer);
+        assert_eq!(p2p.via.len(), 1, "junk via dropped");
+        // A malformed PeerId gives no p2p route at all.
+        std::fs::write(
+            dir.path().join("contacts.json"),
+            format!(
+                r#"[{{"pub_hex":"{}","p2p":"12D3KooWnope"}}]"#,
+                hex::encode(key)
+            ),
+        )
+        .unwrap();
+        let c = contact_routes(dir.path(), &key).unwrap().unwrap();
+        assert!(c.routes.is_empty() && c.p2p.is_none());
     }
 
     #[test]
@@ -1419,6 +1591,7 @@ mod tests {
             Some(ContactRoutes {
                 routes: vec![lan("10.0.0.2:7420"), inet("203.0.113.7:7422")],
                 pinned: false,
+                p2p: None,
             })
         );
         std::fs::write(dir.path().join("contacts.json"), b"{not json").unwrap();

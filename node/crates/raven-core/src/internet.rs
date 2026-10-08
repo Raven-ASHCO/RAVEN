@@ -27,6 +27,12 @@ pub const INTERNET_PROTO_ID: &[u8] = b"raven/internet/v1";
 /// has no prologue), so neither transcript can complete against the other.
 pub const NOISE_PROLOGUE: &[u8] = INTERNET_PROTO_ID;
 
+/// Noise prologue of the Raven link inside a libp2p `/raven/link/1.0.0`
+/// stream (P3, transports design §3.2). Same XX, RIH1 hello layout and frames
+/// as Internet direct; the distinct prologue means neither a raw-TCP nor a
+/// libp2p transcript can complete against the other.
+pub const P2P_LINK_PROLOGUE: &[u8] = b"raven/p2p-link/v1";
+
 /// Max `u32_be`-framed wire message: one Noise message (snow's limit).
 pub const MAX_FRAME_BYTES: usize = lan_noise::MAX_NOISE_MSG;
 
@@ -392,6 +398,24 @@ mod tests {
         handshake_read(&mut r, &m1).unwrap();
         let m2 = handshake_write(&mut r, &[]).unwrap();
         assert!(handshake_read(&mut i, &m2).is_err());
+    }
+
+    #[test]
+    fn p2p_link_and_internet_transcripts_do_not_complete_against_each_other() {
+        let ip = derive_noise_static(&alice()).unwrap();
+        let rp = derive_noise_static(&bob()).unwrap();
+        for (init, resp) in [
+            (NOISE_PROLOGUE, P2P_LINK_PROLOGUE),
+            (P2P_LINK_PROLOGUE, NOISE_PROLOGUE),
+        ] {
+            let mut i = crate::lan_noise::build_initiator_with_prologue(&ip, init).unwrap();
+            let mut r = crate::lan_noise::build_responder_with_prologue(&rp, resp).unwrap();
+            let m1 = handshake_write(&mut i, &[]).unwrap();
+            handshake_read(&mut r, &m1).unwrap();
+            let m2 = handshake_write(&mut r, &[]).unwrap();
+            assert!(handshake_read(&mut i, &m2).is_err());
+        }
+        assert_ne!(P2P_LINK_PROLOGUE, NOISE_PROLOGUE);
     }
 
     #[test]
