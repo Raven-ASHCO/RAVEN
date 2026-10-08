@@ -86,7 +86,7 @@ fail-closed: it used to clone a personal fork and install debug
 Operator install is **release / secure build only**:
 
 * [Linux](docs/INSTALL_Linux.md) — `node/scripts/install/linux_systemd_user.sh`
-  (**limitation:** Linux Release builds cannot create an identity yet — see that guide)
+  (keys in Secret Service when a desktop keyring is unlocked, else a passphrase vault — see that guide)
 * [macOS](docs/INSTALL_macOS.md) — `node/scripts/install/macos_launchd.sh`
 * [Windows](docs/INSTALL_Windows.md)
 

@@ -5,15 +5,37 @@ and does not put binaries on `PATH`. Use the release-build steps below
 (`scripts/install/linux_systemd_user.sh`). Do not `curl | bash` a convenience
 script.
 
-> **Known limitation — Linux Release builds cannot create an identity yet.**
-> Identity creation on GNU/Linux is disabled in Release builds until R1 (existing
-> Secret Service identities still load), musl/other Unix targets have no protected
-> identity backend, and the `locked-file` seed override is refused in Release.
-> So with the `--release` steps below, `raven init` / `ash init` — and therefore
-> the `raven-node service` unit, which creates an identity if none exists — fail
-> closed with an R1 / "no protected identity backend" error on a fresh install.
-> Do not work around this with a debug/lab build for real conversations. Details:
-> [`IDENTITY_SEED_STORAGE.md`](IDENTITY_SEED_STORAGE.md).
+> **Where your keys live.** With an unlocked desktop keyring (GNOME Keyring /
+> KWallet, i.e. Secret Service) RAVEN stores its keys there. Without one (servers,
+> SSH sessions, a Raspberry Pi bridge, musl builds) it keeps them in an encrypted
+> file, `<data-dir>/keystore.vault`, protected by a **passphrase** you choose
+> (Argon2id + XChaCha20-Poly1305). The choice is made once per profile and recorded
+> in `<data-dir>/keystore.backend`; RAVEN never moves keys between the two on its
+> own. Details: [`IDENTITY_SEED_STORAGE.md`](IDENTITY_SEED_STORAGE.md) and
+> [`design/2026-10-linux-keystore.md`](design/2026-10-linux-keystore.md).
+
+### Passphrase vault in practice
+
+- `raven init` / `ash init` on a terminal explains this and asks for the
+  passphrase twice (nothing is echoed; at least 8 characters). Later runs ask once.
+  There is no recovery without it.
+- Non-interactive use (scripts, CI, the service) needs a passphrase **file**:
+
+  ```bash
+  mkdir -p ~/.config/raven && chmod 700 ~/.config/raven
+  ( umask 077; printf '%s\n' 'your long passphrase' > ~/.config/raven/keystore-passphrase )
+  export RAVEN_KEYSTORE_PASSPHRASE_FILE=~/.config/raven/keystore-passphrase
+  ```
+
+  The file must be a regular file owned by you with mode `0600` or `0400`. The
+  passphrase itself is never accepted in an environment variable or on the command
+  line (`RAVEN_KEYSTORE_PASSPHRASE` is refused). A file next to the data dir
+  protects only against copies of the data dir *without* it: keep it out of
+  backups that contain `keystore.vault`.
+- `raven-node service` never prompts. Give it the file through the installer
+  (below), or with systemd `LoadCredential=raven-keystore-passphrase:<file>`.
+- Force the vault on a desktop with `RAVEN_KEYSTORE_BACKEND=vault` before the
+  first `raven init` of a profile.
 
 **Toolchain:** install Rust with [rustup](https://rustup.rs) (current stable);
 distro-packaged compilers are usually too old (rustc 1.83.0 fails at dependency
@@ -30,6 +52,15 @@ bash scripts/install/linux_systemd_user.sh
 export PATH="$HOME/.local/bin:$PATH"
 raven init        # `ash` is only aliased when no system ash shell exists
 raven doctor
+```
+
+Headless host (no desktop keyring): pass the passphrase file so the unit can
+unlock the vault. The unit gets `Environment=RAVEN_KEYSTORE_PASSPHRASE_FILE=<path>`
+(the path only); `RAVEN_SYSTEMD_LOAD_CREDENTIAL=1` uses `LoadCredential=` instead:
+
+```bash
+RAVEN_KEYSTORE_PASSPHRASE_FILE=$HOME/.config/raven/keystore-passphrase \
+  bash scripts/install/linux_systemd_user.sh
 ```
 
 User systemd unit runs `raven-node service` (bridge + IPC). Does not require root.
@@ -83,4 +114,4 @@ packages (deb/rpm) are operator-owned — not produced unsigned.
 
 - `ash` is also the BusyBox / Alpine shell. The installer only links `~/.local/bin/ash` → `raven` when no other `ash` is on the system; otherwise use `raven`.
 - No central message server is configured; see `SERVERLESS_MODEL.md`.
-- Identity seed storage: Linux Release builds cannot create an identity yet (Secret Service creation is disabled before R1; existing identities load). The mode `0600` `locked-file` seed is a debug/lab/CI-only override that Release builds refuse — see [`IDENTITY_SEED_STORAGE.md`](IDENTITY_SEED_STORAGE.md).
+- Identity seed storage: Secret Service when an unlocked keyring answers, else the passphrase vault (above). The mode `0600` `locked-file` seed is a debug/lab/CI-only override that Release builds refuse — see [`IDENTITY_SEED_STORAGE.md`](IDENTITY_SEED_STORAGE.md).

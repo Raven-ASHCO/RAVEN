@@ -511,6 +511,44 @@ fn locked_file_put(path: &Path, value: &[u8]) -> Result<(), PrekeyLifecycleError
         .map_err(|_| PrekeyLifecycleError::ProtectedStore)
 }
 
+/// Prekey state in the profile's passphrase vault (non-macOS Unix without a
+/// reachable Secret Service; docs/design/2026-10-linux-keystore.md). Every
+/// test build compiles it so the adapter runs on all CI hosts.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+struct VaultPrekeyBackend {
+    vault: crate::keystore_vault::Vault,
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn vault_prekey_error(error: crate::keystore_vault::VaultError) -> PrekeyLifecycleError {
+    use crate::keystore_vault::VaultError;
+    match error {
+        VaultError::Corrupt(_) => PrekeyLifecycleError::CorruptProtectedState,
+        VaultError::WrongPassphraseOrTampered
+        | VaultError::PassphraseUnavailable(_)
+        | VaultError::UnsafeFile(_)
+        | VaultError::UnsafeParams(_) => PrekeyLifecycleError::ProtectedStoreUnavailable,
+        _ => PrekeyLifecycleError::ProtectedStore,
+    }
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+impl ProtectedPrekeyBackend for VaultPrekeyBackend {
+    fn get(&self, account: &str) -> Result<Option<Vec<u8>>, PrekeyLifecycleError> {
+        let entry = format!("{}{account}", crate::keystore_vault::PREKEY_ENTRY_PREFIX);
+        Ok(self
+            .vault
+            .get(&entry)
+            .map_err(vault_prekey_error)?
+            .map(|mut value| std::mem::take(&mut *value)))
+    }
+
+    fn put(&self, account: &str, value: &[u8]) -> Result<(), PrekeyLifecycleError> {
+        let entry = format!("{}{account}", crate::keystore_vault::PREKEY_ENTRY_PREFIX);
+        self.vault.put(&entry, value).map_err(vault_prekey_error)
+    }
+}
+
 struct PlatformProtectedPrekeyBackend {
     locked_file: Option<PathBuf>,
     #[cfg(windows)]
@@ -865,13 +903,27 @@ impl fmt::Debug for PrekeyLifecycleActor {
 
 impl PrekeyLifecycleActor {
     /// Opens the only supported platform backend. macOS uses Keychain,
-    /// GNU/Linux uses Secret Service, Windows uses an atomically replaced
-    /// DPAPI blob, and every other target fails closed.
+    /// GNU/Linux uses Secret Service or the passphrase vault (per the
+    /// profile's recorded keystore), musl/other Unix the vault, Windows an
+    /// atomically replaced DPAPI blob, and every other target fails closed.
     pub fn open(data_dir: &Path) -> Result<Self, PrekeyLifecycleError> {
         // rust-linux has no org.freedesktop.secrets. Production `open` is
         // unchanged: this hook is test-only and GNU/Linux-only.
         #[cfg(all(test, target_os = "linux", target_env = "gnu"))]
         test_enable_locked_file_prekey_backend();
+        // Non-macOS Unix: the profile's recorded keystore decides between
+        // Secret Service (below) and the passphrase vault. The debug
+        // locked-file lab override keeps precedence, unchanged.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if !force_locked_file_prekey_backend()?
+            && crate::keystore_select::uses_vault(data_dir, true)
+                .map_err(|_| PrekeyLifecycleError::ProtectedStoreUnavailable)?
+        {
+            let backend = Arc::new(VaultPrekeyBackend {
+                vault: crate::keystore_vault::Vault::for_data_dir(data_dir),
+            });
+            return Self::open_with_backend(data_dir, backend);
+        }
         let backend = Arc::new(PlatformProtectedPrekeyBackend::new(data_dir)?);
         Self::open_with_backend(data_dir, backend)
     }
@@ -2976,5 +3028,39 @@ mod tests {
                 .as_str()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn passphrase_vault_backend_holds_prekey_state() {
+        use crate::keystore_vault::test_support::test_vault;
+        let data_dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(VaultPrekeyBackend {
+            vault: test_vault(data_dir.path(), "prekey vault passphrase").0,
+        });
+        let actor = PrekeyLifecycleActor::open_with_backend(data_dir.path(), backend.clone())
+            .expect("open vault-backed prekey actor");
+        actor.status().expect("status over the vault backend");
+        assert!(backend.get("acct").unwrap().is_none());
+        backend.put("acct", b"state-1").unwrap();
+        backend.put("acct", b"state-2").unwrap();
+        assert_eq!(
+            backend.get("acct").unwrap().as_deref(),
+            Some(&b"state-2"[..])
+        );
+        let names = test_vault(data_dir.path(), "prekey vault passphrase")
+            .0
+            .entry_names()
+            .unwrap();
+        assert!(names.contains(&format!(
+            "{}acct",
+            crate::keystore_vault::PREKEY_ENTRY_PREFIX
+        )));
+        let wrong = VaultPrekeyBackend {
+            vault: test_vault(data_dir.path(), "a wrong passphrase").0,
+        };
+        assert!(matches!(
+            wrong.get("acct"),
+            Err(PrekeyLifecycleError::ProtectedStoreUnavailable)
+        ));
     }
 }

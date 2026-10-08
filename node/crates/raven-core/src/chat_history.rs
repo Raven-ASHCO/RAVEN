@@ -28,28 +28,15 @@
 //! list-UI `preview` stay sanitised at rest.
 
 use crate::sanitize::sanitize_terminal_text;
-#[cfg(any(
-    test,
-    target_os = "macos",
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix))]
 use chacha20poly1305::{
     aead::{Aead, Payload},
     ChaCha20Poly1305, KeyInit, Nonce,
 };
-#[cfg(any(
-    test,
-    target_os = "macos",
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix))]
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-#[cfg(any(
-    test,
-    target_os = "macos",
-    windows,
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix, windows))]
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -149,15 +136,12 @@ trait ChatHistoryProtector: Send + Sync {
 /// Keeps the unwrapped key for one locked load+save so a mutation costs one
 /// keystore round-trip instead of two. Never outlives the operation.
 #[derive(Default)]
-#[cfg_attr(
-    not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))),
-    allow(dead_code)
-)]
+#[cfg_attr(not(unix), allow(dead_code))]
 struct OperationKeyCache {
     cached: std::sync::Mutex<Option<(PathBuf, Zeroizing<[u8; 32]>)>>,
 }
 
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+#[cfg(unix)]
 impl OperationKeyCache {
     fn key(&self, data_dir: &Path, create: bool) -> Result<Zeroizing<[u8; 32]>, ChatHistoryError> {
         let mut cached = self.cached.lock().map_err(|_| {
@@ -183,10 +167,7 @@ impl OperationKeyCache {
 
 #[derive(Default)]
 struct PlatformChatHistoryProtector {
-    #[cfg_attr(
-        not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(unix), allow(dead_code))]
     keys: OperationKeyCache,
 }
 
@@ -200,19 +181,9 @@ const MAX_HISTORY_SERIALIZED_BYTES: usize = 4 * 1024 * 1024 - 36;
 /// `{"entries":[` + `]}` around the comma-separated compact entries.
 const HISTORY_JSON_OVERHEAD: usize = 14;
 const HISTORY_MAGIC: &[u8; 8] = b"RVNHIST1";
-#[cfg(any(
-    test,
-    target_os = "macos",
-    windows,
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix, windows))]
 const HISTORY_AAD_DOMAIN: &[u8] = b"raven/chat-history/v1";
-#[cfg(any(
-    test,
-    target_os = "macos",
-    windows,
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix, windows))]
 const STAGE_AAD_DOMAIN: &[u8] = b"raven/outbound-stage/v1";
 #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
 const HISTORY_KEY_SERVICE: &str = "app.raven.node.chat-history.v1";
@@ -243,14 +214,7 @@ fn history_lock_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Shared by history and outbound stage: both use one keystore item.
-#[cfg_attr(
-    not(any(
-        test,
-        target_os = "macos",
-        all(target_os = "linux", target_env = "gnu")
-    )),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(test, unix)), allow(dead_code))]
 fn key_init_lock_path(data_dir: &Path) -> PathBuf {
     data_dir.join(".chat_history_key.lock.sqlite")
 }
@@ -516,7 +480,7 @@ impl ChatHistory {
     /// key is minted by another path (the outbound stage shares the key).
     /// Otherwise the legacy file would later be refused as a post-protection
     /// replacement. No-op unless the history file is legacy plaintext.
-    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(unix)]
     fn import_legacy_plaintext_before_first_key(data_dir: &Path) -> Result<(), ChatHistoryError> {
         let _lock = HistoryLock::acquire(data_dir)?;
         let Some(bytes) = read_history_file(&history_path(data_dir))? else {
@@ -978,12 +942,7 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), ChatHistoryE
     Ok(())
 }
 
-#[cfg(any(
-    test,
-    target_os = "macos",
-    windows,
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix, windows))]
 fn scoped_aad(data_dir: &Path, domain: &[u8]) -> [u8; 32] {
     let canonical = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let mut hasher = Sha256::new();
@@ -993,11 +952,7 @@ fn scoped_aad(data_dir: &Path, domain: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-#[cfg(any(
-    test,
-    target_os = "macos",
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix))]
 // Only the OS-keystore `history_account` (macOS / GNU Linux) calls this; the other
 // targets compile it for the unit-test build alone, where it is unused.
 #[cfg_attr(
@@ -1013,11 +968,7 @@ fn history_account(data_dir: &Path) -> String {
     hex::encode(history_scope(data_dir))
 }
 
-#[cfg(any(
-    test,
-    target_os = "macos",
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix))]
 fn aead_protect(
     key: &[u8; 32],
     data_dir: &Path,
@@ -1044,11 +995,7 @@ fn aead_protect(
     Ok(result)
 }
 
-#[cfg(any(
-    test,
-    target_os = "macos",
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix))]
 fn aead_unprotect(
     key: &[u8; 32],
     data_dir: &Path,
@@ -1233,7 +1180,7 @@ fn linux_secret_service_connect_failed(err: &ChatHistoryError) -> bool {
     )
 }
 
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+#[cfg(unix)]
 fn chat_history_lab_backend_requested() -> bool {
     for key in ["RAVEN_CHAT_HISTORY_BACKEND", "RAVEN_IDENTITY_BACKEND"] {
         if std::env::var_os(key).is_some_and(|v| v == "locked-file") {
@@ -1251,7 +1198,7 @@ fn chat_history_lab_backend_requested() -> bool {
 /// [`load_platform_key`]). `cfg(test)` keeps `cargo test -p raven-core` green.
 /// Debug ash/raven-node (CI smokes) also take this path when an explicit
 /// locked-file env is set. Never Release; never a 0600-key fallback.
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+#[cfg(unix)]
 fn chat_history_lab_key_allowed() -> bool {
     cfg!(test) || (cfg!(debug_assertions) && chat_history_lab_backend_requested())
 }
@@ -1261,7 +1208,7 @@ fn chat_history_lab_key_allowed() -> bool {
 /// fallback — lab/CI only, per-`data_dir` derived key so send and
 /// lan_dispatch can exercise history/stage without org.freedesktop.secrets or
 /// the login Keychain.
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+#[cfg(unix)]
 fn lab_history_key(data_dir: &Path) -> Zeroizing<[u8; 32]> {
     let canonical = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let mut hasher = Sha256::new();
@@ -1274,11 +1221,7 @@ fn lab_history_key(data_dir: &Path) -> Zeroizing<[u8; 32]> {
 }
 
 /// Keystore primitives behind first-use key initialisation (test seam).
-#[cfg(any(
-    test,
-    target_os = "macos",
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix))]
 trait ProtectedKeyStore {
     fn get(&self, data_dir: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, ChatHistoryError>;
     /// `Ok(false)` when an item already exists; must never replace one.
@@ -1303,11 +1246,7 @@ impl ProtectedKeyStore for PlatformKeyStore {
 /// stage writers (e.g. ash sending while raven-node receives) serialise on
 /// one cross-process lock and re-check under it, and creation is add-only,
 /// so no writer can seal a file under a key that another writer replaces.
-#[cfg(any(
-    test,
-    target_os = "macos",
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix))]
 fn init_protected_key(
     store: &dyn ProtectedKeyStore,
     data_dir: &Path,
@@ -1335,7 +1274,77 @@ fn init_protected_key(
     Ok(confirmed)
 }
 
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+/// History key in the profile's passphrase vault (non-macOS Unix without a
+/// reachable Secret Service; docs/design/2026-10-linux-keystore.md). Add-only
+/// like the Keychain item. Every test build compiles it.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+struct VaultKeyStore {
+    vault: crate::keystore_vault::Vault,
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn vault_history_error(error: crate::keystore_vault::VaultError) -> ChatHistoryError {
+    ChatHistoryError::ProtectedStoreUnavailable(format!("passphrase vault: {error}"))
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+impl ProtectedKeyStore for VaultKeyStore {
+    fn get(&self, _data_dir: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, ChatHistoryError> {
+        let Some(bytes) = self
+            .vault
+            .get(crate::keystore_vault::CHAT_HISTORY_KEY_ENTRY)
+            .map_err(vault_history_error)?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() != 32 {
+            return Err(ChatHistoryError::CorruptProtectedKey);
+        }
+        let mut key = Zeroizing::new([0u8; 32]);
+        key.copy_from_slice(&bytes);
+        Ok(Some(key))
+    }
+
+    fn add(&self, _data_dir: &Path, key: &[u8; 32]) -> Result<bool, ChatHistoryError> {
+        match self
+            .vault
+            .insert_new(crate::keystore_vault::CHAT_HISTORY_KEY_ENTRY, key)
+        {
+            Ok(()) => Ok(true),
+            Err(crate::keystore_vault::VaultError::EntryExists(_)) => Ok(false),
+            Err(error) => Err(vault_history_error(error)),
+        }
+    }
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn load_vault_history_key(
+    store: &VaultKeyStore,
+    data_dir: &Path,
+    create: bool,
+) -> Result<Zeroizing<[u8; 32]>, ChatHistoryError> {
+    if let Some(key) = store.get(data_dir)? {
+        return Ok(key);
+    }
+    if !create {
+        return Err(ChatHistoryError::MissingProtectedKey);
+    }
+    init_protected_key(store, data_dir)
+}
+
+/// Release (non-lab) non-macOS Unix: does this profile keep its history key
+/// in the passphrase vault? The debug locked-file lab path and unit tests
+/// keep their existing behaviour (Secret Service, else the derived lab key).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn vault_history_key_selected(data_dir: &Path, record: bool) -> Result<bool, ChatHistoryError> {
+    if chat_history_lab_key_allowed() {
+        return Ok(false);
+    }
+    crate::keystore_select::uses_vault(data_dir, record)
+        .map_err(ChatHistoryError::ProtectedStoreUnavailable)
+}
+
+#[cfg(unix)]
 fn load_platform_key(
     data_dir: &Path,
     create: bool,
@@ -1348,47 +1357,84 @@ fn load_platform_key(
     if chat_history_lab_key_allowed() {
         return Ok(lab_history_key(data_dir));
     }
-    match platform_get_key(data_dir) {
-        Ok(Some(key)) => return Ok(key),
-        Ok(None) => {}
-        Err(e) => {
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
-            if linux_secret_service_connect_failed(&e) && chat_history_lab_key_allowed() {
-                return Ok(lab_history_key(data_dir));
+    #[cfg(not(target_os = "macos"))]
+    if vault_history_key_selected(data_dir, create)? {
+        let store = VaultKeyStore {
+            vault: crate::keystore_vault::Vault::for_data_dir(data_dir),
+        };
+        return load_vault_history_key(&store, data_dir, create);
+    }
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+    {
+        match platform_get_key(data_dir) {
+            Ok(Some(key)) => return Ok(key),
+            Ok(None) => {}
+            Err(e) => {
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                if linux_secret_service_connect_failed(&e) && chat_history_lab_key_allowed() {
+                    return Ok(lab_history_key(data_dir));
+                }
+                return Err(e);
             }
-            return Err(e);
         }
+        if !create {
+            return Err(ChatHistoryError::MissingProtectedKey);
+        }
+        init_protected_key(&PlatformKeyStore, data_dir)
     }
-    if !create {
-        return Err(ChatHistoryError::MissingProtectedKey);
+    // musl / other Unix without a Secret Service client: only the debug lab
+    // key remains here (release builds took the vault branch above).
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+    {
+        let _ = create;
+        if chat_history_lab_key_allowed() {
+            return Ok(lab_history_key(data_dir));
+        }
+        Err(ChatHistoryError::ProtectedStoreUnavailable(
+            "no protected chat-history keystore on this target".into(),
+        ))
     }
-    init_protected_key(&PlatformKeyStore, data_dir)
 }
 
 /// Whether a real (keystore-held) history key exists. The debug Linux lab
 /// key is not a protected key and never blocks legacy import.
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+#[cfg(unix)]
 fn platform_key_exists(data_dir: &Path) -> Result<bool, ChatHistoryError> {
     // The lab key is not a protected key and never blocks legacy import.
     #[cfg(target_os = "macos")]
     if chat_history_lab_key_allowed() {
         return Ok(false);
     }
-    match platform_get_key(data_dir) {
-        Ok(key) => Ok(key.is_some()),
-        Err(e) => {
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
-            if linux_secret_service_connect_failed(&e) && chat_history_lab_key_allowed() {
-                return Ok(false);
+    #[cfg(not(target_os = "macos"))]
+    if vault_history_key_selected(data_dir, false)? {
+        let store = VaultKeyStore {
+            vault: crate::keystore_vault::Vault::for_data_dir(data_dir),
+        };
+        return Ok(store.get(data_dir)?.is_some());
+    }
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+    {
+        match platform_get_key(data_dir) {
+            Ok(key) => Ok(key.is_some()),
+            Err(e) => {
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                if linux_secret_service_connect_failed(&e) && chat_history_lab_key_allowed() {
+                    return Ok(false);
+                }
+                Err(e)
             }
-            Err(e)
         }
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+    {
+        let _ = data_dir;
+        Ok(false)
     }
 }
 
 impl ChatHistoryProtector for PlatformChatHistoryProtector {
     fn protect(&self, data_dir: &Path, plaintext: &[u8]) -> Result<Vec<u8>, ChatHistoryError> {
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        #[cfg(unix)]
         {
             let key = self.keys.key(data_dir, true)?;
             aead_protect(&key, data_dir, HISTORY_AAD_DOMAIN, plaintext)
@@ -1397,11 +1443,7 @@ impl ChatHistoryProtector for PlatformChatHistoryProtector {
         {
             dpapi_protect_blob(data_dir, HISTORY_AAD_DOMAIN, plaintext)
         }
-        #[cfg(not(any(
-            target_os = "macos",
-            windows,
-            all(target_os = "linux", target_env = "gnu")
-        )))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (data_dir, plaintext);
             Err(ChatHistoryError::ProtectedStoreUnavailable(
@@ -1411,7 +1453,7 @@ impl ChatHistoryProtector for PlatformChatHistoryProtector {
     }
 
     fn unprotect(&self, data_dir: &Path, ciphertext: &[u8]) -> Result<Vec<u8>, ChatHistoryError> {
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        #[cfg(unix)]
         {
             let key = self.keys.key(data_dir, false)?;
             aead_unprotect(&key, data_dir, HISTORY_AAD_DOMAIN, ciphertext)
@@ -1420,11 +1462,7 @@ impl ChatHistoryProtector for PlatformChatHistoryProtector {
         {
             dpapi_unprotect_blob(data_dir, HISTORY_AAD_DOMAIN, ciphertext)
         }
-        #[cfg(not(any(
-            target_os = "macos",
-            windows,
-            all(target_os = "linux", target_env = "gnu")
-        )))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (data_dir, ciphertext);
             Err(ChatHistoryError::ProtectedStoreUnavailable(
@@ -1434,13 +1472,13 @@ impl ChatHistoryProtector for PlatformChatHistoryProtector {
     }
 
     fn protected_key_exists(&self, data_dir: &Path) -> Result<bool, ChatHistoryError> {
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        #[cfg(unix)]
         {
             platform_key_exists(data_dir)
         }
         // DPAPI (user scope) has no key item and offers no integrity against
         // same-user processes anyway; other targets cannot save at all.
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+        #[cfg(not(unix))]
         {
             let _ = data_dir;
             Ok(false)
@@ -1448,23 +1486,20 @@ impl ChatHistoryProtector for PlatformChatHistoryProtector {
     }
 
     fn prepare(&self, data_dir: &Path) {
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        #[cfg(unix)]
         self.keys.warm(data_dir);
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+        #[cfg(not(unix))]
         let _ = data_dir;
     }
 }
 
 #[derive(Default)]
 struct PlatformOutboundStageProtector {
-    #[cfg_attr(
-        not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(unix), allow(dead_code))]
     keys: OperationKeyCache,
 }
 
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+#[cfg(unix)]
 impl PlatformOutboundStageProtector {
     /// The stage may be the first writer to need the shared key. Import any
     /// legacy plaintext history *before* minting it, so that file is not later
@@ -1483,7 +1518,7 @@ impl PlatformOutboundStageProtector {
 
 impl ChatHistoryProtector for PlatformOutboundStageProtector {
     fn protect(&self, data_dir: &Path, plaintext: &[u8]) -> Result<Vec<u8>, ChatHistoryError> {
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        #[cfg(unix)]
         {
             let key = self.key_for_protect(data_dir)?;
             aead_protect(&key, data_dir, STAGE_AAD_DOMAIN, plaintext)
@@ -1492,11 +1527,7 @@ impl ChatHistoryProtector for PlatformOutboundStageProtector {
         {
             dpapi_protect_blob(data_dir, STAGE_AAD_DOMAIN, plaintext)
         }
-        #[cfg(not(any(
-            target_os = "macos",
-            windows,
-            all(target_os = "linux", target_env = "gnu")
-        )))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (data_dir, plaintext);
             Err(ChatHistoryError::ProtectedStoreUnavailable(
@@ -1506,7 +1537,7 @@ impl ChatHistoryProtector for PlatformOutboundStageProtector {
     }
 
     fn unprotect(&self, data_dir: &Path, ciphertext: &[u8]) -> Result<Vec<u8>, ChatHistoryError> {
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        #[cfg(unix)]
         {
             let key = self.keys.key(data_dir, false)?;
             aead_unprotect(&key, data_dir, STAGE_AAD_DOMAIN, ciphertext)
@@ -1515,11 +1546,7 @@ impl ChatHistoryProtector for PlatformOutboundStageProtector {
         {
             dpapi_unprotect_blob(data_dir, STAGE_AAD_DOMAIN, ciphertext)
         }
-        #[cfg(not(any(
-            target_os = "macos",
-            windows,
-            all(target_os = "linux", target_env = "gnu")
-        )))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (data_dir, ciphertext);
             Err(ChatHistoryError::ProtectedStoreUnavailable(
@@ -1533,7 +1560,7 @@ impl ChatHistoryProtector for PlatformOutboundStageProtector {
         data_dir: &Path,
         ciphertext: &[u8],
     ) -> Result<(Vec<u8>, bool), ChatHistoryError> {
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        #[cfg(unix)]
         {
             let key = self.keys.key(data_dir, false)?;
             unprotect_stage_aead_with_legacy_fallback(&key, data_dir, ciphertext)
@@ -1542,11 +1569,7 @@ impl ChatHistoryProtector for PlatformOutboundStageProtector {
         {
             unprotect_stage_dpapi_with_legacy_fallback(data_dir, ciphertext)
         }
-        #[cfg(not(any(
-            target_os = "macos",
-            windows,
-            all(target_os = "linux", target_env = "gnu")
-        )))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (data_dir, ciphertext);
             Err(ChatHistoryError::ProtectedStoreUnavailable(
@@ -1556,20 +1579,16 @@ impl ChatHistoryProtector for PlatformOutboundStageProtector {
     }
 
     fn prepare(&self, data_dir: &Path) {
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        #[cfg(unix)]
         self.keys.warm(data_dir);
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+        #[cfg(not(unix))]
         let _ = data_dir;
     }
 }
 
 /// Prefer stage AAD; accept one prior generation sealed under chat-history AAD.
 /// `true` means the blob used history AAD and must be rewritten.
-#[cfg(any(
-    test,
-    target_os = "macos",
-    all(target_os = "linux", target_env = "gnu")
-))]
+#[cfg(any(test, unix))]
 fn unprotect_stage_aead_with_legacy_fallback(
     key: &[u8; 32],
     data_dir: &Path,
@@ -3671,5 +3690,42 @@ mod tests {
                 Err(ChatHistoryError::TooLarge)
             ));
         }
+    }
+
+    #[test]
+    fn passphrase_vault_history_key_is_minted_once_and_add_only() {
+        use crate::keystore_vault::test_support::test_vault;
+        let dir = tempfile::tempdir().unwrap();
+        let store = VaultKeyStore {
+            vault: test_vault(dir.path(), "history vault passphrase").0,
+        };
+        assert!(matches!(
+            load_vault_history_key(&store, dir.path(), false),
+            Err(ChatHistoryError::MissingProtectedKey)
+        ));
+        assert!(!dir
+            .path()
+            .join(crate::keystore_vault::VAULT_FILE_NAME)
+            .exists());
+        let key = load_vault_history_key(&store, dir.path(), true).unwrap();
+        let again = load_vault_history_key(&store, dir.path(), false).unwrap();
+        assert_eq!(*key, *again);
+        assert!(!store.add(dir.path(), &[0x55; 32]).unwrap(), "add-only");
+        let reopened = VaultKeyStore {
+            vault: test_vault(dir.path(), "history vault passphrase").0,
+        };
+        assert_eq!(*reopened.get(dir.path()).unwrap().unwrap(), *key);
+        let sealed = aead_protect(&key, dir.path(), HISTORY_AAD_DOMAIN, b"hello").unwrap();
+        assert_eq!(
+            aead_unprotect(&again, dir.path(), HISTORY_AAD_DOMAIN, &sealed).unwrap(),
+            b"hello"
+        );
+        let wrong = VaultKeyStore {
+            vault: test_vault(dir.path(), "a wrong passphrase").0,
+        };
+        assert!(matches!(
+            wrong.get(dir.path()),
+            Err(ChatHistoryError::ProtectedStoreUnavailable(_))
+        ));
     }
 }

@@ -45,6 +45,8 @@ pub mod internet;
 pub mod internet_gate;
 pub mod introduction;
 pub mod ipc;
+pub mod keystore_select;
+pub mod keystore_vault;
 pub mod lan_dispatch;
 pub mod lan_gate;
 pub mod lan_noise;

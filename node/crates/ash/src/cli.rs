@@ -5820,6 +5820,11 @@ pub fn run() {
         std::process::exit(1);
     }
     let cli = Cli::parse();
+    // Linux passphrase vault (no reachable Secret Service): the CLI may ask
+    // for the keystore passphrase on its terminal (no echo; twice on first
+    // creation). Non-TTY runs still need RAVEN_KEYSTORE_PASSPHRASE_FILE, and
+    // raven-node never prompts. No effect on macOS / Windows backends.
+    raven_core::keystore_vault::enable_terminal_prompt();
     // Say up front when there is no profile to use (no --data-dir, no
     // RAVEN_DATA_DIR / ASH_DATA_DIR and no usable HOME), instead of letting
     // whichever store is touched first fail with "Not a directory".

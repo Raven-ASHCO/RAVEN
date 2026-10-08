@@ -119,6 +119,14 @@ jobs:
           bash scripts/o6_m1_same_rvn1_bind_check.sh --self-test
           bash scripts/keychain_guard_check.sh --self-test
           bash scripts/keychain_guard_check.sh
+      # R1 stop-line (docs/design/2026-10-linux-keystore.md): Secret Service only
+      # through the frozen no-prompt fork, no-prompt APIs only in the approved
+      # wrapper (identity_store.rs), never Unlock / a plain session.
+      - name: Secret Service R1 boundary (static)
+        run: |
+          set -euo pipefail
+          bash node/scripts/secret_service_r1_boundary_check.sh --self-test
+          bash node/scripts/secret_service_r1_boundary_check.sh
       - name: shellcheck (errexit pitfalls + harness warnings)
         run: |
           set -euo pipefail
@@ -191,8 +199,9 @@ jobs:
     name: Rust + vectors (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # GNU/Linux Secret Service *creation* is fail-closed before R1. Debug CI
-    # uses locked-file so cargo test --locked / ash init can create ephemeral identities.
+    # Headless runner: no Secret Service. Debug CI keeps the lab locked-file
+    # backend so cargo test --locked / ash init create ephemeral identities; the
+    # Release keystore (passphrase vault) is proven by linux-release-keystore.
     env:
       RAVEN_IDENTITY_BACKEND: locked-file
       RAVEN_ALLOW_EPHEMERAL_DATA_DIR: "1"
@@ -364,6 +373,69 @@ jobs:
           name: raven-sbom-linux
           path: node/target/sbom/
           if-no-files-found: error
+
+  # RELEASE-build proof of the Linux keystore (R1, docs/design/2026-10-linux-keystore.md):
+  # no lab backend env. Two profiles on the passphrase vault (passphrase files in a
+  # temp dir), two raven-node services on 127.0.0.1, contacts, `raven send` each way,
+  # inbox check, plus the refusal paths (no passphrase on a non-TTY, env passphrase,
+  # loose file mode, wrong passphrase, backend switch, Release locked-file).
+  linux-release-keystore:
+    name: Linux Release keystore smoke (passphrase vault)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: node
+          prefix-key: linux-release-keystore
+      - name: Release build (locked)
+        run: cargo build --locked --release -p raven-node -p ash
+      - name: Two-node Release smoke over the passphrase vault
+        run: bash scripts/linux_release_keystore_two_node.sh
+
+  # Same Release smoke inside a headless, unlocked GNOME Keyring (dbus-run-session +
+  # gnome-keyring-daemon --unlock with a throwaway test password). Advisory until it
+  # has run green on the hosted image: a provider quirk must not block the vault proof.
+  linux-release-keystore-secret-service:
+    name: Linux Release keystore smoke (Secret Service, headless gnome-keyring)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: node
+          prefix-key: linux-release-keystore
+      - name: Install headless Secret Service provider
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends gnome-keyring dbus dbus-x11
+      - name: Release build (locked)
+        run: cargo build --locked --release -p raven-node -p ash
+      - name: Two-node Release smoke over Secret Service
+        run: |
+          set -euo pipefail
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            printf "%s" "raven-ci-throwaway-keyring" | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+            eval "$(gnome-keyring-daemon --start --components=secrets)"
+            export GNOME_KEYRING_CONTROL
+            bash scripts/linux_release_keystore_two_node.sh --secret-service
+          '
 
   rust-macos:
     name: Rust (macOS)

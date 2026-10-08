@@ -40,9 +40,12 @@ DATA_DIR="$(CDPATH='' cd -- "$DATA_DIR" && pwd)"
 # Paths are written into XML: escape the three characters that are special there.
 xml_escape() {
   local s=$1
-  s=${s//&/&amp;}
-  s=${s//</&lt;}
-  s=${s//>/&gt;}
+  # Quoted patterns and replacements: bash >= 5.2 (patsub_replacement, on by
+  # default) reads an unquoted `&` in the replacement as "the matched text",
+  # which turned `<` into `<lt;`. Quoted, `&` is literal in every bash.
+  s=${s//'&'/'&amp;'}
+  s=${s//'<'/'&lt;'}
+  s=${s//'>'/'&gt;'}
   printf '%s' "$s"
 }
 # --locked: build exactly the audited Cargo.lock.

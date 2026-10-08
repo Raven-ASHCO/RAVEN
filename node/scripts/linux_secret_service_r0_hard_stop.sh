@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Task 0B.3 R0 — native GNU/Linux hard-stop proofs for the pinned secret-service fork.
-# Lab-only. No R1, 0B.4, production, commit, push, or stage.
+# R1 (owner decision 2026-10-08, docs/design/2026-10-linux-keystore.md) put the
+# fork into raven-core's default GNU/Linux graph. The stop-line is now "Secret
+# Service only through the approved wrapper" (secret_service_r1_boundary_check.sh)
+# instead of "no live callsite". Lab-only proofs; no 0B.4, commit, push, or stage.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -34,18 +37,20 @@ echo "=== Default dependency graph isolation ===" | tee -a "$ART/summary.txt"
 DEFAULT_TREE="$ART/default-linux-tree.txt"
 cargo tree -p raven-core --target x86_64-unknown-linux-gnu -e normal \
   >"$DEFAULT_TREE"
-grep -q 'secret-service v2.0.2' "$DEFAULT_TREE" \
-  || fail "default Linux graph lost crates.io secret-service"
-if grep -q 'secret-service-2.0.2-raven-noprompt' "$DEFAULT_TREE"; then
-  fail "Raven fork leaked into default Linux dependency graph"
+grep -q 'secret-service v2.0.2 (.*secret-service-2.0.2-raven-noprompt)' "$DEFAULT_TREE" \
+  || fail "R1: default Linux graph must use the frozen Raven no-prompt fork"
+if grep 'secret-service v' "$DEFAULT_TREE" | grep -vq 'secret-service-2.0.2-raven-noprompt'; then
+  fail "R1: crates.io secret-service client is back in the default Linux graph"
 fi
-if rg -n 'create_item_no_prompt|delete_no_prompt|with_secret_zeroizing' \
-  "$ROOT/node/crates" >"$ART/live-fork-callsites.txt"; then
-  fail "R0 no-prompt fork has a live Raven callsite before R1"
-fi
+rg -n 'create_item_no_prompt|delete_no_prompt|with_secret_zeroizing' \
+  "$ROOT/node/crates" >"$ART/live-fork-callsites.txt" || true
+bash "$ROOT/node/scripts/secret_service_r1_boundary_check.sh" \
+  2>&1 | tee "$ART/r1-boundary.log"
+bash "$ROOT/node/scripts/secret_service_r1_boundary_check.sh" --self-test \
+  2>&1 | tee -a "$ART/r1-boundary.log"
 cargo check -p raven-core --lib --target x86_64-unknown-linux-gnu \
   2>&1 | tee "$ART/default-linux-check.log"
-pass "default Linux graph uses upstream client; no R0 live callsite"
+pass "default Linux graph uses the fork; no-prompt APIs only in the approved wrapper"
 
 echo "=== Raven API static no-prompt boundary ===" | tee -a "$ART/summary.txt"
 python3 - \
@@ -204,5 +209,5 @@ case "$CONTENT_TYPES" in
 esac
 pass "DH seed/RVFA1 exact-byte round-trip, Plain refusal, collection path, prompt tripwire"
 
-echo "R0 HARD-STOP COMPLETE — stop for Independent R0 review (no R1 / plain fallback / 0B.4 / commit)" \
+echo "R0 HARD-STOP + R1 BOUNDARY COMPLETE — no plain-session fallback, no Unlock, no 0B.4 / commit" \
   | tee -a "$ART/summary.txt"

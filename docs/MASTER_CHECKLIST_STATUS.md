@@ -43,7 +43,7 @@ Reviewer for all IMPLEMENTED rows: **pending human** unless noted.
 | 11 | Aliases and Contacts | IMPLEMENTED | Soft Unique Tags; ash find/contact; matrix scenario 06 |
 | 12 | Asynchronous First Contact | IMPLEMENTED | request/accept/block; matrix 06 |
 | 13 | Cryptographic Requirements | IMPLEMENTED | Envelope + ATSAM KATs + tamper/replay matrix 09 (full ML-KEM interop optional debt) |
-| 14 | Key Storage | IMPLEMENTED | identity_store Keychain/DPAPI; Linux Secret Service is load-only (creation disabled before R1, so Linux Release cannot create an identity yet); iOS PeerKeyDirectory is OFF-MAIN |
+| 14 | Key Storage | IMPLEMENTED | identity_store Keychain/DPAPI; Linux: Secret Service (add-only no-prompt create, R1 2026-10-08) else passphrase vault (`keystore_vault`, Argon2id); first Linux Release proof is the CI `linux-release-keystore` job; iOS PeerKeyDirectory is OFF-MAIN |
 | 15 | Canonical Raven Envelope | FROZEN | rust/swift/python vectors |
 | 16 | Delivery States and ACK | IMPLEMENTED | matrix + §59 |
 | 17 | Raven Node Core | IMPLEMENTED | raven-node daemon + service |

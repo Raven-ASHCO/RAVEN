@@ -27,6 +27,9 @@ spqr = { git = "https://github.com/signalapp/SparsePostQuantumRatchet", rev = "f
 rand_core = { workspace = true }
 zeroize = { workspace = true }
 snow = { workspace = true }
+# Linux passphrase vault KDF (docs/design/2026-10-linux-keystore.md). `zeroize`
+# wipes the Argon2 working memory after each derivation.
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "2"
@@ -43,9 +46,14 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
-# Secret Service needs libdbus — glibc desktop only (not musl static releases).
+# Secret Service — glibc desktop only (not musl static releases). R1
+# (docs/design/2026-10-linux-keystore.md): the frozen Raven no-prompt fork of
+# secret-service 2.0.2 (API superset of upstream; provenance:
+# scripts/verify_secret_service_2_0_2_raven_noprompt.sh) replaces the crates.io
+# client, so identity creation can use the add-only, prompt-refusing
+# `create_item_no_prompt` and every caller links the audited code.
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-secret-service = "2.0"
+secret-service = { path = "../../third_party/secret-service-2.0.2-raven-noprompt" }
 # Direct D-Bus access belongs only to the durable Full Braid lab. Existing
 # production-facing stores continue to use the unmodified crates.io client.
 zbus = { version = "1.9", optional = true }

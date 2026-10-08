@@ -1007,6 +1007,49 @@ impl ProtectedSessionBackend for LockedFileSessionBackend {
     }
 }
 
+/// Session secrets in the profile's passphrase vault (non-macOS Unix without
+/// a reachable Secret Service; docs/design/2026-10-linux-keystore.md). Every
+/// test build compiles it so the adapter is exercised on all CI hosts.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+struct VaultSessionBackend {
+    vault: crate::keystore_vault::Vault,
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+impl VaultSessionBackend {
+    fn entry(account: &str) -> String {
+        format!("{}{account}", crate::keystore_vault::SESSION_ENTRY_PREFIX)
+    }
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn vault_session_error(error: crate::keystore_vault::VaultError) -> IndexedSessionStoreError {
+    IndexedSessionStoreError::ProtectedStore(format!("passphrase vault: {error}"))
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+impl ProtectedSessionBackend for VaultSessionBackend {
+    fn get(&self, account: &str) -> Result<Option<Vec<u8>>, IndexedSessionStoreError> {
+        Ok(self
+            .vault
+            .get(&Self::entry(account))
+            .map_err(vault_session_error)?
+            .map(|mut value| std::mem::take(&mut *value)))
+    }
+
+    fn put(&self, account: &str, value: &[u8]) -> Result<(), IndexedSessionStoreError> {
+        self.vault
+            .put(&Self::entry(account), value)
+            .map_err(vault_session_error)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), IndexedSessionStoreError> {
+        self.vault
+            .delete(&Self::entry(account))
+            .map_err(vault_session_error)
+    }
+}
+
 #[cfg(not(any(
     target_os = "macos",
     windows,
@@ -1556,14 +1599,25 @@ pub struct IndexedSessionStore {
 }
 
 impl IndexedSessionStore {
-    /// Opens the platform implementation. GNU/Linux requires Secret Service;
-    /// unsupported platforms fail closed. There is no plaintext file fallback:
+    /// Opens the platform implementation. GNU/Linux uses Secret Service or,
+    /// per the profile's recorded keystore, the passphrase vault; musl/other
+    /// Unix the vault; unsupported platforms fail closed. There is no
+    /// plaintext file fallback:
     /// the lab-only `locked-file` backend (`RAVEN_SESSION_BACKEND` or
     /// `RAVEN_IDENTITY_BACKEND`) is honored in debug builds only and is
     /// refused in Release builds.
     pub fn open(data_dir: &Path) -> Result<Self, IndexedSessionStoreError> {
         if force_locked_file_session_backend()? {
             let backend = Arc::new(LockedFileSessionBackend::new(data_dir)?);
+            return Self::open_with_backend(&data_dir.join(INDEXED_SESSION_METADATA_FILE), backend);
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if crate::keystore_select::uses_vault(data_dir, true)
+            .map_err(IndexedSessionStoreError::ProtectedStore)?
+        {
+            let backend = Arc::new(VaultSessionBackend {
+                vault: crate::keystore_vault::Vault::for_data_dir(data_dir),
+            });
             return Self::open_with_backend(&data_dir.join(INDEXED_SESSION_METADATA_FILE), backend);
         }
         let backend = Arc::new(PlatformProtectedSessionBackend::new(data_dir)?);
@@ -11447,6 +11501,58 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn passphrase_vault_backend_keeps_session_secrets_across_handles() {
+        use crate::keystore_vault::test_support::test_vault;
+        const PASS: &str = "session vault passphrase";
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let path = dir.join("sessions.sqlite");
+        let vault_backend = |passphrase: &str| {
+            Arc::new(VaultSessionBackend {
+                vault: test_vault(dir, passphrase).0,
+            })
+        };
+        let binding = fixture_binding();
+        let key = binding.key.clone();
+        {
+            let mut store = IndexedSessionStore::open_with_backend(&path, vault_backend(PASS))
+                .expect("open vault-backed store");
+            store.create_session(binding, [0xA7; 32]).unwrap();
+        }
+        let names = test_vault(dir, PASS).0.entry_names().unwrap();
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with(crate::keystore_vault::SESSION_ENTRY_PREFIX)),
+            "{names:?}"
+        );
+        assert!(!names.is_empty());
+        {
+            let mut store =
+                IndexedSessionStore::open_with_backend(&path, vault_backend(PASS)).unwrap();
+            assert_eq!(
+                store.session_lifecycle(&key).unwrap(),
+                SessionLifecycle::Provisional
+            );
+        }
+        // A wrong passphrase fails closed as soon as protected state is read.
+        let error = match IndexedSessionStore::open_with_backend(
+            &path,
+            vault_backend("a wrong passphrase"),
+        ) {
+            Err(error) => error,
+            Ok(mut wrong) => wrong.session_lifecycle(&key).unwrap_err(),
+        };
+        assert!(error.to_string().contains("passphrase"), "{error}");
+        let backend = vault_backend(PASS);
+        backend.delete("00").unwrap();
+        backend.put("00", b"x").unwrap();
+        assert_eq!(backend.get("00").unwrap().as_deref(), Some(&b"x"[..]));
+        backend.delete("00").unwrap();
+        assert!(backend.get("00").unwrap().is_none());
     }
 
     #[test]

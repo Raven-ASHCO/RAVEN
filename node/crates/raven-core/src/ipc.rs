@@ -300,7 +300,7 @@ fn normalized_data_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[cfg(unix)]
-fn current_euid() -> u32 {
+pub(crate) fn current_euid() -> u32 {
     extern "C" {
         fn geteuid() -> u32;
     }

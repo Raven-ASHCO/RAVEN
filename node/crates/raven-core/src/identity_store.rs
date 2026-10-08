@@ -3,8 +3,12 @@
 //! Platform backends (never log or print seed bytes):
 //! - macOS: Keychain (generic password)
 //! - Windows: DPAPI-protected `identity.seed` file
-//! - Linux: Secret Service (glibc) — *loading only*; creation stays fail-closed
-//!   until R1 authorizes an add-only prompt-free backend
+//! - GNU/Linux: Secret Service (glibc) when an unlocked keyring answers,
+//!   created add-only and prompt-free through the Raven fork
+//!   (`create_item_no_prompt`, R1 2026-10-08); otherwise the passphrase vault
+//!   (`keystore_vault`). The per-profile choice is recorded and never changes
+//!   silently (`keystore_select`, docs/design/2026-10-linux-keystore.md).
+//! - musl / other non-macOS Unix: the passphrase vault only
 //! - locked-file mode is an explicit lab/CI override only (debug builds).
 //!   First-install and unmarked-seed load require proven platform absence
 //!   (`Ok(None)`). macOS `SecureStore` (locked/denied Keychain) is Continuity.
@@ -58,6 +62,9 @@ pub enum IdentityStoreBackend {
     WindowsDpapiFile,
     LinuxSecretService,
     LockedFile,
+    /// Passphrase vault (`keystore.vault`, entry `identity-seed`): non-macOS
+    /// Unix without a reachable Secret Service.
+    PassphraseVault,
 }
 
 impl IdentityStoreBackend {
@@ -67,6 +74,7 @@ impl IdentityStoreBackend {
             Self::WindowsDpapiFile => "windows-dpapi-file",
             Self::LinuxSecretService => "linux-secret-service",
             Self::LockedFile => "locked-file",
+            Self::PassphraseVault => "passphrase-vault",
         }
     }
 
@@ -76,6 +84,7 @@ impl IdentityStoreBackend {
             "windows-dpapi-file" => Some(Self::WindowsDpapiFile),
             "linux-secret-service" => Some(Self::LinuxSecretService),
             "locked-file" => Some(Self::LockedFile),
+            "passphrase-vault" => Some(Self::PassphraseVault),
             _ => None,
         }
     }
@@ -86,6 +95,7 @@ impl IdentityStoreBackend {
             Self::WindowsDpapiFile => 2,
             Self::LinuxSecretService => 3,
             Self::LockedFile => 4,
+            Self::PassphraseVault => 5,
         }
     }
 
@@ -95,6 +105,7 @@ impl IdentityStoreBackend {
             2 => Some(Self::WindowsDpapiFile),
             3 => Some(Self::LinuxSecretService),
             4 => Some(Self::LockedFile),
+            5 => Some(Self::PassphraseVault),
             _ => None,
         }
     }
@@ -266,8 +277,10 @@ fn binding_exists_checked(data_dir: &Path) -> Result<bool, IdentityStoreError> {
 /// exact name: files that read-only commands (`status`, `bridge`, the ash menus,
 /// `bootstrap`/policy setup) or the OS leave behind in a fresh profile and that
 /// carry no identity-bound state.
-const FIRST_INSTALL_INERT_FILES: [&str; 8] = [
+const FIRST_INSTALL_INERT_FILES: [&str; 9] = [
     IDENTITY_STORE_LOCK_NAME,
+    // Non-secret keystore choice (non-macOS Unix); the vault itself is not inert.
+    crate::keystore_select::KEYSTORE_MARKER_NAME,
     ".identity_store.lock.sqlite-wal",
     ".identity_store.lock.sqlite-shm",
     ".identity_store.lock.sqlite-journal",
@@ -992,19 +1005,33 @@ fn load_dpapi_seed_file(path: &Path) -> Result<Option<[u8; 32]>, IdentityStoreEr
 // --- Linux Secret Service (glibc / desktop session) -------------------------
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+const SECRET_SERVICE_IDENTITY_LABEL: &str = "RAVEN node identity seed";
+
+/// R1 (owner decision 2026-10-08): add-only, prompt-free identity creation
+/// through the frozen Raven fork. `create_item_no_prompt` requires the DH
+/// session, hard-wires the D-Bus `replace` flag to false, refuses a provider
+/// prompt (`PromptRequired`) and a locked collection (`Locked`); Raven never
+/// calls `Unlock`. Exclusion comes from the identity-store lock plus the
+/// proven-absent search before this call, and the strict readback after it
+/// (exactly one item) catches a duplicate created behind our back.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn secret_service_set(account: &str, seed: &[u8; 32]) -> Result<(), IdentityStoreError> {
-    // R0 stop-line: GNU/Linux identity *creation* stays fail-closed until R1
-    // explicitly authorizes an add-only, prompt-free create backend. The
-    // upstream crates.io client has no such API, and the frozen no-prompt fork
-    // must never gain a live Raven callsite before R1 (enforced by
-    // scripts/linux_secret_service_r0_hard_stop.sh). Loading, verifying, and
-    // deleting existing Secret Service identities remain fully available.
-    let _ = (account, seed);
-    Err(IdentityStoreError::SecureStore(
-        "GNU/Linux Secret Service identity creation is disabled before R1 (fail-closed); \
-         existing identities still load"
-            .into(),
-    ))
+    use secret_service::{EncryptionType, SecretService};
+    use std::collections::HashMap;
+    let ss = SecretService::new(EncryptionType::Dh)
+        .map_err(|e| IdentityStoreError::SecureStore(format!("secret-service connect: {e}")))?;
+    let collection = ss
+        .get_default_collection()
+        .map_err(|e| IdentityStoreError::SecureStore(format!("secret-service collection: {e}")))?;
+    collection
+        .create_item_no_prompt(
+            SECRET_SERVICE_IDENTITY_LABEL,
+            HashMap::from([("service", KEYCHAIN_SERVICE), ("account", account)]),
+            seed,
+            "application/octet-stream",
+        )
+        .map(|_| ())
+        .map_err(|e| IdentityStoreError::SecureStore(format!("secret-service create: {e}")))
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -1051,10 +1078,17 @@ fn secret_service_get(account: &str) -> Result<Option<[u8; 32]>, IdentityStoreEr
         || item
             .get_label()
             .map_err(|e| IdentityStoreError::SecureStore(format!("secret-service label: {e}")))?
-            != "RAVEN node identity seed"
-        || item.get_secret_content_type().map_err(|e| {
-            IdentityStoreError::SecureStore(format!("secret-service content type: {e}"))
-        })? != "text/plain"
+            != SECRET_SERVICE_IDENTITY_LABEL
+        // R1 content-type policy: Raven creates `application/octet-stream`;
+        // GNOME Keyring reports it back as `text/plain` (R0 observation).
+        || !matches!(
+            item.get_secret_content_type()
+                .map_err(|e| {
+                    IdentityStoreError::SecureStore(format!("secret-service content type: {e}"))
+                })?
+                .as_str(),
+            "text/plain" | "application/octet-stream"
+        )
     {
         return Err(IdentityStoreError::Corrupt);
     }
@@ -1131,6 +1165,12 @@ fn store_seed(
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
+        let keystore = crate::keystore_select::resolve(data_dir, true)
+            .map_err(IdentityStoreError::SecureStore)?;
+        if keystore == crate::keystore_select::KeystoreBackend::PassphraseVault {
+            let vault = crate::keystore_vault::Vault::for_data_dir(data_dir);
+            return store_vault_seed(data_dir, &vault, &path, seed);
+        }
         secret_service_set(&account, seed)?;
         let mut stored = secret_service_get(&account)?.ok_or(IdentityStoreError::Continuity(
             "Secret Service create had no readable result",
@@ -1153,11 +1193,11 @@ fn store_seed(
         not(all(target_os = "linux", target_env = "gnu"))
     ))]
     {
-        let _ = (account, path, seed);
-        return Err(IdentityStoreError::SecureStore(
-            "no protected identity backend on this Unix target; locked-file requires explicit lab override"
-                .into(),
-        ));
+        // musl / other Unix: no Secret Service client, the passphrase vault only.
+        let _ = account;
+        crate::keystore_select::resolve(data_dir, true).map_err(IdentityStoreError::SecureStore)?;
+        let vault = crate::keystore_vault::Vault::for_data_dir(data_dir);
+        return store_vault_seed(data_dir, &vault, &path, seed);
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1176,6 +1216,92 @@ fn bytes_to_seed(bytes: &[u8]) -> Result<[u8; 32], IdentityStoreError> {
     let mut seed = [0u8; 32];
     seed.copy_from_slice(bytes);
     Ok(seed)
+}
+
+// --- Passphrase vault (non-macOS Unix without Secret Service) ---------------
+//
+// Compiled into every test build so the vault-backed identity logic is
+// exercised on macOS / Windows CI hosts as well.
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn vault_error(error: crate::keystore_vault::VaultError) -> IdentityStoreError {
+    IdentityStoreError::SecureStore(format!("passphrase vault: {error}"))
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn vault_get_seed(
+    vault: &crate::keystore_vault::Vault,
+) -> Result<Option<[u8; 32]>, IdentityStoreError> {
+    vault
+        .get(crate::keystore_vault::IDENTITY_SEED_ENTRY)
+        .map_err(vault_error)?
+        .map(|bytes| bytes_to_seed(&bytes))
+        .transpose()
+}
+
+/// First-install (or migration) write: add-only, verified by readback.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn store_vault_seed(
+    data_dir: &Path,
+    vault: &crate::keystore_vault::Vault,
+    path: &Path,
+    seed: &[u8; 32],
+) -> Result<IdentityStoreBackend, IdentityStoreError> {
+    vault
+        .insert_new(crate::keystore_vault::IDENTITY_SEED_ENTRY, seed)
+        .map_err(vault_error)?;
+    let mut stored = vault_get_seed(vault)?.ok_or(IdentityStoreError::Continuity(
+        "passphrase vault create had no readable result",
+    ))?;
+    if stored != *seed {
+        stored.zeroize();
+        return Err(IdentityStoreError::Continuity(
+            "passphrase vault readback changed identity",
+        ));
+    }
+    stored.zeroize();
+    wipe_seed_file(path)?;
+    write_marker(data_dir, IdentityStoreBackend::PassphraseVault)?;
+    Ok(IdentityStoreBackend::PassphraseVault)
+}
+
+/// Same continuity rules as the Keychain / Secret Service loaders: a recorded
+/// vault identity that is missing never becomes a first install, and a wrong
+/// passphrase or damaged vault is an error, not absence.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn load_vault_seed_with_migrate(
+    data_dir: &Path,
+    vault: &crate::keystore_vault::Vault,
+    path: &Path,
+    marker: Option<IdentityStoreBackend>,
+) -> Result<Option<([u8; 32], IdentityStoreBackend)>, IdentityStoreError> {
+    if marker.is_some() && marker != Some(IdentityStoreBackend::PassphraseVault) {
+        return Err(IdentityStoreError::Continuity(
+            "identity backend marker conflicts with the profile's passphrase vault",
+        ));
+    }
+    if let Some(seed) = vault_get_seed(vault)? {
+        reconcile_secure_and_raw_seed(path, &seed)?;
+        return Ok(Some((seed, IdentityStoreBackend::PassphraseVault)));
+    }
+    if marker == Some(IdentityStoreBackend::PassphraseVault) {
+        return Err(IdentityStoreError::Continuity(
+            "recorded passphrase-vault identity is missing",
+        ));
+    }
+    if let Some(mut bytes) = read_raw_seed_file(path)? {
+        if !is_legacy_plaintext(&bytes) {
+            bytes.zeroize();
+            return Err(IdentityStoreError::Corrupt);
+        }
+        let seed = bytes_to_seed(&bytes)?;
+        bytes.zeroize();
+        // Verified migration: add-only insert, readback, then wipe + marker.
+        let backend = store_vault_seed(data_dir, vault, path, &seed)?;
+        return Ok(Some((seed, backend)));
+    }
+    require_proven_first_install(data_dir, marker)?;
+    Ok(None)
 }
 
 /// Locked-file lab/CI (debug only) may proceed only when Keychain is
@@ -1413,6 +1539,12 @@ fn load_seed_with_migrate(
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
+        let keystore = crate::keystore_select::resolve(data_dir, false)
+            .map_err(IdentityStoreError::SecureStore)?;
+        if keystore == crate::keystore_select::KeystoreBackend::PassphraseVault {
+            let vault = crate::keystore_vault::Vault::for_data_dir(data_dir);
+            return load_vault_seed_with_migrate(data_dir, &vault, &path, marker);
+        }
         if marker.is_some() && marker != Some(IdentityStoreBackend::LinuxSecretService) {
             return Err(IdentityStoreError::Continuity(
                 "identity backend marker is not valid on GNU/Linux",
@@ -1470,16 +1602,12 @@ fn load_seed_with_migrate(
         not(all(target_os = "linux", target_env = "gnu"))
     ))]
     {
+        // musl / other Unix: the passphrase vault only.
         let _ = account;
-        if marker.is_some()
-            || read_raw_seed_file(&path)?.is_some()
-            || binding_exists_checked(data_dir)?
-        {
-            return Err(IdentityStoreError::SecureStore(
-                "protected identity backend unavailable on this Unix target".into(),
-            ));
-        }
-        return Ok(None);
+        crate::keystore_select::resolve(data_dir, false)
+            .map_err(IdentityStoreError::SecureStore)?;
+        let vault = crate::keystore_vault::Vault::for_data_dir(data_dir);
+        return load_vault_seed_with_migrate(data_dir, &vault, &path, marker);
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1583,6 +1711,7 @@ fn backend_consistency_with(
                 IdentityStoreBackend::MacosKeychain
                     | IdentityStoreBackend::WindowsDpapiFile
                     | IdentityStoreBackend::LinuxSecretService
+                    | IdentityStoreBackend::PassphraseVault
             )
         ) {
             ok = false;
@@ -1672,6 +1801,8 @@ pub fn test_cleanup(data_dir: &Path) {
     let _ = std::fs::remove_file(marker_path(data_dir));
     let _ = std::fs::remove_file(binding_path(data_dir));
     let _ = std::fs::remove_file(data_dir.join(IDENTITY_STORE_LOCK_NAME));
+    let _ = std::fs::remove_file(data_dir.join(crate::keystore_vault::VAULT_FILE_NAME));
+    let _ = std::fs::remove_file(data_dir.join(crate::keystore_select::KEYSTORE_MARKER_NAME));
 }
 
 #[cfg(test)]
@@ -2582,5 +2713,122 @@ mod tests {
             started.elapsed() < Duration::from_secs(4),
             "it kept retrying"
         );
+    }
+
+    fn test_identity_vault(dir: &Path, passphrase: &str) -> crate::keystore_vault::Vault {
+        crate::keystore_vault::test_support::test_vault(dir, passphrase).0
+    }
+
+    #[test]
+    fn vault_identity_create_load_add_only_and_continuity() {
+        const PASS: &str = "identity vault passphrase";
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let vault = test_identity_vault(dir, PASS);
+        let path = seed_path(dir);
+        assert!(load_vault_seed_with_migrate(dir, &vault, &path, None)
+            .unwrap()
+            .is_none());
+        let id = Identity::generate();
+        let seed = id.seed_bytes();
+        assert_eq!(
+            store_vault_seed(dir, &vault, &path, &seed).unwrap(),
+            IdentityStoreBackend::PassphraseVault
+        );
+        let marker = read_marker_checked(dir).unwrap();
+        assert_eq!(marker, Some(IdentityStoreBackend::PassphraseVault));
+        let (loaded, backend) = load_vault_seed_with_migrate(dir, &vault, &path, marker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, seed);
+        let (loaded_id, _) = finish_loaded_identity(dir, loaded, backend).unwrap();
+        assert_eq!(loaded_id.public_key_bytes(), id.public_key_bytes());
+        assert!(
+            store_vault_seed(dir, &vault, &path, &[9u8; 32]).is_err(),
+            "add-only: a second create never replaces the root"
+        );
+        let reopened = test_identity_vault(dir, PASS);
+        let (again, _) = load_vault_seed_with_migrate(dir, &reopened, &path, marker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, seed);
+        let wrong = test_identity_vault(dir, "not the identity passphrase");
+        assert!(matches!(
+            load_vault_seed_with_migrate(dir, &wrong, &path, marker),
+            Err(IdentityStoreError::SecureStore(_))
+        ));
+        assert!(matches!(
+            load_vault_seed_with_migrate(
+                dir,
+                &vault,
+                &path,
+                Some(IdentityStoreBackend::LinuxSecretService)
+            ),
+            Err(IdentityStoreError::Continuity(_))
+        ));
+        vault
+            .delete(crate::keystore_vault::IDENTITY_SEED_ENTRY)
+            .unwrap();
+        assert!(matches!(
+            load_vault_seed_with_migrate(dir, &vault, &path, marker),
+            Err(IdentityStoreError::Continuity(_))
+        ));
+    }
+
+    #[test]
+    fn vault_identity_migrates_legacy_plaintext_and_refuses_unmarked_vault_state() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let original = Identity::generate().seed_bytes();
+        let path = seed_path(dir);
+        crate::paths::create_new_private(&path, &original).unwrap();
+        let vault = test_identity_vault(dir, "migration passphrase");
+        let (seed, backend) = load_vault_seed_with_migrate(dir, &vault, &path, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seed, original);
+        assert_eq!(backend, IdentityStoreBackend::PassphraseVault);
+        assert!(!path.exists(), "plaintext seed is wiped after migration");
+        assert_eq!(
+            read_marker_checked(dir).unwrap(),
+            Some(IdentityStoreBackend::PassphraseVault)
+        );
+
+        // A vault that holds other secrets but no identity is established
+        // state, never a first install.
+        let other = TempDir::new().unwrap();
+        let other_vault = test_identity_vault(other.path(), "other passphrase");
+        other_vault
+            .put(crate::keystore_vault::CHAT_HISTORY_KEY_ENTRY, &[1u8; 32])
+            .unwrap();
+        assert!(matches!(
+            load_vault_seed_with_migrate(
+                other.path(),
+                &other_vault,
+                &seed_path(other.path()),
+                None
+            ),
+            Err(IdentityStoreError::Continuity(_))
+        ));
+        // The keystore marker and the vault lock alone are inert.
+        std::fs::write(
+            other
+                .path()
+                .join(crate::keystore_select::KEYSTORE_MARKER_NAME),
+            "passphrase-vault\n",
+        )
+        .unwrap();
+        assert!(first_install_entry_is_inert(
+            other.path(),
+            crate::keystore_select::KEYSTORE_MARKER_NAME
+        ));
+        assert!(first_install_entry_is_inert(
+            other.path(),
+            crate::keystore_vault::VAULT_LOCK_NAME
+        ));
+        assert!(!first_install_entry_is_inert(
+            other.path(),
+            crate::keystore_vault::VAULT_FILE_NAME
+        ));
     }
 }

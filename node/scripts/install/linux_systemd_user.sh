@@ -11,6 +11,17 @@
 # but is a host-wide setting, so it is opt-in:
 #   RAVEN_ENABLE_LINGER=1 bash node/scripts/install/linux_systemd_user.sh
 # (or run `loginctl enable-linger "$USER"` yourself; it may need admin rights).
+#
+# Keystore (docs/design/2026-10-linux-keystore.md): with an unlocked desktop
+# keyring (Secret Service) the keys go there. Otherwise RAVEN keeps them in a
+# passphrase vault, and the background service needs the passphrase from a
+# file only you can read (mode 0600/0400). Pass its path at install time:
+#   RAVEN_KEYSTORE_PASSPHRASE_FILE=$HOME/.config/raven/keystore-passphrase \
+#     bash node/scripts/install/linux_systemd_user.sh
+# The unit then gets Environment=RAVEN_KEYSTORE_PASSPHRASE_FILE=<path> (the
+# path only, never the passphrase). RAVEN_SYSTEMD_LOAD_CREDENTIAL=1 uses
+# LoadCredential=raven-keystore-passphrase:<path> instead (needs a systemd
+# whose user manager supports credentials).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN_DIR="${RAVEN_BIN_DIR:-$HOME/.local/bin}"
@@ -32,6 +43,29 @@ resolve_data_dir() {
 }
 DATA_DIR="$(resolve_data_dir)"
 LAN_LISTEN="${RAVEN_LAN_LISTEN:-127.0.0.1:7420}"
+PASSPHRASE_FILE="${RAVEN_KEYSTORE_PASSPHRASE_FILE:-}"
+if [[ -n "${RAVEN_KEYSTORE_PASSPHRASE:-}" ]]; then
+  echo "RAVEN_KEYSTORE_PASSPHRASE is refused: put the passphrase in a 0600 file and set RAVEN_KEYSTORE_PASSPHRASE_FILE" >&2
+  exit 1
+fi
+if [[ -n "$PASSPHRASE_FILE" ]]; then
+  case "$PASSPHRASE_FILE" in
+    /*) ;;
+    *) echo "RAVEN_KEYSTORE_PASSPHRASE_FILE must be an absolute path" >&2; exit 1 ;;
+  esac
+  if [[ "$PASSPHRASE_FILE" == *[\$%\"\\]* || "$PASSPHRASE_FILE" == *$'\n'* ]]; then
+    echo "RAVEN_KEYSTORE_PASSPHRASE_FILE must not contain \$ % \" \\ or newlines" >&2
+    exit 1
+  fi
+  if [[ ! -f "$PASSPHRASE_FILE" || -L "$PASSPHRASE_FILE" ]]; then
+    echo "RAVEN_KEYSTORE_PASSPHRASE_FILE=$PASSPHRASE_FILE is not a regular file" >&2
+    exit 1
+  fi
+  case "$(stat -c '%a' "$PASSPHRASE_FILE")" in
+    600|400) ;;
+    *) echo "RAVEN_KEYSTORE_PASSPHRASE_FILE must be mode 0600 or 0400 (chmod 600 $PASSPHRASE_FILE)" >&2; exit 1 ;;
+  esac
+fi
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/raven-node.service"
 
@@ -53,6 +87,15 @@ sd_quote() {
   s=${s//%/%%}
   s=${s//\$/\$\$}
   printf '"%s"' "$s"
+}
+# Passphrase vault: hand the service the passphrase *file* (never its contents).
+keystore_unit_lines() {
+  [[ -n "$PASSPHRASE_FILE" ]] || return 0
+  if [[ "${RAVEN_SYSTEMD_LOAD_CREDENTIAL:-0}" == "1" ]]; then
+    printf 'LoadCredential=raven-keystore-passphrase:%s\n' "$PASSPHRASE_FILE"
+  else
+    printf 'Environment=%s\n' "$(sd_quote "RAVEN_KEYSTORE_PASSPHRASE_FILE=${PASSPHRASE_FILE}")"
+  fi
 }
 # --locked: build exactly the audited Cargo.lock.
 cargo build --locked -p raven-node -p ash --release --manifest-path "$ROOT/Cargo.toml"
@@ -89,6 +132,7 @@ LockPersonality=yes
 RestrictRealtime=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
+$(keystore_unit_lines)
 
 [Install]
 WantedBy=default.target
@@ -96,7 +140,14 @@ EOF
 
 systemctl --user daemon-reload
 # Identity + prekey must exist before LAN preflight will keep the service up.
+# On a host without a desktop keyring this creates the passphrase vault: from
+# RAVEN_KEYSTORE_PASSPHRASE_FILE when set, else by asking twice on this terminal.
 "${BIN_DIR}/raven" --data-dir "${DATA_DIR}" init
+if [[ "$(cat "${DATA_DIR}/keystore.backend" 2>/dev/null || true)" == "passphrase-vault" && -z "$PASSPHRASE_FILE" ]]; then
+  echo "NOTE: this profile's keys are in a passphrase vault, but the service was given no passphrase file."
+  echo "  The service will fail to start until you re-run this installer with"
+  echo "  RAVEN_KEYSTORE_PASSPHRASE_FILE=<file holding the passphrase, chmod 600> (see docs/INSTALL_Linux.md)."
+fi
 # `enable --now` is a no-op for an already-active unit, which would keep the
 # previous binary running after an upgrade; `restart` also starts an inactive unit.
 systemctl --user enable raven-node.service
