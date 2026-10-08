@@ -24,6 +24,17 @@
 //!   while `INTERNET_DIRECT_PRODUCTION_ENABLED` is false, and without it once
 //!   the flag is flipped.
 //!
+//! - **C4 outbox restart (P2a):** A and B on loopback with a confirmed session.
+//!   B goes down, A sends (queued: `raven send` ends at once and says raven-node
+//!   keeps trying), A's service is killed, B stays down a few seconds, then
+//!   both restart (A first, B on its old port). A's rebuilt outbox delivers the
+//!   exact staged bytes with no new `raven send`: `raven outbox status` and the
+//!   history say delivered, and B's inbox holds the message exactly once.
+//!
+//! Internet direct is for verified (pinned) contacts only (owner decision
+//! 2026-10-08): C2 also checks that an unverified contact is refused on send
+//! (nothing dialled) and by the listener (treated like a stranger).
+//!
 //! Synchronisation is event driven: the harness reads each daemon's stderr and
 //! waits for its own "ipc: listening" / "lan_direct: listen <addr>" lines. Every
 //! wait and every child process has a bounded deadline; nothing sleeps to
@@ -240,11 +251,17 @@ impl Profile {
     /// [`Self::start_service`], plus an Internet direct listener on `internet`
     /// (waited for too) when given.
     fn start_service_with(&self, internet: Option<&str>) -> Service {
+        self.start_service_on("127.0.0.1:0", internet)
+    }
+
+    /// [`Self::start_service_with`] on a chosen LAN listen address (a restart
+    /// that must come back on the same port).
+    fn start_service_on(&self, lan_listen: &str, internet: Option<&str>) -> Service {
         let mut cmd = Command::new(NODE);
         self.env(&mut cmd);
         cmd.arg("service").arg("--data-dir").arg(&self.dir).args([
             "--lan-listen",
-            "127.0.0.1:0",
+            lan_listen,
             "--ble-listen",
             "127.0.0.1:0",
         ]);
@@ -608,6 +625,53 @@ fn c2_internet_direct_routes_both_ways_and_stranger_is_refused() {
         "a's contact for b must hold only the Internet route:\n{a_book}"
     );
 
+    // B has not verified A (no --verify-fp): Internet delivery needs a pinned
+    // contact, so B's send is refused at once and nothing is dialled.
+    let a_inbox_before = a.inbox();
+    let unverified = b.send("alice", "c2 must wait for verification");
+    assert!(!unverified.ok, "{}", unverified.all());
+    assert!(
+        unverified.all().contains(
+            "@alice is not verified: Internet delivery needs the fingerprint checked first"
+        ),
+        "{}",
+        unverified.all()
+    );
+    assert!(
+        unverified.all().contains("CONTACT_NOT_VERIFIED")
+            && unverified.all().contains("Nothing was dialled")
+            && unverified.all().contains("--verify-fp"),
+        "{}",
+        unverified.all()
+    );
+    assert_eq!(a.inbox(), a_inbox_before, "nothing reached a");
+    assert!(
+        !a_svc.log.text().contains("internet_direct inbound"),
+        "a saw no Internet dial at all:\n{}",
+        a_svc.log.text()
+    );
+    // B verifies A's fingerprint and pins it (adding again with --verify-fp
+    // keeps the petname, tag and routes).
+    let pinned = b.raven(
+        &[
+            "contact",
+            "add",
+            "--address",
+            &a.address,
+            "--pub-hex",
+            &a.pub_hex,
+            "--verify-fp",
+            &a.fingerprint,
+        ],
+        None,
+    );
+    assert!(pinned.ok, "b pins a:\n{}", pinned.all());
+    assert!(
+        pinned.stdout.contains("pinned      yes"),
+        "{}",
+        pinned.all()
+    );
+
     // No LAN route: `--carrier lan` refuses at once, nothing is dialled.
     let lan_only = a.raven(
         &["send", "--contact", "@bob", "--carrier", "lan"],
@@ -657,7 +721,7 @@ fn c2_internet_direct_routes_both_ways_and_stranger_is_refused() {
         .unwrap_or_else(|| panic!("no internet row in status:\n{}", status.stdout));
     assert!(row.contains("YES"), "{row}");
 
-    // ── Stranger: S holds B's card, B does not know S ───────────────────
+    // ── Stranger: S holds B's card (verified), B does not know S ─────────
     let s = Profile::create_with(root.path(), "is", internet_lab_unlock());
     let _s_svc = s.start_service();
     let added = s.raven(
@@ -670,6 +734,8 @@ fn c2_internet_direct_routes_both_ways_and_stranger_is_refused() {
             "bob",
             "--tag",
             "bob",
+            "--verify-fp",
+            &b.fingerprint,
         ],
         None,
     );
@@ -692,6 +758,7 @@ fn c2_internet_direct_routes_both_ways_and_stranger_is_refused() {
             l.contains("internet_direct inbound") && l.contains("not a local contact")
         })
         .unwrap_or_else(|| panic!("b did not log the refusal:\n{}", b_svc.log.text()));
+    let stranger_logged = Instant::now();
     assert!(
         !reason.contains(&s.pub_hex) && !reason.contains(&s.address),
         "the refusal log names the stranger: {reason}"
@@ -705,8 +772,192 @@ fn c2_internet_direct_routes_both_ways_and_stranger_is_refused() {
         !b.inbox().contains("c2 stranger probe"),
         "b accepted the stranger's message"
     );
-    // A still gets through after the refusal.
+    // ── Unverified contact: B adds S but never pins it ───────────────────
+    // On the Internet listener such a contact is a stranger: S learns nothing
+    // but "not accepted" (no hello, no RLB1), and B logs a key-free reason.
+    let added = b.raven(
+        &[
+            "contact",
+            "add",
+            "--address",
+            &s.address,
+            "--pub-hex",
+            &s.pub_hex,
+            "--petname",
+            "sam",
+            "--tag",
+            "sam",
+        ],
+        None,
+    );
+    assert!(added.ok, "b contact add s:\n{}", added.all());
+    // Peer-caused refusals are logged once per 10 s window: let the stranger's
+    // window close so this refusal gets its own line.
+    std::thread::sleep(Duration::from_secs(11).saturating_sub(stranger_logged.elapsed()));
+    let refused = s.send("bob", "c2 unverified contact probe");
+    assert!(!refused.ok, "unverified send succeeded:\n{}", refused.all());
+    assert!(
+        !refused.stdout.to_lowercase().contains("delivered"),
+        "{}",
+        refused.all()
+    );
+    assert!(
+        refused.all().contains("LINK_NOT_ACCEPTED"),
+        "an unverified contact must see only the fixed refusal:\n{}",
+        refused.all()
+    );
+    let reason = b_svc
+        .log
+        .wait_for(LOG_TIMEOUT, |l| {
+            l.contains("internet_direct inbound") && l.contains("not verified")
+        })
+        .unwrap_or_else(|| panic!("b did not log the refusal:\n{}", b_svc.log.text()));
+    assert!(
+        !reason.contains(&s.pub_hex) && !reason.contains(&s.address),
+        "the refusal log names the contact: {reason}"
+    );
+    let cache = std::fs::read_to_string(s.dir.join("peer_device_certs.json")).unwrap_or_default();
+    assert!(
+        !cache.contains(&b.pub_hex),
+        "the unverified contact received b's certificate:\n{cache}"
+    );
+    assert!(
+        !b.inbox().contains("c2 unverified contact probe"),
+        "b accepted the unverified contact's Internet message"
+    );
+    // A still gets through after the refusals.
     let again = a.send("bob", "c2 after the stranger");
     assert_delivered("a→b after the stranger", &again);
     assert!(b.inbox().contains("c2 after the stranger"));
+}
+
+/// A free loopback port for a service that must restart on the same address.
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// The 8-hex message id a queued send prints (`mid=1a2b3c4d…`).
+fn queued_mid(out: &Output) -> String {
+    let all = out.all();
+    let at = all
+        .find("mid=")
+        .unwrap_or_else(|| panic!("no mid= in the queued line:\n{all}"));
+    all[at + 4..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect()
+}
+
+/// C4: a message staged while B is down is delivered by A's background outbox
+/// after both services restart, with no new `raven send` (transports design
+/// §6.4 C4, P2a).
+#[test]
+#[ignore = "multi-process harness: cargo build -p ash first, then run with --ignored"]
+fn c4_outbox_delivers_after_a_restart_without_a_new_send() {
+    if !lab_ready() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let a = Profile::create(root.path(), "oa");
+    let b = Profile::create(root.path(), "ob");
+    let b_listen = format!("127.0.0.1:{}", free_loopback_port());
+    let a_svc = a.start_service();
+    let b_svc = b.start_service_on(&b_listen, None);
+    assert_eq!(b_svc.lan_dial, b_listen);
+    a.add_contact(&b, "bob", &b_svc.lan_dial);
+    b.add_contact(&a, "alice", &a_svc.lan_dial);
+    assert_delivered("a→b (session)", &a.send("bob", "c4 first"));
+
+    // B goes down; A's send is queued and handed to raven-node's outbox, and
+    // `raven send` ends right away instead of waiting the peer out.
+    drop(b_svc);
+    let text = "c4 sent while bob was down";
+    let started = Instant::now();
+    let queued = a.send("bob", text);
+    let took = started.elapsed();
+    assert!(!queued.ok, "nothing confirmed it yet:\n{}", queued.all());
+    assert!(
+        queued
+            .all()
+            .contains("raven-node keeps trying in the background until"),
+        "{}",
+        queued.all()
+    );
+    assert!(took < Duration::from_secs(10), "raven send took {took:?}");
+    let mid = queued_mid(&queued);
+    assert_eq!(mid.len(), 8, "{mid}");
+    let status = a.raven(&["outbox", "status", &mid], None);
+    assert!(status.ok, "{}", status.all());
+    assert!(
+        ["state       queued", "state       sent", "state       held"]
+            .iter()
+            .any(|s| status.stdout.contains(s)),
+        "{}",
+        status.all()
+    );
+
+    // Kill A after staging: the schedule is in memory only, the staged bytes
+    // are in A's session store. B stays down for a few seconds (the scenario,
+    // not a synchronisation), then A comes back first (its rebuilt outbox
+    // tries, finds B down and backs off), then B on its old port.
+    drop(a_svc);
+    std::thread::sleep(Duration::from_secs(3));
+    let a_svc = a.start_service();
+    assert!(
+        a_svc
+            .log
+            .wait_for(READY_TIMEOUT, |l| l.contains("raven-node outbox: running"))
+            .is_some(),
+        "a's outbox did not start:\n{}",
+        a_svc.log.text()
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let b_svc = b.start_service_on(&b_listen, None);
+
+    // No new send: A's outbox delivers on its next retry (5 s doubling).
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let delivered = loop {
+        let st = a.raven(&["outbox", "status", &mid], None);
+        if st.ok && st.stdout.contains("state       delivered") {
+            break st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not delivered within 90 s:\n{}\n{}\n{}",
+            st.all(),
+            a_svc.log.text(),
+            b_svc.log.text()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(
+        delivered.stdout.contains("history     delivered"),
+        "{}",
+        delivered.all()
+    );
+    assert!(
+        delivered.stdout.contains("carrier     lan_dial"),
+        "{}",
+        delivered.all()
+    );
+    let inbox = b.inbox();
+    assert_eq!(
+        inbox.matches(text).count(),
+        1,
+        "exactly once on b:\n{inbox}"
+    );
+    let list = a.raven(&["outbox", "list"], None);
+    assert!(list.ok, "{}", list.all());
+    assert!(
+        list.stdout.contains("Nothing waiting"),
+        "nothing left to retry:\n{}",
+        list.all()
+    );
+    // The next send needs nothing from the outbox and is delivered as usual.
+    assert_delivered("a→b after c4", &a.send("bob", "c4 after the restart"));
+    assert_eq!(b.inbox().matches(text).count(), 1, "still exactly once");
 }

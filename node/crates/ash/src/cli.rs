@@ -369,6 +369,20 @@ enum Commands {
     },
     /// Show the messages you received.
     Inbox,
+    /// Messages raven-node is still trying to deliver (it retries them in the
+    /// background until they are confirmed or expire).
+    ///
+    ///   raven outbox                    # what is waiting
+    ///
+    ///   raven outbox status 1a2b3c4d    # one message (the id the list shows)
+    ///
+    ///   raven outbox retry 1a2b3c4d     # try again now
+    ///
+    ///   raven outbox cancel 1a2b3c4d    # stop trying (it may already have arrived)
+    Outbox {
+        #[command(subcommand)]
+        cmd: Option<OutboxCommands>,
+    },
     /// Print welcome banner only (safe — no secrets).
     Banner,
     /// Stay online to receive messages from your contacts (keep this window open).
@@ -437,6 +451,30 @@ enum Commands {
     Lab {
         #[command(subcommand)]
         cmd: LabCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OutboxCommands {
+    /// What is waiting, and what finished recently.
+    List {
+        /// Only messages to this contact (name, @tag or rvn1 address).
+        #[arg(long)]
+        contact: Option<String>,
+    },
+    /// Where one message stands: state, carrier, attempts, next try, last error.
+    Status {
+        /// Message id (8+ hex characters, as `raven outbox list` shows it).
+        mid: String,
+    },
+    /// Try to deliver it again now.
+    Retry { mid: String },
+    /// Stop trying to deliver it (it may already have arrived).
+    Cancel {
+        mid: String,
+        /// Skip the typed confirmation (scripts).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
 }
 
@@ -2075,7 +2113,7 @@ fn cmd_messages(data_dir: &Path) {
             }
             if marked {
                 println!(
-                    "{C_DIM}[queued] = not delivered yet; [failed] = could not be delivered.{C_RESET}"
+                    "{C_DIM}[queued] = not delivered yet; [failed] = could not be delivered; [expired] = not delivered before it expired; [cancelled] = you stopped it.{C_RESET}"
                 );
             }
         }
@@ -2083,6 +2121,37 @@ fn cmd_messages(data_dir: &Path) {
             eprintln!("local protected history unavailable: {error}");
         }
     }
+}
+
+/// `raven outbox ...`: the contact selector becomes its key first.
+fn cmd_outbox_cli(data_dir: &Path, cmd: Option<OutboxCommands>) -> Result<(), String> {
+    let cmd = match cmd.unwrap_or(OutboxCommands::List { contact: None }) {
+        OutboxCommands::List { contact } => {
+            let contact_pub_hex = match contact {
+                None => None,
+                Some(sel) => {
+                    let contacts = load_contacts(data_dir)?;
+                    let hits = resolve_contact_arg(&contacts, &sel);
+                    match hits.as_slice() {
+                        [one] => Some(one.pub_hex.clone()),
+                        [] => return Err(no_contact_message(&contacts, &sel)),
+                        many => {
+                            return Err(format!(
+                                "contact {} is ambiguous ({} matches): use the @tag",
+                                sanitize_terminal_line(&sel),
+                                many.len()
+                            ))
+                        }
+                    }
+                }
+            };
+            ext::OutboxCmd::List { contact_pub_hex }
+        }
+        OutboxCommands::Status { mid } => ext::OutboxCmd::Status { mid },
+        OutboxCommands::Retry { mid } => ext::OutboxCmd::Retry { mid },
+        OutboxCommands::Cancel { mid, yes } => ext::OutboxCmd::Cancel { mid, yes },
+    };
+    ext::cmd_outbox(data_dir, cmd)
 }
 
 fn now_ms() -> u64 {
@@ -4558,6 +4627,7 @@ fn cmd_contact_remove(
     }
     contacts.retain(|c| !c.pub_hex.eq_ignore_ascii_case(&target.pub_hex));
     save_contacts(data_dir, &contacts)?;
+    forget_outbox_routes(data_dir, &target.pub_hex);
     println!("{C_GREEN}removed{C_RESET} {}", target.primary_label());
     // Removing a contact is the explicit re-pin: also forget the prekey pinned
     // for it, so a contact that reinstalled (and is refused as PEER_PREKEY_RESET
@@ -4610,6 +4680,7 @@ fn cmd_contact_set_dial(
     let contacts = load_contacts(data_dir)?;
     let target = select_one_contact(&contacts, tag, petname, address)?;
     update_contact_lan_dial(data_dir, &target.pub_hex, lan_dial)?;
+    forget_outbox_routes(data_dir, &target.pub_hex);
     println!(
         "{C_GREEN}lan_dial updated{C_RESET} {} → {}",
         target.primary_label(),
@@ -4709,6 +4780,15 @@ fn select_contact_for_edit(
     }
 }
 
+/// The contact's addresses changed or it was removed: raven-node's outbox
+/// forgets the routes recorded for its queued messages (it then plans from the
+/// contact book alone). Best effort: the records are hints only.
+fn forget_outbox_routes(data_dir: &Path, pub_hex: &str) {
+    if let Ok(key) = parse_pub_hex(pub_hex) {
+        let _ = raven_core::outbox::clear_peer_routes(data_dir, &key);
+    }
+}
+
 /// `raven contact set-addr`: set or clear one contact's LAN and Internet
 /// routes in place (petname, tag and pin are untouched). Every value is checked
 /// before the book is read, so a typo changes nothing.
@@ -4738,6 +4818,7 @@ fn cmd_contact_set_addr(
     }
     let (lan_now, inet_now) = (row.lan_dial.clone(), row.internet_dial.clone());
     save_contacts(data_dir, &contacts)?;
+    forget_outbox_routes(data_dir, &target.pub_hex);
     let show = |v: &str| {
         if v.is_empty() {
             "(none)".to_string()
@@ -5804,6 +5885,29 @@ fn set_addr_hint(c: &Contact, flag: &str) -> String {
     format!("raven contact set-addr {sel} {flag} HOST:PORT")
 }
 
+/// The refusal for an Internet send to a contact that is not verified, with the
+/// two commands that fix it (show the fingerprint; pin it by adding again).
+fn unverified_contact_text(c: &Contact) -> String {
+    let (who, verify) = match c.tag_subtitle() {
+        Some(tag) => (
+            tag.clone(),
+            format!("raven contact verify --tag {}", tag.trim_start_matches('@')),
+        ),
+        None => (
+            c.primary_label(),
+            format!(
+                "raven contact verify --address {}",
+                sanitize_terminal_line(&c.address)
+            ),
+        ),
+    };
+    let pin = match parse_pub_hex(&c.pub_hex) {
+        Ok(key) => pair_init_lab::pin_command_hint(&key),
+        Err(_) => "raven contact add … --verify-fp <the fingerprint they read out>".into(),
+    };
+    pair_init_lab::unverified_internet_text(&who, &verify, &pin)
+}
+
 /// The routes `choice` allows for contact `c`, LAN first (transports design
 /// §2.3). `env` is the `RAVEN_PEER` / `ASH_LAN_DIAL` LAN dial; `internet_live`
 /// is the Internet direct gate. `auto` never plans a held carrier, and a LAN-only
@@ -5839,7 +5943,20 @@ fn plan_contact_routes(
         }
     }
     if choice != CarrierChoice::Lan {
+        // Internet delivery only for a verified (pinned) contact (owner
+        // decision 2026-10-08); LAN stays open to every contact. Decided where
+        // Internet would really be tried (the gate is open): `auto` then keeps
+        // the LAN route alone, and with no LAN route the send is refused.
+        let unverified = internet_live
+            && !raven_core::carrier_allowed_for_contact(
+                raven_core::OutboxCarrier::Internet,
+                c.pinned,
+            );
         match inet {
+            Some(_) if unverified && (routes.is_empty() || choice == CarrierChoice::Internet) => {
+                return Err(unverified_contact_text(c));
+            }
+            Some(_) if unverified => {}
             Some(addr) if internet_live || choice == CarrierChoice::Internet => {
                 routes.push(internet_route(&addr));
             }
@@ -6119,6 +6236,11 @@ fn run_send(
             &target.pub_hex,
             text,
             choice == CarrierChoice::Internet,
+            match choice {
+                CarrierChoice::Auto => raven_core::outbox::CarrierChoice::Auto,
+                CarrierChoice::Lan => raven_core::outbox::CarrierChoice::Lan,
+                CarrierChoice::Internet => raven_core::outbox::CarrierChoice::Internet,
+            },
         ),
     }
 }
@@ -6776,6 +6898,7 @@ pub fn run() {
         Some(Commands::Doctor { require_ready }) => cmd_doctor(&data_dir, require_ready),
         Some(Commands::IpcPing) => cmd_ipc_ping(&data_dir),
         Some(Commands::Inbox) => exit_on_err(cmd_endpoint_inbox(&data_dir)),
+        Some(Commands::Outbox { cmd }) => exit_on_err(cmd_outbox_cli(&data_dir, cmd)),
         Some(Commands::Send {
             peer,
             peer_pub_hex,
@@ -9667,6 +9790,79 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             before
         );
     }
+
+    /// O: when a contact's addresses change (set-dial, set-addr, set-addr
+    /// --clear) or the contact is removed, raven-node's outbox forgets the
+    /// routes it recorded for that contact's queued messages; another
+    /// contact's records stay.
+    #[test]
+    fn contact_edits_and_removal_forget_the_outbox_routes_recorded_for_it() {
+        use raven_core::outbox::{
+            object_route_records, record_object_routes, CarrierChoice, OutboxCarrier, OutboxRoute,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        seed_book(dir.path());
+        let alice = ident(0x0a).public_key_bytes();
+        let bob = ident(0x0b).public_key_bytes();
+        let now = super::now_ms();
+        let record = |mid: u8, peer: &[u8; 32]| {
+            let route = OutboxRoute {
+                carrier: OutboxCarrier::Lan,
+                dial: "192.168.1.20:7420".into(),
+            };
+            record_object_routes(
+                dir.path(),
+                &[mid; 16],
+                peer,
+                CarrierChoice::Lan,
+                &[route],
+                now + 3_600_000,
+                now,
+            )
+            .unwrap();
+        };
+        let held = |mid: u8| {
+            object_route_records(dir.path(), now)
+                .unwrap()
+                .contains_key(&[mid; 16])
+        };
+        let edits: [&dyn Fn() -> Result<(), String>; 4] = [
+            &|| cmd_contact_set_dial(dir.path(), Some("@alice"), None, None, "192.168.1.31:7420"),
+            &|| {
+                cmd_contact_set_addr(
+                    dir.path(),
+                    Some("@alice"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("[2001:db8::7]:7422"),
+                    &[],
+                )
+            },
+            &|| {
+                cmd_contact_set_addr(
+                    dir.path(),
+                    Some("@alice"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &["internet".into()],
+                )
+            },
+            &|| cmd_contact_remove(dir.path(), Some("alice"), None, None, true),
+        ];
+        for (i, edit) in edits.iter().enumerate() {
+            record(1, &alice);
+            record(2, &bob);
+            assert!(held(1) && held(2));
+            edit().unwrap();
+            assert!(!held(1), "edit {i} kept Alice's recorded routes");
+            assert!(held(2), "edit {i} dropped Bob's recorded routes");
+        }
+    }
     // ── plain-language screens ──────────────────────────────────────────────
 
     #[test]
@@ -10406,6 +10602,52 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
                 && err.contains("raven contact set-addr @alice --internet"),
             "{err}"
         );
+    }
+
+    /// Owner decision 2026-10-08: Internet delivery only for verified (pinned)
+    /// contacts. An unpinned contact keeps LAN exactly as before.
+    #[test]
+    fn an_unverified_contact_never_gets_an_internet_route() {
+        let unpinned = |lan: &str, inet: &str| Contact {
+            pinned: false,
+            ..contact_with(lan, inet)
+        };
+        let both = unpinned("192.168.1.20:7420", "203.0.113.7:7422");
+        let inet_only = unpinned("", "203.0.113.7:7422");
+        let auto = CarrierChoice::Auto;
+        // auto: the Internet route is skipped, LAN stays.
+        assert_eq!(
+            plan(&both, auto, None, true).unwrap(),
+            ["lan_dial=192.168.1.20:7420"]
+        );
+        // Internet the only route, or asked for: refused, nothing planned.
+        for (c, choice) in [
+            (&inet_only, auto),
+            (&inet_only, CarrierChoice::Internet),
+            (&both, CarrierChoice::Internet),
+        ] {
+            let err = plan(c, choice, None, true).unwrap_err();
+            assert!(
+                err.starts_with("NOT SENT: @alice is not verified: Internet delivery needs the fingerprint checked first"),
+                "{err}"
+            );
+            assert!(err.contains("raven contact verify --tag alice"), "{err}");
+            assert!(
+                err.contains("raven contact add --address rvn1") && err.contains("--verify-fp"),
+                "{err}"
+            );
+            assert!(err.contains("Nothing was dialled"), "{err}");
+            assert!(err.contains(raven_core::CONTACT_NOT_VERIFIED), "{err}");
+        }
+        // LAN is untouched for an unpinned contact.
+        assert_eq!(
+            plan(&both, CarrierChoice::Lan, None, true).unwrap(),
+            ["lan_dial=192.168.1.20:7420"]
+        );
+        // With the gate held the gate refusal still comes first.
+        assert!(plan(&inet_only, auto, None, false)
+            .unwrap_err()
+            .starts_with("INTERNET_DIRECT_HOLD"));
     }
 
     #[test]

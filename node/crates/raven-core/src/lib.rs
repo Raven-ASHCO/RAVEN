@@ -60,6 +60,7 @@ pub mod messaging_path;
 pub mod mlkem768_incremental;
 pub mod nearby;
 pub mod node_policy;
+pub mod outbox;
 pub mod pair_init;
 pub mod pair_init_lan_oob;
 pub mod paths;
@@ -172,6 +173,10 @@ pub use messaging_path::{
 };
 pub use nearby::{nearby_safety_phrase, NearbyAdvertisement, NearbyRegistry};
 pub use node_policy::{load_policy, policy_path, save_policy, BridgeStatusSnapshot, NodePolicy};
+pub use outbox::{
+    carrier_allowed_for_contact, contact_is_pinned, envelope_expires_at, OutboxCarrier,
+    OutboxRoute, PeerSendLock, CONTACT_NOT_VERIFIED, ENVELOPE_VALIDITY_MS,
+};
 pub use pair_init::{
     confirmation_tag, decode_init, decode_response as decode_pair_response,
     derive_provisional_root, device_certificate_hash, encode_init,

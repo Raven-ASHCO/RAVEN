@@ -3167,6 +3167,35 @@ impl IndexedSessionStore {
         Ok(changed > 0)
     }
 
+    /// An accepted ACK proved that this message reached its recipient while its
+    /// outbox row was still `Prepared` (the dial that carried it ended before
+    /// the reply, and the ACK came back another way). Record the handoff, the
+    /// same `Prepared -> Queued` step a successful dial records, so no retry
+    /// dials a delivered message again. Only when the outstanding row is
+    /// `Delivered` or `Read`; `Ok(true)` when a row moved.
+    pub fn settle_delivered_outbound(
+        &mut self,
+        session_id: &[u8; 32],
+        message_id: &[u8; 16],
+    ) -> Result<bool, IndexedSessionStoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE endpoint_outbox SET state = 1
+             WHERE session_id = ?1 AND message_id = ?2 AND kind = 1 AND state = 0
+               AND EXISTS (
+                 SELECT 1 FROM endpoint_outstanding_messages m
+                 WHERE m.session_id = endpoint_outbox.session_id
+                   AND m.message_id = endpoint_outbox.message_id
+                   AND m.recipient_device = endpoint_outbox.recipient_device
+                   AND m.delivery_state IN (1, 2))",
+            params![session_id.as_slice(), message_id.as_slice()],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
     pub fn list_record_keys(
         &self,
     ) -> Result<Vec<IndexedSessionRecordKey>, IndexedSessionStoreError> {

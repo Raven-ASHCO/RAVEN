@@ -599,6 +599,9 @@ struct Net {
     a: tempfile::TempDir,
     b: tempfile::TempDir,
     mode: Arc<AtomicU8>,
+    /// The faked service runs raven-node's background outbox (it accepts
+    /// `OutboxKick`); off, it answers like an older service.
+    outbox: Arc<AtomicBool>,
 }
 
 impl Net {
@@ -625,11 +628,13 @@ impl Net {
         }
         let a_bundle = local_bundle(a.path(), &alice).unwrap();
         let mode = Arc::new(AtomicU8::new(UP));
+        let outbox = Arc::new(AtomicBool::new(false));
         let listener = UnixListener::bind(raven_core::default_socket_path(a.path())).unwrap();
-        let (b_dir, bob_c, mode_c) = (
+        let (b_dir, bob_c, mode_c, outbox_c) = (
             b.path().to_path_buf(),
             Identity::from_seed(&[0x42; 32]),
             mode.clone(),
+            outbox.clone(),
         );
         let alice_pub = alice.public_key_bytes();
         std::thread::spawn(move || {
@@ -644,14 +649,19 @@ impl Net {
                     &alice_pub,
                     &mode_c,
                     &first_ack,
+                    &outbox_c,
                 );
             }
         });
-        Self { a, b, mode }
+        Self { a, b, mode, outbox }
     }
 
     fn set_mode(&self, mode: u8) {
         self.mode.store(mode, Ordering::SeqCst);
+    }
+
+    fn set_outbox(&self, running: bool) {
+        self.outbox.store(running, Ordering::SeqCst);
     }
 
     fn send(&self, message: &str) -> Output {
@@ -674,6 +684,7 @@ impl Net {
 }
 
 /// One framed `IpcRequest` in, one framed `IpcResponse` out.
+#[allow(clippy::too_many_arguments)]
 fn serve_one(
     stream: &mut UnixStream,
     b_dir: &Path,
@@ -682,6 +693,7 @@ fn serve_one(
     alice_pub: &[u8; 32],
     mode: &AtomicU8,
     first_ack: &std::sync::Mutex<Option<Vec<u8>>>,
+    outbox: &AtomicBool,
 ) {
     let mut len = [0u8; 4];
     if stream.read_exact(&mut len).is_err() {
@@ -757,6 +769,9 @@ fn serve_one(
                 }
             }
         },
+        Ok(IpcRequest::OutboxKick { .. }) if outbox.load(Ordering::SeqCst) => {
+            IpcResponse::Accepted { v: IPC_VERSION }
+        }
         _ => error("unsupported request"),
     };
     let _ = stream.write_all(&encode_response(&response).unwrap());
@@ -889,8 +904,10 @@ fn a_queued_message_is_named_by_its_text_and_delivered_by_the_next_send() {
         ),
         "{err}"
     );
+    // This faked service has no background outbox (an older raven-node): the
+    // next send retries it, until the envelope's expiry a day from now.
     assert!(err.contains("It is NOT retried automatically"), "{err}");
-    assert!(err.contains("within 60 minutes"), "{err}");
+    assert!(err.contains("UTC (in about 24 h)"), "{err}");
 
     let o = net.send("second one");
     let err = text(&o.stderr);
@@ -921,6 +938,44 @@ fn a_queued_message_is_named_by_its_text_and_delivered_by_the_next_send() {
         "{out}"
     );
     assert_eq!(net.bob_inbox(), vec!["are you there", "first", "third"]);
+}
+
+/// With raven-node's background outbox the queued sentence says so: nothing to
+/// do, no retyping, and until when it keeps trying (a day, the envelope's
+/// validity). The send itself returns at once instead of waiting it out.
+#[test]
+fn a_queued_message_is_handed_to_the_background_outbox() {
+    let net = Net::new(true);
+    assert_eq!(code(&net.send("first")), 0);
+    net.set_mode(DOWN);
+    net.set_outbox(true);
+    let started = std::time::Instant::now();
+    let o = net.send("are you there");
+    let (out, err) = (text(&o.stdout), text(&o.stderr));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "a queued send ends within 10 s"
+    );
+    assert_eq!(code(&o), 1, "not delivered yet: {err}");
+    assert!(!out.to_lowercase().contains("delivered"), "stdout: {out}");
+    assert!(
+        err.starts_with(
+            "not delivered yet: your message \"are you there\" to Bob is queued locally because"
+        ),
+        "{err}"
+    );
+    for words in [
+        "Queued: raven-node keeps trying in the background until ",
+        "UTC (in about 24 h)",
+        "you do not need to send it again",
+        "Do not retype this message: it goes out as soon as Bob can be reached.",
+    ] {
+        assert!(err.contains(words), "{words:?} missing: {err}");
+    }
+    assert!(!err.contains("NOT retried"), "{err}");
+    // The routes this send used are recorded for the worker (hints only).
+    let routes = std::fs::read_to_string(net.a.path().join("outbox_routes.json")).unwrap();
+    assert!(routes.contains("127.0.0.1:9"), "{routes}");
 }
 
 /// A local chat-history failure while the message is being staged leaves nothing

@@ -396,6 +396,79 @@ fn handle_req(req: IpcRequest, data_dir: &Path, forward: &Option<ForwardQueue>) 
                 }
             }
         }
+        IpcRequest::OutboxKick { v, peer_pub_hex } => {
+            let peer = match peer_pub_hex.as_deref().map(parse_hex_array::<32>) {
+                None => None,
+                Some(Some(peer)) => Some(peer),
+                Some(None) => {
+                    return IpcResponse::Error {
+                        v,
+                        code: "IPC_BAD_PEER".into(),
+                        message: "peer_pub_hex must be 64 hex chars".into(),
+                    };
+                }
+            };
+            if crate::outbox::kick(peer.as_ref(), true) {
+                IpcResponse::Accepted { v }
+            } else {
+                IpcResponse::Error {
+                    v,
+                    code: "OUTBOX_WORKER_OFF".into(),
+                    message: "this raven-node runs no outbox worker (only `raven-node service` \
+                              does): nothing is retried in the background"
+                        .into(),
+                }
+            }
+        }
+        IpcRequest::OutboxStatus { v, message_id_hex } => {
+            let Some(mid) = parse_hex_array::<16>(&message_id_hex) else {
+                return IpcResponse::Error {
+                    v,
+                    code: "IPC_BAD_MESSAGE_ID".into(),
+                    message: "message_id_hex must be 32 hex chars".into(),
+                };
+            };
+            match crate::outbox::status_anywhere(data_dir, &mid) {
+                Some(item) => IpcResponse::OutboxStatusResult { v, item },
+                None => IpcResponse::Error {
+                    v,
+                    code: "OUTBOX_NOT_FOUND".into(),
+                    message: "no outbound message with that id on this profile".into(),
+                },
+            }
+        }
+        IpcRequest::OutboxList {
+            v,
+            peer_pub_hex,
+            limit,
+        } => {
+            let peer = match peer_pub_hex.as_deref().map(parse_hex_array::<32>) {
+                None => None,
+                Some(Some(peer)) => Some(peer),
+                Some(None) => {
+                    return IpcResponse::Error {
+                        v,
+                        code: "IPC_BAD_PEER".into(),
+                        message: "peer_pub_hex must be 64 hex chars".into(),
+                    };
+                }
+            };
+            let limit = limit
+                .unwrap_or(50)
+                .clamp(1, raven_core::ipc::MAX_OUTBOX_LIST) as usize;
+            match crate::outbox::list_anywhere(data_dir, peer.as_ref(), limit) {
+                Ok((worker_running, items)) => IpcResponse::OutboxListResult {
+                    v,
+                    worker_running,
+                    items,
+                },
+                Err(e) => IpcResponse::Error {
+                    v,
+                    code: "OUTBOX_STORE".into(),
+                    message: e,
+                },
+            }
+        }
         IpcRequest::LanDial { v, .. } => IpcResponse::Error {
             v,
             code: "INTERNAL".into(),
@@ -436,6 +509,15 @@ fn outbox_failed_message(forward_queued: bool, cause: &str) -> String {
 fn is_device_pub_hex(s: &str) -> bool {
     let t = s.trim();
     t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Exactly `N` bytes of hex (either case), or `None`.
+fn parse_hex_array<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let t = s.trim();
+    if t.len() != N * 2 {
+        return None;
+    }
+    hex::decode(t).ok()?.try_into().ok()
 }
 
 /// Ops that read or write the shared forward queue (serialized by its lock).

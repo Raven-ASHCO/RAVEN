@@ -27,8 +27,8 @@ use crate::device_sync::RevocationStore;
 use crate::envelope::{EnvType, Envelope};
 use crate::identity::Identity;
 use crate::indexed_session_store::{
-    AuthorizedEndpointDevice, EndpointAcceptance, EndpointDeliveryState, IndexedSessionRecordKey,
-    IndexedSessionStore, IndexedSessionStoreError, LocalRole,
+    AuthorizedEndpointDevice, EndpointAcceptance, EndpointAckAcceptance, EndpointDeliveryState,
+    IndexedSessionRecordKey, IndexedSessionStore, IndexedSessionStoreError, LocalRole,
 };
 use crate::lan_rlb1::{decode_offer, encode_offer, is_rlb1, LanBundle};
 use crate::pair_init::{
@@ -561,16 +561,59 @@ pub const LINK_REFUSED_BLOCKED: &str =
 /// the Raven ID) and that it was not accepted. Fail closed: an unreadable
 /// contact book or block list admits nobody.
 pub fn link_peer_admission(data_dir: &Path, noise_ed: &[u8; 32]) -> Result<(), &'static str> {
-    let key = hex::encode(noise_ed);
-    let contact = contact_pub_set(data_dir)
-        .map(|set| set.contains(&key))
-        .unwrap_or(false);
-    if !contact {
-        return Err(LINK_REFUSED_NOT_CONTACT);
+    match crate::outbox::contact_admission(data_dir, noise_ed) {
+        crate::outbox::ContactAdmission::Allowed(_) => Ok(()),
+        crate::outbox::ContactAdmission::Blocked => Err(LINK_REFUSED_BLOCKED),
+        crate::outbox::ContactAdmission::NotContact
+        | crate::outbox::ContactAdmission::Unreadable => Err(LINK_REFUSED_NOT_CONTACT),
     }
-    match BlockList::load_checked(data_dir) {
-        Ok(blocks) if !blocks.is_blocked(&key) => Ok(()),
-        _ => Err(LINK_REFUSED_BLOCKED),
+}
+
+/// Why a responder closed a dialer that is a local contact but not a verified
+/// one, on a link where that is not enough (Internet; LAN from outside the
+/// local network). Local log text only.
+pub const LINK_REFUSED_NOT_VERIFIED: &str =
+    "inbound peer is a contact but not verified (this link needs a pinned fingerprint); link \
+     closed before our identity was sent";
+
+/// [`link_peer_admission`] for one carrier, as the listeners apply it before
+/// they reveal anything: the dialer must be a current, unblocked contact, and
+/// beyond the local network a **verified** (pinned) one
+/// ([`crate::outbox::carrier_allowed_for_contact`] and
+/// [`crate::outbox::is_local_network_ip`], owner decision 2026-10-08):
+/// - Internet direct: pinned contacts only;
+/// - LAN direct: any contact from a local-network source address (`source`),
+///   pinned contacts from anywhere. An unknown source counts as remote.
+///
+/// A refused contact is treated exactly like a stranger. Every refusal path
+/// does the same work (one contact-book read, one block-list read), so the
+/// time to refuse does not tell a scanner whether a key is a contact.
+/// Fail closed on an unreadable book or block list.
+pub fn link_admission(
+    data_dir: &Path,
+    noise_ed: &[u8; 32],
+    carrier: crate::outbox::OutboxCarrier,
+    source: Option<std::net::IpAddr>,
+) -> Result<(), &'static str> {
+    use crate::outbox::{
+        carrier_allowed_for_contact, contact_admission, is_local_network_ip, ContactAdmission,
+        OutboxCarrier,
+    };
+    let local = source.is_some_and(is_local_network_ip);
+    match contact_admission(data_dir, noise_ed) {
+        ContactAdmission::Allowed(contact) => {
+            let allowed = carrier_allowed_for_contact(carrier, contact.pinned)
+                && (carrier != OutboxCarrier::Lan || contact.pinned || local);
+            if allowed {
+                Ok(())
+            } else {
+                Err(LINK_REFUSED_NOT_VERIFIED)
+            }
+        }
+        ContactAdmission::Blocked => Err(LINK_REFUSED_BLOCKED),
+        ContactAdmission::NotContact | ContactAdmission::Unreadable => {
+            Err(LINK_REFUSED_NOT_CONTACT)
+        }
     }
 }
 
@@ -581,13 +624,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Envelope expiry must stay inside the PairInit session window (typically 24h).
+/// Envelope expiry must stay inside the PairInit session window (typically
+/// 24h): the shared validity policy of `raven send` and the outbox
+/// ([`crate::outbox::ENVELOPE_VALIDITY_MS`]).
 fn envelope_expires(now: u64, session_expires: u64) -> Result<u64, String> {
-    let expires = now.saturating_add(60 * 60 * 1000).min(session_expires);
-    if expires <= now {
-        return Err("session expired".into());
-    }
-    Ok(expires)
+    crate::outbox::envelope_expires_at(now, session_expires)
 }
 
 /// Publish a local hybrid prekey if none is valid or the current one is due
@@ -1543,7 +1584,30 @@ fn handle_ack(data_dir: &Path, peer: &LanBundle, packed: &[u8]) -> Result<Vec<Ve
         match sessions.accept_ack_envelope(&key, packed, &peer.cert, sender_revoked, now) {
             Err(IndexedSessionStoreError::RouteTagMismatch) => continue,
             result => {
-                result.map_err(|e| e.redacted_display())?;
+                let (EndpointAckAcceptance::Committed {
+                    session_id,
+                    acked_message_id,
+                    ..
+                }
+                | EndpointAckAcceptance::Duplicate {
+                    session_id,
+                    acked_message_id,
+                    ..
+                }) = result.map_err(|e| e.redacted_display())?;
+                // An ACK that arrives on a link the peer opened (its outbox
+                // pushing an ACK our dial never got back, transports design
+                // F8) is the delivery: record it in the history now. Best
+                // effort: the ACK is committed, and a missing history row is
+                // repaired by `reconcile_outbound_stage_history` later.
+                // The ACK proves delivery: a row still `Prepared` (our dial
+                // ended before the reply) must not be dialled again.
+                let _ = sessions.settle_delivered_outbound(&session_id, &acked_message_id);
+                let _ = crate::outbox::record_inbound_ack_delivery(
+                    data_dir,
+                    &peer.cert.device_ed_pub,
+                    &session_id,
+                    &acked_message_id,
+                );
                 return Ok(Vec::new());
             }
         }
@@ -1676,6 +1740,19 @@ fn load_session_bound_peer_cert(
         }
     }
     Ok(None)
+}
+
+/// The peer certificate bound into `record_key` at PairInit, from the local
+/// caches (see `load_session_bound_peer_cert`): the only certificate the send
+/// path and the outbox worker evaluate revocation against and verify ACKs with.
+/// `None` when no cached certificate hashes to the session's digest.
+pub fn session_bound_peer_certificate(
+    data_dir: &Path,
+    store: &mut IndexedSessionStore,
+    record_key: &IndexedSessionRecordKey,
+    peer_device: &[u8; 32],
+) -> Result<Option<DeviceCertificate>, String> {
+    load_session_bound_peer_cert(data_dir, store, record_key, peer_device)
 }
 
 pub fn find_confirmed_peer_session(
@@ -2576,6 +2653,51 @@ mod tests {
             // The smoke scripts grep the service log for this phrase.
             assert!(reason.contains("not a local contact") || reason.contains("blocked"));
         }
+    }
+
+    /// Owner decision 2026-10-08 on the listeners: an unverified contact is
+    /// accepted on LAN direct from a local-network source only, never on
+    /// Internet direct; a verified one is accepted from anywhere. Refused
+    /// contacts get the stranger's treatment.
+    #[test]
+    fn link_admission_needs_a_verified_contact_beyond_the_local_network() {
+        use crate::outbox::OutboxCarrier::{Internet, Lan};
+        let dir = tempfile::tempdir().unwrap();
+        let (plain, pinned, stranger) = ([0x11u8; 32], [0x22u8; 32], [0x33u8; 32]);
+        std::fs::write(
+            dir.path().join("contacts.json"),
+            format!(
+                r#"[{{"pub_hex":"{}"}},{{"pub_hex":"{}","pinned":true}}]"#,
+                hex::encode(plain),
+                hex::encode(pinned)
+            ),
+        )
+        .unwrap();
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+        let admit =
+            |key: &[u8; 32], carrier, source| link_admission(dir.path(), key, carrier, source);
+        // LAN: an unverified contact from the local network only.
+        assert_eq!(admit(&plain, Lan, ip("192.168.1.20")), Ok(()));
+        assert_eq!(admit(&plain, Lan, ip("::ffff:10.0.0.4")), Ok(()));
+        for remote in [ip("203.0.113.7"), ip("100.64.1.1"), ip("2001:db8::1"), None] {
+            assert_eq!(
+                admit(&plain, Lan, remote),
+                Err(LINK_REFUSED_NOT_VERIFIED),
+                "{remote:?}"
+            );
+        }
+        assert_eq!(admit(&pinned, Lan, ip("203.0.113.7")), Ok(()));
+        // Internet: verified contacts only, whatever the source.
+        assert_eq!(
+            admit(&plain, Internet, ip("127.0.0.1")),
+            Err(LINK_REFUSED_NOT_VERIFIED)
+        );
+        assert_eq!(admit(&pinned, Internet, ip("203.0.113.7")), Ok(()));
+        assert_eq!(
+            admit(&stranger, Lan, ip("127.0.0.1")),
+            Err(LINK_REFUSED_NOT_CONTACT)
+        );
+        assert!(!LINK_REFUSED_NOT_VERIFIED.contains(&hex::encode(plain)));
     }
 
     #[test]

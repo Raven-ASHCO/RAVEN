@@ -9,6 +9,7 @@ mod internet_direct;
 #[cfg(any(unix, windows))]
 mod ipc_server;
 mod lan_direct;
+mod outbox;
 
 #[cfg(any(unix, windows))]
 use std::convert::Infallible;
@@ -2969,6 +2970,7 @@ async fn wait_service_end(
     inet: &mut JoinHandle<Infallible>,
     bridge: &mut JoinHandle<Infallible>,
     prune: &mut JoinHandle<Infallible>,
+    outbox: &mut JoinHandle<Infallible>,
     timeout: Option<Duration>,
 ) -> ServiceEnd {
     let timer = async {
@@ -2999,6 +3001,10 @@ async fn wait_service_end(
         r = &mut *prune => {
             eprintln!("durable_prune supervisor ended: {r:?}");
             ServiceEnd::SupervisorDied("durable_prune")
+        }
+        r = &mut *outbox => {
+            eprintln!("outbox supervisor ended: {r:?}");
+            ServiceEnd::SupervisorDied("outbox")
         }
         _ = timer => {
             eprintln!("raven-node: service timeout");
@@ -3492,6 +3498,12 @@ async fn main() {
             let mut prune_task = tokio::spawn(supervise("durable_prune", None, move || {
                 lan_direct::run_durable_prune(data_prune.clone())
             }));
+            // Retries staged messages (and ACKs we owe) in the background until
+            // the first verified ACK or expiry (transports design §2.4).
+            let data_outbox = data_dir.clone();
+            let mut outbox_task = tokio::spawn(supervise("outbox", None, move || {
+                outbox::run_worker(data_outbox.clone())
+            }));
             // Mock BLE stays on ble_listen. Do not fanout the production LAN port.
             // The service owns --timeout-secs; the bridge itself runs until stopped.
             let mut bridge_task =
@@ -3514,6 +3526,7 @@ async fn main() {
                 &mut inet_task,
                 &mut bridge_task,
                 &mut prune_task,
+                &mut outbox_task,
                 timeout,
             )
             .await;
@@ -3522,6 +3535,7 @@ async fn main() {
             inet_task.abort();
             bridge_task.abort();
             prune_task.abort();
+            outbox_task.abort();
             std::process::exit(end.exit_code());
         }
         Commands::BleStatus => {
@@ -3752,9 +3766,18 @@ mod lifecycle_tests {
         let mut inet = tokio::spawn(std::future::pending::<Infallible>());
         let mut bridge = tokio::spawn(std::future::pending::<Infallible>());
         let mut prune = tokio::spawn(std::future::pending::<Infallible>());
+        let mut outbox = tokio::spawn(std::future::pending::<Infallible>());
         let outcome = tokio::time::timeout(
             Duration::from_secs(3600),
-            wait_service_end(&mut ipc, &mut lan, &mut inet, &mut bridge, &mut prune, None),
+            wait_service_end(
+                &mut ipc,
+                &mut lan,
+                &mut inet,
+                &mut bridge,
+                &mut prune,
+                &mut outbox,
+                None,
+            ),
         )
         .await;
         assert!(
@@ -3768,6 +3791,7 @@ mod lifecycle_tests {
         inet.abort();
         bridge.abort();
         prune.abort();
+        outbox.abort();
         lan.abort();
     }
 
@@ -3826,12 +3850,14 @@ mod lifecycle_tests {
         let mut inet = tokio::spawn(std::future::pending::<Infallible>());
         let mut bridge = tokio::spawn(std::future::pending::<Infallible>());
         let mut prune = tokio::spawn(std::future::pending::<Infallible>());
+        let mut outbox = tokio::spawn(std::future::pending::<Infallible>());
         let end = wait_service_end(
             &mut ipc,
             &mut lan,
             &mut inet,
             &mut bridge,
             &mut prune,
+            &mut outbox,
             Some(Duration::from_secs(300)),
         )
         .await;
@@ -3842,6 +3868,7 @@ mod lifecycle_tests {
         inet.abort();
         bridge.abort();
         prune.abort();
+        outbox.abort();
     }
 
     /// IPC is the one task whose end stops the service, with a non-zero
@@ -3854,11 +3881,53 @@ mod lifecycle_tests {
         let mut inet = tokio::spawn(std::future::pending::<Infallible>());
         let mut bridge = tokio::spawn(std::future::pending::<Infallible>());
         let mut prune = tokio::spawn(std::future::pending::<Infallible>());
-        let end =
-            wait_service_end(&mut ipc, &mut lan, &mut inet, &mut bridge, &mut prune, None).await;
+        let mut outbox = tokio::spawn(std::future::pending::<Infallible>());
+        let end = wait_service_end(
+            &mut ipc,
+            &mut lan,
+            &mut inet,
+            &mut bridge,
+            &mut prune,
+            &mut outbox,
+            None,
+        )
+        .await;
         assert_eq!(end, ServiceEnd::IpcStopped);
         assert_eq!(end.exit_code(), 1);
         assert_eq!(ServiceEnd::SupervisorDied("bridge").exit_code(), 1);
+        lan.abort();
+        inet.abort();
+        bridge.abort();
+        prune.abort();
+        outbox.abort();
+    }
+
+    /// The outbox worker is the sixth supervised task: should its supervisor
+    /// itself ever end, the service stops with a failure status (restarted by
+    /// launchd / systemd), like for every other transport.
+    #[cfg(any(unix, windows))]
+    #[tokio::test(start_paused = true)]
+    async fn the_outbox_supervisor_is_waited_for_like_the_transports() {
+        let mut ipc = tokio::spawn(std::future::pending::<()>());
+        let mut lan = tokio::spawn(std::future::pending::<Infallible>());
+        let mut inet = tokio::spawn(std::future::pending::<Infallible>());
+        let mut bridge = tokio::spawn(std::future::pending::<Infallible>());
+        let mut prune = tokio::spawn(std::future::pending::<Infallible>());
+        let mut outbox: JoinHandle<Infallible> =
+            tokio::spawn(async { panic!("outbox supervisor bug (test)") });
+        let end = wait_service_end(
+            &mut ipc,
+            &mut lan,
+            &mut inet,
+            &mut bridge,
+            &mut prune,
+            &mut outbox,
+            None,
+        )
+        .await;
+        assert_eq!(end, ServiceEnd::SupervisorDied("outbox"));
+        assert_eq!(end.exit_code(), 1);
+        ipc.abort();
         lan.abort();
         inet.abort();
         bridge.abort();

@@ -337,11 +337,21 @@ async fn serve_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     // (or a blocked key) that completed XX gets the connection closed and
     // nothing else, not our hello (Raven identity) and not our RLB1
     // (certificate + prekey bundle). An Internet scanner cannot map IP → ID.
+    // Internet also needs a *verified* (pinned) contact (owner decision
+    // 2026-10-08): an unverified one is treated exactly like a stranger, and
+    // every refusal does the same work (one read of each file), so its timing
+    // does not tell a scanner whether a key is a contact.
     let gate_started = tokio::time::Instant::now();
     {
         let dd = data_dir.clone();
         blocking(move || {
-            raven_core::lan_dispatch::link_peer_admission(&dd, &remote_ed).map_err(String::from)
+            raven_core::lan_dispatch::link_admission(
+                &dd,
+                &remote_ed,
+                raven_core::OutboxCarrier::Internet,
+                None,
+            )
+            .map_err(String::from)
         })
         .await?;
     }
@@ -379,6 +389,8 @@ async fn serve_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     // self-sign a bundle (see `lan_direct::handle_inbound`).
     if trusted {
         slot.authenticated();
+        // A contact that reaches us is online now: retry what we owe it.
+        crate::outbox::peer_seen(&remote_ed);
     }
     write_inet_frame(&mut stream, &mut transport, &local).await?;
 
@@ -414,8 +426,13 @@ async fn serve_inbound<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|e| format!("dispatch join: {e}"))?
         .map_err(|e| format!("dispatch: {e}"))?
         .ok_or_else(|| "blocked peer".to_string())?;
-        for reply in replies {
-            write_inet_frame(&mut stream, &mut transport, &reply).await?;
+        for (i, reply) in replies.iter().enumerate() {
+            if let Err(e) = write_inet_frame(&mut stream, &mut transport, reply).await {
+                // See `lan_direct::handle_inbound`: the outbox pushes the ACK
+                // that never left (transports design F8).
+                crate::outbox::note_unsent_replies(&remote_ed, &replies[i..]);
+                return Err(e);
+            }
         }
     }
     Ok(())
@@ -469,6 +486,7 @@ async fn run_listener_with_limits(
     eprintln!("CLAIM: InternetTransport localhost/lab listen — dial≠WAN");
     LISTENER_UP.store(true, Ordering::Relaxed);
     let _up = ListenerGuard;
+    crate::outbox::listener_up();
     match serve_listener(listener, data_dir, identity, limits).await {}
 }
 
@@ -589,7 +607,27 @@ pub async fn dial(
     frames: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, String> {
     require_live()?;
+    require_verified_contact(data_dir, expected_pub_hex).await?;
     dial_unchecked(data_dir, internet_dial, expected_pub_hex, frames).await
+}
+
+/// Internet delivery is only for a verified (pinned) contact
+/// ([`raven_core::carrier_allowed_for_contact`]). `raven send` and the outbox
+/// worker refuse before they get here; this keeps the IPC `InternetDial` op
+/// from dialling anyone else. Nothing is dialled on refusal.
+async fn require_verified_contact(data_dir: &Path, expected_pub_hex: &str) -> Result<(), String> {
+    let expected = parse_pub_hex(expected_pub_hex)?;
+    let dd = data_dir.to_path_buf();
+    let pinned = blocking(move || raven_core::contact_is_pinned(&dd, &expected)).await?;
+    if raven_core::carrier_allowed_for_contact(raven_core::OutboxCarrier::Internet, pinned) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: Internet delivery needs a verified contact (fingerprint pinned); nothing was \
+             dialled",
+            raven_core::CONTACT_NOT_VERIFIED
+        ))
+    }
 }
 
 async fn dial_unchecked(
@@ -977,10 +1015,20 @@ mod tests {
         assert!(started.elapsed() < PRODUCTION_LIMITS.lifetime);
     }
 
+    /// Verified (pinned) contacts: the only kind the Internet listener answers.
     fn write_contacts(dir: &Path, contacts: &[&Identity]) {
+        write_contacts_pinned(dir, contacts, true);
+    }
+
+    fn write_contacts_pinned(dir: &Path, contacts: &[&Identity], pinned: bool) {
         let rows: Vec<String> = contacts
             .iter()
-            .map(|c| format!(r#"{{"pub_hex":"{}"}}"#, hex::encode(c.public_key_bytes())))
+            .map(|c| {
+                format!(
+                    r#"{{"pub_hex":"{}","pinned":{pinned}}}"#,
+                    hex::encode(c.public_key_bytes())
+                )
+            })
             .collect();
         std::fs::write(dir.join("contacts.json"), format!("[{}]", rows.join(","))).unwrap();
     }
@@ -1043,7 +1091,12 @@ mod tests {
     #[tokio::test]
     async fn stranger_learns_nothing_but_not_accepted() {
         let responder = Arc::new(bob());
-        for case in ["no contacts.json", "other contact", "blocked contact"] {
+        for case in [
+            "no contacts.json",
+            "other contact",
+            "blocked contact",
+            "unverified contact",
+        ] {
             let resp_dir = tempfile::tempdir().unwrap();
             match case {
                 "other contact" => write_contacts(resp_dir.path(), &[&alice()]),
@@ -1052,6 +1105,11 @@ mod tests {
                     let mut blocks = raven_core::BlockList::default();
                     blocks.block(&hex::encode(mallory().public_key_bytes()));
                     blocks.save(resp_dir.path()).unwrap();
+                }
+                // A contact whose fingerprint was never confirmed: LAN would
+                // answer it, the Internet listener treats it as a stranger.
+                "unverified contact" => {
+                    write_contacts_pinned(resp_dir.path(), &[&mallory()], false)
                 }
                 _ => {}
             }
@@ -1071,14 +1129,37 @@ mod tests {
                 .expect("handler ends")
                 .unwrap()
                 .unwrap_err();
-            let want = if case == "blocked contact" {
-                raven_core::lan_dispatch::LINK_REFUSED_BLOCKED
-            } else {
-                raven_core::lan_dispatch::LINK_REFUSED_NOT_CONTACT
+            let want = match case {
+                "blocked contact" => raven_core::lan_dispatch::LINK_REFUSED_BLOCKED,
+                "unverified contact" => raven_core::lan_dispatch::LINK_REFUSED_NOT_VERIFIED,
+                _ => raven_core::lan_dispatch::LINK_REFUSED_NOT_CONTACT,
             };
             assert_eq!(refusal, want, "{case}");
+            assert!(!refusal.contains(&hex::encode(mallory().public_key_bytes())));
             let mut rest = Vec::new();
             assert_eq!(scanner.read_to_end(&mut rest).await.unwrap_or(0), 0);
+        }
+    }
+
+    /// The dial side of the same rule: an Internet dial to a contact that is
+    /// not verified is refused before anything is dialled (no listener here:
+    /// a dial attempt would fail with a connect error instead).
+    #[tokio::test]
+    async fn dial_to_an_unverified_contact_is_refused_before_connecting() {
+        if !internet_direct_live_enabled() {
+            return; // HOLD answers first; covered by the gate tests.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let expected = hex::encode(bob().public_key_bytes());
+        for pinned in [None, Some(false)] {
+            if let Some(pinned) = pinned {
+                write_contacts_pinned(dir.path(), &[&bob()], pinned);
+            }
+            let err = dial(dir.path(), "127.0.0.1:9", &expected, &[])
+                .await
+                .unwrap_err();
+            assert!(err.starts_with(raven_core::CONTACT_NOT_VERIFIED), "{err}");
+            assert!(err.contains("nothing was dialled"), "{err}");
         }
     }
 

@@ -1188,6 +1188,9 @@ pub(crate) struct SendCtx {
     /// verbose mode. A carrier picked by `--carrier auto` is named only in
     /// verbose mode.
     pub(crate) show_carrier: bool,
+    /// What `--carrier` asked for, recorded with a queued message so
+    /// raven-node's outbox never retries it on more (`None`: from the routes).
+    pub(crate) choice: Option<raven_core::outbox::CarrierChoice>,
 }
 
 /// `s` as one shell word in a hint: bare when plain, else quoted.
@@ -1235,6 +1238,11 @@ impl SendCtx {
         } else {
             self.name.clone()
         }
+    }
+
+    /// The name the outcome lines use for the recipient.
+    pub(crate) fn display_name(&self) -> String {
+        self.who()
     }
 
     fn whose(&self) -> String {
@@ -1288,6 +1296,7 @@ pub(crate) fn send_ctx(data_dir: &Path, petname: &str, tag: &str, peer_pub_hex: 
         data_dir: Some(data_dir.to_path_buf()),
         chat: false,
         show_carrier: false,
+        choice: None,
     }
 }
 
@@ -1729,38 +1738,94 @@ pub(crate) fn not_sent_text(ctx: &SendCtx, raw: &str, first_contact: bool) -> St
     not_sent_for(classify_cause(raw), ctx, raw, first_contact)
 }
 
+/// How long a staged message can still go out, and who retries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetryNote {
+    /// Unix ms when its sealed envelope expires (min(session end, now + 24 h)).
+    pub(crate) expires_at_ms: u64,
+    /// raven-node's background outbox took it (its `OutboxKick` was accepted):
+    /// it keeps retrying without another send. False with a service that has
+    /// no outbox (an older raven-node): only the next send retries it.
+    pub(crate) background: bool,
+}
+
+/// The phrase the chat looks for to show "raven-node keeps trying".
+pub(crate) const BACKGROUND_RETRY: &str = "raven-node keeps trying";
+
+impl RetryNote {
+    /// `14:05 UTC (in about 24 h)`. A wall-clock time with no time zone
+    /// database (std has none) is only honest in UTC, so the relative part
+    /// is the one a reader acts on.
+    fn until(&self) -> String {
+        until_text(self.expires_at_ms, now_ms())
+    }
+
+    /// Who sends it again: the service, or the user's next send.
+    fn retried_by(&self, who: &str) -> String {
+        if self.background {
+            "raven-node, in the background,".into()
+        } else {
+            format!("your next send to {who}")
+        }
+    }
+}
+
+/// `HH:MM UTC (in about ...)` for `expires_at_ms` seen at `now_ms`. Plain ASCII.
+pub(crate) fn until_text(expires_at_ms: u64, now_ms: u64) -> String {
+    let secs = expires_at_ms / 1000;
+    let clock = format!("{:02}:{:02} UTC", (secs / 3600) % 24, (secs / 60) % 60);
+    let minutes = expires_at_ms.saturating_sub(now_ms) / 60_000;
+    let left = match minutes {
+        0 => "in less than a minute".to_string(),
+        1..=89 => format!("in about {minutes} min"),
+        _ => format!("in about {} h", (minutes + 30) / 60),
+    };
+    format!("{clock} ({left})")
+}
+
 /// [`next_step`] for a message that is already queued: advice that ends in "then
 /// send again" must not invite retyping it (the retry would deliver both copies).
-fn next_step_queued(cause: Cause, ctx: &SendCtx, raw: &str) -> String {
+fn next_step_queued(cause: Cause, ctx: &SendCtx, raw: &str, retry: &RetryNote) -> String {
     let step = next_step(cause, ctx, false, raw)
         .replace(", then send again.", ".")
         .replace("Try again in a moment. ", "");
+    let who = ctx.who();
     join_sentences(&[
         step,
-        format!(
-            "Do not retype this message: it goes out with your next send to {}.",
-            ctx.who()
-        ),
+        if retry.background {
+            format!("Do not retype this message: it goes out as soon as {who} can be reached.")
+        } else {
+            format!("Do not retype this message: it goes out with your next send to {who}.")
+        },
     ])
 }
 
-/// The message is durably queued here but its dial failed. The retry only works
-/// while the sealed envelope is valid, so say for how long, and that nothing
-/// retries it in the background.
-pub(crate) fn queued_text(ctx: &SendCtx, raw: &str, preview: &str, minutes: u64) -> String {
+/// The message is durably queued here but its dial failed. Say until when it
+/// can still go out, and whether raven-node keeps trying it in the background
+/// (only the next send does with a service that has no outbox).
+pub(crate) fn queued_text(ctx: &SendCtx, raw: &str, preview: &str, retry: &RetryNote) -> String {
     let cause = classify_cause(raw);
     let who = ctx.who();
+    let until = retry.until();
     join_sentences(&[
         format!(
             "{QUEUED_PREFIX}: your message{} to {who} is queued locally because {}.",
             spaced(preview),
             cause_sentence(cause, ctx, raw, false)
         ),
-        format!(
-            "It is NOT retried automatically: it is sent when you next send {who} a message, \
-             within {minutes} minutes; after that it expires and is marked failed."
-        ),
-        next_step_queued(cause, ctx, raw),
+        if retry.background {
+            format!(
+                "Queued: {BACKGROUND_RETRY} in the background until {until}; you do not need \
+                 to send it again (`raven outbox list` shows it)."
+            )
+        } else {
+            format!(
+                "It is NOT retried automatically (this raven-node has no background outbox): \
+                 it is sent when you next send {who} a message, until {until}; after that it \
+                 expires."
+            )
+        },
+        next_step_queued(cause, ctx, raw, retry),
         format!("(technical: {raw})"),
     ])
 }
@@ -1771,7 +1836,7 @@ pub(crate) fn recorded_locally_failed_text(
     ctx: &SendCtx,
     raw: &str,
     preview: &str,
-    minutes: u64,
+    retry: &RetryNote,
 ) -> String {
     let (who, whose) = (ctx.who(), ctx.whose());
     let cause = classify_cause(raw);
@@ -1791,8 +1856,9 @@ pub(crate) fn recorded_locally_failed_text(
             }
         ),
         format!(
-            "Do not retype it: fix the problem below, and your next send to {who} finishes the \
-             record (within {minutes} minutes)."
+            "Do not retype it: fix the problem below, and {} finishes the record (until {}).",
+            retry.retried_by(&who),
+            retry.until()
         ),
         if local {
             next_step(cause, ctx, false, raw)
@@ -1805,7 +1871,12 @@ pub(crate) fn recorded_locally_failed_text(
 
 /// The new message's frames were written and only its ACK is missing: the peer
 /// may already hold it, so it must not be retyped.
-pub(crate) fn unconfirmed_text(ctx: &SendCtx, raw: &str, preview: &str, minutes: u64) -> String {
+pub(crate) fn unconfirmed_text(
+    ctx: &SendCtx,
+    raw: &str,
+    preview: &str,
+    retry: &RetryNote,
+) -> String {
     let (who, whose) = (ctx.who(), ctx.whose());
     join_sentences(&[
         format!(
@@ -1814,10 +1885,19 @@ pub(crate) fn unconfirmed_text(ctx: &SendCtx, raw: &str, preview: &str, minutes:
              removed or blocked you).",
             spaced(preview)
         ),
-        format!(
-            "Do not retype it: it stays queued, and your next send to {who} tries again, \
-             within {minutes} minutes."
-        ),
+        if retry.background {
+            format!(
+                "Do not retype it: {BACKGROUND_RETRY} in the background until {who} confirms \
+                 it, until {}.",
+                retry.until()
+            )
+        } else {
+            format!(
+                "Do not retype it: it stays queued, and your next send to {who} tries again, \
+                 until {}.",
+                retry.until()
+            )
+        },
         format!("(technical: {raw})"),
     ])
 }
@@ -1828,7 +1908,7 @@ pub(crate) fn earlier_undelivered_text(
     ctx: &SendCtx,
     raw: &str,
     preview: &str,
-    minutes: u64,
+    retry: &RetryNote,
 ) -> String {
     let cause = classify_cause(raw);
     let who = ctx.who();
@@ -1840,10 +1920,18 @@ pub(crate) fn earlier_undelivered_text(
             cause_sentence(cause, ctx, raw, false)
         ),
         next_step(cause, ctx, false, raw),
-        format!(
-            "Then send this message again: the earlier one goes first, within its {minutes} \
-             minutes."
-        ),
+        if retry.background {
+            format!(
+                "{BACKGROUND_RETRY} the earlier one in the background (until {}); send this \
+                 message again once it has arrived (`raven outbox list`).",
+                retry.until()
+            )
+        } else {
+            format!(
+                "Then send this message again: the earlier one goes first (until {}).",
+                retry.until()
+            )
+        },
         format!("(technical: {raw})"),
     ])
 }
@@ -2142,6 +2230,7 @@ pub fn run_send_secure_routes(
     peer_pub_hex: &str,
     text: &str,
     show_carrier: bool,
+    choice: raven_core::outbox::CarrierChoice,
 ) -> Result<super::pair_init_lab::DialRoute, String> {
     let first = routes.first().ok_or_else(|| {
         "valid lan_dial host:port required — refusing LocalListenQueue / 127.0.0.1:0 fallback"
@@ -2150,6 +2239,7 @@ pub fn run_send_secure_routes(
     let ctx = SendCtx {
         dial: first.dial.trim().to_string(),
         show_carrier,
+        choice: Some(choice),
         ..send_ctx(data_dir, "", "", peer_pub_hex)
     };
     deliver_routes(data_dir, id, routes, peer_pub_hex, text, &ctx)
@@ -2219,7 +2309,7 @@ fn deliver_routes(
     if blocks.is_blocked(peer_pub_hex) {
         return Err("peer is on the local block list".into());
     }
-    let _peer_pub = parse_pub_hex(peer_pub_hex)?;
+    let peer_pub = parse_pub_hex(peer_pub_hex)?;
     if text.trim().is_empty() {
         return Err("message is empty".into());
     }
@@ -2241,7 +2331,27 @@ fn deliver_routes(
         if route.carrier == DialCarrier::Internet && !raven_core::internet_direct_live_enabled() {
             return Err(super::pair_init_lab::INTERNET_DIRECT_HOLD.into());
         }
+        // And only for a verified (pinned) contact: refused before anything
+        // starts or is dialled.
+        if route.carrier == DialCarrier::Internet
+            && !raven_core::carrier_allowed_for_contact(
+                raven_core::OutboxCarrier::Internet,
+                raven_core::contact_is_pinned(data_dir, &peer_pub)?,
+            )
+        {
+            return Err(super::pair_init_lab::unverified_internet_text(
+                &ctx.who(),
+                &format!(
+                    "raven contact verify --address {}",
+                    encode_address(&peer_pub)
+                ),
+                &super::pair_init_lab::pin_command_hint(&peer_pub),
+            ));
+        }
     }
+    // Unverified contacts are LAN only, at local-network addresses only: a
+    // name is resolved first and dialled as the resolved address.
+    let dial_routes = local_dial_routes(data_dir, routes, &peer_pub, ctx)?;
     let (dial, carrier) = (first.dial.as_str(), first.carrier);
 
     let mut message_id = [0u8; 16];
@@ -2285,14 +2395,64 @@ fn deliver_routes(
         ctx.who(),
         sanitize_terminal_line(dial)
     ));
-    super::pair_init_lab::run_pair_init_and_send_routes(
+    let used = super::pair_init_lab::run_pair_init_and_send_routes(
         data_dir,
         id,
-        routes,
+        &dial_routes,
         peer_pub_hex,
         text,
         ctx,
-    )
+    )?;
+    // The caller knows the routes as planned (the saved / env addresses).
+    Ok(dial_routes
+        .iter()
+        .position(|r| *r == used)
+        .map(|i| routes[i].clone())
+        .unwrap_or(used))
+}
+
+/// The routes to dial for `peer`: as planned for a verified contact; for an
+/// unverified one every LAN address must be on the local network
+/// (`raven_core::outbox::localize_lan_route`, the rule raven-node's outbox
+/// applies too), else nothing is dialled.
+fn local_dial_routes(
+    data_dir: &Path,
+    routes: &[super::pair_init_lab::DialRoute],
+    peer: &[u8; 32],
+    ctx: &SendCtx,
+) -> Result<Vec<super::pair_init_lab::DialRoute>, String> {
+    use raven_core::outbox::{localize_lan_route, RouteRefusal, LOCALIZE_RESOLVE_TIMEOUT};
+    let pinned = raven_core::contact_is_pinned(data_dir, peer)?;
+    let mut out = Vec::with_capacity(routes.len());
+    for route in routes {
+        let planned = raven_core::OutboxRoute {
+            carrier: route.carrier.outbox(),
+            dial: route.dial.trim().to_string(),
+        };
+        let shown = sanitize_terminal_line(route.dial.trim());
+        let local =
+            localize_lan_route(&planned, pinned, LOCALIZE_RESOLVE_TIMEOUT).map_err(|why| {
+                let reason = match why {
+                    RouteRefusal::NotLocal => format!("{shown} is not on your local network"),
+                    RouteRefusal::Unresolved(e) => format!(
+                        "{shown} could not be resolved ({}), so RAVEN cannot tell it is on your \
+                     local network",
+                        sanitize_terminal_line(&e)
+                    ),
+                };
+                super::pair_init_lab::unverified_remote_lan_text(
+                    &ctx.who(),
+                    &reason,
+                    &format!("raven contact verify --address {}", encode_address(peer)),
+                    &super::pair_init_lab::pin_command_hint(peer),
+                )
+            })?;
+        out.push(super::pair_init_lab::DialRoute {
+            carrier: route.carrier,
+            dial: local.dial,
+        });
+    }
+    Ok(out)
 }
 
 /// The send path dials through the local raven-node service: refuse with the
@@ -2308,6 +2468,425 @@ fn require_local_daemon(data_dir: &Path) -> Result<(), String> {
             format!("local raven-node service is not running and could not be started: {e}")
         }
     })
+}
+
+// ── Outbox: what raven-node is still trying to deliver ────────────────────
+
+/// What `raven outbox` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboxCmd {
+    List { contact_pub_hex: Option<String> },
+    Status { mid: String },
+    Retry { mid: String },
+    Cancel { mid: String, yes: bool },
+}
+
+/// Rows `raven outbox list` asks for (the IPC cap).
+const OUTBOX_LIST_LIMIT: u16 = raven_core::ipc::MAX_OUTBOX_LIST;
+
+/// The outbox as raven-node sees it, or as the store holds it when no service
+/// answers (then nothing is retrying it: `worker_running` is false).
+fn outbox_items(
+    data_dir: &Path,
+    peer: Option<&str>,
+) -> Result<(bool, Vec<raven_core::ipc::OutboxItem>), String> {
+    let req = IpcRequest::OutboxList {
+        v: IPC_VERSION,
+        peer_pub_hex: peer.map(str::to_string),
+        limit: Some(OUTBOX_LIST_LIMIT),
+    };
+    if let Ok(IpcResponse::OutboxListResult {
+        worker_running,
+        items,
+        ..
+    }) = super::ipc_client::ipc_request(data_dir, &req)
+    {
+        return Ok((worker_running, items));
+    }
+    // No (new enough) service: read the store directly. Read only.
+    let store = raven_core::IndexedSessionStore::open(data_dir)
+        .map_err(|e| format!("outbox: {}", e.redacted_display()))?;
+    let want = peer.and_then(|p| parse_pub_hex(p).ok());
+    let mut items = Vec::new();
+    for (rows, state) in [
+        (
+            store.pending_endpoint_outbound_for_recipient(want.as_ref()),
+            "queued",
+        ),
+        (
+            store.awaiting_ack_endpoint_outbound_for_recipient(want.as_ref()),
+            "sent",
+        ),
+    ] {
+        for row in rows.map_err(|e| format!("outbox: {}", e.redacted_display()))? {
+            items.push(raven_core::ipc::OutboxItem {
+                message_id_hex: hex::encode(row.message_id),
+                peer_pub_hex: hex::encode(row.recipient_device),
+                kind: match row.kind {
+                    raven_core::EndpointOutboundKind::Message => "message".into(),
+                    raven_core::EndpointOutboundKind::Ack => "ack".into(),
+                },
+                state: state.into(),
+                expires_at_ms: Envelope::unpack(&row.immutable_envelope_bytes)
+                    .map(|e| e.expires_at)
+                    .unwrap_or(0),
+                ..Default::default()
+            });
+        }
+    }
+    Ok((false, items))
+}
+
+/// The full message id for a prefix the user typed (8+ hex, as `mid=` and the
+/// history show it): among the outbox and the outbound history. Unique or an
+/// error.
+fn resolve_outbox_mid(
+    data_dir: &Path,
+    typed: &str,
+    items: &[raven_core::ipc::OutboxItem],
+) -> Result<[u8; 16], String> {
+    let want = typed
+        .trim()
+        .trim_end_matches('…')
+        .trim_end_matches("...")
+        .to_ascii_lowercase();
+    if want.len() < 8 || want.len() > 32 || !want.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "message id {} must be 8 to 32 hex characters (the id `raven outbox list` shows)",
+            sanitize_terminal_line(typed)
+        ));
+    }
+    let mut hits: Vec<String> = items
+        .iter()
+        .filter(|i| i.kind == "message")
+        .map(|i| i.message_id_hex.to_ascii_lowercase())
+        .collect();
+    if let Ok(history) = ChatHistory::load(data_dir) {
+        hits.extend(
+            history
+                .entries
+                .iter()
+                .filter(|e| e.direction == "out")
+                .map(|e| e.message_id_hex.to_ascii_lowercase()),
+        );
+    }
+    hits.retain(|m| m.starts_with(&want));
+    hits.sort_unstable();
+    hits.dedup();
+    match hits.as_slice() {
+        [one] => hex::decode(one)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| "message id is not valid hex".to_string()),
+        [] => Err(format!(
+            "no message {} you sent on this profile (see `raven outbox list`)",
+            sanitize_terminal_line(&want)
+        )),
+        many => Err(format!(
+            "{} messages start with {}: type more of the id",
+            many.len(),
+            sanitize_terminal_line(&want)
+        )),
+    }
+}
+
+/// `"first words…"` of one of our staged messages (local only; never sent
+/// over IPC), or nothing.
+fn outbox_preview(data_dir: &Path, message_id: &[u8; 16]) -> String {
+    raven_core::load_staged_outbound_body(data_dir, message_id)
+        .ok()
+        .flatten()
+        .map(|s| quoted_preview(&s.body))
+        .unwrap_or_default()
+}
+
+/// "in 40 s" / "now" / "-" for the next scheduled attempt.
+fn next_try_text(next_attempt_ms: u64, now: u64) -> String {
+    if next_attempt_ms == 0 {
+        "-".into()
+    } else if next_attempt_ms <= now {
+        "now".into()
+    } else {
+        let secs = (next_attempt_ms - now).div_ceil(1000);
+        if secs < 120 {
+            format!("in {secs} s")
+        } else {
+            format!("in {} min", secs.div_ceil(60))
+        }
+    }
+}
+
+fn outbox_row_line(data_dir: &Path, item: &raven_core::ipc::OutboxItem, now: u64) -> String {
+    let mid: [u8; 16] = hex::decode(&item.message_id_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .unwrap_or([0; 16]);
+    let who = send_ctx(data_dir, "", "", &item.peer_pub_hex).who();
+    let what = if item.kind == "ack" {
+        "receipt for a message from".to_string()
+    } else {
+        format!("message{} to", spaced(&outbox_preview(data_dir, &mid)))
+    };
+    let mut line = format!(
+        "  {}  {:<9} {what} {who}",
+        &item.message_id_hex[..8.min(item.message_id_hex.len())],
+        sanitize_terminal_line(&item.state)
+    );
+    if item.attempts > 0 {
+        line.push_str(&format!("  attempts {}", item.attempts));
+    }
+    if !item.last_error_code.is_empty() {
+        line.push_str(&format!(
+            "  last: {}",
+            sanitize_terminal_line(&item.last_error_code)
+        ));
+    }
+    if item.next_attempt_ms > 0 {
+        line.push_str(&format!(
+            "  next try {}",
+            next_try_text(item.next_attempt_ms, now)
+        ));
+    }
+    if item.expires_at_ms > 0 && !matches!(item.state.as_str(), "delivered" | "gone") {
+        line.push_str(&format!(
+            "  expires {}",
+            until_text(item.expires_at_ms, now)
+        ));
+    }
+    line
+}
+
+/// `raven outbox [list|status|retry|cancel]`.
+pub fn cmd_outbox(data_dir: &Path, cmd: OutboxCmd) -> Result<(), String> {
+    let now = now_ms();
+    match cmd {
+        OutboxCmd::List { contact_pub_hex } => {
+            let (running, items) = outbox_items(data_dir, contact_pub_hex.as_deref())?;
+            let live: Vec<_> = items
+                .iter()
+                .filter(|i| matches!(i.state.as_str(), "queued" | "sent" | "held"))
+                .collect();
+            if live.is_empty() {
+                println!("Nothing waiting: every message you sent was delivered or given up.");
+            } else {
+                println!("{C_BOLD}outbox{C_RESET} ({} waiting)", live.len());
+                for item in &live {
+                    println!("{}", outbox_row_line(data_dir, item, now));
+                }
+            }
+            let finished: Vec<_> = items
+                .iter()
+                .filter(|i| !matches!(i.state.as_str(), "queued" | "sent" | "held"))
+                .take(10)
+                .collect();
+            if !finished.is_empty() {
+                println!("{C_DIM}recently finished:{C_RESET}");
+                for item in finished {
+                    println!("{}", outbox_row_line(data_dir, item, now));
+                }
+            }
+            if !running && !live.is_empty() {
+                println!(
+                    "{C_DIM}raven-node's outbox is not running, so nothing is retried right \
+                     now: start it with `ash listen` (or send a message, which starts it).{C_RESET}"
+                );
+            }
+            Ok(())
+        }
+        OutboxCmd::Status { mid } => {
+            let (running, items) = outbox_items(data_dir, None)?;
+            let message_id = resolve_outbox_mid(data_dir, &mid, &items)?;
+            let mid_hex = hex::encode(message_id);
+            let req = IpcRequest::OutboxStatus {
+                v: IPC_VERSION,
+                message_id_hex: mid_hex.clone(),
+            };
+            let item = match super::ipc_client::ipc_request(data_dir, &req) {
+                Ok(IpcResponse::OutboxStatusResult { item, .. }) => Some(item),
+                _ => items.into_iter().find(|i| i.message_id_hex == mid_hex),
+            };
+            let history = ChatHistory::load(data_dir).ok().and_then(|h| {
+                h.entries.into_iter().find(|e| {
+                    e.direction == "out" && e.message_id_hex.eq_ignore_ascii_case(&mid_hex)
+                })
+            });
+            let (peer_hex, state) = match (&item, &history) {
+                (Some(i), _) => (i.peer_pub_hex.clone(), i.state.clone()),
+                (None, Some(h)) => (h.peer_pub_hex.clone(), h.delivery.clone()),
+                (None, None) => return Err("no such message on this profile".into()),
+            };
+            let who = send_ctx(data_dir, "", "", &peer_hex).who();
+            let preview = outbox_preview(data_dir, &message_id);
+            println!(
+                "{C_BOLD}message{C_RESET} {}…{} to {who}",
+                &mid_hex[..8],
+                spaced(&preview)
+            );
+            println!("  state       {}", sanitize_terminal_line(&state));
+            if let Some(i) = &item {
+                if !i.carrier.is_empty() {
+                    println!("  carrier     {}", sanitize_terminal_line(&i.carrier));
+                }
+                println!("  attempts    {}", i.attempts);
+                println!("  next try    {}", next_try_text(i.next_attempt_ms, now));
+                if !i.last_error_code.is_empty() {
+                    println!(
+                        "  last error  {}",
+                        sanitize_terminal_line(&i.last_error_code)
+                    );
+                }
+                if i.expires_at_ms > 0 && matches!(i.state.as_str(), "queued" | "sent" | "held") {
+                    println!("  expires     {}", until_text(i.expires_at_ms, now));
+                }
+            }
+            if let Some(h) = &history {
+                println!(
+                    "  history     {}",
+                    if h.delivery.is_empty() {
+                        "delivered".to_string()
+                    } else {
+                        sanitize_terminal_line(&h.delivery)
+                    }
+                );
+            }
+            if item
+                .as_ref()
+                .is_some_and(|i| i.last_error_code == raven_core::CONTACT_NOT_VERIFIED)
+            {
+                println!(
+                    "{C_DIM}Its only route is the Internet, which needs {who} verified: compare \
+                     the fingerprint with them, then add them again with --verify-fp.{C_RESET}"
+                );
+            }
+            if !running
+                && item
+                    .as_ref()
+                    .is_some_and(|i| matches!(i.state.as_str(), "queued" | "sent" | "held"))
+            {
+                println!(
+                    "{C_DIM}raven-node's outbox is not running: start it with `ash listen`.{C_RESET}"
+                );
+            }
+            Ok(())
+        }
+        OutboxCmd::Retry { mid } => {
+            let (_, items) = outbox_items(data_dir, None)?;
+            let message_id = resolve_outbox_mid(data_dir, &mid, &items)?;
+            let mid_hex = hex::encode(message_id);
+            let Some(item) = items.iter().find(|i| i.message_id_hex == mid_hex) else {
+                return Err(format!(
+                    "message {}… is not waiting to be delivered (`raven outbox status {}` says \
+                     what happened to it)",
+                    &mid_hex[..8],
+                    &mid_hex[..8]
+                ));
+            };
+            let peer = parse_pub_hex(&item.peer_pub_hex)?;
+            let who = send_ctx(data_dir, "", "", &item.peer_pub_hex).who();
+            if super::pair_init_lab::outbox_kick(data_dir, Some(&peer)) {
+                println!(
+                    "raven-node is trying again now: `raven outbox status {}` shows the result.",
+                    &mid_hex[..8]
+                );
+                Ok(())
+            } else {
+                Err(format!(
+                    "raven-node's outbox is not running here, so nothing retries it in the \
+                     background: start it with `ash listen`, or it goes out with your next send \
+                     to {who}."
+                ))
+            }
+        }
+        OutboxCmd::Cancel { mid, yes } => {
+            let (_, items) = outbox_items(data_dir, None)?;
+            let message_id = resolve_outbox_mid(data_dir, &mid, &items)?;
+            cancel_outbound(data_dir, &message_id, yes)
+        }
+    }
+}
+
+/// Stop retrying one of our messages: abandoned in the store, `cancelled` in
+/// the history, under the same per-peer lock as every send. A message that
+/// was already written may still have arrived.
+fn cancel_outbound(data_dir: &Path, message_id: &[u8; 16], yes: bool) -> Result<(), String> {
+    let mid_hex = hex::encode(message_id);
+    let store = raven_core::IndexedSessionStore::open(data_dir)
+        .map_err(|e| format!("outbox: {}", e.redacted_display()))?;
+    let mut rows = store
+        .pending_endpoint_outbound()
+        .map_err(|e| e.redacted_display())?;
+    rows.extend(
+        store
+            .awaiting_ack_endpoint_outbound()
+            .map_err(|e| e.redacted_display())?,
+    );
+    drop(store);
+    let Some(row) = rows.into_iter().find(|r| {
+        r.kind == raven_core::EndpointOutboundKind::Message && r.message_id == *message_id
+    }) else {
+        return Err(format!(
+            "message {}… is not waiting to be delivered (`raven outbox status {}` says what \
+             happened to it)",
+            &mid_hex[..8],
+            &mid_hex[..8]
+        ));
+    };
+    let who = send_ctx(data_dir, "", "", &hex::encode(row.recipient_device)).who();
+    let preview = outbox_preview(data_dir, message_id);
+    if !yes {
+        if !io::stdin().is_terminal() {
+            return Err("add --yes to cancel without the typed confirmation".into());
+        }
+        print!(
+            "Stop trying to deliver your message{} to {who}? Type yes to confirm: ",
+            spaced(&preview)
+        );
+        let _ = io::stdout().flush();
+        match read_line_result() {
+            LineResult::Line(l) if l.trim().eq_ignore_ascii_case("yes") => {}
+            _ => {
+                println!("{C_DIM}not cancelled: nothing changed.{C_RESET}");
+                return Ok(());
+            }
+        }
+    }
+    let _lock = super::pair_init_lab::acquire_send_lock(data_dir, &row.recipient_device)?;
+    let mut store = raven_core::IndexedSessionStore::open(data_dir)
+        .map_err(|e| format!("outbox: {}", e.redacted_display()))?;
+    let key = store
+        .record_key_for_session_id(&row.session_id)
+        .map_err(|e| e.redacted_display())?
+        .ok_or("the session of that message is gone; nothing to cancel")?;
+    let outcome = raven_core::outbox::give_up_outbound(
+        data_dir,
+        &mut store,
+        &key,
+        &row.recipient_device,
+        &row.session_id,
+        &row.object_digest,
+        &row.message_id,
+        raven_core::outbox::HISTORY_CANCELLED,
+    )?;
+    let _ = raven_core::outbox::clear_object_routes(data_dir, &[row.message_id]);
+    if outcome == raven_core::outbox::GiveUp::Delivered {
+        println!(
+            "{C_GREEN}status{C_RESET} delivered - {who} confirmed it before it could be cancelled"
+        );
+        return Ok(());
+    }
+    // The worker notices at once (and drops it from its schedule).
+    let _ = super::pair_init_lab::outbox_kick(data_dir, Some(&row.recipient_device));
+    let reached = row.state == raven_core::EndpointOutboxState::Queued;
+    println!(
+        "cancelled: raven-node stops trying to deliver your message{} to {who}.{}",
+        spaced(&preview),
+        if reached {
+            format!(" It was already sent once, so {who} may have it anyway.")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
 }
 
 // ── Chat session with slash commands ──────────────────────────────────────
@@ -2839,7 +3418,9 @@ fn chat_echo(text: &str, result: &Result<(), String>, name: &str) -> (String, Op
         ),
         Err(error) => {
             let line = friendly_send_error(error, name);
-            let marker = if line.starts_with(QUEUED_PREFIX) {
+            let marker = if line.starts_with(QUEUED_PREFIX) && line.contains(BACKGROUND_RETRY) {
+                "[queued: raven-node keeps trying]"
+            } else if line.starts_with(QUEUED_PREFIX) {
                 "[queued: goes out with your next message]"
             } else if line.starts_with(UNCONFIRMED_PREFIX) {
                 "[sent, not confirmed]"
@@ -4914,6 +5495,25 @@ mod send_outcome_tests {
             data_dir: Some(PathBuf::from("/data")),
             chat: false,
             show_carrier: false,
+            choice: None,
+        }
+    }
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+    /// Staged now, retried only by the next send (a service without outbox).
+    fn next_send() -> RetryNote {
+        RetryNote {
+            expires_at_ms: now_ms() + DAY_MS,
+            background: false,
+        }
+    }
+
+    /// Staged now and taken by raven-node's background outbox.
+    fn background() -> RetryNote {
+        RetryNote {
+            expires_at_ms: now_ms() + DAY_MS,
+            background: true,
         }
     }
 
@@ -5125,11 +5725,15 @@ mod send_outcome_tests {
     #[test]
     fn queued_advice_never_invites_retyping_the_queued_message() {
         let raw = "ipc LAN_DIAL: lan connect: cannot connect to 192.168.0.14:7420 (192.168.0.14:7420: Connection refused (os error 61)); mid=abcdef01…";
-        let text = queued_text(&bob(), raw, "\"hello\"", 60);
+        let text = queued_text(&bob(), raw, "\"hello\"", &next_send());
         assert!(text.starts_with(QUEUED_PREFIX), "{text}");
         assert!(text.contains("Do not retype this message"), "{text}");
         assert!(!text.contains(", then send again"), "{text}");
         assert!(text.contains("ash listen"), "the next step stays: {text}");
+        let text = queued_text(&bob(), raw, "\"hello\"", &background());
+        assert!(text.contains("Do not retype this message"), "{text}");
+        assert!(text.contains("as soon as Bob can be reached"), "{text}");
+        assert!(!text.contains(", then send again"), "{text}");
     }
 
     /// The peer's acknowledgement came back but this computer could not record it:
@@ -5137,7 +5741,7 @@ mod send_outcome_tests {
     #[test]
     fn an_acknowledged_message_that_could_not_be_recorded_is_never_called_not_sent() {
         let raw = "chat history I/O failed: history lock: still held by another raven process after 10s (database is locked)";
-        let text = recorded_locally_failed_text(&bob(), raw, "\"hello\"", 60);
+        let text = recorded_locally_failed_text(&bob(), raw, "\"hello\"", &next_send());
         assert!(text.starts_with(UNCONFIRMED_PREFIX), "{text}");
         assert!(
             !text.contains("NOT SENT") && !text.contains("Nothing was queued"),
@@ -5155,7 +5759,11 @@ mod send_outcome_tests {
             None,
             "an outcome line passes through unchanged"
         );
-        let other = recorded_locally_failed_text(&bob(), "disk full", "", 60);
+        let other = recorded_locally_failed_text(&bob(), "disk full", "", &background());
+        assert!(
+            other.contains("raven-node, in the background, finishes"),
+            "{other}"
+        );
         assert!(
             other.contains("this computer could not finish recording it"),
             "{other}"
@@ -5189,45 +5797,99 @@ mod send_outcome_tests {
     }
 
     #[test]
+    fn the_expiry_is_a_utc_clock_time_and_how_long_is_left() {
+        // 2026-10-08 13:05:00 UTC.
+        let at = 1_791_464_700_000;
+        assert_eq!(
+            until_text(at, at - 30_000),
+            "13:05 UTC (in less than a minute)"
+        );
+        assert_eq!(
+            until_text(at, at - 45 * 60_000),
+            "13:05 UTC (in about 45 min)"
+        );
+        assert_eq!(
+            until_text(at, at - 24 * 3_600_000),
+            "13:05 UTC (in about 24 h)"
+        );
+        assert_eq!(
+            until_text(at, at - (23 * 60 + 40) * 60_000),
+            "13:05 UTC (in about 24 h)"
+        );
+        assert_eq!(
+            until_text(at, at + 5_000),
+            "13:05 UTC (in less than a minute)"
+        );
+        assert!(until_text(at, 0).is_ascii());
+    }
+
+    #[test]
     fn queued_unconfirmed_and_earlier_texts_say_what_happened_to_the_text() {
         let ctx = bob();
         let raw = "ipc LAN_DIAL: lan read timeout; mid=01020304…";
-        let queued = queued_text(&ctx, raw, "\"see you at 5\"", 60);
+        let queued = queued_text(&ctx, raw, "\"see you at 5\"", &next_send());
         for word in [
             "not delivered yet: your message \"see you at 5\" to Bob is queued locally because",
             "NOT retried automatically",
-            "within 60 minutes",
-            "expires and is marked failed",
+            "UTC (in about 24 h)",
+            "after that it expires",
             "(technical: ipc LAN_DIAL: lan read timeout; mid=01020304…)",
         ] {
             assert!(queued.contains(word), "{word:?} missing from: {queued}");
         }
+        // With raven-node's outbox: the background promise, not "NOT retried".
+        let kept = queued_text(&ctx, raw, "\"see you at 5\"", &background());
+        for word in [
+            "not delivered yet: your message \"see you at 5\" to Bob is queued locally because",
+            "Queued: raven-node keeps trying in the background until ",
+            "UTC (in about 24 h)",
+            "you do not need to send it again",
+            "raven outbox list",
+        ] {
+            assert!(kept.contains(word), "{word:?} missing from: {kept}");
+        }
+        assert!(!kept.contains("NOT retried"), "{kept}");
+        let sentence = kept.split("(technical:").next().unwrap();
+        assert!(
+            sentence.is_ascii(),
+            "plain ASCII for any console: {sentence}"
+        );
         let unconfirmed = unconfirmed_text(
             &ctx,
             "WAITING_FOR_ENDPOINT_ACK: no sealed ACK came back; mid=01020304…",
             "\"hi\"",
-            60,
+            &next_send(),
         );
         for word in [
             "sent, delivery unconfirmed: your message \"hi\" was sent to Bob's computer",
             "Bob has not confirmed it yet",
             "Do not retype it",
-            "within 60 minutes",
+            "your next send to Bob tries again, until ",
         ] {
             assert!(
                 unconfirmed.contains(word),
                 "{word:?} missing from: {unconfirmed}"
             );
         }
-        let earlier = earlier_undelivered_text(&ctx, raw, "\"see you at 5\"", 60);
+        let unconfirmed = unconfirmed_text(&ctx, "no sealed ACK", "\"hi\"", &background());
+        assert!(
+            unconfirmed.contains("raven-node keeps trying in the background until Bob confirms it"),
+            "{unconfirmed}"
+        );
+        let earlier = earlier_undelivered_text(&ctx, raw, "\"see you at 5\"", &next_send());
         for word in [
             "NOT SENT: an earlier message \"see you at 5\" to Bob is still undelivered",
             "this message was not queued behind it",
             "send this message again",
-            "the earlier one goes first, within its 60 minutes",
+            "the earlier one goes first (until ",
         ] {
             assert!(earlier.contains(word), "{word:?} missing from: {earlier}");
         }
+        let earlier_kept = earlier_undelivered_text(&ctx, raw, "\"see you at 5\"", &background());
+        assert!(
+            earlier_kept.contains("raven-node keeps trying the earlier one in the background"),
+            "{earlier_kept}"
+        );
         let awaiting = earlier_unconfirmed_text(&ctx, "");
         assert!(
             awaiting.starts_with("NOT SENT: an earlier message to Bob was sent again"),
@@ -5247,9 +5909,11 @@ mod send_outcome_tests {
     fn outcome_texts_pass_through_and_unknown_text_keeps_the_old_refusal_form() {
         let ctx = bob();
         let outcomes = [
-            queued_text(&ctx, "ipc LAN_DIAL: lan read timeout", "", 60),
-            unconfirmed_text(&ctx, "no sealed ACK", "", 60),
-            earlier_undelivered_text(&ctx, "ipc LAN_DIAL: early eof", "", 60),
+            queued_text(&ctx, "ipc LAN_DIAL: lan read timeout", "", &next_send()),
+            queued_text(&ctx, "ipc LAN_DIAL: lan read timeout", "", &background()),
+            unconfirmed_text(&ctx, "no sealed ACK", "", &next_send()),
+            unconfirmed_text(&ctx, "no sealed ACK", "", &background()),
+            earlier_undelivered_text(&ctx, "ipc LAN_DIAL: early eof", "", &next_send()),
             earlier_unconfirmed_text(&ctx, ""),
             not_sent_text(&ctx, "ipc LAN_DIAL: early eof", false),
             "NOT SENT, nothing queued: another `ash send` to this peer from this profile was still running after 120s; try again shortly".to_string(),
@@ -5703,13 +6367,31 @@ mod chat_ux_tests {
             name: "Bob".into(),
             ..SendCtx::default()
         };
-        let queued = queued_text(&ctx, "ipc LAN_DIAL: lan read timeout", "\"hi\"", 60);
-        let unconfirmed = unconfirmed_text(&ctx, "no sealed ACK", "\"hi\"", 60);
+        let day = RetryNote {
+            expires_at_ms: now_ms() + 24 * 60 * 60 * 1000,
+            background: false,
+        };
+        let queued = queued_text(&ctx, "ipc LAN_DIAL: lan read timeout", "\"hi\"", &day);
+        let kept = queued_text(
+            &ctx,
+            "ipc LAN_DIAL: lan read timeout",
+            "\"hi\"",
+            &RetryNote {
+                background: true,
+                ..day
+            },
+        );
+        let unconfirmed = unconfirmed_text(&ctx, "no sealed ACK", "\"hi\"", &day);
         let refused = not_sent_text(&ctx, "ipc LAN_DIAL: early eof", false);
         for (text, marker, sentence) in [
             (
                 queued,
                 "[queued: goes out with your next message]",
+                "not delivered yet",
+            ),
+            (
+                kept,
+                "[queued: raven-node keeps trying]",
                 "not delivered yet",
             ),
             (
@@ -5933,5 +6615,90 @@ mod chat_ux_tests {
             format!("To undo: ash contact unblock --pub-hex {}", "cd".repeat(32))
         );
         assert!(unblock_hint(&SendCtx::default()).contains("--pub-hex <their key>"));
+    }
+}
+
+#[cfg(test)]
+mod local_route_tests {
+    use super::super::pair_init_lab::{DialCarrier, DialRoute};
+    use super::*;
+    use raven_core::CONTACT_NOT_VERIFIED;
+
+    fn book(dir: &Path, peer: &[u8; 32], pinned: bool) {
+        std::fs::write(
+            dir.join("contacts.json"),
+            format!(
+                r#"[{{"petname":"Bob","public_tag":"","alias":"","address":"","pub_hex":"{}","pinned":{pinned},"lan_dial":""}}]"#,
+                hex::encode(peer)
+            ),
+        )
+        .unwrap();
+    }
+
+    fn lan(dial: &str) -> DialRoute {
+        DialRoute {
+            carrier: DialCarrier::Lan,
+            dial: dial.into(),
+        }
+    }
+
+    fn dials(routes: &[DialRoute]) -> Vec<String> {
+        routes.iter().map(|r| r.dial.clone()).collect()
+    }
+
+    /// L (`raven send` side): an unverified contact is dialled only when every
+    /// address resolves to the local network (names are resolved first and the
+    /// resolved literal is what gets dialled); one address outside it refuses the
+    /// whole send before anything is dialled. A verified contact is unchanged.
+    #[test]
+    fn an_unverified_contact_is_dialled_only_at_local_network_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = [0x5bu8; 32];
+        let ctx = SendCtx {
+            name: "Bob".into(),
+            ..SendCtx::default()
+        };
+        book(dir.path(), &peer, false);
+
+        let ok = local_dial_routes(
+            dir.path(),
+            &[
+                lan("192.168.1.20:7300"),
+                lan("10.0.0.7:7300"),
+                lan("[fe80::1%en0]:7300"),
+            ],
+            &peer,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            dials(&ok),
+            ["192.168.1.20:7300", "10.0.0.7:7300", "[fe80::1%en0]:7300"]
+        );
+
+        let named = local_dial_routes(dir.path(), &[lan("localhost:7300")], &peer, &ctx).unwrap();
+        let addr: std::net::SocketAddr = named[0].dial.parse().expect("a resolved literal");
+        assert!(addr.ip().is_loopback() && addr.port() == 7300, "{addr}");
+
+        for public in ["203.0.113.5:7300", "100.64.1.2:7300", "[2001:db8::1]:7300"] {
+            let err = local_dial_routes(dir.path(), &[lan(public)], &peer, &ctx).unwrap_err();
+            assert!(err.starts_with("NOT SENT: Bob is not verified"), "{err}");
+            assert!(err.contains("is not on your local network"), "{err}");
+            assert!(err.contains("Nothing was dialled"), "{err}");
+            assert!(err.contains(CONTACT_NOT_VERIFIED), "{err}");
+        }
+        // Every address must be local, not just the first.
+        assert!(local_dial_routes(
+            dir.path(),
+            &[lan("192.168.1.20:7300"), lan("203.0.113.5:7300")],
+            &peer,
+            &ctx
+        )
+        .is_err());
+
+        book(dir.path(), &peer, true);
+        let pinned =
+            local_dial_routes(dir.path(), &[lan("203.0.113.5:7300")], &peer, &ctx).unwrap();
+        assert_eq!(dials(&pinned), ["203.0.113.5:7300"]);
     }
 }

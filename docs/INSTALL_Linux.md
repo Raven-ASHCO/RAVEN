@@ -124,7 +124,14 @@ Contacts: `raven contact add --card '<their card line>'` saves their routes,
 internet`) edits them, and `raven send --contact <name>` tries their LAN
 address first, then their Internet address (`--carrier lan|internet` forces
 one). An address is only a hint: every connection still has to prove the
-contact's pinned key.
+contact's pinned key. Internet delivery is for verified contacts only. A contact
+whose fingerprint you have not confirmed (`--verify-fp` when adding) is reached
+over the LAN carrier only, and only when every address its LAN route resolves to
+is on your local network: loopback, private (10/8, 172.16/12, 192.168/16),
+link-local (169.254/16, fe80::/10) or unique-local IPv6 (fc00::/7); a public or
+CGNAT (100.64/10) address is refused and nothing is dialled. Your Internet
+listener treats an unverified contact like a stranger, and so does your LAN
+listener when it connects from outside those ranges.
 
 ## Unsigned tarball
 

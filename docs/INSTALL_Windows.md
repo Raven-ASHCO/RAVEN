@@ -61,7 +61,15 @@ Forward TCP 7422 on your router if the PC is behind NAT. The logon task runs onl
 while you are signed in, so a Windows PC is reachable only then. Contacts:
 `raven contact add --card "<their card line>"`, `raven contact set-addr <name>
 --internet HOST:PORT`, then `raven send --contact <name>` (LAN address first,
-then Internet; `--carrier lan|internet` forces one).
+then Internet; `--carrier lan|internet` forces one). Internet delivery is for
+verified contacts only. A contact whose fingerprint you have not confirmed
+(`--verify-fp` when adding) is reached over the LAN carrier only, and only when
+every address its LAN route resolves to is on your local network: loopback,
+private (10/8, 172.16/12, 192.168/16), link-local (169.254/16, fe80::/10) or
+unique-local IPv6 (fc00::/7); a public or CGNAT (100.64/10) address is refused
+and nothing is dialled. Your Internet listener treats an unverified contact like
+a stranger, and so does your LAN listener when it connects from outside those
+ranges.
 
 **Toolchain:** install Rust with [rustup](https://rustup.rs) (current stable);
 older compilers fail at dependency resolution (rustc 1.83.0: the locked graph

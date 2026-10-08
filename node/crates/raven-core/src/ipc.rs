@@ -57,6 +57,58 @@ pub enum IpcRequest {
         expected_pub_hex: String,
         frames_b64: Vec<String>,
     },
+    /// Wake the background outbox worker (`raven-node service`): retry the
+    /// staged objects to one peer (64 hex Ed25519), or to every peer, now.
+    /// Carries no content; answered `Accepted`. A daemon without a worker (or
+    /// an older one, which answers `IPC_FRAME`) does not retry in the
+    /// background, and the client must say so.
+    OutboxKick {
+        v: u16,
+        #[serde(default)]
+        peer_pub_hex: Option<String>,
+    },
+    /// Delivery state of one of our outbound messages (32 hex message id).
+    /// Metadata only, never content.
+    OutboxStatus {
+        v: u16,
+        message_id_hex: String,
+    },
+    /// Our outbound objects the outbox still tracks, oldest first: at most
+    /// `limit` rows ([`MAX_OUTBOX_LIST`] at most; default 50).
+    OutboxList {
+        v: u16,
+        #[serde(default)]
+        peer_pub_hex: Option<String>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+}
+
+/// Hard cap on `OutboxList` rows.
+pub const MAX_OUTBOX_LIST: u16 = 200;
+
+/// One outbound object as the outbox sees it. Identifiers, states and counts
+/// only: no plaintext, preview or ciphertext ever travels in it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutboxItem {
+    pub message_id_hex: String,
+    pub peer_pub_hex: String,
+    /// `message` or `ack`.
+    pub kind: String,
+    /// `queued` (not yet handed to a carrier), `sent` (written, no ACK yet),
+    /// `held` (not tried: see `last_error_code`), `delivered`, `expired`,
+    /// `failed` or `cancelled`.
+    pub state: String,
+    /// The carrier of the last attempt (`lan_dial` / `internet_dial`), or "".
+    pub carrier: String,
+    pub attempts: u32,
+    /// Unix ms of the next scheduled attempt; 0 when none is scheduled.
+    pub next_attempt_ms: u64,
+    /// Stable code of the last failure (`NOT_REACHABLE`,
+    /// `CONTACT_NOT_VERIFIED`, ...), or "".
+    pub last_error_code: String,
+    /// Unix ms when the sealed envelope stops being valid (0 = unknown).
+    pub expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,6 +140,17 @@ pub enum IpcResponse {
     SealUnderSessionResult {
         v: u16,
         envelope_b64: String,
+    },
+    OutboxStatusResult {
+        v: u16,
+        item: OutboxItem,
+    },
+    OutboxListResult {
+        v: u16,
+        /// False when this daemon runs no outbox worker (nothing is retried
+        /// in the background); the items then come from the store alone.
+        worker_running: bool,
+        items: Vec<OutboxItem>,
     },
     Error {
         v: u16,
@@ -162,7 +225,10 @@ pub fn decode_request_checked(frame: &[u8]) -> Result<IpcRequest, IpcDecodeError
         | IpcRequest::EnqueueSealed { v, .. }
         | IpcRequest::SealUnderSession { v, .. }
         | IpcRequest::LanDial { v, .. }
-        | IpcRequest::InternetDial { v, .. } => {
+        | IpcRequest::InternetDial { v, .. }
+        | IpcRequest::OutboxKick { v, .. }
+        | IpcRequest::OutboxStatus { v, .. }
+        | IpcRequest::OutboxList { v, .. } => {
             if *v != IPC_VERSION {
                 return Err(IpcDecodeError::new("IPC_VERSION", "ipc version"));
             }
@@ -1095,6 +1161,112 @@ mod tests {
         for bad in ["seed", "private_key", "plaintext", "recovery"] {
             assert!(!raw.contains(bad), "{bad} leaked into EnqueueSealed JSON");
         }
+    }
+
+    /// The outbox ops carry identifiers, states and counts only: no field
+    /// (and so no value) can hold message content, and the JSON keys pass the
+    /// secret-name denylist both ways.
+    #[test]
+    fn outbox_ops_roundtrip_and_carry_no_content() {
+        let item = OutboxItem {
+            message_id_hex: "ab".repeat(16),
+            peer_pub_hex: "cd".repeat(32),
+            kind: "message".into(),
+            state: "queued".into(),
+            carrier: "lan_dial".into(),
+            attempts: 3,
+            next_attempt_ms: 1_700_000_000_000,
+            last_error_code: "NOT_REACHABLE".into(),
+            expires_at_ms: 1_700_000_086_400,
+        };
+        let reqs = [
+            IpcRequest::OutboxKick {
+                v: IPC_VERSION,
+                peer_pub_hex: Some("cd".repeat(32)),
+            },
+            IpcRequest::OutboxKick {
+                v: IPC_VERSION,
+                peer_pub_hex: None,
+            },
+            IpcRequest::OutboxStatus {
+                v: IPC_VERSION,
+                message_id_hex: "ab".repeat(16),
+            },
+            IpcRequest::OutboxList {
+                v: IPC_VERSION,
+                peer_pub_hex: None,
+                limit: Some(MAX_OUTBOX_LIST),
+            },
+        ];
+        for req in &reqs {
+            let f = encode_request(req).unwrap();
+            assert_eq!(&decode_request(&f).unwrap(), req);
+            assert_json_has_no_secret_tokens(std::str::from_utf8(&f[4..]).unwrap());
+        }
+        // Optional fields may be absent (and a minimal kick is just the op).
+        let kick = decode_request(&frame_of(br#"{"op":"outbox_kick","v":1}"#)).unwrap();
+        assert_eq!(
+            kick,
+            IpcRequest::OutboxKick {
+                v: IPC_VERSION,
+                peer_pub_hex: None
+            }
+        );
+        let resps = [
+            IpcResponse::OutboxStatusResult {
+                v: IPC_VERSION,
+                item: item.clone(),
+            },
+            IpcResponse::OutboxListResult {
+                v: IPC_VERSION,
+                worker_running: true,
+                items: vec![item.clone()],
+            },
+        ];
+        for resp in &resps {
+            let f = encode_response(resp).unwrap();
+            assert_eq!(&decode_response(&f).unwrap(), resp);
+            let json = std::str::from_utf8(&f[4..]).unwrap();
+            assert_json_has_no_secret_tokens(json);
+            for word in ["body", "preview", "text", "envelope", "frames"] {
+                assert!(!json.contains(word), "{word} in outbox IPC JSON: {json}");
+            }
+        }
+        // The item has exactly these fields: adding one is a reviewed change.
+        let value = serde_json::to_value(&item).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "attempts",
+                "carrier",
+                "expires_at_ms",
+                "kind",
+                "last_error_code",
+                "message_id_hex",
+                "next_attempt_ms",
+                "peer_pub_hex",
+                "state"
+            ]
+        );
+        // A wrong version is refused like every other op.
+        let err = decode_request_checked(&frame_of(br#"{"op":"outbox_list","v":2}"#)).unwrap_err();
+        assert_eq!(err.code, "IPC_VERSION");
+    }
+
+    /// An op this build does not know (a newer client talking to an older
+    /// daemon) is the typed `IPC_FRAME` refusal, never a crash or a guess.
+    #[test]
+    fn unknown_ops_are_a_typed_frame_error() {
+        let err =
+            decode_request_checked(&frame_of(br#"{"op":"outbox_frobnicate","v":1}"#)).unwrap_err();
+        assert_eq!(err.code, "IPC_FRAME");
     }
 
     #[test]

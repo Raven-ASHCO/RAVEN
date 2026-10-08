@@ -79,7 +79,10 @@ A_ADDR=$(grep '^address=' "$WORKDIR/a.init" | cut -d= -f2)
 B_ADDR=$(grep '^address=' "$WORKDIR/b.init" | cut -d= -f2)
 A_PUB=$(grep '^pub_hex=' "$WORKDIR/a.init" | cut -d= -f2)
 B_PUB=$(grep '^pub_hex=' "$WORKDIR/b.init" | cut -d= -f2)
+A_FP=$(grep '^fingerprint=' "$WORKDIR/a.init" | cut -d= -f2)
+B_FP=$(grep '^fingerprint=' "$WORKDIR/b.init" | cut -d= -f2)
 test -n "$A_ADDR" && test -n "$B_ADDR" && test -n "$A_PUB" && test -n "$B_PUB"
+test -n "$A_FP" && test -n "$B_FP"
 
 "$ASH" --data-dir "$A" prekey publish
 "$ASH" --data-dir "$B" prekey publish
@@ -132,10 +135,13 @@ fi
 echo "A_INET=$A_INET B_INET=$B_INET"
 
 echo "=== contact add (trust only; send uses --carrier internet --peer) ==="
+# Internet delivery is for verified contacts only (fingerprint pinned with
+# --verify-fp): the sender refuses to dial an unpinned one and the Internet
+# listener treats an unpinned dialer like a stranger.
 "$ASH" --data-dir "$A" contact add \
-  --address "$B_ADDR" --pub-hex "$B_PUB" --petname "Bob" --tag bob
+  --address "$B_ADDR" --pub-hex "$B_PUB" --petname "Bob" --tag bob --verify-fp "$B_FP"
 "$ASH" --data-dir "$B" contact add \
-  --address "$A_ADDR" --pub-hex "$A_PUB" --petname "Alice" --tag alice
+  --address "$A_ADDR" --pub-hex "$A_PUB" --petname "Alice" --tag alice --verify-fp "$A_FP"
 
 echo "=== ash send --carrier internet (localhost indexed; not WAN) ==="
 set +e
@@ -189,8 +195,9 @@ if ! raven_ipc_up "$ASH" "$C"; then
   cat "$WORKDIR/c.node.log" >&2 || true
   fail "stranger daemon did not answer IPC (ash ipc-ping)"
 fi
+# C has verified B (so C's own send dials); B has never heard of C.
 "$ASH" --data-dir "$C" contact add \
-  --address "$B_ADDR" --pub-hex "$B_PUB" --petname "Bob" --tag bob
+  --address "$B_ADDR" --pub-hex "$B_PUB" --petname "Bob" --tag bob --verify-fp "$B_FP"
 # B must be up and listening when the probe arrives; otherwise a failed send
 # could only mean "connection refused", not "B refused the stranger".
 if ! kill -0 "$B_PID" 2>/dev/null; then

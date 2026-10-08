@@ -252,6 +252,9 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     limits: InboundLimits,
     slot: &mut AdmissionSlot,
+    // The dialer's address: an unverified contact is answered only from the
+    // local network (`None` counts as remote).
+    source: Option<std::net::IpAddr>,
 ) -> Result<(), String> {
     let started = std::time::Instant::now();
     // Identity comes from the listener (loaded once): an unauthenticated peer
@@ -272,11 +275,19 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     // Contact gate before anything identifying leaves this node: a stranger
     // (or a blocked key) gets the connection closed and nothing else, not our
     // bind (Raven identity) and not our RLB1 (certificate + prekey bundle).
+    // An unverified contact dialling from outside the local network is
+    // treated exactly like a stranger (owner decision 2026-10-08).
     let gate_started = tokio::time::Instant::now();
     {
         let dd = data_dir.clone();
         blocking(move || {
-            raven_core::lan_dispatch::link_peer_admission(&dd, &remote_ed).map_err(String::from)
+            raven_core::lan_dispatch::link_admission(
+                &dd,
+                &remote_ed,
+                raven_core::OutboxCarrier::Lan,
+                source,
+            )
+            .map_err(String::from)
         })
         .await?;
     }
@@ -318,6 +329,8 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     // listener with throw-away identities and lock real contacts out.
     if trusted {
         slot.authenticated();
+        // A contact that reaches us is online now: retry what we owe it.
+        crate::outbox::peer_seen(&remote_ed);
     }
     write_cipher(&mut stream, &mut transport, &local).await?;
 
@@ -353,8 +366,13 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|e| format!("dispatch join: {e}"))?
         .map_err(|e| format!("dispatch: {e}"))?
         .ok_or_else(|| "blocked peer".to_string())?;
-        for reply in replies {
-            write_cipher(&mut stream, &mut transport, &reply).await?;
+        for (i, reply) in replies.iter().enumerate() {
+            if let Err(e) = write_cipher(&mut stream, &mut transport, reply).await {
+                // The sealed ACK of a message we just accepted never left: the
+                // outbox pushes it to the sender later (transports design F8).
+                crate::outbox::note_unsent_replies(&remote_ed, &replies[i..]);
+                return Err(e);
+            }
         }
     }
     Ok(())
@@ -408,6 +426,8 @@ async fn run_listener_with_limits(
     eprintln!("raven-node lan_direct: listen {local}");
     LISTENER_UP.store(true, Ordering::Relaxed);
     let _up = ListenerGuard;
+    // Back on the network: whatever the outbox holds is worth a try now.
+    crate::outbox::listener_up();
     match serve_listener(listener, data_dir, identity, limits).await {}
 }
 
@@ -425,7 +445,10 @@ async fn serve_listener(
         move |stream, mut slot| {
             let dd = data_dir.clone();
             let id = identity.clone();
-            async move { handle_inbound(dd, id, stream, limits, &mut slot).await }
+            async move {
+                let source = stream.peer_addr().ok().map(|a| a.ip());
+                handle_inbound(dd, id, stream, limits, &mut slot, source).await
+            }
         },
     )
     .await
@@ -589,6 +612,10 @@ pub async fn dial(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The source address the scripted dialers of these tests connect from.
+    const LOOPBACK: Option<std::net::IpAddr> =
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     use crate::netutil::{Admission, ReplyWaits};
     use raven_core::envelope::{EnvType, Envelope};
     use tokio::net::TcpStream;
@@ -649,7 +676,15 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut slot = test_slot();
-            handle_inbound(data_dir, responder, stream, PRODUCTION_LIMITS, &mut slot).await
+            handle_inbound(
+                data_dir,
+                responder,
+                stream,
+                PRODUCTION_LIMITS,
+                &mut slot,
+                LOOPBACK,
+            )
+            .await
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
         let mut transport = initiator_session(&mut client, &initiator, &expected)
@@ -719,7 +754,15 @@ mod tests {
         let (mut client, server_side) = tokio::io::duplex(1 << 18);
         let (data_dir, resp) = (resp_dir.path().to_path_buf(), responder.clone());
         let server = tokio::spawn(async move {
-            handle_inbound(data_dir, resp, server_side, PRODUCTION_LIMITS, &mut slot).await
+            handle_inbound(
+                data_dir,
+                resp,
+                server_side,
+                PRODUCTION_LIMITS,
+                &mut slot,
+                LOOPBACK,
+            )
+            .await
         });
         let mut t = initiator_session(&mut client, &initiator, &responder.public_key_bytes())
             .await
@@ -777,7 +820,15 @@ mod tests {
             let (data_dir, resp) = (resp_dir.path().to_path_buf(), responder.clone());
             let server = tokio::spawn(async move {
                 let mut slot = test_slot();
-                handle_inbound(data_dir, resp, server_side, PRODUCTION_LIMITS, &mut slot).await
+                handle_inbound(
+                    data_dir,
+                    resp,
+                    server_side,
+                    PRODUCTION_LIMITS,
+                    &mut slot,
+                    LOOPBACK,
+                )
+                .await
             });
             let err = initiator_session(&mut client, &stranger, &responder.public_key_bytes())
                 .await
@@ -803,6 +854,77 @@ mod tests {
         }
     }
 
+    /// Owner decision 2026-10-08: an unverified contact is answered on LAN
+    /// direct only from a local-network address. From anywhere else (or an
+    /// unknown source) it gets exactly the stranger's treatment: the link
+    /// closes after its bind, before any byte of ours. A verified (pinned)
+    /// contact is answered from anywhere.
+    #[tokio::test]
+    async fn an_unverified_contact_from_outside_the_local_network_is_a_stranger() {
+        let responder = Arc::new(Identity::from_seed(&[0x7c; 32]));
+        let dialer = Identity::from_seed(&[0x7d; 32]);
+        let public: Option<std::net::IpAddr> = Some("203.0.113.9".parse().unwrap());
+        let cgnat: Option<std::net::IpAddr> = Some("100.64.3.4".parse().unwrap());
+        for (source, pinned, refused) in [
+            (public, false, true),
+            (cgnat, false, true),
+            (None, false, true),
+            (public, true, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("contacts.json"),
+                format!(
+                    r#"[{{"pub_hex":"{}","pinned":{pinned}}}]"#,
+                    hex::encode(dialer.public_key_bytes())
+                ),
+            )
+            .unwrap();
+            let (mut client, server_side) = tokio::io::duplex(1 << 18);
+            let (data_dir, resp) = (dir.path().to_path_buf(), responder.clone());
+            let server = tokio::spawn(async move {
+                let mut slot = test_slot();
+                handle_inbound(
+                    data_dir,
+                    resp,
+                    server_side,
+                    PRODUCTION_LIMITS,
+                    &mut slot,
+                    source,
+                )
+                .await
+            });
+            let got = initiator_session(&mut client, &dialer, &responder.public_key_bytes()).await;
+            let case = format!("{source:?} pinned={pinned}");
+            if refused {
+                assert_eq!(
+                    got.err().as_deref(),
+                    Some(netutil::LINK_NOT_ACCEPTED),
+                    "{case}"
+                );
+                let refusal = tokio::time::timeout(Duration::from_secs(10), server)
+                    .await
+                    .expect("handler ends")
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(
+                    refusal,
+                    raven_core::lan_dispatch::LINK_REFUSED_NOT_VERIFIED,
+                    "{case}"
+                );
+                let mut rest = Vec::new();
+                assert_eq!(
+                    client.read_to_end(&mut rest).await.unwrap_or(0),
+                    0,
+                    "{case}"
+                );
+            } else {
+                assert!(got.is_ok(), "{case}: {:?}", got.err());
+                server.abort();
+            }
+        }
+    }
+
     /// The dialer authenticates first, so a contact that dials a responder
     /// which has *it* as a contact still verifies the responder's bind.
     #[tokio::test]
@@ -816,7 +938,15 @@ mod tests {
         let (data_dir, resp) = (resp_dir.path().to_path_buf(), responder.clone());
         let _server = tokio::spawn(async move {
             let mut slot = test_slot();
-            handle_inbound(data_dir, resp, server_side, PRODUCTION_LIMITS, &mut slot).await
+            handle_inbound(
+                data_dir,
+                resp,
+                server_side,
+                PRODUCTION_LIMITS,
+                &mut slot,
+                LOOPBACK,
+            )
+            .await
         });
         // Dialing the right listener but expecting someone else still fails on
         // the responder's (now disclosed) bind.
@@ -851,6 +981,7 @@ mod tests {
             server_side,
             PRODUCTION_LIMITS,
             &mut slot,
+            LOOPBACK,
         )
         .await
         .unwrap_err();

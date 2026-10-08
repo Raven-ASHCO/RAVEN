@@ -9,17 +9,22 @@ use std::path::Path;
 use std::time::Duration;
 
 use raven_core::device_cert::{ensure_local_device_certificate, DeviceCertificate, DeviceRegistry};
-use raven_core::device_sync::RevocationStore;
-use raven_core::envelope::{EnvType, Envelope};
+use raven_core::envelope::Envelope;
 use raven_core::identity::Identity;
 use raven_core::indexed_session_store::{
-    AuthorizedEndpointDevice, EndpointAckAcceptance, EndpointOutboundKind, IndexedSessionRecordKey,
-    IndexedSessionStore,
+    AuthorizedEndpointDevice, EndpointOutboundKind, IndexedSessionRecordKey, IndexedSessionStore,
 };
 use raven_core::ipc::{ipc_endpoint, IpcRequest, IpcResponse, IPC_VERSION};
 use raven_core::lan_dispatch::{
     cache_peer_bundle, create_initiator_pair_init, find_confirmed_peer_session,
     load_cached_peer_bundle, parse_peer_offer, wrap_pair_init,
+};
+use raven_core::outbox::{
+    abandon_undelivered_to_peer, clear_object_routes, envelope_expires_at,
+    finish_outbound_delivered, first_ack_frame, give_up_outbound, outbound_already_delivered,
+    peer_lineage_denied, record_object_routes, record_outbound_delivered, send_lock_busy,
+    CarrierChoice, GiveUp, OutboxCarrier, OutboxRoute, PeerSendLock, ACK_FOR_ANOTHER_MESSAGE,
+    CONTACT_NOT_VERIFIED, HISTORY_EXPIRED, HISTORY_FAILED,
 };
 use raven_core::pair_init_lan_oob::{classify_packed_envelope, PairInitOobClassify};
 use raven_core::paths::PRIMARY_DEVICE_ID;
@@ -27,7 +32,8 @@ use raven_core::sanitize::sanitize_terminal_line;
 
 use super::ext::{
     earlier_unconfirmed_text, earlier_undelivered_text, friendly_send_error, not_sent_text,
-    queued_text, quoted_preview, recorded_locally_failed_text, unconfirmed_text, SendCtx,
+    queued_text, quoted_preview, recorded_locally_failed_text, unconfirmed_text, RetryNote,
+    SendCtx,
 };
 use super::trace_delivery;
 
@@ -39,61 +45,98 @@ const PEER_CERT_CACHE: &str = "peer_device_certs.json";
 /// Mirrors raven-core `lan_dispatch::MAX_TRUSTED_PEER_CERT_KEYS`: the lab
 /// import must not grow the shared peer cert cache past the production cap.
 const MAX_PEER_CERT_CACHE_KEYS: usize = 256;
-/// How long a sealed message envelope stays valid (same window as the daemon's
-/// `envelope_expires`). A message staged for retry can only be retried inside
-/// it: afterwards the store refuses the retry as `EndpointNotCurrentlyValid`
-/// and the message is marked failed.
-const MESSAGE_VALIDITY_MS: u64 = 60 * 60 * 1000;
-/// Longest one `ash send` waits for another `ash send` from this profile to the
-/// same peer (see [`PeerSendLock`]).
+/// Longest one `ash send` waits for another send from this profile to the same
+/// peer (another `ash send`, or raven-node's outbox retrying it; see
+/// [`acquire_send_lock`]).
 const PEER_SEND_LOCK_WAIT: Duration = Duration::from_secs(120);
 
-/// Cross-process lock serialising the stateful part of every `ash send` to one
-/// peer from this profile: pairing (first contact), the retry of an earlier
-/// queued message, staging the new one and its dial.
-///
-/// Without it, concurrent invocations interleave in ways the store can only
-/// refuse. Two first-contact sends each ran PairInit and left two sessions the
-/// peer then refused (the pair stayed wedged until the message expired), and a
-/// burst of sends fought over the single outstanding-message slot, so some of
-/// them lost their text. Under the lock the second sender finds the first one's
-/// confirmed session and reuses it, and a burst goes out one after the other.
+/// The per-peer send lock shared with raven-node's outbox worker
+/// ([`raven_core::outbox::PeerSendLock`]): pairing (first contact), the retry
+/// of an earlier queued message, staging the new one and its dial run under it.
+/// Without it, concurrent senders interleave in ways the store can only refuse
+/// (two first-contact sends each ran PairInit; a burst lost texts to the single
+/// outstanding-message slot). Under the lock the second sender finds the first
+/// one's confirmed session and reuses it, and a burst goes out one by one.
 ///
 /// It is taken *after* the RLB1 probe, so waiting on an unreachable peer is not
 /// serialised, and an offline send (stage only, no dial) holds it just briefly.
 /// Held per peer, so sends to different peers never wait on each other.
-struct PeerSendLock {
-    _lock: raven_core::DataDirLock,
+pub(crate) fn acquire_send_lock(
+    data_dir: &Path,
+    peer_device: &[u8; 32],
+) -> Result<PeerSendLock, String> {
+    acquire_send_lock_within(data_dir, peer_device, PEER_SEND_LOCK_WAIT)
 }
 
-impl PeerSendLock {
-    fn acquire(data_dir: &Path, peer_device: &[u8; 32]) -> Result<Self, String> {
-        Self::acquire_within(data_dir, peer_device, PEER_SEND_LOCK_WAIT)
-    }
-
-    fn acquire_within(
-        data_dir: &Path,
-        peer_device: &[u8; 32],
-        wait: Duration,
-    ) -> Result<Self, String> {
-        // Dot-prefixed `*.lock.sqlite`: the same inert lock-database shape the
-        // first-install check already tolerates.
-        let name = format!(".send_{}.lock.sqlite", hex::encode(peer_device));
-        raven_core::DataDirLock::acquire_within(data_dir, &name, wait)
-            .map(|_lock| Self { _lock })
-            .map_err(|e| {
-                if e.contains("database is locked") || e.contains("database is busy") {
-                    format!(
-                        "NOT SENT, nothing queued: another `ash send` to this peer from this \
-                         profile was still running after {}s; try again shortly",
-                        wait.as_secs()
-                    )
-                } else {
-                    format!("NOT SENT, nothing queued: send lock: {e}")
-                }
-            })
-    }
+/// [`acquire_send_lock`] for a send to `who`: when the lock is not free at
+/// once, say so on stderr (one plain line) before the bounded wait, so a send
+/// that waits behind raven-node's background retry (or another terminal) does
+/// not look frozen.
+fn acquire_send_lock_noting(
+    data_dir: &Path,
+    peer_device: &[u8; 32],
+    who: &str,
+) -> Result<PeerSendLock, String> {
+    acquire_send_lock_noting_within(data_dir, peer_device, who, PEER_SEND_LOCK_WAIT, &mut |l| {
+        eprintln!("{C_DIM}{l}{C_RESET}")
+    })
 }
+
+fn acquire_send_lock_noting_within(
+    data_dir: &Path,
+    peer_device: &[u8; 32],
+    who: &str,
+    wait: Duration,
+    note: &mut dyn FnMut(&str),
+) -> Result<PeerSendLock, String> {
+    match PeerSendLock::acquire_within(data_dir, peer_device, Duration::ZERO) {
+        Ok(lock) => return Ok(lock),
+        Err(e) if !send_lock_busy(&e) => {
+            return Err(format!("NOT SENT, nothing queued: send lock: {e}"));
+        }
+        Err(_) => {}
+    }
+    note(&send_lock_waiting_text(who, wait));
+    acquire_send_lock_within(data_dir, peer_device, wait)
+}
+
+/// The one line a send prints while it waits for the per-peer send lock.
+fn send_lock_waiting_text(who: &str, wait: Duration) -> String {
+    format!(
+        "waiting: another send to {who} is in progress (raven-node retrying an earlier \
+         message, or another terminal); this waits at most {}s",
+        wait.as_secs()
+    )
+}
+
+fn acquire_send_lock_within(
+    data_dir: &Path,
+    peer_device: &[u8; 32],
+    wait: Duration,
+) -> Result<PeerSendLock, String> {
+    PeerSendLock::acquire_within(data_dir, peer_device, wait).map_err(|e| {
+        if send_lock_busy(&e) {
+            format!(
+                "NOT SENT, nothing queued: another `ash send` to this peer from this \
+                 profile (or raven-node's outbox retrying an earlier message) was still \
+                 running after {}s; try again shortly",
+                wait.as_secs()
+            )
+        } else {
+            format!("NOT SENT, nothing queued: send lock: {e}")
+        }
+    })
+}
+
+/// How long the RLB1 probe may take when the message can be queued anyway (a
+/// confirmed session exists): `raven send` then ends within about 10 s and
+/// raven-node's outbox keeps trying. A first message still waits for the
+/// full dial, since it cannot be queued.
+const QUEUEABLE_PROBE_TIMEOUT: Duration = Duration::from_secs(7);
+/// The IPC wait of every other dial (just above the daemon's 45 s dial cap).
+const DIAL_IPC_TIMEOUT: Duration = Duration::from_secs(50);
+/// How long `raven send` waits for raven-node to accept an `OutboxKick`.
+const OUTBOX_KICK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Refusal for the lab-only Internet carrier. Shared with ext.rs, which refuses
 /// with it before it would start a daemon.
@@ -111,11 +154,27 @@ pub enum DialCarrier {
 
 impl DialCarrier {
     pub(crate) fn label(self) -> &'static str {
+        self.outbox().label()
+    }
+
+    /// The same carrier in the shared outbox / route policy.
+    pub(crate) fn outbox(self) -> OutboxCarrier {
         match self {
-            Self::Lan => "lan_dial",
-            Self::Internet => "internet_dial",
+            Self::Lan => OutboxCarrier::Lan,
+            Self::Internet => OutboxCarrier::Internet,
         }
     }
+}
+
+/// Refusal for an Internet send to a contact that is not verified (owner
+/// decision 2026-10-08: Internet delivery only for pinned contacts). Nothing
+/// was dialled.
+pub(crate) fn unverified_internet_text(who: &str, verify_cmd: &str, pin_cmd: &str) -> String {
+    format!(
+        "NOT SENT: {who} is not verified: Internet delivery needs the fingerprint checked \
+         first. Compare it with {who} by phone or in person (run: {verify_cmd}), then pin it: \
+         {pin_cmd}. Nothing was dialled. ({CONTACT_NOT_VERIFIED})"
+    )
 }
 
 fn ensure_local_device_cert(
@@ -161,6 +220,27 @@ fn ipc_carrier_dial(
     expected_pub_hex: &str,
     frames: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, String> {
+    ipc_carrier_dial_within(
+        data_dir,
+        carrier,
+        dial,
+        expected_pub_hex,
+        frames,
+        DIAL_IPC_TIMEOUT,
+    )
+}
+
+/// [`ipc_carrier_dial`] that waits at most `timeout` for the daemon's answer.
+/// Only for frame-less probes when shorter than the daemon's own dial cap: the
+/// daemon may still finish such a dial, which sends nothing.
+fn ipc_carrier_dial_within(
+    data_dir: &Path,
+    carrier: DialCarrier,
+    dial: &str,
+    expected_pub_hex: &str,
+    frames: &[Vec<u8>],
+    timeout: Duration,
+) -> Result<Vec<Vec<u8>>, String> {
     use base64::Engine;
     let ep = ipc_endpoint(data_dir);
     if !ep.transport_available() {
@@ -195,7 +275,20 @@ fn ipc_carrier_dial(
     };
     // Retry only the connect (daemon just auto-started / restarting); a request
     // that was written is never replayed.
-    match super::ipc_client::ipc_request_retrying_connect(data_dir, &req, Duration::from_secs(50)) {
+    let answer = super::ipc_client::ipc_request_retrying_connect(data_dir, &req, timeout);
+    if timeout < DIAL_IPC_TIMEOUT && frames.is_empty() {
+        if let Err(e) = &answer {
+            if super::ipc_client::error_means_no_answer(e) {
+                return Err(format!(
+                    "{} {}: no answer within {}s (the probe was cut short; nothing was sent)",
+                    carrier.label(),
+                    dial,
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
+    match answer {
         Ok(IpcResponse::LanDialResult { frames_b64, .. }) if carrier == DialCarrier::Lan => {
             frames_b64
                 .iter()
@@ -242,8 +335,26 @@ fn ipc_carrier_dial_patient(
     expected_pub_hex: &str,
     frames: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, String> {
+    ipc_carrier_dial_patient_within(
+        data_dir,
+        carrier,
+        dial,
+        expected_pub_hex,
+        frames,
+        DIAL_IPC_TIMEOUT,
+    )
+}
+
+fn ipc_carrier_dial_patient_within(
+    data_dir: &Path,
+    carrier: DialCarrier,
+    dial: &str,
+    expected_pub_hex: &str,
+    frames: &[Vec<u8>],
+    timeout: Duration,
+) -> Result<Vec<Vec<u8>>, String> {
     retry_while_peer_sheds_load(PROBE_ATTEMPTS, PROBE_BACKOFF, std::thread::sleep, || {
-        ipc_carrier_dial(data_dir, carrier, dial, expected_pub_hex, frames)
+        ipc_carrier_dial_within(data_dir, carrier, dial, expected_pub_hex, frames, timeout)
     })
 }
 
@@ -252,26 +363,6 @@ fn first_pair_response(frames: &[Vec<u8>]) -> Option<raven_core::PairResponse> {
         if let PairInitOobClassify::PairResponse(wire) = classify_packed_envelope(packed) {
             if let Ok(response) = raven_core::pair_init::decode_response(&wire) {
                 return Some(response);
-            }
-        }
-    }
-    None
-}
-
-/// Lineage-aware peer denial, the same predicate the receive side uses
-/// (`RevocationStore::denies_certificate`): legacy `(user, device_id)` records
-/// plus RVDR1 claims covering the device id, either device key or the cert
-/// hash. The bare `is_revoked` misses an RVDR1 lineage re-certified under a
-/// new `device_id` with reused keys.
-fn peer_lineage_denied(data_dir: &Path, peer_cert: &DeviceCertificate) -> Result<bool, String> {
-    RevocationStore::load_checked(data_dir)?.denies_certificate(peer_cert)
-}
-
-fn first_ack_frame(frames: &[Vec<u8>]) -> Option<&[u8]> {
-    for packed in frames {
-        if let Some(env) = Envelope::unpack(packed) {
-            if env.env_type == EnvType::Ack as u8 {
-                return Some(packed.as_slice());
             }
         }
     }
@@ -352,21 +443,52 @@ pub fn run_pair_init_and_send_routes(
             ));
         }
     }
-    ensure_lab_local_material(data_dir, id)?;
     let peer_pub = parse_pub_hex(peer_pub_hex)?;
+    // Internet delivery only for a verified (pinned) contact: refuse before
+    // anything is dialled (`--peer … --carrier internet` included).
+    if routes.iter().any(|r| r.carrier == DialCarrier::Internet)
+        && !raven_core::carrier_allowed_for_contact(
+            OutboxCarrier::Internet,
+            raven_core::contact_is_pinned(data_dir, &peer_pub)?,
+        )
+    {
+        return Err(unverified_internet_text(
+            &ctx.display_name(),
+            &format!(
+                "raven contact verify --address {}",
+                raven_core::encode_address(&peer_pub)
+            ),
+            &pin_command_hint(&peer_pub),
+        ));
+    }
+    ensure_lab_local_material(data_dir, id)?;
     let (local_cert, registry) = ensure_local_device_cert(data_dir, id)?;
+    let handoff = OutboxHandoff::new(data_dir, routes, peer_pub, ctx.choice);
+    // With a confirmed session the message can be queued for raven-node's
+    // outbox whatever the probe says, so an unreachable peer costs ~10 s here,
+    // not a full dial timeout. A first message needs the probe's answer.
+    let probe_timeout = match offline_send_target(data_dir, &peer_pub) {
+        Ok(Some(_)) => QUEUEABLE_PROBE_TIMEOUT,
+        _ => DIAL_IPC_TIMEOUT,
+    };
 
     let mut probe_errors: Vec<String> = Vec::new();
     let mut answered: Option<(DialRoute, raven_core::LanBundle)> = None;
     for (i, route) in routes.iter().enumerate() {
-        let probe =
-            ipc_carrier_dial_patient(data_dir, route.carrier, &route.dial, peer_pub_hex, &[])
-                .and_then(|replies| {
-                    replies
-                        .iter()
-                        .find_map(|f| parse_peer_offer(f).ok())
-                        .ok_or_else(|| "peer did not return an RLB1 bundle".to_string())
-                });
+        let probe = ipc_carrier_dial_patient_within(
+            data_dir,
+            route.carrier,
+            &route.dial,
+            peer_pub_hex,
+            &[],
+            probe_timeout,
+        )
+        .and_then(|replies| {
+            replies
+                .iter()
+                .find_map(|f| parse_peer_offer(f).ok())
+                .ok_or_else(|| "peer did not return an RLB1 bundle".to_string())
+        });
         match probe {
             Ok(bundle) => {
                 answered = Some((route.clone(), bundle));
@@ -393,7 +515,7 @@ pub fn run_pair_init_and_send_routes(
     // From here on the send reads and writes per-peer session state: serialise it
     // with every other `ash send` to this peer (see `PeerSendLock`). After the
     // probe, so an unreachable peer's timeouts are not serialised.
-    let _send_lock = PeerSendLock::acquire(data_dir, &peer_pub)?;
+    let _send_lock = acquire_send_lock_noting(data_dir, &peer_pub, &ctx.display_name())?;
     let (route, peer_bundle) = match answered {
         Some(hit) => hit,
         // Peer asleep / unreachable on every route: the RLB1 probe is not needed
@@ -416,6 +538,7 @@ pub fn run_pair_init_and_send_routes(
                 first.carrier,
                 probe_errors.join("; "),
                 &ctx,
+                &handoff,
             )
             .map(|()| first.clone());
         }
@@ -435,6 +558,18 @@ pub fn run_pair_init_and_send_routes(
     {
         existing
     } else {
+        // PairInit (addresses and trust material in clear, PairInit V1 §7) only
+        // rides a carrier whose Raven Noise session ends at the contact.
+        if !carrier.outbox().confidential_to_endpoint() {
+            return Err(not_sent_text(
+                ctx,
+                &format!(
+                    "{} is not confidential to the endpoint; no PairInit on it",
+                    carrier.label()
+                ),
+                true,
+            ));
+        }
         let (init, key) = create_initiator_pair_init(data_dir, id, &peer_bundle)?;
         let init_frame = wrap_pair_init(id, &init)?;
         // A responder that does not list us as a contact already closed the RLB1
@@ -495,8 +630,130 @@ pub fn run_pair_init_and_send_routes(
         carrier,
         None,
         ctx,
+        &handoff,
     )
     .map(|()| route.clone())
+}
+
+/// Refusal for a LAN send to an unverified contact at an address that is not
+/// on the local network (owner decision 2026-10-08: unverified contacts are
+/// LAN only). Nothing was dialled.
+pub(crate) fn unverified_remote_lan_text(
+    who: &str,
+    reason: &str,
+    verify_cmd: &str,
+    pin_cmd: &str,
+) -> String {
+    format!(
+        "NOT SENT: {who} is not verified, and {reason}: an unverified contact is reached only \
+         at addresses on your local network. Compare the fingerprint with {who} by phone or in \
+         person (run: {verify_cmd}), then pin it: {pin_cmd}. Nothing was dialled. \
+         ({CONTACT_NOT_VERIFIED})"
+    )
+}
+
+/// `raven contact add …` that pins the contact whose key is `peer`, for the
+/// verified-contact refusal (the existing verify command only shows the
+/// fingerprint; adding again with `--verify-fp` pins it).
+pub(crate) fn pin_command_hint(peer: &[u8; 32]) -> String {
+    format!(
+        "raven contact add --address {} --pub-hex {} --verify-fp <the fingerprint they read out>",
+        raven_core::encode_address(peer),
+        hex::encode(peer)
+    )
+}
+
+/// Hands a message this send left undelivered to raven-node's background
+/// outbox: records, for that object, the carrier choice and the routes this
+/// send planned (so the worker never widens them; the record expires with the
+/// envelope) and kicks the worker once per send.
+pub(crate) struct OutboxHandoff<'a> {
+    data_dir: &'a Path,
+    routes: &'a [DialRoute],
+    peer: [u8; 32],
+    choice: CarrierChoice,
+    taken: std::cell::Cell<Option<bool>>,
+}
+
+impl<'a> OutboxHandoff<'a> {
+    /// `choice`: what `--carrier` asked for; `None` derives it from the routes
+    /// (both carriers: auto; one: that one).
+    pub(crate) fn new(
+        data_dir: &'a Path,
+        routes: &'a [DialRoute],
+        peer: [u8; 32],
+        choice: Option<CarrierChoice>,
+    ) -> Self {
+        let has = |c: DialCarrier| routes.iter().any(|r| r.carrier == c);
+        let derived = match (has(DialCarrier::Lan), has(DialCarrier::Internet)) {
+            (true, true) => CarrierChoice::Auto,
+            (false, true) => CarrierChoice::Internet,
+            _ => CarrierChoice::Lan,
+        };
+        Self {
+            data_dir,
+            routes,
+            peer,
+            choice: choice.unwrap_or(derived),
+            taken: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Did raven-node's outbox take it (its `OutboxKick` was accepted)? An
+    /// older service answers with an error: nothing retries it then.
+    fn kicked(&self) -> bool {
+        if let Some(taken) = self.taken.get() {
+            return taken;
+        }
+        let taken = outbox_kick(self.data_dir, Some(&self.peer));
+        self.taken.set(Some(taken));
+        taken
+    }
+
+    /// Record `message_id` for the worker and return the retry promise for its
+    /// envelope, which expires at `expires_at_ms`.
+    pub(crate) fn note(&self, message_id: &[u8; 16], expires_at_ms: u64) -> RetryNote {
+        let routes: Vec<OutboxRoute> = self
+            .routes
+            .iter()
+            .map(|r| OutboxRoute {
+                carrier: r.carrier.outbox(),
+                dial: r.dial.clone(),
+            })
+            .collect();
+        // Best effort: without the record the worker plans LAN from the book.
+        let _ = record_object_routes(
+            self.data_dir,
+            message_id,
+            &self.peer,
+            self.choice,
+            &routes,
+            expires_at_ms,
+            now_ms(),
+        );
+        RetryNote {
+            expires_at_ms,
+            background: self.kicked(),
+        }
+    }
+}
+
+/// Ask raven-node's outbox to retry the objects to `peer` (or all) now.
+/// `true` only when a worker accepted it.
+pub(crate) fn outbox_kick(data_dir: &Path, peer: Option<&[u8; 32]>) -> bool {
+    let req = IpcRequest::OutboxKick {
+        v: IPC_VERSION,
+        peer_pub_hex: peer.map(hex::encode),
+    };
+    matches!(
+        super::ipc_client::ipc_request_timeout(data_dir, &req, OUTBOX_KICK_TIMEOUT),
+        Ok(IpcResponse::Accepted { .. })
+    )
+}
+
+/// When the sealed envelope `bytes` stops being valid (0 if unreadable).
+fn envelope_expiry(bytes: &[u8]) -> u64 {
+    Envelope::unpack(bytes).map(|e| e.expires_at).unwrap_or(0)
 }
 
 /// Attempts at a dial the peer shed at the handshake, and the first back-off
@@ -577,6 +834,7 @@ fn send_when_peer_unreachable(
     carrier: DialCarrier,
     probe_err: String,
     ctx: &SendCtx,
+    handoff: &OutboxHandoff<'_>,
 ) -> Result<(), String> {
     let (peer_cert, record_key) = match offline_send_target(data_dir, peer_pub) {
         Ok(Some(target)) => target,
@@ -605,12 +863,9 @@ fn send_when_peer_unreachable(
         carrier,
         Some(&probe_err),
         ctx,
+        handoff,
     )
 }
-
-/// Minutes a staged message stays deliverable (its sealed envelope's validity):
-/// the retry promise in the queued / unconfirmed sentences.
-const MESSAGE_VALIDITY_MINUTES: u64 = MESSAGE_VALIDITY_MS / 60_000;
 
 /// One line for a failed `ash send`. The outcomes differ, and one blanket
 /// "send refused:" prefix misreported two of them:
@@ -632,7 +887,7 @@ pub(crate) fn send_failure_line(error: &str) -> String {
 /// Why an earlier queued message was given up: it outlived its envelope validity
 /// before it could be (re)delivered; the retry paths abandon it, and this says so.
 const EXPIRED_BEFORE_DELIVERY: &str = "it expired before delivery was confirmed and was marked \
-     failed; send it again if you still need it";
+     expired (not delivered); send it again if you still need it";
 
 /// Why a queued message was abandoned: it was sealed under a session the peer no
 /// longer accepts while a newer confirmed session exists, so it can never be
@@ -723,7 +978,7 @@ fn refuse_revoked_peer(
     require_session_bound_peer_cert(peer_cert, bound_digest)?;
     let peer_revoked = peer_lineage_denied(data_dir, peer_cert)?;
     if peer_revoked {
-        abandon_undelivered_to_peer(data_dir, store, peer_cert)?;
+        abandon_undelivered_to_peer(data_dir, store, &peer_cert.device_ed_pub)?;
     }
     raven_core::refuse_if_session_lineage_revoked(data_dir, local_cert, peer_cert).map_err(|e| {
         if peer_revoked {
@@ -732,44 +987,6 @@ fn refuse_revoked_peer(
             e
         }
     })
-}
-
-fn abandon_undelivered_to_peer(
-    data_dir: &Path,
-    store: &mut IndexedSessionStore,
-    peer_cert: &DeviceCertificate,
-) -> Result<(), String> {
-    let recipient = &peer_cert.device_ed_pub;
-    let mut rows = store
-        .pending_endpoint_outbound_for_recipient(Some(recipient))
-        .map_err(|e| e.redacted_display())?;
-    rows.extend(
-        store
-            .awaiting_ack_endpoint_outbound_for_recipient(Some(recipient))
-            .map_err(|e| e.redacted_display())?,
-    );
-    for row in rows {
-        if row.kind != EndpointOutboundKind::Message {
-            continue;
-        }
-        let Some(key) = store
-            .record_key_for_session_id(&row.session_id)
-            .map_err(|e| e.redacted_display())?
-        else {
-            continue;
-        };
-        store
-            .abandon_undelivered_outbound(&key, &row.object_digest)
-            .map_err(|e| e.redacted_display())?;
-        mark_outbound_failed(
-            data_dir,
-            recipient,
-            &row.session_id,
-            &row.object_digest,
-            &row.message_id,
-        )?;
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -788,6 +1005,8 @@ fn send_indexed_text(
     // Stage and queue as usual but skip the network, failing with `reason`.
     peer_unreachable: Option<&str>,
     ctx: &SendCtx,
+    // Where a message this send leaves undelivered goes: raven-node's outbox.
+    handoff: &OutboxHandoff<'_>,
 ) -> Result<(), String> {
     // LAN and Internet both carry each envelope as one Noise transport message.
     let max_text = raven_core::lan_noise::MAX_LAN_ENDPOINT_TEXT;
@@ -812,10 +1031,8 @@ fn send_indexed_text(
     let session_expires = store
         .session_expires_at(record_key)
         .map_err(|e| e.redacted_display())?;
-    let expires = now.saturating_add(MESSAGE_VALIDITY_MS).min(session_expires);
-    if expires <= now {
-        return Err("session expired".into());
-    }
+    // The shared validity policy (min(session end, now + 24 h)).
+    let expires = envelope_expires_at(now, session_expires)?;
     let mut rng = rand::rngs::OsRng;
     let replies = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
     let dial_err = std::cell::RefCell::new(None::<String>);
@@ -901,30 +1118,79 @@ fn send_indexed_text(
             }
         }
     };
-    for pending in store
+    // Earlier messages to this peer first (queued, then sent without an ACK):
+    // one outstanding message per peer, in order.
+    let mut earlier: Vec<(raven_core::EndpointOutbound, bool)> = store
         .pending_endpoint_outbound_for_recipient(Some(recipient))
         .map_err(|e| e.redacted_display())?
-    {
-        if pending.kind != EndpointOutboundKind::Message {
+        .into_iter()
+        .map(|row| (row, false))
+        .collect();
+    earlier.extend(
+        store
+            .awaiting_ack_endpoint_outbound_for_recipient(Some(recipient))
+            .map_err(|e| e.redacted_display())?
+            .into_iter()
+            .map(|row| (row, true)),
+    );
+    for (earlier_row, resend) in earlier {
+        if earlier_row.kind != EndpointOutboundKind::Message {
             continue;
         }
-        let Some(pending_key) = store
-            .record_key_for_session_id(&pending.session_id)
+        let Some(row_key) = store
+            .record_key_for_session_id(&earlier_row.session_id)
             .map_err(|e| e.redacted_display())?
         else {
             continue;
         };
-        *dial_session.borrow_mut() = pending.session_id;
-        *dial_expected_digest.borrow_mut() = Some(pending.object_digest);
-        match store.retry_endpoint_outbound(
-            &pending_key,
-            &pending.object_digest,
-            &local_device,
-            now,
-            &mut dial,
-        ) {
+        let preview = staged_preview(data_dir, &earlier_row.message_id);
+        let note = || {
+            handoff.note(
+                &earlier_row.message_id,
+                envelope_expiry(&earlier_row.immutable_envelope_bytes),
+            )
+        };
+        // An ACK that came back another way (pushed by the peer's outbox, or
+        // seen by raven-node) already delivered it: record that, never dial it.
+        if outbound_already_delivered(
+            &store,
+            &earlier_row.session_id,
+            &earlier_row.message_id,
+            recipient,
+        )? {
+            record_outbound_delivered(
+                data_dir,
+                &mut store,
+                recipient,
+                &earlier_row.session_id,
+                &earlier_row.message_id,
+            )?;
+            let _ = clear_object_routes(data_dir, &[earlier_row.message_id]);
+            ctx.say_earlier_delivered(&preview);
+            continue;
+        }
+        *dial_session.borrow_mut() = earlier_row.session_id;
+        *dial_expected_digest.borrow_mut() = Some(earlier_row.object_digest);
+        replies.borrow_mut().clear();
+        let result = if resend {
+            store.resend_queued_endpoint_outbound(
+                &row_key,
+                &earlier_row.object_digest,
+                &local_device,
+                now,
+                &mut dial,
+            )
+        } else {
+            store.retry_endpoint_outbound(
+                &row_key,
+                &earlier_row.object_digest,
+                &local_device,
+                now,
+                &mut dial,
+            )
+        };
+        match result {
             Ok(row) => {
-                let preview = staged_preview(data_dir, &row.message_id);
                 let frames = replies.borrow();
                 if let Some(ack) = first_ack_frame(&frames) {
                     let ack = ack.to_vec();
@@ -932,36 +1198,53 @@ fn send_indexed_text(
                     finish_outbound_delivered(
                         data_dir,
                         &mut store,
-                        &pending_key,
+                        &row_key,
                         peer_cert,
-                        &pending.session_id,
-                        &pending.object_digest,
+                        &earlier_row.session_id,
+                        &earlier_row.object_digest,
                         &row.message_id,
                         &ack,
                         now,
                     )
-                    .map_err(|e| finish_failure_text(ctx, &e, &preview))?;
+                    .map_err(|e| finish_failure_text(ctx, &e, &preview, &note()))?;
+                    let _ = clear_object_routes(data_dir, &[row.message_id]);
                     ctx.say_earlier_delivered(&preview);
                 } else {
+                    // Sent again, no ACK yet: the outbox keeps resending it.
+                    let _ = note();
                     return Err(earlier_unconfirmed_text(ctx, &preview));
                 }
             }
             Err(raven_core::IndexedSessionStoreError::NotFound)
             | Err(raven_core::IndexedSessionStoreError::BindingConflict) => continue,
             Err(raven_core::IndexedSessionStoreError::EndpointNotCurrentlyValid) => {
-                let preview = staged_preview(data_dir, &pending.message_id);
-                store
-                    .abandon_undelivered_outbound(&pending_key, &pending.object_digest)
-                    .map_err(|e| e.redacted_display())?;
-                mark_outbound_failed(
-                    data_dir,
-                    &peer_cert.device_ed_pub,
-                    &pending.session_id,
-                    &pending.object_digest,
-                    &pending.message_id,
-                )?;
-                ctx.say_earlier_failed(&preview, EXPIRED_BEFORE_DELIVERY);
-                continue;
+                // Expired by its own clock: give it up. Otherwise the clock
+                // moved (a step backwards): keep it, raven-node retries it.
+                if envelope_expiry(&earlier_row.immutable_envelope_bytes) <= now {
+                    match give_up_row(
+                        data_dir,
+                        &mut store,
+                        &row_key,
+                        recipient,
+                        &earlier_row,
+                        HISTORY_EXPIRED,
+                    )? {
+                        GiveUp::Abandoned => {
+                            ctx.say_earlier_failed(&preview, EXPIRED_BEFORE_DELIVERY)
+                        }
+                        GiveUp::Delivered => ctx.say_earlier_delivered(&preview),
+                    }
+                    continue;
+                }
+                if resend {
+                    continue;
+                }
+                return Err(earlier_undelivered_text(
+                    ctx,
+                    CLOCK_MOVED,
+                    &preview,
+                    &note(),
+                ));
             }
             Err(e) => {
                 let detail = dial_err
@@ -969,147 +1252,34 @@ fn send_indexed_text(
                     .clone()
                     .unwrap_or_else(|| e.redacted_display());
                 if stage_or_body_handoff_failure(&detail) {
-                    store
-                        .abandon_undelivered_outbound(&pending_key, &pending.object_digest)
-                        .map_err(|e| e.redacted_display())?;
-                    mark_outbound_failed(
+                    give_up_row(
                         data_dir,
-                        &peer_cert.device_ed_pub,
-                        &pending.session_id,
-                        &pending.object_digest,
-                        &pending.message_id,
+                        &mut store,
+                        &row_key,
+                        recipient,
+                        &earlier_row,
+                        HISTORY_FAILED,
                     )?;
                     return Err(detail);
                 }
-                if superseded_row_was_refused(peer_unreachable, &pending_key, record_key, &detail) {
+                if superseded_row_was_refused(peer_unreachable, &row_key, record_key, &detail) {
                     // Sealed under a session the (reachable) peer refuses while a
                     // newer one exists: it can never be accepted, and left alone it
                     // would block every later send until its envelope expires.
-                    let preview = staged_preview(data_dir, &pending.message_id);
-                    store
-                        .abandon_undelivered_outbound(&pending_key, &pending.object_digest)
-                        .map_err(|e| e.redacted_display())?;
-                    mark_outbound_failed(
-                        data_dir,
-                        &peer_cert.device_ed_pub,
-                        &pending.session_id,
-                        &pending.object_digest,
-                        &pending.message_id,
-                    )?;
-                    ctx.say_earlier_failed(&preview, SUPERSEDED_SESSION);
-                    continue;
-                }
-                return Err(earlier_undelivered_text(
-                    ctx,
-                    &detail,
-                    &staged_preview(data_dir, &pending.message_id),
-                    MESSAGE_VALIDITY_MINUTES,
-                ));
-            }
-        }
-    }
-    for awaiting in store
-        .awaiting_ack_endpoint_outbound_for_recipient(Some(recipient))
-        .map_err(|e| e.redacted_display())?
-    {
-        if awaiting.kind != EndpointOutboundKind::Message {
-            continue;
-        }
-        let Some(await_key) = store
-            .record_key_for_session_id(&awaiting.session_id)
-            .map_err(|e| e.redacted_display())?
-        else {
-            continue;
-        };
-        *dial_session.borrow_mut() = awaiting.session_id;
-        *dial_expected_digest.borrow_mut() = Some(awaiting.object_digest);
-        match store.resend_queued_endpoint_outbound(
-            &await_key,
-            &awaiting.object_digest,
-            &local_device,
-            now,
-            &mut dial,
-        ) {
-            Ok(row) => {
-                let preview = staged_preview(data_dir, &row.message_id);
-                let frames = replies.borrow();
-                if let Some(ack) = first_ack_frame(&frames) {
-                    let ack = ack.to_vec();
-                    drop(frames);
-                    finish_outbound_delivered(
+                    match give_up_row(
                         data_dir,
                         &mut store,
-                        &await_key,
-                        peer_cert,
-                        &awaiting.session_id,
-                        &awaiting.object_digest,
-                        &row.message_id,
-                        &ack,
-                        now,
-                    )
-                    .map_err(|e| finish_failure_text(ctx, &e, &preview))?;
-                    ctx.say_earlier_delivered(&preview);
-                } else {
-                    return Err(earlier_unconfirmed_text(ctx, &preview));
-                }
-            }
-            Err(raven_core::IndexedSessionStoreError::NotFound)
-            | Err(raven_core::IndexedSessionStoreError::BindingConflict) => continue,
-            Err(raven_core::IndexedSessionStoreError::EndpointNotCurrentlyValid) => {
-                let preview = staged_preview(data_dir, &awaiting.message_id);
-                store
-                    .abandon_undelivered_outbound(&await_key, &awaiting.object_digest)
-                    .map_err(|e| e.redacted_display())?;
-                mark_outbound_failed(
-                    data_dir,
-                    &peer_cert.device_ed_pub,
-                    &awaiting.session_id,
-                    &awaiting.object_digest,
-                    &awaiting.message_id,
-                )?;
-                ctx.say_earlier_failed(&preview, EXPIRED_BEFORE_DELIVERY);
-                continue;
-            }
-            Err(e) => {
-                let detail = dial_err
-                    .borrow()
-                    .clone()
-                    .unwrap_or_else(|| e.redacted_display());
-                if stage_or_body_handoff_failure(&detail) {
-                    store
-                        .abandon_undelivered_outbound(&await_key, &awaiting.object_digest)
-                        .map_err(|e| e.redacted_display())?;
-                    mark_outbound_failed(
-                        data_dir,
-                        &peer_cert.device_ed_pub,
-                        &awaiting.session_id,
-                        &awaiting.object_digest,
-                        &awaiting.message_id,
-                    )?;
-                    return Err(detail);
-                }
-                if superseded_row_was_refused(peer_unreachable, &await_key, record_key, &detail) {
-                    // See the retry loop above: same reasoning for a resend.
-                    let preview = staged_preview(data_dir, &awaiting.message_id);
-                    store
-                        .abandon_undelivered_outbound(&await_key, &awaiting.object_digest)
-                        .map_err(|e| e.redacted_display())?;
-                    mark_outbound_failed(
-                        data_dir,
-                        &peer_cert.device_ed_pub,
-                        &awaiting.session_id,
-                        &awaiting.object_digest,
-                        &awaiting.message_id,
-                    )?;
-                    ctx.say_earlier_failed(&preview, SUPERSEDED_SESSION);
+                        &row_key,
+                        recipient,
+                        &earlier_row,
+                        HISTORY_FAILED,
+                    )? {
+                        GiveUp::Abandoned => ctx.say_earlier_failed(&preview, SUPERSEDED_SESSION),
+                        GiveUp::Delivered => ctx.say_earlier_delivered(&preview),
+                    }
                     continue;
                 }
-                return Err(earlier_undelivered_text(
-                    ctx,
-                    &detail,
-                    &staged_preview(data_dir, &awaiting.message_id),
-                    MESSAGE_VALIDITY_MINUTES,
-                ));
+                return Err(earlier_undelivered_text(ctx, &detail, &preview, &note()));
             }
         }
     }
@@ -1181,7 +1351,7 @@ fn send_indexed_text(
                     ctx,
                     &format!("{detail}; mid={}…", hex::encode(&mid[..4])),
                     &quoted_preview(text),
-                    MESSAGE_VALIDITY_MINUTES,
+                    &handoff.note(&mid, expires),
                 ),
                 _ => not_sent_nothing_queued(ctx, &detail),
             });
@@ -1208,7 +1378,14 @@ fn send_indexed_text(
             ack,
             now,
         )
-        .map_err(|e| finish_failure_text(ctx, &e, &quoted_preview(text)))?;
+        .map_err(|e| {
+            finish_failure_text(
+                ctx,
+                &e,
+                &quoted_preview(text),
+                &handoff.note(&outbound.message_id, expires),
+            )
+        })?;
         // Only a verified ACK gets here: "delivered" means the receiver confirmed.
         ctx.say_delivered(carrier.label(), &outbound.message_id);
         trace_delivery::trace_event(
@@ -1223,10 +1400,39 @@ fn send_indexed_text(
             ctx,
             &format!("WAITING_FOR_ENDPOINT_ACK: no sealed ACK came back; mid={mid}…"),
             &quoted_preview(text),
-            MESSAGE_VALIDITY_MINUTES,
+            &handoff.note(&outbound.message_id, expires),
         ));
     }
     Ok(())
+}
+
+/// The detail of an earlier message the store refuses although its envelope
+/// has not expired: the computer's clock moved back past its creation time.
+const CLOCK_MOVED: &str = "ENDPOINT_NOT_CURRENTLY_VALID: the earlier message is dated ahead of \
+     this computer's clock (did the clock change?); it is kept, not given up, and raven-node \
+     tries it again";
+
+/// [`give_up_outbound`] for one outbox row; its route record goes too.
+fn give_up_row(
+    data_dir: &Path,
+    store: &mut IndexedSessionStore,
+    key: &IndexedSessionRecordKey,
+    peer: &[u8; 32],
+    row: &raven_core::EndpointOutbound,
+    delivery: &str,
+) -> Result<GiveUp, String> {
+    let outcome = give_up_outbound(
+        data_dir,
+        store,
+        key,
+        peer,
+        &row.session_id,
+        &row.object_digest,
+        &row.message_id,
+        delivery,
+    )?;
+    let _ = clear_object_routes(data_dir, &[row.message_id]);
+    Ok(outcome)
 }
 
 fn stage_or_body_handoff_failure(detail: &str) -> bool {
@@ -1262,145 +1468,26 @@ fn abandon_prepared_binding(
     let Some(pending) = pending else {
         return Ok(());
     };
-    store
-        .abandon_undelivered_outbound(&pending_key, &pending.object_digest)
-        .map_err(|e| e.redacted_display())?;
-    mark_outbound_failed(
+    give_up_row(
         data_dir,
+        store,
+        &pending_key,
         peer_pub,
-        &pending.session_id,
-        &pending.object_digest,
-        &pending.message_id,
+        &pending,
+        HISTORY_FAILED,
     )?;
     Ok(())
 }
-
-#[allow(clippy::too_many_arguments)]
-fn finish_outbound_delivered(
-    data_dir: &Path,
-    store: &mut IndexedSessionStore,
-    record_key: &IndexedSessionRecordKey,
-    peer_cert: &DeviceCertificate,
-    session_id: &[u8; 32],
-    object_digest: &[u8; 32],
-    message_id: &[u8; 16],
-    ack: &[u8],
-    now: u64,
-) -> Result<(), String> {
-    // History body must exist before Delivered is committed.
-    raven_core::ensure_outbound_queued_history(
-        data_dir,
-        &peer_cert.device_ed_pub,
-        session_id,
-        object_digest,
-        message_id,
-        now,
-        None,
-    )?;
-    let accepted = store
-        .accept_ack_envelope(
-            record_key,
-            ack,
-            peer_cert,
-            peer_lineage_denied(data_dir, peer_cert)?,
-            now_ms(),
-        )
-        .map_err(|e| e.redacted_display())?;
-    let acked = match accepted {
-        EndpointAckAcceptance::Committed {
-            acked_message_id, ..
-        }
-        | EndpointAckAcceptance::Duplicate {
-            acked_message_id, ..
-        } => acked_message_id,
-    };
-    if acked != *message_id {
-        // A genuine ACK (the store matched it to an outstanding message of this
-        // session) but for ANOTHER message: that one is delivered, this one is
-        // still unconfirmed. It must never make this message read "delivered".
-        let _ = raven_core::mark_lan_chat_history_delivery(
-            data_dir,
-            "out",
-            &peer_cert.device_ed_pub,
-            &acked,
-            "delivered",
-        );
-        return Err(format!(
-            "{ACK_FOR_ANOTHER_MESSAGE}: the acknowledgement that came back is for message \
-             {}…, not for this one",
-            hex::encode(&acked[..4])
-        ));
-    }
-    raven_core::mark_lan_chat_history_delivery(
-        data_dir,
-        "out",
-        &peer_cert.device_ed_pub,
-        message_id,
-        "delivered",
-    )?;
-    raven_core::clear_staged_outbound_body(data_dir, message_id).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Start of the error [`finish_outbound_delivered`] returns when the ACK that came
-/// back belongs to another outstanding message of the session.
-const ACK_FOR_ANOTHER_MESSAGE: &str = "ACK_FOR_ANOTHER_MESSAGE";
 
 /// How a failure of [`finish_outbound_delivered`] is told: an ACK for another
 /// message leaves this one unconfirmed; anything else happened after the peer
 /// acknowledged this message, so it must not be retyped.
-fn finish_failure_text(ctx: &SendCtx, raw: &str, preview: &str) -> String {
+fn finish_failure_text(ctx: &SendCtx, raw: &str, preview: &str, retry: &RetryNote) -> String {
     if raw.starts_with(ACK_FOR_ANOTHER_MESSAGE) {
-        unconfirmed_text(ctx, raw, preview, MESSAGE_VALIDITY_MINUTES)
+        unconfirmed_text(ctx, raw, preview, retry)
     } else {
-        recorded_locally_failed_text(ctx, raw, preview, MESSAGE_VALIDITY_MINUTES)
+        recorded_locally_failed_text(ctx, raw, preview, retry)
     }
-}
-
-fn mark_outbound_failed(
-    data_dir: &Path,
-    peer_pub: &[u8; 32],
-    session_id: &[u8; 32],
-    object_digest: &[u8; 32],
-    message_id: &[u8; 16],
-) -> Result<(), String> {
-    if let Some(staged) =
-        raven_core::load_staged_outbound_body(data_dir, message_id).map_err(|e| e.to_string())?
-    {
-        if !staged
-            .peer_pub_hex
-            .eq_ignore_ascii_case(&hex::encode(peer_pub))
-            || !staged
-                .session_id_hex
-                .eq_ignore_ascii_case(&hex::encode(session_id))
-            || !staged
-                .object_digest_hex
-                .eq_ignore_ascii_case(&hex::encode(object_digest))
-            || !staged
-                .message_id_hex
-                .eq_ignore_ascii_case(&hex::encode(message_id))
-        {
-            return Err(format!(
-                "staged outbound binding mismatch on fail mid={}",
-                hex::encode(message_id)
-            ));
-        }
-        raven_core::persist_lan_chat_history(
-            data_dir,
-            "out",
-            peer_pub,
-            message_id,
-            staged.created_at_ms,
-            "failed",
-            staged.body.as_bytes(),
-        )?;
-    } else {
-        raven_core::mark_lan_chat_history_delivery(
-            data_dir, "out", peer_pub, message_id, "failed",
-        )?;
-    }
-    raven_core::clear_staged_outbound_body(data_dir, message_id).map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 pub fn export_lab_device_cert(data_dir: &Path, id: &Identity) -> Result<(), String> {
@@ -1645,6 +1732,7 @@ mod revocation_and_offline_tests {
     use super::*;
     use raven_core::device_revocation::DeviceRevocationV1;
     use raven_core::device_sync::RevocationRecord;
+    use raven_core::device_sync::RevocationStore;
 
     const FAR_FUTURE: u64 = u64::MAX / 2;
 
@@ -1847,6 +1935,11 @@ mod revocation_and_offline_tests {
             .is_none());
 
         let (local_cert, registry) = ensure_local_device_cert(dir.path(), &local).unwrap();
+        let routes = [DialRoute {
+            carrier: DialCarrier::Lan,
+            dial: "127.0.0.1:9".into(),
+        }];
+        let handoff = OutboxHandoff::new(dir.path(), &routes, peer_pub, None);
         let err = send_when_peer_unreachable(
             dir.path(),
             &local,
@@ -1861,10 +1954,17 @@ mod revocation_and_offline_tests {
              refused (os error 61))"
                 .into(),
             &bob_ctx(dir.path()),
+            &handoff,
         )
         .unwrap_err();
         assert!(err.starts_with("NOT SENT: "), "{err}");
         assert!(err.contains("Bob"), "names the person: {err}");
+        assert!(
+            !dir.path()
+                .join(raven_core::outbox::OUTBOX_ROUTES_FILE)
+                .exists(),
+            "nothing was queued, so nothing was handed to the outbox"
+        );
         assert!(err.contains("Nothing was queued"), "{err}");
         assert!(
             err.contains("a first message needs Bob to be online"),
@@ -1882,32 +1982,47 @@ mod revocation_and_offline_tests {
     #[test]
     fn delivery_status_wording_distinguishes_queued_from_not_sent() {
         let ctx = bob_ctx(Path::new("/p"));
+        let day = RetryNote {
+            expires_at_ms: now_ms() + raven_core::ENVELOPE_VALIDITY_MS,
+            background: false,
+        };
         let queued = queued_text(
             &ctx,
             "ipc LAN_DIAL: lan dial timeout; mid=abababab…",
             "\"see you at 5\"",
-            MESSAGE_VALIDITY_MINUTES,
+            &day,
         );
         assert!(queued.starts_with("not delivered yet"), "{queued}");
         assert!(queued.contains("queued locally"), "{queued}");
         assert!(queued.contains("\"see you at 5\""), "{queued}");
         assert!(queued.contains("abababab"), "{queued}");
         assert!(queued.contains("timeout"), "{queued}");
-        // The retry promise carries the real window (the envelope validity), and
-        // says nothing retries in the background.
-        assert!(queued.contains("within 60 minutes"), "{queued}");
+        // The retry promise carries the real window (the envelope validity, a
+        // day), and says when nothing retries in the background.
+        assert!(queued.contains("UTC (in about 24 h)"), "{queued}");
         assert!(queued.contains("expires"), "{queued}");
         assert!(queued.contains("NOT retried automatically"), "{queued}");
+        let kept = queued_text(
+            &ctx,
+            "ipc LAN_DIAL: lan dial timeout; mid=abababab…",
+            "\"see you at 5\"",
+            &RetryNote {
+                background: true,
+                ..day
+            },
+        );
+        assert!(kept.contains("raven-node keeps trying"), "{kept}");
+        assert!(!kept.contains("NOT retried"), "{kept}");
+        assert!(SUPERSEDED_SESSION.contains("marked failed"));
+        assert!(EXPIRED_BEFORE_DELIVERY.contains("marked expired (not delivered)"));
         for why in [EXPIRED_BEFORE_DELIVERY, SUPERSEDED_SESSION] {
-            assert!(why.contains("marked failed"), "{why}");
             assert!(why.contains("send it again"), "{why}");
         }
-        assert!(EXPIRED_BEFORE_DELIVERY.contains("expired"));
         let held = earlier_undelivered_text(
             &ctx,
             "ipc LAN_DIAL: lan dial timeout",
             "\"see you at 5\"",
-            MESSAGE_VALIDITY_MINUTES,
+            &day,
         );
         assert!(held.starts_with("NOT SENT"), "{held}");
         assert!(held.contains("not queued"), "{held}");
@@ -1916,7 +2031,7 @@ mod revocation_and_offline_tests {
             &ctx,
             "WAITING_FOR_ENDPOINT_ACK: no sealed ACK came back; mid=abababab…",
             "",
-            MESSAGE_VALIDITY_MINUTES,
+            &day,
         );
         assert!(
             unconfirmed.starts_with("sent, delivery unconfirmed"),
@@ -1942,6 +2057,7 @@ mod send_path_tests {
     use super::super::ipc_client::test_support::short_tempdir;
     use super::*;
     use base64::Engine;
+    use raven_core::envelope::EnvType;
     use raven_core::ipc::{decode_request, encode_response};
     use raven_core::lan_dispatch::{dispatch_frame, encode_local_offer, local_bundle};
     use std::io::{Read, Write};
@@ -2320,6 +2436,116 @@ mod send_path_tests {
         assert_eq!(rig.bob_inbox(), vec!["hello", "on the new session"]);
     }
 
+    /// C (ash side): a queued message whose ACK already came back another way
+    /// (raven-node's outbox, or the peer pushing it) is recorded as delivered
+    /// by the next send and never dialled again, and the new message goes out
+    /// behind it as usual.
+    #[test]
+    fn a_queued_message_already_acknowledged_is_not_dialled_again() {
+        let rig = Rig::new(0x8a);
+        rig.send("hello").unwrap();
+        rig.set_mode(DOWN);
+        let queued = rig.send("acked elsewhere").unwrap_err();
+        assert!(queued.starts_with("not delivered yet"), "{queued}");
+        // Bob got the exact bytes some other way; his ACK reaches Alice's store
+        // without touching the row (the F8 race).
+        let row = IndexedSessionStore::open(rig.a.path())
+            .unwrap()
+            .pending_endpoint_outbound()
+            .unwrap()
+            .remove(0);
+        let a_bundle = local_bundle(rig.a.path(), &rig.alice).unwrap();
+        let ack = dispatch_frame(
+            rig.b.path(),
+            &rig.bob,
+            &a_bundle,
+            &rig.alice.public_key_bytes(),
+            &row.immutable_envelope_bytes,
+        )
+        .unwrap()
+        .into_iter()
+        .find(|f| Envelope::unpack(f).is_some())
+        .unwrap();
+        let key = IndexedSessionStore::open(rig.a.path())
+            .unwrap()
+            .record_key_for_session_id(&row.session_id)
+            .unwrap()
+            .unwrap();
+        let bob_cert = local_bundle(rig.b.path(), &rig.bob).unwrap().cert;
+        IndexedSessionStore::open(rig.a.path())
+            .unwrap()
+            .accept_ack_envelope(&key, &ack, &bob_cert, false, now_ms())
+            .unwrap();
+        // Bob is still down: the next send must not dial (or wait on) the
+        // delivered row, and queues its own text.
+        let err = rig.send("next").unwrap_err();
+        assert!(err.starts_with("not delivered yet"), "{err}");
+        assert!(!err.contains("earlier message"), "{err}");
+        assert!(rig
+            .alice_history()
+            .iter()
+            .any(|(body, state)| body == "acked elsewhere" && state == "delivered"));
+        assert_eq!(rig.alice_pending(), 1, "only the new message is queued");
+    }
+
+    /// D(b) (ash side): an earlier message the store refuses only because the
+    /// clock stepped back (it is dated ahead of now) is kept, not given up as
+    /// expired, and the next send says why.
+    #[test]
+    fn an_earlier_message_dated_ahead_of_the_clock_is_kept_not_expired() {
+        let rig = Rig::new(0x8c);
+        rig.send("hello").unwrap();
+        // Stage a message sealed 10 minutes "in the future" (a fast clock that
+        // was corrected since), its dial failing.
+        let ahead = now_ms() + 10 * 60_000;
+        let (cert, registry) = ensure_local_device_cert(rig.a.path(), &rig.alice).unwrap();
+        let device =
+            AuthorizedEndpointDevice::authorize(&cert, &rig.alice, &registry, ahead).unwrap();
+        let bob = rig.bob.public_key_bytes();
+        let mut store = IndexedSessionStore::open(rig.a.path()).unwrap();
+        let key = store
+            .find_confirmed_session_for_peer(&bob)
+            .unwrap()
+            .unwrap();
+        let session = store.session_id_for_record_key(&key).unwrap();
+        let end = store.session_expires_at(&key).unwrap();
+        let a_dir = rig.a.path().to_path_buf();
+        let _ = store.send_message_envelope(
+            &key,
+            "from a fast clock",
+            &device,
+            ahead,
+            (ahead + 3_600_000).min(end),
+            ahead,
+            &mut rand::rngs::OsRng,
+            &mut |d: &[u8; 32], bytes: &[u8]| {
+                let env = Envelope::unpack(bytes).unwrap();
+                raven_core::ensure_outbound_queued_history(
+                    &a_dir,
+                    &bob,
+                    &session,
+                    d,
+                    &env.message_id,
+                    ahead,
+                    Some("from a fast clock"),
+                )
+                .unwrap();
+                Err(())
+            },
+        );
+        drop(store);
+        assert_eq!(rig.alice_pending(), 1);
+        let err = rig.send("now").unwrap_err();
+        assert!(err.starts_with("NOT SENT: an earlier message"), "{err}");
+        assert!(err.contains("ENDPOINT_NOT_CURRENTLY_VALID"), "{err}");
+        assert!(err.contains("did the clock change"), "{err}");
+        assert_eq!(rig.alice_pending(), 1, "kept, not abandoned");
+        assert!(rig
+            .alice_history()
+            .iter()
+            .any(|(body, state)| body == "from a fast clock" && state == "queued"));
+    }
+
     /// First contact: the PairInit itself is refused silently (the stranger case,
     /// the peer logs "peer is not a local contact" and says nothing on the wire).
     /// The error must name the likely cause.
@@ -2474,21 +2700,26 @@ mod send_path_tests {
     fn peer_send_lock_is_per_peer_and_times_out_with_a_clear_message() {
         let dir = tempfile::tempdir().unwrap();
         let (p1, p2) = ([1u8; 32], [2u8; 32]);
-        let held = PeerSendLock::acquire(dir.path(), &p1).unwrap();
+        let held = acquire_send_lock(dir.path(), &p1).unwrap();
         // Another peer is not held up.
-        let other = PeerSendLock::acquire_within(dir.path(), &p2, Duration::from_millis(50));
+        let other = acquire_send_lock_within(dir.path(), &p2, Duration::from_millis(50));
         assert!(other.is_ok());
         // The same peer waits, then gives up with an actionable message.
         let started = std::time::Instant::now();
-        let err = match PeerSendLock::acquire_within(dir.path(), &p1, Duration::from_millis(80)) {
+        let err = match acquire_send_lock_within(dir.path(), &p1, Duration::from_millis(80)) {
             Ok(_) => panic!("lock must be held"),
             Err(e) => e,
         };
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(err.starts_with("NOT SENT, nothing queued"), "{err}");
         assert!(err.contains("another `ash send` to this peer"), "{err}");
+        assert!(err.contains("raven-node's outbox"), "{err}");
         drop(held);
-        assert!(PeerSendLock::acquire_within(dir.path(), &p1, Duration::from_millis(80)).is_ok());
+        // raven-node's outbox takes the very same lock (shared core type).
+        let worker = PeerSendLock::acquire_within(dir.path(), &p1, Duration::ZERO).unwrap();
+        assert!(acquire_send_lock_within(dir.path(), &p1, Duration::from_millis(80)).is_err());
+        drop(worker);
+        assert!(acquire_send_lock_within(dir.path(), &p1, Duration::from_millis(80)).is_ok());
         // The lock file is the inert `*.lock.sqlite` shape (first-install safe).
         let names: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -2502,18 +2733,81 @@ mod send_path_tests {
         );
     }
 
+    /// K: a send that finds the per-peer lock taken (raven-node's outbox doing
+    /// its store work, or another terminal) says so in one line and waits a
+    /// bounded time; a free lock prints nothing.
+    #[test]
+    fn a_send_behind_a_held_lock_says_it_is_waiting_and_stays_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = [7u8; 32];
+        let mut lines = Vec::new();
+        let free = acquire_send_lock_noting_within(
+            dir.path(),
+            &peer,
+            "Bob",
+            Duration::from_secs(1),
+            &mut |l| lines.push(l.to_string()),
+        );
+        assert!(free.is_ok() && lines.is_empty(), "{lines:?}");
+        drop(free);
+
+        // Held briefly (the worker's store-only section): wait, then go on.
+        let held = PeerSendLock::acquire_within(dir.path(), &peer, Duration::ZERO).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let got = acquire_send_lock_noting_within(
+            dir.path(),
+            &peer,
+            "Bob",
+            Duration::from_secs(5),
+            &mut |l| lines.push(l.to_string()),
+        );
+        releaser.join().unwrap();
+        assert!(got.is_ok());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("waiting: another send to Bob"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("raven-node"), "{}", lines[0]);
+        assert!(lines[0].contains("at most 5s"), "{}", lines[0]);
+        drop(got);
+
+        // Held throughout: the wait ends at its bound with the refusal.
+        let _held = PeerSendLock::acquire_within(dir.path(), &peer, Duration::ZERO).unwrap();
+        lines.clear();
+        let started = std::time::Instant::now();
+        let err = match acquire_send_lock_noting_within(
+            dir.path(),
+            &peer,
+            "Bob",
+            Duration::from_millis(150),
+            &mut |l| lines.push(l.to_string()),
+        ) {
+            Ok(_) => panic!("lock must be held"),
+            Err(e) => e,
+        };
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(lines.len(), 1);
+        assert!(err.starts_with("NOT SENT, nothing queued"), "{err}");
+        // The production bound is stated in the line and is finite.
+        assert!(send_lock_waiting_text("Bob", PEER_SEND_LOCK_WAIT).contains("at most 120s"));
+    }
+
     #[test]
     fn send_failure_line_distinguishes_queued_unconfirmed_and_refused() {
         let ctx = SendCtx {
             name: "Bob".into(),
             ..SendCtx::default()
         };
-        let queued = queued_text(
-            &ctx,
-            "ipc: timed out; mid=07070707…",
-            "",
-            MESSAGE_VALIDITY_MINUTES,
-        );
+        let day = RetryNote {
+            expires_at_ms: now_ms() + raven_core::ENVELOPE_VALIDITY_MS,
+            background: false,
+        };
+        let queued = queued_text(&ctx, "ipc: timed out; mid=07070707…", "", &day);
         assert_eq!(
             send_failure_line(&queued),
             queued,
@@ -2523,7 +2817,7 @@ mod send_path_tests {
             &ctx,
             "WAITING_FOR_ENDPOINT_ACK: no sealed ACK came back; mid=07070707…",
             "",
-            MESSAGE_VALIDITY_MINUTES,
+            &day,
         );
         assert_eq!(send_failure_line(&unconfirmed), unconfirmed);
         assert!(!unconfirmed.contains("send refused"), "{unconfirmed}");

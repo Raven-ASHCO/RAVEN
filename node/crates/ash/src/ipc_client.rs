@@ -244,6 +244,12 @@ pub(crate) fn error_means_not_running(err: &str) -> bool {
     err.contains(NOT_RUNNING)
 }
 
+/// True for the text of a request the service accepted but did not answer
+/// within the caller's timeout ([`NO_ANSWER`]).
+pub(crate) fn error_means_no_answer(err: &str) -> bool {
+    err.starts_with(NO_ANSWER)
+}
+
 /// Text for a failed *connect* to the service endpoint `target` (a socket path
 /// or pipe name). The OS text ("No such file or directory (os error 2)",
 /// "Connection refused (os error 61)") means "no service" to an engineer and

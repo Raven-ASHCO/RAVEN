@@ -199,6 +199,22 @@ const MAX_PREVIEW_CHARS: usize = 120;
 /// Full message body retained for durable history (matches LAN endpoint text cap).
 const MAX_BODY_CHARS: usize = 48 * 1024;
 
+/// The delivery state an outbound row moves to when `next` is written over
+/// `current`. A confirmed delivery (`delivered`, `read`) is final: a retry
+/// that re-stages the row (`queued`) or a late give-up (`failed`, `expired`,
+/// `cancelled`) never turns it back into "not delivered". `read` may still
+/// follow `delivered`. Inbound rows take `next` as is.
+pub fn delivery_after(direction: &str, current: &str, next: &str) -> String {
+    let confirmed = |d: &str| matches!(d, "delivered" | "read");
+    if direction == "out" && confirmed(current) && !confirmed(next) {
+        return current.to_string();
+    }
+    if direction == "out" && current == "read" && next == "delivered" {
+        return current.to_string();
+    }
+    next.to_string()
+}
+
 pub fn history_path(data_dir: &Path) -> PathBuf {
     // Retain the historical path for compatibility. Its contents are binary,
     // authenticated ciphertext after the first protected save/migration.
@@ -374,8 +390,13 @@ impl ChatHistory {
                 && e.peer_pub_hex.eq_ignore_ascii_case(&want_peer)
                 && e.direction == want_dir
         }) {
-            entry.delivery = want_delivery;
-            history.save_unlocked(data_dir, protector)?;
+            // A confirmed delivery is final (see [`delivery_after`]); the row
+            // still counts as found.
+            let next = delivery_after(&entry.direction, &entry.delivery, &want_delivery);
+            if next != entry.delivery {
+                entry.delivery = next;
+                history.save_unlocked(data_dir, protector)?;
+            }
             return Ok(true);
         }
         Ok(false)
@@ -538,7 +559,8 @@ impl ChatHistory {
                 existing.preview = entry.preview;
             }
             if !entry.delivery.is_empty() {
-                existing.delivery = entry.delivery;
+                existing.delivery =
+                    delivery_after(&existing.direction, &existing.delivery, &entry.delivery);
             }
             if entry.created_at_ms > 0 {
                 existing.created_at_ms = entry.created_at_ms;
@@ -3331,6 +3353,47 @@ mod tests {
             history.entries.last().unwrap().message_id_hex,
             format!("{:032x}", 119)
         );
+    }
+
+    #[test]
+    fn a_confirmed_delivery_is_never_downgraded() {
+        for (current, next, want) in [
+            ("queued", "delivered", "delivered"),
+            ("delivered", "queued", "delivered"),
+            ("delivered", "failed", "delivered"),
+            ("delivered", "expired", "delivered"),
+            ("delivered", "cancelled", "delivered"),
+            ("delivered", "read", "read"),
+            ("read", "delivered", "read"),
+            ("read", "queued", "read"),
+            ("queued", "expired", "expired"),
+            ("failed", "queued", "queued"),
+        ] {
+            assert_eq!(
+                delivery_after("out", current, next),
+                want,
+                "{current} -> {next}"
+            );
+        }
+        // Inbound rows are not outbound delivery states.
+        assert_eq!(delivery_after("in", "delivered", "received"), "received");
+        // Through upsert too (the retry path re-stages `queued`).
+        let mut history = ChatHistory::default();
+        let mut row = ChatHistoryEntry {
+            message_id_hex: "aa".repeat(16),
+            direction: "out".into(),
+            peer_petname: String::new(),
+            peer_tag: String::new(),
+            peer_pub_hex: "bb".repeat(32),
+            created_at_ms: 1,
+            delivery: "delivered".into(),
+            preview: "hi".into(),
+            body: "hi".into(),
+        };
+        history.upsert(row.clone());
+        row.delivery = "queued".into();
+        history.upsert(row);
+        assert_eq!(history.entries[0].delivery, "delivered");
     }
 
     #[test]
