@@ -1629,8 +1629,36 @@ fn load_seed_with_migrate(
 /// blocking thread such as `tokio::task::spawn_blocking`, and prefer loading
 /// the identity once at listener start-up over once per inbound connection.
 pub fn load_identity(data_dir: &Path) -> Result<Option<Identity>, IdentityStoreError> {
+    preload_vault_key_before_locks(data_dir)?;
     let _lock = acquire_identity_store_lock(data_dir)?;
     load_identity_under_lock(data_dir)
+}
+
+/// Passphrase-vault profiles (Linux without Secret Service, musl, other Unix):
+/// ask for the passphrase and run Argon2id *before* the identity lock is
+/// taken, so a person typing it never holds up `raven-node` or another `raven`
+/// waiting on that lock. The key stays in the process cache, so the vault reads
+/// under the lock (and in later session transactions) do not prompt again.
+/// Only a first `init` still asks for the *new* passphrase under the lock (the
+/// vault does not exist yet; documented in docs/design/2026-10-linux-keystore.md).
+fn preload_vault_key_before_locks(data_dir: &Path) -> Result<(), IdentityStoreError> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let vault_profile = matches!(
+            crate::keystore_select::recorded_backend(data_dir),
+            Ok(Some(
+                crate::keystore_select::KeystoreBackend::PassphraseVault
+            ))
+        );
+        if vault_profile && !locked_file_backend_requested() {
+            crate::keystore_vault::Vault::for_data_dir(data_dir)
+                .preload_key()
+                .map_err(vault_error)?;
+        }
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let _ = data_dir;
+    Ok(())
 }
 
 fn load_identity_under_lock(data_dir: &Path) -> Result<Option<Identity>, IdentityStoreError> {
@@ -1644,6 +1672,7 @@ fn load_identity_under_lock(data_dir: &Path) -> Result<Option<Identity>, Identit
 pub fn load_or_create_identity(
     data_dir: &Path,
 ) -> Result<(Identity, IdentityStoreBackend), IdentityStoreError> {
+    preload_vault_key_before_locks(data_dir)?;
     let _lock = acquire_identity_store_lock(data_dir)?;
     if let Some((seed, backend)) = load_seed_with_migrate(data_dir)? {
         return finish_loaded_identity(data_dir, seed, backend);

@@ -4,6 +4,8 @@
 
 use raven_core::alias_record::{AliasClaimStore, AliasPublishQuota, AliasRecord};
 use raven_core::bootstrap::BootstrapConfig;
+use raven_core::bridge::DropReason;
+use raven_core::carrier_admission::CustodyRefusal;
 use raven_core::chat_history::BlockList;
 use raven_core::contact_request::{
     ContactAcceptV1, ContactRequestInbox, ContactRequestInner, RavenContactRequestV1,
@@ -488,11 +490,15 @@ fn a10_contact_request_offline_store() {
         },
         true,
     ) {
-        RouterOutcome::QueuedForForward { message_id, .. } => {
-            assert_eq!(message_id, [10u8; 16]);
-        }
-        other => panic!("expected store queue: {other:?}"),
+        // F3 custody allow-list: a legacy contact-request blob is not a sealed
+        // indexed-session object, so no relay stores it (the legacy entry
+        // points are fail-closed anyway).
+        RouterOutcome::Dropped {
+            reason: DropReason::NotAdmitted(CustodyRefusal::NotSealedIndexed),
+        } => {}
+        other => panic!("contact request must not enter custody: {other:?}"),
     }
+    assert_eq!(q.count_all().unwrap(), 0);
 }
 
 /// 11 Ciphertext-only store
@@ -559,22 +565,19 @@ fn a12_ble_bridge_internet_contact_request() {
         },
         true,
     ) {
-        RouterOutcome::ForwardNow {
-            packed,
-            egress,
-            identity,
-        } => {
-            assert_eq!(egress, TransportKind::Lan);
-            assert_eq!(identity.message_id, [12u8; 16]);
-            let fwd = Envelope::unpack(&packed).unwrap();
-            // Wire body carries outer metadata + opaque ciphertext; plaintext note absent.
-            assert!(!String::from_utf8_lossy(&fwd.message_ciphertext).contains("via bridge"));
-            let decoded = RavenContactRequestV1::decode_wire(&fwd.message_ciphertext).unwrap();
-            assert_eq!(decoded.ciphertext, req.ciphertext);
-            assert!(decoded.is_ciphertext_only());
-        }
+        // F3: refused before custody (see a10); the blob itself stays
+        // ciphertext-only for the out-of-band file path that still exists.
+        RouterOutcome::Dropped {
+            reason: DropReason::NotAdmitted(CustodyRefusal::NotSealedIndexed),
+        } => {}
         other => panic!("case12: {other:?}"),
     }
+    let wire = Envelope::unpack(&env.pack()).unwrap().message_ciphertext;
+    assert!(!String::from_utf8_lossy(&wire).contains("via bridge"));
+    let decoded = RavenContactRequestV1::decode_wire(&wire).unwrap();
+    assert_eq!(decoded.ciphertext, req.ciphertext);
+    assert!(decoded.is_ciphertext_only());
+    assert_eq!(q.count_all().unwrap(), 0);
 }
 
 /// 13 Bridge cannot decrypt
@@ -648,7 +651,13 @@ fn a14_multi_transport_dedup() {
         },
         true,
     );
-    assert!(matches!(first, RouterOutcome::ForwardNow { .. }));
+    // F3: never admitted, on any ingress; nothing to dedup against later.
+    assert!(matches!(
+        first,
+        RouterOutcome::Dropped {
+            reason: DropReason::NotAdmitted(_)
+        }
+    ));
     let second = router.handle_inbound(
         &q,
         InboundEnvelope {

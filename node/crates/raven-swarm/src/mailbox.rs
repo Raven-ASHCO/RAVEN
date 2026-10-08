@@ -936,6 +936,13 @@ impl MailboxService {
         if object.expires_at_ms > latest_allowed || object.created_at_ms > future_creation {
             return Err(MailboxReject::Ttl);
         }
+        // Custody allow-list (F3): a store holds only sealed indexed-session
+        // messages / ACKs, never a PairInit / PairResponse, demo or plaintext
+        // frame. Reported with the existing code (no new wire value).
+        if raven_core::carrier_admission::admit_relayable(&object.packed_envelope, now_ms).is_err()
+        {
+            return Err(MailboxReject::Malformed);
+        }
         let expires_at_ms = object.expires_at_ms;
         let store_tag = object.store_tag;
         self.purge_expired(now_ms);
@@ -1149,7 +1156,11 @@ mod tests {
             replication_budget: 2,
             anti_replay_nonce: [0x18; 12],
             ratchet_header_ciphertext: Vec::new(),
-            message_ciphertext: body.to_vec(),
+            // The shape custody admits (F3); the bytes stay opaque.
+            message_ciphertext: raven_core::carrier_admission::opaque_indexed_body_for_tests(
+                raven_core::carrier_admission::RelayableKind::Message,
+                body,
+            ),
             sender_authentication: Vec::new(),
         };
         envelope.sign_with(&signer);
@@ -1421,6 +1432,32 @@ mod tests {
         assert_eq!(
             service.handle(MailboxRequest::Put(long_lived.pack().unwrap()), now),
             MailboxResponse::Rejected(MailboxReject::Ttl)
+        );
+    }
+
+    /// F3: a store never holds a wrapped PairInit or a plaintext envelope; it
+    /// is refused with the existing `Malformed` code and nothing is stored.
+    #[test]
+    fn pairing_and_plaintext_envelopes_are_refused_before_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = unix_time_ms();
+        let mut service = MailboxService::open(directory.path()).unwrap();
+        let mut init = raven_core::pair_init::INIT_MAGIC.to_vec();
+        init.resize(raven_core::pair_init::INIT_WIRE_LEN, 0x01);
+        for body in [init, b"plaintext".to_vec()] {
+            let mut object = StoreObject::unpack(&valid_store_object(now, b"x")).unwrap();
+            let mut envelope = Envelope::unpack(&object.packed_envelope).unwrap();
+            envelope.message_ciphertext = body;
+            envelope.sign_with(&Identity::from_seed(&[0x31; 32]));
+            object.packed_envelope = envelope.pack();
+            assert_eq!(
+                service.handle(MailboxRequest::Put(object.pack().unwrap()), now),
+                MailboxResponse::Rejected(MailboxReject::Malformed)
+            );
+        }
+        assert_eq!(
+            service.handle(MailboxRequest::Put(valid_store_object(now, b"ok")), now),
+            MailboxResponse::Stored
         );
     }
 

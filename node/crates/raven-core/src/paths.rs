@@ -7,6 +7,14 @@ use std::time::Duration;
 pub const DEFAULT_LAN_LISTEN: &str = "0.0.0.0:7420";
 /// Mock BLE stays loopback-only.
 pub const DEFAULT_BLE_LISTEN: &str = "127.0.0.1:7421";
+/// Port of the (opt-in, lab-gated) Internet-direct listener: distinct from LAN
+/// direct (7420) and mock BLE (7421). Transports design 2026-10 §3.6.
+pub const DEFAULT_INTERNET_PORT: u16 = 7422;
+/// Reserved for the libp2p host (TCP + QUIC), transports design §3.6.
+pub const DEFAULT_P2P_PORT: u16 = 7423;
+/// Ports RAVEN itself uses besides LAN direct: never suggest one of them as a
+/// LAN listener for a second profile.
+pub const RESERVED_RAVEN_PORTS: [u16; 3] = [7421, DEFAULT_INTERNET_PORT, DEFAULT_P2P_PORT];
 /// Shared device_id for the local cert + prekey on this node.
 pub const PRIMARY_DEVICE_ID: &str = "ash-primary";
 /// Per-profile log the auto-started `raven-node service` writes its stdout and

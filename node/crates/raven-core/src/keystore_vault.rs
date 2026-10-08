@@ -214,9 +214,7 @@ fn choose_source(
     credential_exists: &dyn Fn(&Path) -> bool,
 ) -> SourceChoice {
     if env(FORBIDDEN_PASSPHRASE_ENV).is_some() {
-        return SourceChoice::Refused(format!(
-            "{FORBIDDEN_PASSPHRASE_ENV} is set; RAVEN never takes the passphrase itself from the environment (other processes can read it). Put it in a file only you can read (chmod 600) and set {PASSPHRASE_FILE_ENV}=<path> instead"
-        ));
+        return SourceChoice::Refused(forbidden_env_message());
     }
     if let Some(path) = env(PASSPHRASE_FILE_ENV).filter(|v| !v.is_empty()) {
         return SourceChoice::File(PathBuf::from(path));
@@ -231,6 +229,15 @@ fn choose_source(
         return SourceChoice::Terminal;
     }
     SourceChoice::Unavailable
+}
+
+/// The refusal for a set [`FORBIDDEN_PASSPHRASE_ENV`], whatever else is set
+/// and whichever purpose (create or unlock) and program (`raven` or
+/// `raven-node`) asked. The release smoke greps for "is refused".
+fn forbidden_env_message() -> String {
+    format!(
+        "{FORBIDDEN_PASSPHRASE_ENV} is set and is refused: RAVEN never takes the passphrase itself from the environment (other processes can read it). Unset it, put the passphrase in a file only you can read (chmod 600) and set {PASSPHRASE_FILE_ENV}=<path> instead"
+    )
 }
 
 fn no_source_message(vault_path: &Path) -> String {
@@ -256,29 +263,44 @@ impl DefaultPassphraseSource {
     }
 }
 
+/// The one place a [`SourceChoice`] becomes a passphrase, for both purposes
+/// (vault creation and unlock) and every program. A refused choice is final:
+/// nothing else (file, credential, terminal) is consulted.
+fn passphrase_from_choice(
+    choice: SourceChoice,
+    purpose: PassphrasePurpose,
+    vault_path: &Path,
+) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    match choice {
+        SourceChoice::Refused(message) => Err(VaultError::PassphraseUnavailable(message)),
+        SourceChoice::File(path) => read_passphrase_file(&path, purpose, false),
+        SourceChoice::Credential(path) => read_passphrase_file(&path, purpose, true),
+        SourceChoice::Terminal => terminal::prompt(purpose, vault_path),
+        SourceChoice::Unavailable => Err(VaultError::PassphraseUnavailable(no_source_message(
+            vault_path,
+        ))),
+    }
+}
+
+fn unlock_attempts_for(choice: &SourceChoice) -> u32 {
+    if *choice == SourceChoice::Terminal {
+        INTERACTIVE_UNLOCK_ATTEMPTS
+    } else {
+        1
+    }
+}
+
 impl PassphraseSource for DefaultPassphraseSource {
     fn passphrase(
         &self,
         purpose: PassphrasePurpose,
         vault_path: &Path,
     ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
-        match self.choice() {
-            SourceChoice::Refused(message) => Err(VaultError::PassphraseUnavailable(message)),
-            SourceChoice::File(path) => read_passphrase_file(&path, purpose, false),
-            SourceChoice::Credential(path) => read_passphrase_file(&path, purpose, true),
-            SourceChoice::Terminal => terminal::prompt(purpose, vault_path),
-            SourceChoice::Unavailable => Err(VaultError::PassphraseUnavailable(no_source_message(
-                vault_path,
-            ))),
-        }
+        passphrase_from_choice(self.choice(), purpose, vault_path)
     }
 
     fn unlock_attempts(&self) -> u32 {
-        if self.choice() == SourceChoice::Terminal {
-            INTERACTIVE_UNLOCK_ATTEMPTS
-        } else {
-            1
-        }
+        unlock_attempts_for(&self.choice())
     }
 
     fn wrong_passphrase(&self) {
@@ -422,12 +444,31 @@ mod terminal {
             })
     }
 
-    /// Restores terminal echo when dropped (also on an early `?` return).
-    struct EchoOff {
-        tty: File,
+    fn stty(tty: &File, args: &[&str]) -> Option<String> {
+        let stdin = tty.try_clone().ok()?;
+        let out = Command::new("stty")
+            .args(args)
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    impl EchoOff {
+    /// No echo, no line discipline and no signal keys while the passphrase is
+    /// typed; the saved settings are restored when dropped, on every return
+    /// path. Ctrl-C therefore reaches [`read_hidden`] as a byte (it cancels
+    /// and returns an error) instead of killing the process with echo still
+    /// off, which used to leave the shell blind.
+    struct HiddenInput {
+        tty: File,
+        saved: String,
+    }
+
+    impl HiddenInput {
         fn new(tty: &File) -> Result<Self, VaultError> {
             let refuse = || {
                 VaultError::PassphraseUnavailable(format!(
@@ -435,30 +476,63 @@ mod terminal {
                 ))
             };
             let tty = tty.try_clone().map_err(|_| refuse())?;
-            let stdin = tty.try_clone().map_err(|_| refuse())?;
-            let ok = Command::new("stty")
-                .arg("-echo")
-                .stdin(Stdio::from(stdin))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            if !ok {
-                return Err(refuse());
-            }
-            Ok(Self { tty })
+            let saved = stty(&tty, &["-g"])
+                .filter(|s| !s.is_empty())
+                .ok_or_else(refuse)?;
+            let guard = Self { tty, saved };
+            // From here on, Drop restores `saved` even if this call fails.
+            stty(
+                &guard.tty,
+                &["-echo", "-icanon", "-isig", "min", "1", "time", "0"],
+            )
+            .ok_or_else(refuse)?;
+            Ok(guard)
         }
     }
 
-    impl Drop for EchoOff {
+    impl Drop for HiddenInput {
         fn drop(&mut self) {
-            if let Ok(stdin) = self.tty.try_clone() {
-                let _ = Command::new("stty")
-                    .arg("echo")
-                    .stdin(Stdio::from(stdin))
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+            if stty(&self.tty, &[self.saved.as_str()]).is_none() {
+                let _ = stty(&self.tty, &["sane"]);
+            }
+        }
+    }
+
+    pub(super) enum Key {
+        Continue,
+        Done,
+        Cancel,
+    }
+
+    /// One byte of hidden input (raw mode: we do the line editing).
+    pub(super) fn edit_hidden_line(line: &mut Zeroizing<Vec<u8>>, byte: u8) -> Key {
+        match byte {
+            b'\r' | b'\n' => Key::Done,
+            // Ctrl-C and Ctrl-\ cancel; Ctrl-D on an empty line ends the input.
+            0x03 | 0x1c => Key::Cancel,
+            0x04 if line.is_empty() => Key::Cancel,
+            // Backspace / DEL: drop one UTF-8 character.
+            0x08 | 0x7f => {
+                while let Some(last) = line.pop() {
+                    if last & 0xc0 != 0x80 {
+                        break;
+                    }
+                }
+                Key::Continue
+            }
+            // Ctrl-U: clear the line.
+            0x15 => {
+                line.clear();
+                Key::Continue
+            }
+            // Other control keys (Ctrl-D mid-line, Ctrl-Z, escape sequences'
+            // ESC) are ignored rather than becoming part of the passphrase.
+            b if b < 0x20 => Key::Continue,
+            b => {
+                if line.len() <= MAX_PASSPHRASE_BYTES {
+                    line.push(b);
+                }
+                Key::Continue
             }
         }
     }
@@ -467,28 +541,28 @@ mod terminal {
         let io = |e: std::io::Error| VaultError::PassphraseUnavailable(format!("terminal: {e}"));
         tty.write_all(prompt.as_bytes()).map_err(io)?;
         tty.flush().map_err(io)?;
-        let echo = EchoOff::new(tty)?;
+        let hidden = HiddenInput::new(tty)?;
         let mut line = Zeroizing::new(Vec::with_capacity(64));
         let mut byte = [0u8; 1];
-        loop {
+        let outcome = loop {
             match tty.read(&mut byte) {
-                Ok(0) => break,
-                Ok(_) if byte[0] == b'\n' => break,
-                Ok(_) => {
-                    if line.len() <= MAX_PASSPHRASE_BYTES {
-                        line.push(byte[0]);
+                Ok(0) => break Ok(()),
+                Ok(_) => match edit_hidden_line(&mut line, byte[0]) {
+                    Key::Continue => {}
+                    Key::Done => break Ok(()),
+                    Key::Cancel => {
+                        break Err(VaultError::PassphraseUnavailable(
+                            "passphrase entry cancelled".into(),
+                        ))
                     }
-                }
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(io(e)),
+                Err(e) => break Err(io(e)),
             }
-        }
-        drop(echo);
+        };
+        drop(hidden);
         let _ = tty.write_all(b"\n");
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        Ok(line)
+        outcome.map(|()| line)
     }
 
     pub(super) fn notice(text: &str) {
@@ -854,6 +928,21 @@ impl Vault {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Unlock an existing vault now, asking for the passphrase if this process
+    /// has no key for it yet, and keep the key in the process cache. Takes no
+    /// lock: callers run it *before* they take the identity lock or open a
+    /// session transaction, so a person typing the passphrase never holds
+    /// those up. `Ok(false)` when there is no vault (creation still asks
+    /// inside [`Self::insert_new`]).
+    pub fn preload_key(&self) -> Result<bool, VaultError> {
+        let Some(raw) = self.read_raw()? else {
+            return Ok(false);
+        };
+        let header = Header::decode(&raw, &self.bounds)?;
+        self.unlock(&raw, &header, None)?;
+        Ok(true)
     }
 
     /// Whether the vault file exists (a symlink or other non-file is refused).
@@ -1682,5 +1771,154 @@ mod tests {
         );
         let message = no_source_message(Path::new("/d/keystore.vault"));
         assert!(message.contains(PASSPHRASE_FILE_ENV) && message.contains("LoadCredential"));
+    }
+
+    #[test]
+    fn preload_asks_once_outside_any_lock_and_later_reads_use_the_cache() {
+        let tmp = TempDir::new().unwrap();
+        let (vault, source) = test_vault(tmp.path(), PASS);
+        assert!(!vault.preload_key().unwrap(), "no vault yet");
+        assert!(source.asked().is_empty());
+        vault.put("k", b"v").unwrap();
+        // A fresh process (new cache) with the same vault file.
+        let (later, source) = test_vault(tmp.path(), PASS);
+        assert!(later.preload_key().unwrap());
+        assert_eq!(source.asked(), vec![PassphrasePurpose::Unlock]);
+        assert_eq!(later.get("k").unwrap().unwrap().as_slice(), b"v");
+        later.put("k2", b"w").unwrap();
+        assert_eq!(source.asked().len(), 1, "no second prompt after preload");
+        let (wrong, _) = test_vault(tmp.path(), "a different passphrase");
+        assert!(matches!(
+            wrong.preload_key(),
+            Err(VaultError::WrongPassphraseOrTampered)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_line_editing_cancels_on_ctrl_c_and_never_keeps_control_bytes() {
+        use super::terminal::{edit_hidden_line, Key};
+        let feed = |bytes: &[u8]| {
+            let mut line = Zeroizing::new(Vec::new());
+            for &b in bytes {
+                match edit_hidden_line(&mut line, b) {
+                    Key::Continue => {}
+                    Key::Done => return Ok(line.to_vec()),
+                    Key::Cancel => return Err(()),
+                }
+            }
+            Ok(line.to_vec())
+        };
+        assert_eq!(feed(b"secret\r"), Ok(b"secret".to_vec()));
+        assert_eq!(feed(b"secret\n"), Ok(b"secret".to_vec()));
+        assert_eq!(feed(b"sec\x03ret\r"), Err(()), "Ctrl-C cancels");
+        assert_eq!(feed(b"\x04"), Err(()), "Ctrl-D on an empty line");
+        assert_eq!(feed(b"ab\x7fc\r"), Ok(b"ac".to_vec()), "backspace");
+        assert_eq!(
+            feed("é\x7fx\r".as_bytes()),
+            Ok(b"x".to_vec()),
+            "UTF-8 backspace"
+        );
+        assert_eq!(feed(b"junk\x15ok\r"), Ok(b"ok".to_vec()), "Ctrl-U");
+        assert_eq!(
+            feed(b"a\x1a\x1bb\r"),
+            Ok(b"ab".to_vec()),
+            "control keys dropped"
+        );
+    }
+
+    /// The production source with an injected environment: the same
+    /// `choose_source` → `passphrase_from_choice` path `DefaultPassphraseSource`
+    /// takes, so the vault create and unlock paths are tested end to end.
+    struct EnvChoiceSource {
+        env: Vec<(&'static str, String)>,
+        terminal: bool,
+    }
+
+    impl PassphraseSource for EnvChoiceSource {
+        fn passphrase(
+            &self,
+            purpose: PassphrasePurpose,
+            vault_path: &Path,
+        ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+            passphrase_from_choice(self.choice(), purpose, vault_path)
+        }
+
+        fn unlock_attempts(&self) -> u32 {
+            unlock_attempts_for(&self.choice())
+        }
+    }
+
+    impl EnvChoiceSource {
+        fn choice(&self) -> SourceChoice {
+            let env = |key: &str| {
+                self.env
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| OsString::from(v))
+            };
+            choose_source(&env, self.terminal, &|_| true)
+        }
+    }
+
+    fn env_vault(dir: &Path, env: Vec<(&'static str, String)>) -> Vault {
+        Vault::with_options(
+            dir,
+            TEST_PARAMS,
+            TEST_BOUNDS,
+            Arc::new(EnvChoiceSource {
+                env,
+                // `raven` enables the prompt; the refusal must win anyway.
+                terminal: true,
+            }),
+            Arc::new(KeyCache::default()),
+        )
+    }
+
+    /// CI regression (release keystore smoke): `RAVEN_KEYSTORE_PASSPHRASE` set
+    /// on `raven init` (vault *creation*) and on an unlock is refused with the
+    /// explicit message, before any file, credential or terminal is used, and
+    /// no vault file is created.
+    #[test]
+    fn env_passphrase_is_refused_on_create_and_unlock_before_any_other_source() {
+        let tmp = TempDir::new().unwrap();
+        let pass_file = tmp.path().join("pass");
+        crate::paths::atomic_write_private(&pass_file, PASS.as_bytes()).unwrap();
+        let env = vec![
+            (FORBIDDEN_PASSPHRASE_ENV, "not-allowed".to_string()),
+            (PASSPHRASE_FILE_ENV, pass_file.display().to_string()),
+            ("CREDENTIALS_DIRECTORY", tmp.path().display().to_string()),
+        ];
+        let create_dir = tmp.path().join("new");
+        std::fs::create_dir(&create_dir).unwrap();
+        let vault = env_vault(&create_dir, env.clone());
+        let err = vault
+            .insert_new(IDENTITY_SEED_ENTRY, &[7u8; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is refused"), "{err}");
+        assert!(err.contains(FORBIDDEN_PASSPHRASE_ENV), "{err}");
+        assert!(err.contains(PASSPHRASE_FILE_ENV), "{err}");
+        assert!(!err.contains("not-allowed"), "never echo the value: {err}");
+        assert!(!vault.exists().unwrap(), "a refused create leaves no vault");
+
+        // Unlock of an existing vault: same refusal, file untouched.
+        let (existing, _) = test_vault(tmp.path(), PASS);
+        existing.put(IDENTITY_SEED_ENTRY, &[9u8; 32]).unwrap();
+        let before = std::fs::read(existing.path()).unwrap();
+        let vault = env_vault(tmp.path(), env);
+        let err = vault.get(IDENTITY_SEED_ENTRY).unwrap_err().to_string();
+        assert!(err.contains("is refused"), "{err}");
+        assert_eq!(std::fs::read(vault.path()).unwrap(), before);
+
+        // Without the forbidden variable the same source reads the file.
+        let vault = env_vault(
+            tmp.path(),
+            vec![(PASSPHRASE_FILE_ENV, pass_file.display().to_string())],
+        );
+        assert_eq!(
+            vault.get(IDENTITY_SEED_ENTRY).unwrap().unwrap().as_slice(),
+            &[9u8; 32]
+        );
     }
 }

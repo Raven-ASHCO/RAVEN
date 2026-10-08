@@ -256,6 +256,16 @@ jobs:
       # can persist chat-history (not a production 0600-key fallback).
       - name: LAN direct two-node smoke
         run: ./scripts/lan_direct_two_node.sh
+      # Portable carrier harness (transports design §6.4): two real raven-node
+      # services + `raven send` each way + inbox (C1) and a stranger refused
+      # before the responder identifies itself (C3, F4). Rust, not bash, so the
+      # same scenario runs on all three runners (named-pipe IPC on Windows).
+      - name: Portable carrier harness (C1 LAN direct both ways + C3 contact gating)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p ash -p raven-node
+          cargo test --locked -p raven-node --test carrier_matrix -- --ignored --nocapture
       - name: bridge + fuzz smoke
         run: cargo test --locked -p raven-core --test bridge_v1 --test fuzz_smoke
       - name: 10,000-message queue reliability gate
@@ -485,6 +495,16 @@ jobs:
           RAVEN_IDENTITY_BACKEND: locked-file
           RAVEN_ALLOW_EPHEMERAL_DATA_DIR: "1"
           RAVEN_LAB_TEST_A: "1"
+      # Portable carrier harness (transports design §6.4): two real raven-node
+      # services + `raven send` each way + inbox (C1) and a stranger refused
+      # before the responder identifies itself (C3, F4). Rust, not bash, so the
+      # same scenario runs on all three runners (named-pipe IPC on Windows).
+      - name: Portable carrier harness (C1 LAN direct both ways + C3 contact gating)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p ash -p raven-node
+          cargo test --locked -p raven-node --test carrier_matrix -- --ignored --nocapture
 
   rust-windows:
     name: Rust (Windows)
@@ -531,6 +551,16 @@ jobs:
         run: cargo test --locked -p raven-core --test reliability_10k -- --ignored
       - name: bridge_v1 (pure Rust)
         run: cargo test --locked -p raven-core --test bridge_v1
+      # Portable carrier harness (transports design §6.4): two real raven-node
+      # services + `raven send` each way + inbox (C1) and a stranger refused
+      # before the responder identifies itself (C3, F4). Rust, not bash, so the
+      # same scenario runs on all three runners (named-pipe IPC on Windows).
+      - name: Portable carrier harness (C1 LAN direct both ways + C3 contact gating)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p ash -p raven-node
+          cargo test --locked -p raven-node --test carrier_matrix -- --ignored --nocapture
       - name: ash doctor→send smoke (Windows terminal path)
         shell: pwsh
         run: |

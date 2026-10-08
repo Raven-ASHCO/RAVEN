@@ -1,7 +1,7 @@
 # RAVEN Protocol Version Inventory
 
 **Status:** Living inventory (docs only). Not a wire change.
-**Updated:** 2026-10-07
+**Updated:** 2026-10-08
 **Audience:** protocol owners, ports, CI readers.
 
 This page lists which protocol families are frozen, which are draft / production-disabled, and which CI jobs in `.github/workflows/raven-serverless.yml` (workflow display name: **Raven Serverless Node**) and `.github/workflows/raven-b1-always-on.yml` (workflow display name: **Raven B1 Always-On**) can be cited as evidence on the current serverless `main` tree.
@@ -112,6 +112,23 @@ Watch jobs remain **N/A** on this serverless tree (no `RAVEN-WatchApp/` paths). 
 Platform vector consumers outside this workflow: see [`../shared-vectors/README.md`](../shared-vectors/README.md). **.NET / C# `rvn1` CI consumer is NOT YET.**
 
 ---
+
+## Freeze record changes (2026-10-08)
+
+Owner-approved spec maintenance. **No wire format, key derivation, signature
+input or vector changed.**
+
+- **`dest_device_hint = 0` erratum.** `ATSAM_ENDPOINT_TRANSACTION_V1.md` §4.1
+  step 2 now requires `dest_device_hint=0` for new indexed-session messages
+  and ACKs instead of the recipient-derived hint
+  `SHA-256("rvn1/device-hint/v1" || device_pub)[:8]`, which any holder of the
+  recipient's public key could match. Stored-object revalidation and receivers
+  accept `0` or the legacy value (§1 step 4); `RAVEN_ENVELOPE_V1.md` §5 says
+  why. Rust: `raven_core::indexed_session_store::OUTBOUND_DEST_DEVICE_HINT`.
+- **Contact-gated responder.** `RAVEN_TRANSPORT_INTERFACE_V1.md` §3 now states
+  that a responder sends its hello and RLB1 only to an initiator whose hello
+  names a local contact, and otherwise closes (same frames and order as
+  before; the initiator always authenticated first).
 
 ## Freeze record changes (2026-10-07)
 

@@ -4349,12 +4349,33 @@ impl IndexedSessionStore {
     }
 }
 
+/// The legacy recipient hint `SHA-256("rvn1/device-hint/v1" || device_pub)[:8]`.
+///
+/// Anyone holding the recipient's public key (its address) can compute it, so
+/// a relay, store or bridge holding the envelope would recognise the recipient.
+/// New outbound envelopes and ACKs therefore carry [`OUTBOUND_DEST_DEVICE_HINT`]
+/// (`0`, "no hint"; ATSAM endpoint transaction erratum 2026-10-08). Receivers
+/// and stored-outbound validation still accept this value from senders and
+/// outbox rows that predate the change.
 pub fn endpoint_device_hint(device_ed25519: &[u8; 32]) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update(b"rvn1/device-hint/v1");
     hasher.update(device_ed25519);
     let digest = hasher.finalize();
     u64::from_be_bytes(digest[..8].try_into().expect("fixed SHA-256 prefix"))
+}
+
+/// `dest_device_hint` this node writes into every new outbound envelope and
+/// sealed ACK: `0` names nobody. The field is outside the envelope signature
+/// and the object digest (`RAVEN_ENVELOPE_V1.md` §2), so this changes no
+/// signed or digested byte.
+pub const OUTBOUND_DEST_DEVICE_HINT: u64 = 0;
+
+/// Stored outbound bytes are valid with the current hint (`0`) or with the
+/// legacy recipient hint of rows queued before the 2026-10-08 change (their
+/// exact bytes are retried unchanged and must keep validating).
+fn stored_outbound_hint_ok(hint: u64, recipient_device: &[u8; 32]) -> bool {
+    hint == OUTBOUND_DEST_DEVICE_HINT || hint == endpoint_device_hint(recipient_device)
 }
 
 /// Constant-time route-tag equality. The expected tag is derived from the
@@ -4606,7 +4627,7 @@ fn outbound_envelope(
         flags: OUTBOUND_FLAGS,
         message_id,
         routing_tag,
-        dest_device_hint: endpoint_device_hint(remote_device_for_binding(&state.binding)),
+        dest_device_hint: OUTBOUND_DEST_DEVICE_HINT,
         created_at: created_at_ms,
         expires_at: expires_at_ms,
         hop_limit: OUTBOUND_HOP_LIMIT,
@@ -4913,7 +4934,10 @@ fn insert_pending_outbound(
     )
     .map_err(|_| IndexedSessionStoreError::OutboundBindingMismatch)?;
     if !envelope.verify(local_device_for_binding(binding))
-        || envelope.dest_device_hint != endpoint_device_hint(remote_device_for_binding(binding))
+        || !stored_outbound_hint_ok(
+            envelope.dest_device_hint,
+            remote_device_for_binding(binding),
+        )
         || !route_tag_eq(&envelope.routing_tag, &expected_route)
         || before_session_start(envelope.created_at, binding.created_at_ms)
         || envelope.expires_at > binding.expires_at_ms
@@ -5085,8 +5109,10 @@ fn validate_committed_outbound(
     if envelope.flags != OUTBOUND_FLAGS
         || envelope.message_id != row.message_id
         || !route_tag_eq(&envelope.routing_tag, &expected_route)
-        || envelope.dest_device_hint
-            != endpoint_device_hint(remote_device_for_binding(&state.binding))
+        || !stored_outbound_hint_ok(
+            envelope.dest_device_hint,
+            remote_device_for_binding(&state.binding),
+        )
         || before_session_start(envelope.created_at, state.binding.created_at_ms)
         || envelope.expires_at > state.binding.expires_at_ms
         || !endpoint_time_window_valid(
@@ -9196,10 +9222,9 @@ mod tests {
         let envelope = Envelope::unpack(&outbound.immutable_envelope_bytes).unwrap();
         assert_eq!(envelope.env_type, EnvType::Message as u8);
         assert_eq!(envelope.flags, OUTBOUND_FLAGS);
-        assert_eq!(
-            envelope.dest_device_hint,
-            endpoint_device_hint(&fixture.key.responder_device_ed25519)
-        );
+        // F1: no recipient-identifying hint on new outbound envelopes.
+        assert_eq!(envelope.dest_device_hint, OUTBOUND_DEST_DEVICE_HINT);
+        assert_eq!(envelope.dest_device_hint, 0);
         assert!(envelope.verify(&fixture.local_identity.public_key_bytes()));
         let key = message_key_at_index(
             &fixture.root,
@@ -10720,6 +10745,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, EndpointOutboxState::Prepared as i64);
+    }
+
+    /// F1 migration: a row queued before the hint change carries the legacy
+    /// recipient hint. Its exact bytes must keep validating (and be retried
+    /// unchanged); any other non-zero hint is still a binding mismatch. The
+    /// hint is outside the signature and the object digest, so both rows share
+    /// one digest.
+    #[test]
+    fn stored_outbound_accepts_zero_and_legacy_hint_only() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let local_device = authorized_local_device(&fixture);
+        let mut store = open_test_store(&path, backend);
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let mut rng = StdRng::from_seed([0xCE; 32]);
+        let mut ok_queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+        let outbound = store
+            .send_message_envelope(
+                &fixture.key,
+                "legacy hint row",
+                &local_device,
+                fixture.now_ms,
+                fixture.now_ms + 60_000,
+                fixture.now_ms,
+                &mut rng,
+                &mut ok_queue,
+            )
+            .unwrap();
+        let current = Envelope::unpack(&outbound.immutable_envelope_bytes).unwrap();
+        assert_eq!(current.dest_device_hint, 0);
+        let legacy_hint = endpoint_device_hint(&fixture.key.responder_device_ed25519);
+        let rewrite = |hint: u64| {
+            let mut env = current.clone();
+            env.dest_device_hint = hint;
+            assert!(env.verify(&fixture.local_identity.public_key_bytes()));
+            assert_eq!(
+                crate::bridge::authenticated_object_digest(&env),
+                outbound.object_digest
+            );
+            let packed = env.pack();
+            Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "UPDATE endpoint_outbox SET immutable_envelope_bytes = ?1
+                     WHERE object_digest = ?2",
+                    params![packed.as_slice(), outbound.object_digest.as_slice()],
+                )
+                .unwrap();
+            packed
+        };
+        let legacy = rewrite(legacy_hint);
+        let mut seen = Vec::new();
+        let mut record = |digest: &[u8; 32], bytes: &[u8]| {
+            seen.push(bytes.to_vec());
+            Ok(*digest)
+        };
+        let retried = store
+            .retry_endpoint_outbound(
+                &fixture.key,
+                &outbound.object_digest,
+                &local_device,
+                fixture.now_ms,
+                &mut record,
+            )
+            .expect("a pre-upgrade row with the legacy hint still validates");
+        assert_eq!(retried.immutable_envelope_bytes, legacy, "exact bytes");
+        rewrite(legacy_hint ^ 1);
+        assert!(matches!(
+            store.retry_endpoint_outbound(
+                &fixture.key,
+                &outbound.object_digest,
+                &local_device,
+                fixture.now_ms,
+                &mut ok_queue,
+            ),
+            Err(IndexedSessionStoreError::OutboundBindingMismatch)
+        ));
+        assert!(stored_outbound_hint_ok(0, &[7; 32]));
+        assert!(stored_outbound_hint_ok(
+            endpoint_device_hint(&[7; 32]),
+            &[7; 32]
+        ));
+        assert!(!stored_outbound_hint_ok(
+            endpoint_device_hint(&[8; 32]),
+            &[7; 32]
+        ));
     }
 
     #[test]

@@ -633,15 +633,35 @@ fn listen_is_loopback(listen: &str) -> bool {
         .unwrap_or_else(|_| listen.starts_with("localhost"))
 }
 
+/// The next port after `port` that is not one RAVEN itself uses (mock BLE
+/// 7421, Internet direct 7422, libp2p 7423): suggesting 7421 for a second
+/// profile's LAN listener collided with the service's own mock BLE listener.
+fn next_free_lan_port(port: u16) -> Option<u16> {
+    let mut next = port.checked_add(1)?;
+    while raven_core::paths::RESERVED_RAVEN_PORTS.contains(&next) {
+        next = next.checked_add(1)?;
+    }
+    Some(next)
+}
+
 /// A listen address for a second profile on this computer: the same host, the
-/// next port.
+/// next port RAVEN does not use itself.
 fn alternative_listen(listen: &str) -> String {
+    let fallback = || {
+        format!(
+            "0.0.0.0:{}",
+            next_free_lan_port(DEFAULT_LAN_PORT).unwrap_or(DEFAULT_LAN_PORT)
+        )
+    };
     match listen.parse::<std::net::SocketAddr>() {
-        Ok(mut addr) if addr.port() != 0 && addr.port() < u16::MAX => {
-            addr.set_port(addr.port() + 1);
-            addr.to_string()
-        }
-        _ => format!("0.0.0.0:{}", DEFAULT_LAN_PORT.saturating_add(1)),
+        Ok(mut addr) if addr.port() != 0 => match next_free_lan_port(addr.port()) {
+            Some(port) => {
+                addr.set_port(port);
+                addr.to_string()
+            }
+            None => fallback(),
+        },
+        _ => fallback(),
     }
 }
 
@@ -1312,6 +1332,7 @@ fn classify_cause(raw: &str) -> Cause {
         Cause::WrongIdentity
     } else if has(&[
         "_dial_peer_closed",
+        "link_not_accepted",
         "closed the connection without",
         "waiting_for_pair_response",
         "not a local contact",
@@ -5419,7 +5440,7 @@ mod send_outcome_tests {
             "Sending still works",
             "free that port (the service keeps retrying by itself)",
             "stop this service (kill 4242)",
-            "run ash again with RAVEN_SERVICE_LAN_LISTEN=0.0.0.0:7421",
+            "run ash again with RAVEN_SERVICE_LAN_LISTEN=0.0.0.0:7424",
             "Setting the variable while this service keeps running changes nothing",
         ] {
             assert!(down.contains(word), "{word:?} missing from: {down}");
@@ -5434,11 +5455,13 @@ mod send_outcome_tests {
 
     #[test]
     fn a_second_profile_is_offered_the_next_port() {
-        assert_eq!(alternative_listen("0.0.0.0:7420"), "0.0.0.0:7421");
-        assert_eq!(alternative_listen("[::]:7420"), "[::]:7421");
+        // 7421-7423 are RAVEN's own ports (mock BLE, Internet, libp2p).
+        assert_eq!(alternative_listen("0.0.0.0:7420"), "0.0.0.0:7424");
+        assert_eq!(alternative_listen("[::]:7420"), "[::]:7424");
+        assert_eq!(alternative_listen("0.0.0.0:7424"), "0.0.0.0:7425");
         assert_eq!(alternative_listen("192.168.1.9:9000"), "192.168.1.9:9001");
         for odd in ["127.0.0.1:0", "0.0.0.0:65535", "not-an-address", ""] {
-            assert_eq!(alternative_listen(odd), "0.0.0.0:7421", "{odd}");
+            assert_eq!(alternative_listen(odd), "0.0.0.0:7424", "{odd}");
         }
         assert!(listen_is_loopback("127.0.0.1:7420") && listen_is_loopback("localhost:7420"));
         assert!(!listen_is_loopback("0.0.0.0:7420") && !listen_is_loopback("192.168.1.9:7420"));

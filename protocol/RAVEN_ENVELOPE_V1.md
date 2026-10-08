@@ -152,7 +152,11 @@ conversation/room identifier in the clear:
 - `dest_device_hint` is explicitly a *hint*: it is mutable, excluded from the
   signature (§2), and MUST be treated by any receiver as unauthenticated —
   never as a verified recipient identity. Implementations MUST NOT put
-  anything more identifying than a small opaque hint value in it.
+  anything more identifying than a small opaque hint value in it. A value any
+  holder of the recipient's public key can compute (such as a truncated hash
+  of it) names the recipient to every relay; the indexed-session profile
+  therefore sends `0` (`ATSAM_ENDPOINT_TRANSACTION_V1.md` §4.1, erratum
+  2026-10-08).
 - Everything with actual semantic content (message text, alias claims, ACK
   status, capability bits) lives inside `ratchet_header_ciphertext` /
   `message_ciphertext`, which are opaque to any party without the session key.

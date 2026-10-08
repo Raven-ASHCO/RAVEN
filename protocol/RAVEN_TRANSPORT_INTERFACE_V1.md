@@ -55,6 +55,12 @@ Verification rules:
   Noise handshake hash, and the peer static key authenticated by XX. Any
   mismatch closes the connection. Both sides require `CAP_INTERNET`; the dialer
   also requires `ed25519_pub` to equal the identity it dialed.
+- Contact gate (2026-10-08): the responder answers (its hello, then its RLB1
+  offer) only an initiator whose verified hello names a local, unblocked
+  contact; for anyone else it closes the connection at that point. A stranger
+  that completes XX therefore learns the responder's Noise static key (which
+  does not name the Raven ID) and nothing else. No byte or message changes.
+  The LAN link (bind after XX, initiator first) applies the same rule.
 - The handshake hash covers both ephemeral keys, so a hello is valid for exactly
   one connection and one direction. A captured hello cannot be replayed on
   another connection, and a reflected hello fails on `role_u8`.

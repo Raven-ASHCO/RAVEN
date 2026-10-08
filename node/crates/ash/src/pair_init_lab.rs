@@ -359,9 +359,11 @@ pub fn run_pair_init_and_send_on(
     } else {
         let (init, key) = create_initiator_pair_init(data_dir, id, &peer_bundle)?;
         let init_frame = wrap_pair_init(id, &init)?;
-        // The stranger case: the receiver logs "pair init refused: peer is not a
-        // local contact" and says nothing on the wire, so the dial ends in a silent
-        // close; `not_sent_text` names the likely cause (and nothing was queued).
+        // A responder that does not list us as a contact already closed the RLB1
+        // probe above after our hello (`LINK_NOT_ACCEPTED`). Should it refuse the
+        // PairInit itself ("pair init refused: peer is not a local contact"), it
+        // says nothing on the wire, so the dial ends in a silent close;
+        // `not_sent_text` names the likely cause (and nothing was queued).
         let replies =
             ipc_carrier_dial_patient(data_dir, carrier, peer, peer_pub_hex, &[init_frame])
                 .map_err(|e| not_sent_text(ctx, &e, true))?;

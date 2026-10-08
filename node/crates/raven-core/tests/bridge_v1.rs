@@ -1,7 +1,9 @@
 //! Integration tests for Raven Bridge V1 (cases 1–8). Mock BLE = TCP length-prefix.
 
 use raven_core::ack::{Ack, STATUS_DELIVERED};
-use raven_core::atsam_aead::{seal_rvna1_v2, unseal_rvna1_v2};
+use raven_core::atsam_indexed_session::{
+    open_indexed_message_with_key, seal_indexed_message_with_key, Direction,
+};
 use raven_core::bridge::{authenticated_object_digest, DropReason};
 use raven_core::envelope::{EnvType, Envelope};
 use raven_core::forward_queue::{
@@ -13,8 +15,9 @@ use raven_core::message_router::{InboundEnvelope, MessageRouter, RouterOutcome};
 use raven_core::transport::TransportKind;
 use tempfile::tempdir;
 
-/// A known test-session root. This exercises the shipping RVNA1 v2 wire and
-/// AEAD path without pretending that public identity keys are a secret.
+/// A known test message key. This exercises the indexed-session RVNA1 `0x03`
+/// wire and AEAD path (the only body custody admits) without pretending that
+/// public identity keys are a secret.
 const BRIDGE_TEST_ROOT: [u8; 32] = [0x42; 32];
 
 fn now() -> u64 {
@@ -32,12 +35,14 @@ fn make_env(
     let message_id_text = hex::encode(message_id);
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&message_id[..12]);
-    let sealed = seal_rvna1_v2(
+    let _ = message_id_text;
+    let sealed = seal_indexed_message_with_key(
         &BRIDGE_TEST_ROOT,
         &signer.address(),
         &seal_to.address(),
-        &message_id_text,
+        Direction::InitiatorToResponder,
         0,
+        &message_id,
         plaintext,
         &nonce,
     )
@@ -401,12 +406,13 @@ fn e2ee_survives_bridge_hop() {
     };
     let fwd = Envelope::unpack(&out).unwrap();
     assert_eq!(fwd.message_ciphertext, body_before);
-    let pt = unseal_rvna1_v2(
+    let pt = open_indexed_message_with_key(
         &BRIDGE_TEST_ROOT,
-        &fwd.message_ciphertext,
         &a.address(),
         &c.address(),
-        &hex::encode(mid),
+        Direction::InitiatorToResponder,
+        &mid,
+        &fwd.message_ciphertext,
     )
     .unwrap();
     assert_eq!(pt, b"secret-e2ee");
@@ -488,16 +494,21 @@ fn make_ack(signer: &Identity, recipient: &Identity, acked_message_id: [u8; 16])
     plaintext.extend_from_slice(&ack.sign(signer));
     let mut mid = [0xACu8; 16];
     mid[0] = acked_message_id[0];
-    let body = seal_rvna1_v2(
+    let body = seal_indexed_message_with_key(
         &BRIDGE_TEST_ROOT,
         &signer.address(),
         &recipient.address(),
-        &hex::encode(mid),
+        Direction::InitiatorToResponder,
         0,
+        &mid,
         &plaintext,
         &[0x33u8; 12],
     )
     .unwrap();
+    assert_eq!(
+        body.len(),
+        raven_core::atsam_indexed_session::ACK_SEALED_WIRE_LEN
+    );
     let mut env = Envelope {
         env_type: EnvType::Ack as u8,
         flags: 0,
@@ -562,12 +573,13 @@ fn case10_ack_reverse_relay_opaque() {
             assert_eq!(fwd.env_type, EnvType::Ack as u8);
             assert_eq!(fwd.message_ciphertext, ack.message_ciphertext);
             assert!(fwd.verify(&c.public_key_bytes()));
-            let opened = unseal_rvna1_v2(
+            let opened = open_indexed_message_with_key(
                 &BRIDGE_TEST_ROOT,
-                &fwd.message_ciphertext,
                 &c.address(),
                 &a.address(),
-                &hex::encode(fwd.message_id),
+                Direction::InitiatorToResponder,
+                &fwd.message_id,
+                &fwd.message_ciphertext,
             )
             .unwrap();
             assert_eq!(&opened[..16], &acked);
@@ -707,40 +719,60 @@ fn case12_queue_full_reports_store_full() {
 
 /// 13. Relay custody is capped at MAX_FORWARD_TTL_MS.
 ///
-/// A far-future envelope expiry cannot squat a pending slot forever.
+/// A far-future envelope expiry cannot squat a pending slot forever: the
+/// custody allow-list refuses validity beyond 24 h (+ skew) outright, and the
+/// queue itself still clamps any row (defence in depth for other writers).
 #[test]
 fn case13_relay_custody_ttl_is_clamped() {
+    use raven_core::carrier_admission::CustodyRefusal;
     let dir = tempdir().unwrap();
     let q = ForwardQueue::open(&dir.path().join("f.sqlite")).unwrap();
     let a = Identity::generate();
     let c = Identity::generate();
     let mid = [0x14; 16];
     let far = now() + 365 * 24 * 60 * 60 * 1_000;
-    let packed = make_env(&a, &c, b"long-lived", mid, 8, far).pack();
+    let env = make_env(&a, &c, b"long-lived", mid, 8, far);
+    let packed = env.pack();
     let router = MessageRouter {
         local_has_internet: false,
         ..relay_router()
     };
-    assert!(matches!(
+    assert_eq!(
         router.handle_inbound(
             &q,
             InboundEnvelope {
-                packed,
+                packed: packed.clone(),
                 ingress: TransportKind::MockBle,
                 previous_hop: "c".into(),
                 now_ms: now(),
             },
             true
         ),
-        RouterOutcome::QueuedForForward { .. }
-    ));
+        RouterOutcome::Dropped {
+            reason: DropReason::NotAdmitted(CustodyRefusal::ValidityTooLong)
+        }
+    );
+    assert_eq!(q.count_all().unwrap(), 0);
+    // A writer that bypasses the router still gets a clamped row.
+    q.enqueue(&ForwardItem {
+        object_digest: authenticated_object_digest(&env),
+        message_id: mid,
+        packed_envelope: packed,
+        ingress: TransportKind::MockBle,
+        egress: TransportKind::Lan,
+        state: ForwardState::Queued,
+        created_at_ms: now(),
+        expires_at_ms: far,
+        previous_hop: "c".into(),
+    })
+    .unwrap();
     let row = q.get(&mid).unwrap().unwrap();
     assert_eq!(row.expires_at_ms, now() + MAX_FORWARD_TTL_MS);
     let later = now() + MAX_FORWARD_TTL_MS + 1;
     assert!(router.recover_pending(&q, later).unwrap().is_empty());
-    assert_eq!(q.get(&mid).unwrap().unwrap().state, ForwardState::Expired);
+    assert_ne!(q.get(&mid).unwrap().unwrap().state, ForwardState::Queued);
     q.maintain(later).unwrap();
-    assert_eq!(q.count_all().unwrap(), 0);
+    assert_eq!(q.count_pending().unwrap(), 0);
 }
 
 /// 14. Forwarded relay rows keep no ciphertext and are garbage-collected.
@@ -769,18 +801,19 @@ fn case14_forwarded_rows_are_garbage_collected() {
     assert_eq!(q.count_all().unwrap(), 0);
 }
 
-/// 15. Far-future replay after the custody period is still a duplicate.
+/// 15. A replay after the custody period is never re-forwarded.
 ///
-/// The seen cache has forgotten the object, but the Forwarded tombstone lasts
-/// until the envelope's own expiry, so it is not re-forwarded every 7 days.
+/// Far-future objects are refused at admission (case 13), so the longest an
+/// object can live is 24 h: a replay after the custody period arrives
+/// expired, and the Forwarded tombstone covers it until then.
 #[test]
 fn case15_far_future_replay_after_custody_is_duplicate() {
     let dir = tempdir().unwrap();
     let q = ForwardQueue::open(&dir.path().join("f.sqlite")).unwrap();
     let a = Identity::generate();
     let c = Identity::generate();
-    let far = now() + 365 * 24 * 60 * 60 * 1_000;
-    let packed = make_env(&a, &c, b"long-lived", [0x15; 16], 8, far).pack();
+    let day = now() + 24 * 60 * 60 * 1_000;
+    let packed = make_env(&a, &c, b"long-lived", [0x15; 16], 8, day).pack();
     let router = relay_router();
     let identity = match router.handle_inbound(&q, inbound(packed.clone(), "a", now()), true) {
         RouterOutcome::ForwardNow { identity, .. } => identity,
@@ -789,12 +822,11 @@ fn case15_far_future_replay_after_custody_is_duplicate() {
     q.mark_object_state(&identity.object_digest, ForwardState::Forwarded)
         .unwrap();
 
-    let later = now() + MAX_FORWARD_TTL_MS + 1;
-    q.prune_seen_objects(later).unwrap();
-    assert!(!q.object_was_seen(&identity.object_digest).unwrap());
-    q.maintain(later).unwrap();
-
-    let replay = router.handle_inbound(&q, inbound(packed, "a2", later), true);
+    // Before its expiry the tombstone makes a replay a duplicate, even once
+    // the bounded seen cache forgot the object.
+    let soon = now() + 60 * 60 * 1_000;
+    q.prune_seen_objects(soon + MAX_FORWARD_TTL_MS).unwrap();
+    let replay = router.handle_inbound(&q, inbound(packed.clone(), "a2", soon), true);
     assert!(
         matches!(
             replay,
@@ -804,9 +836,21 @@ fn case15_far_future_replay_after_custody_is_duplicate() {
         ),
         "case15 replay: {replay:?}"
     );
+    // After the custody period the object itself has expired.
+    let later = now() + MAX_FORWARD_TTL_MS + 1;
+    q.maintain(later).unwrap();
+    let replay = router.handle_inbound(&q, inbound(packed, "a3", later), true);
+    assert!(
+        matches!(
+            replay,
+            RouterOutcome::Dropped {
+                reason: DropReason::Expired
+            }
+        ),
+        "case15 late replay: {replay:?}"
+    );
     assert_eq!(q.count_pending().unwrap(), 0);
-    // The tombstone goes once the envelope itself has expired.
-    q.maintain(far + 1).unwrap();
+    q.maintain(day + 1).unwrap();
     assert_eq!(q.count_all().unwrap(), 0);
 }
 

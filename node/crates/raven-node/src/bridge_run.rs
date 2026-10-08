@@ -646,10 +646,12 @@ impl BridgeState {
                 continue;
             }
             if self.fanout(item.egress, &item.object_digest, &item.packed_envelope) > 0 {
+                // A 4-byte prefix like DROP_LOG: enough to correlate lines, not
+                // a full public object id in a log users back up and sync.
                 blog!(
-                    "raven-node: BRIDGE flush → {} (opaque) mid={}",
+                    "raven-node: BRIDGE flush → {} (opaque) mid={}…",
                     item.egress.as_str(),
-                    hex::encode(item.message_id)
+                    hex::encode(&item.message_id[..4])
                 );
             } else {
                 // Subscriber queues full: retry once one has room.
@@ -731,18 +733,18 @@ async fn on_frame(
             st.known_pending += 1; // the row just stored
             if st.fanout(egress, &identity.object_digest, &fwd) > 0 {
                 blog!(
-                    "raven-node: BRIDGE forward {}→{} (opaque) mid={}",
+                    "raven-node: BRIDGE forward {}→{} (opaque) mid={}…",
                     ingress.as_str(),
                     egress.as_str(),
-                    hex::encode(identity.message_id)
+                    hex::encode(&identity.message_id[..4])
                 );
             } else {
                 // No subscriber with room: the row stays Queued for a flush.
                 st.want_flush(egress);
                 blog!(
-                    "raven-node: BRIDGE queued waiting {} (opaque) mid={}",
+                    "raven-node: BRIDGE queued waiting {} (opaque) mid={}…",
                     egress.as_str(),
-                    hex::encode(identity.message_id)
+                    hex::encode(&identity.message_id[..4])
                 );
             }
             true
@@ -1425,7 +1427,6 @@ pub async fn run_bridge_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raven_core::atsam_aead::seal_rvna1_v2;
     use raven_core::bridge::authenticated_object_digest;
     use raven_core::envelope::{EnvType, Envelope};
     use raven_core::forward_queue::{ForwardItem, MAX_ENVELOPE_BYTES, MAX_FORWARD_QUEUE};
@@ -1462,7 +1463,20 @@ mod tests {
         }
     }
 
+    /// A message custody admits: `body` behind the sealed indexed-session
+    /// header (still opaque bytes, never decrypted by the bridge).
     fn signed_message(mid: [u8; 16], body: &[u8]) -> Vec<u8> {
+        signed_raw_message(
+            mid,
+            &raven_core::carrier_admission::opaque_indexed_body_for_tests(
+                raven_core::carrier_admission::RelayableKind::Message,
+                body,
+            ),
+        )
+    }
+
+    /// `body` exactly as given (pairing / plaintext refusal tests).
+    fn signed_raw_message(mid: [u8; 16], body: &[u8]) -> Vec<u8> {
         let now = now_ms();
         let mut env = Envelope {
             env_type: EnvType::Message as u8,
@@ -1568,16 +1582,10 @@ mod tests {
 
         let sender = Identity::generate();
         let message_id = [0xA5; 16];
-        let sealed_ack = seal_rvna1_v2(
-            &[0x42; 32],
-            "recipient-device",
-            "origin-device",
-            "ack-envelope-1",
-            0,
+        let sealed_ack = raven_core::carrier_admission::opaque_indexed_body_for_tests(
+            raven_core::carrier_admission::RelayableKind::Ack,
             &[0x77; 101],
-            &[0x24; 12],
-        )
-        .unwrap();
+        );
         let now = now_ms();
         let mut envelope = Envelope {
             env_type: EnvType::Ack as u8,
@@ -2105,7 +2113,7 @@ mod tests {
         let state = state_with(queue);
         let mut wire = vec![0u8; raven_core::pair_init::RESPONSE_WIRE_LEN];
         wire[..8].copy_from_slice(&raven_core::pair_init::RESPONSE_MAGIC);
-        let packed = signed_message([0x71; 16], &wire);
+        let packed = signed_raw_message([0x71; 16], &wire);
         assert!(matches!(
             raven_core::pair_init_lan_oob::classify_packed_envelope(&packed),
             raven_core::pair_init_lan_oob::PairInitOobClassify::PairResponse(_)
@@ -2113,6 +2121,50 @@ mod tests {
         on_frame(&state, dir.path(), packed, TransportKind::Lan, "127.0.0.1").await;
         assert!(!dir.path().join("lab_pair_response.rvpr1").exists());
         assert!(!dir.path().join("lab_endpoint_inbox").exists());
+        // F3: and it never enters bridge custody either.
+        assert_eq!(state.lock().await.queue.count_all().unwrap(), 0);
+    }
+
+    /// F3: the bridge stores and forwards only sealed indexed-session
+    /// objects. A PairInit wrapped as an ordinary message (addresses and trust
+    /// material in clear, PairInit §7) or a plaintext body is dropped on
+    /// either ingress, never queued and never handed to a subscriber.
+    #[tokio::test]
+    async fn bridge_never_takes_custody_of_pairing_or_plaintext_frames() {
+        let dir = tempdir().unwrap();
+        let queue = ForwardQueue::open(&forward_queue_path(dir.path())).unwrap();
+        let state = state_with(queue);
+        let (lan_tx, mut lan_rx) = mpsc::channel(4);
+        let (ble_tx, mut ble_rx) = mpsc::channel(4);
+        state.lock().await.subscribe(TransportKind::Lan, lan_tx);
+        state.lock().await.subscribe(TransportKind::MockBle, ble_tx);
+        let mut init = vec![0u8; raven_core::pair_init::INIT_WIRE_LEN];
+        init[..raven_core::pair_init::INIT_MAGIC.len()]
+            .copy_from_slice(&raven_core::pair_init::INIT_MAGIC);
+        for (i, body) in [init, b"hello in the clear".to_vec()]
+            .into_iter()
+            .enumerate()
+        {
+            for ingress in [TransportKind::Lan, TransportKind::MockBle] {
+                let packed = signed_raw_message([0xd0 + i as u8; 16], &body);
+                assert!(!on_frame(&state, dir.path(), packed, ingress, "10.0.0.9").await);
+            }
+        }
+        assert_eq!(state.lock().await.queue.count_all().unwrap(), 0);
+        assert!(lan_rx.try_recv().is_err());
+        assert!(ble_rx.try_recv().is_err());
+        // The same path still carries a sealed object.
+        assert!(
+            on_frame(
+                &state,
+                dir.path(),
+                signed_message([0xdf; 16], b"sealed"),
+                TransportKind::Lan,
+                "10.0.0.9"
+            )
+            .await
+        );
+        assert!(ble_rx.try_recv().is_ok());
     }
 
     /// node-swarm#10: a present but unreadable policy disables the bridge.

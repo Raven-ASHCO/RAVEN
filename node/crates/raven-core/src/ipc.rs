@@ -374,15 +374,44 @@ pub fn windows_pipe_name_for_sid(sid: &str) -> Option<String> {
     well_formed.then(|| format!("{WINDOWS_NAMED_PIPE}-{sid}"))
 }
 
+/// Debug-build lab override: `RAVEN_LAB_IPC_PIPE_SUFFIX=<1-32 of [A-Za-z0-9_-]>`
+/// appends `-<suffix>` to this process's per-user pipe name. The Windows pipe
+/// is per user, not per data dir (Unix sockets live in the data dir), so
+/// without it two `raven-node service` profiles of one account (the portable
+/// carrier harness on a CI runner) would share one pipe. Release builds ignore
+/// it; a malformed value yields no name at all (fail closed, never the shared
+/// default).
+pub const LAB_IPC_PIPE_SUFFIX_ENV: &str = "RAVEN_LAB_IPC_PIPE_SUFFIX";
+
+/// Apply [`LAB_IPC_PIPE_SUFFIX_ENV`] to a per-user pipe name (pure, testable
+/// on every OS).
+pub fn with_lab_pipe_suffix(
+    user_pipe: String,
+    suffix: Option<&str>,
+    lab_build: bool,
+) -> Option<String> {
+    match suffix {
+        Some(s) if lab_build => {
+            let ok = (1..=32).contains(&s.len())
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            ok.then(|| format!("{user_pipe}-{s}"))
+        }
+        _ => Some(user_pipe),
+    }
+}
+
 /// Per-user pipe name for the current process token user (cached).
 /// `None` if the SID cannot be read — callers fail closed.
 #[cfg(windows)]
 pub fn windows_user_pipe_name() -> Option<&'static str> {
     static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
+        let suffix = std::env::var(LAB_IPC_PIPE_SUFFIX_ENV).ok();
         win_pipe::current_user_sid()
             .ok()
             .and_then(|sid| windows_pipe_name_for_sid(&sid))
+            .and_then(|name| with_lab_pipe_suffix(name, suffix.as_deref(), cfg!(debug_assertions)))
     })
     .as_deref()
 }
@@ -634,6 +663,29 @@ mod tests {
     fn windows_named_pipe_is_canonical_bind_name() {
         assert_eq!(WINDOWS_NAMED_PIPE, r"\\.\pipe\raven-node");
         assert_eq!(default_pipe_name(), WINDOWS_NAMED_PIPE);
+    }
+
+    /// The lab pipe suffix separates two profiles of one Windows account in a
+    /// debug build only, and a malformed one fails closed (no shared default).
+    #[test]
+    fn lab_pipe_suffix_is_debug_only_and_strict() {
+        let user = windows_pipe_name_for_sid("S-1-5-21-1-2-3-1001").unwrap();
+        assert_eq!(
+            with_lab_pipe_suffix(user.clone(), None, true),
+            Some(user.clone())
+        );
+        assert_eq!(
+            with_lab_pipe_suffix(user.clone(), Some("alice-1_2"), true),
+            Some(format!("{user}-alice-1_2"))
+        );
+        assert_eq!(
+            with_lab_pipe_suffix(user.clone(), Some("alice"), false),
+            Some(user.clone()),
+            "release ignores the lab override"
+        );
+        for bad in ["", "a\\b", "../x", "a b", &"x".repeat(33)] {
+            assert_eq!(with_lab_pipe_suffix(user.clone(), Some(bad), true), None);
+        }
     }
 
     #[cfg(unix)]

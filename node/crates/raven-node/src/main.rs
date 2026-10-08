@@ -270,6 +270,23 @@ pub(crate) mod netutil {
     /// EOF, a reset, an abort or a broken pipe.
     pub(crate) const PEER_CLOSED: &str = "peer closed the connection";
 
+    /// The dialer's view of a contact-gated responder's refusal: the link closed
+    /// after our signed bind/hello and before the peer identified itself. The
+    /// responder sends nothing that names it or says why. Never retried: a
+    /// refused dialer that repeats only repeats the refusal.
+    pub(crate) const LINK_NOT_ACCEPTED: &str = "LINK_NOT_ACCEPTED: the peer closed the \
+        connection after our signed hello, before identifying itself: it does not accept this \
+        node (this identity is not one of its contacts, or it is blocked), or it is overloaded";
+
+    /// Map a hang-up while waiting for the peer's bind/hello to [`LINK_NOT_ACCEPTED`].
+    pub(crate) fn closed_before_peer_identity(e: String) -> String {
+        if e == PEER_CLOSED {
+            LINK_NOT_ACCEPTED.to_string()
+        } else {
+            e
+        }
+    }
+
     pub(crate) fn io_error_text(e: &std::io::Error) -> String {
         use std::io::ErrorKind;
         match e.kind() {

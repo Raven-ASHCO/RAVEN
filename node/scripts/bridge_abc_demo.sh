@@ -127,7 +127,12 @@ run_happy() {
   local MID
   MID=$(grep 'ENVELOPE_FP mid=' "$WORKDIR/a.log" | head -1 | sed -n 's/.*mid=\([0-9a-f]*\).*/\1/p')
   [[ -n "$MID" ]]
-  grep -q "$MID" "$WORKDIR/b.log"
+  # B logs only a 4-byte message-id prefix (log hygiene; never the full id).
+  grep -q "mid=${MID:0:8}" "$WORKDIR/b.log"
+  if grep -q "$MID" "$WORKDIR/b.log"; then
+    echo "FAIL: bridge log carries the full message id" >&2
+    exit 1
+  fi
   echo "round $round OK mid=${MID:0:8}…"
 }
 

@@ -106,13 +106,24 @@ Interactive prompts allow 3 attempts.
    mode exactly 0400 or 0600, ≤ 1024 bytes; one trailing newline is stripped.
 2. systemd credential: `$CREDENTIALS_DIRECTORY/raven-keystore-passphrase` (`LoadCredential=`), owned
    by the user or root, no group/other mode bits.
-3. Interactive terminal, only in `ash`/`raven` and only when stdin is a TTY: no echo (`stty -echo`
-   on `/dev/tty`, restored on drop); on creation a plain-words explanation, then the passphrase twice
-   (≥ 8 characters, must match).
+3. Interactive terminal, only in `ash`/`raven` and only when stdin is a TTY: no echo, no line
+   discipline and no signal keys while typing (`stty -echo -icanon -isig` on `/dev/tty`; the saved
+   `stty -g` settings are restored on drop, on every return path). Ctrl-C / Ctrl-\ therefore cancel
+   the prompt with an error instead of killing the process with echo off; backspace and Ctrl-U edit
+   the line. On creation a plain-words explanation, then the passphrase twice (≥ 8 characters, must
+   match). An external `kill` during the prompt can still leave echo off (`stty sane` restores it).
 4. Otherwise fail with instructions. `raven-node` never prompts.
 
 The passphrase itself is never accepted from argv or an environment variable: a set
-`RAVEN_KEYSTORE_PASSPHRASE` is an error. New passphrases (any source) must be ≥ 8 characters.
+`RAVEN_KEYSTORE_PASSPHRASE` is refused (create and unlock, `raven` and `raven-node`, whatever else is
+set) with a message saying it "is refused". New passphrases (any source) must be ≥ 8 characters.
+
+**Locks while a person types (2026-10-08).** Loading the identity unlocks an existing vault
+(`Vault::preload_key`) *before* the identity-store lock is taken; the derived key stays in the
+process cache, so the vault reads under that lock and in later session-store transactions never
+prompt. Remaining limit: the very first `init` of a vault profile asks for the *new* passphrase while
+it holds the identity-store lock (the vault does not exist before that write); a daemon started at
+that moment waits on the lock with its "waiting" notice.
 
 ## 6. Verification
 

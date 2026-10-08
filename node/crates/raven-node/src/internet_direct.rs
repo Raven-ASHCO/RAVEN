@@ -3,7 +3,10 @@
 //! Every `u32_be`-framed message is a Noise message. After the XX handshake
 //! each side sends an encrypted RIH1 hello signed over the handshake hash,
 //! its role and its Noise static key (see `raven_core::internet`), so a
-//! captured hello cannot authenticate another connection. The same indexed
+//! captured hello cannot authenticate another connection. The dialer's hello
+//! comes first, and the listener answers (hello, then RLB1) only a dialer whose
+//! hello names a local, unblocked contact: anyone else is disconnected before
+//! learning the listener's Raven identity or prekey bundle. The same indexed
 //! PairInit / message / sealed-ACK dispatcher as LAN-direct then runs on
 //! Noise transport frames (transport auth ≠ E2EE); RLB1 and PairInit never
 //! travel in cleartext. Lab-gated: [`raven_core::internet_direct_live_enabled`].
@@ -236,19 +239,27 @@ async fn initiator_session<S: AsyncRead + AsyncWrite + Unpin>(
         handshake_hash: hash,
         noise_static_pub: remote_static,
     };
-    let pk = verify_peer_hello(&read_inet_frame(stream, &mut t).await?, &theirs)?;
+    // A contact-gated responder closes here, before its own hello, unless our
+    // hello names one of its contacts (see `responder_handshake`).
+    let raw = read_inet_frame(stream, &mut t)
+        .await
+        .map_err(netutil::closed_before_peer_identity)?;
+    let pk = verify_peer_hello(&raw, &theirs)?;
     if pk != *expected {
         return Err("internet hello identity mismatch".into());
     }
     Ok((pk, t))
 }
 
-/// Listener side: XX, verify the dialer's hello against this handshake, then
-/// answer with ours. Returns the dialer's authenticated Ed25519 key.
-async fn responder_session<S: AsyncRead + AsyncWrite + Unpin>(
+/// Listener side: XX, then verify the dialer's hello (the initiator always
+/// sends first) against this handshake. Returns the dialer's authenticated
+/// Ed25519 key, the transport and our own hello, which is **not** sent yet:
+/// the caller decides first whether the dialer may learn who we are
+/// ([`raven_core::lan_dispatch::link_peer_admission`]).
+async fn responder_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     identity: &Identity,
-) -> Result<([u8; 32], NoiseTransport), String> {
+) -> Result<([u8; 32], NoiseTransport, Vec<u8>), String> {
     let secret = derive_noise_static(identity).map_err(|e| e.to_string())?;
     let local_static = noise_static_public(&secret);
     let mut hs = build_noise_responder(&secret).map_err(|e| e.to_string())?;
@@ -273,7 +284,17 @@ async fn responder_session<S: AsyncRead + AsyncWrite + Unpin>(
         handshake_hash: hash,
         noise_static_pub: local_static,
     };
-    write_inet_frame(stream, &mut t, &pack_hello(identity, CAP_INTERNET, &ours)).await?;
+    Ok((pk, t, pack_hello(identity, CAP_INTERNET, &ours)))
+}
+
+/// [`responder_handshake`] that answers every dialer (scripted test peers).
+#[cfg(test)]
+async fn responder_session<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    identity: &Identity,
+) -> Result<([u8; 32], NoiseTransport), String> {
+    let (pk, mut t, ours) = responder_handshake(stream, identity).await?;
+    write_inet_frame(stream, &mut t, &ours).await?;
     Ok((pk, t))
 }
 
@@ -300,14 +321,37 @@ async fn serve_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     // Identity comes from the listener (loaded once): an unauthenticated peer
     // must not be able to trigger identity-lock / secret-store work. The
     // network half of the handshake has its own short deadline; the local
-    // blocking work below deliberately does not.
-    let handshake = tokio::time::timeout(limits.handshake_deadline, async {
-        let (remote_ed, mut transport) = responder_session(&mut stream, &identity).await?;
-        let peer_offer = read_inet_frame(&mut stream, &mut transport).await?;
-        Ok::<_, String>((remote_ed, transport, peer_offer))
+    // blocking work below deliberately does not, so the contact check's time
+    // is added back to it.
+    let mut deadline = tokio::time::Instant::now() + limits.handshake_deadline;
+    let (remote_ed, mut transport, our_hello) = match tokio::time::timeout_at(
+        deadline,
+        responder_handshake(&mut stream, &identity),
+    )
+    .await
+    {
+        Ok(done) => done?,
+        Err(_) => return Err(HANDSHAKE_TIMEOUT.into()),
+    };
+    // Contact gate before anything identifying leaves this node: a stranger
+    // (or a blocked key) that completed XX gets the connection closed and
+    // nothing else, not our hello (Raven identity) and not our RLB1
+    // (certificate + prekey bundle). An Internet scanner cannot map IP → ID.
+    let gate_started = tokio::time::Instant::now();
+    {
+        let dd = data_dir.clone();
+        blocking(move || {
+            raven_core::lan_dispatch::link_peer_admission(&dd, &remote_ed).map_err(String::from)
+        })
+        .await?;
+    }
+    deadline += gate_started.elapsed();
+    let offer = tokio::time::timeout_at(deadline, async {
+        write_inet_frame(&mut stream, &mut transport, &our_hello).await?;
+        read_inet_frame(&mut stream, &mut transport).await
     })
     .await;
-    let (remote_ed, mut transport, peer_offer) = match handshake {
+    let peer_offer = match offer {
         Ok(done) => done?,
         Err(_) => return Err(HANDSHAKE_TIMEOUT.into()),
     };
@@ -555,10 +599,11 @@ async fn dial_unchecked(
     frames: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, String> {
     if !looks_like_internet_dial(internet_dial) {
-        return Err(
-            "internet_dial must be host:port (e.g. 127.0.0.1:7421 or relay.example.com:7421)"
-                .into(),
-        );
+        // 7421 is mock BLE's port; Internet direct uses its own (7422).
+        return Err(format!(
+            "internet_dial must be host:port (e.g. 203.0.113.7:{p} or node.example.com:{p})",
+            p = raven_core::paths::DEFAULT_INTERNET_PORT
+        ));
     }
     let expected = parse_pub_hex(expected_pub_hex)?;
     let mut progress = DialProgress::new("INTERNET", PRODUCTION_REPLY_WAITS);
@@ -612,9 +657,21 @@ mod tests {
         assert_eq!(seen, 4);
     }
 
+    /// F9: the example port in the error is the Internet port, never mock
+    /// BLE's 7421 (or LAN's 7420).
+    #[tokio::test]
+    async fn bad_dial_text_names_the_internet_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = dial_unchecked(dir.path(), "no-port", &"ab".repeat(32), &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains(":7422"), "{err}");
+        assert!(!err.contains("7421") && !err.contains("7420"), "{err}");
+    }
+
     #[test]
     fn dial_string_rejects_non_host_port() {
-        assert!(looks_like_internet_dial("127.0.0.1:7421"));
+        assert!(looks_like_internet_dial("127.0.0.1:7422"));
         assert!(!looks_like_internet_dial("127.0.0.1:0"));
         assert!(!looks_like_internet_dial("rvn1qabc"));
         assert!(!looks_like_internet_dial(""));
@@ -916,6 +973,14 @@ mod tests {
         assert!(started.elapsed() < PRODUCTION_LIMITS.lifetime);
     }
 
+    fn write_contacts(dir: &Path, contacts: &[&Identity]) {
+        let rows: Vec<String> = contacts
+            .iter()
+            .map(|c| format!(r#"{{"pub_hex":"{}"}}"#, hex::encode(c.public_key_bytes())))
+            .collect();
+        std::fs::write(dir.join("contacts.json"), format!("[{}]", rows.join(","))).unwrap();
+    }
+
     /// Mirrors `lan_direct::only_a_local_contact_earns_a_protected_slot`: an
     /// RLB1 offer proves possession of *a* key only, so just a local contact
     /// leaves the pre-auth caps for a non-displaceable slot.
@@ -929,54 +994,104 @@ mod tests {
             return;
         }
         let ip: std::net::IpAddr = "10.9.8.8".parse().unwrap();
-        for contact in [false, true] {
+        let resp_dir = tempfile::tempdir().unwrap();
+        let init_dir = tempfile::tempdir().unwrap();
+        let responder = Arc::new(Identity::from_seed(&[0x73; 32]));
+        let initiator = Identity::from_seed(&[0x74; 32]);
+        write_contacts(resp_dir.path(), &[&initiator]);
+        let admission = Admission::new(PRODUCTION_LIMITS);
+        let mut slot = admission.try_admit(ip).expect("slot");
+        let (mut client, server_side) = tokio::io::duplex(1 << 18);
+        let (data_dir, resp) = (resp_dir.path().to_path_buf(), responder.clone());
+        let server = tokio::spawn(async move {
+            serve_inbound(data_dir, resp, server_side, PRODUCTION_LIMITS, &mut slot).await
+        });
+        let (_, mut t) = initiator_session(&mut client, &initiator, &responder.public_key_bytes())
+            .await
+            .expect("RIH1 session");
+        let offer = encode_local_offer(init_dir.path(), &initiator).unwrap();
+        write_inet_frame(&mut client, &mut t, &offer).await.unwrap();
+        let theirs = read_inet_frame(&mut client, &mut t).await.unwrap();
+        assert!(parse_peer_offer(&theirs).is_ok(), "a contact gets our RLB1");
+
+        let mut held = Vec::new();
+        while let Some(s) = admission.try_admit(ip) {
+            held.push(s);
+        }
+        assert_eq!(
+            held.len(),
+            PRODUCTION_LIMITS.max_handshaking_per_ip,
+            "a contact no longer counts as pre-auth"
+        );
+        drop(held);
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("handler ends when the dialer hangs up")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// F4: an Internet scanner that completes Noise XX with any key that is not
+    /// a local contact (or is blocked) is disconnected right after its hello.
+    /// It gets no transport frame at all: no RIH1 hello (Raven identity), no
+    /// RLB1 (certificate + prekey bundle), just the fixed `LINK_NOT_ACCEPTED`.
+    #[tokio::test]
+    async fn stranger_learns_nothing_but_not_accepted() {
+        let responder = Arc::new(bob());
+        for case in ["no contacts.json", "other contact", "blocked contact"] {
             let resp_dir = tempfile::tempdir().unwrap();
-            let init_dir = tempfile::tempdir().unwrap();
-            let responder = Arc::new(Identity::from_seed(&[0x73; 32]));
-            let initiator = Identity::from_seed(&[0x74; 32]);
-            if contact {
-                std::fs::write(
-                    resp_dir.path().join("contacts.json"),
-                    format!(
-                        r#"[{{"pub_hex":"{}"}}]"#,
-                        hex::encode(initiator.public_key_bytes())
-                    ),
-                )
-                .unwrap();
+            match case {
+                "other contact" => write_contacts(resp_dir.path(), &[&alice()]),
+                "blocked contact" => {
+                    write_contacts(resp_dir.path(), &[&mallory()]);
+                    let mut blocks = raven_core::BlockList::default();
+                    blocks.block(&hex::encode(mallory().public_key_bytes()));
+                    blocks.save(resp_dir.path()).unwrap();
+                }
+                _ => {}
             }
-            let admission = Admission::new(PRODUCTION_LIMITS);
-            let mut slot = admission.try_admit(ip).expect("slot");
-            let (mut client, server_side) = tokio::io::duplex(1 << 18);
+            let (mut scanner, server_side) = tokio::io::duplex(1 << 18);
             let (data_dir, resp) = (resp_dir.path().to_path_buf(), responder.clone());
             let server = tokio::spawn(async move {
+                let mut slot = test_slot();
                 serve_inbound(data_dir, resp, server_side, PRODUCTION_LIMITS, &mut slot).await
             });
-            let (_, mut t) =
-                initiator_session(&mut client, &initiator, &responder.public_key_bytes())
-                    .await
-                    .expect("RIH1 session");
-            let offer = encode_local_offer(init_dir.path(), &initiator).unwrap();
-            write_inet_frame(&mut client, &mut t, &offer).await.unwrap();
-            let _theirs = read_inet_frame(&mut client, &mut t).await.unwrap();
-
-            let mut held = Vec::new();
-            while let Some(s) = admission.try_admit(ip) {
-                held.push(s);
-            }
-            let cap = PRODUCTION_LIMITS.max_handshaking_per_ip;
-            if contact {
-                assert_eq!(held.len(), cap, "a contact no longer counts as pre-auth");
-            } else {
-                assert_eq!(held.len(), cap - 1, "a stranger must stay a pre-auth slot");
-            }
-            drop(held);
-            drop(client);
-            tokio::time::timeout(Duration::from_secs(10), server)
+            let err = initiator_session(&mut scanner, &mallory(), &bob().public_key_bytes())
                 .await
-                .expect("handler ends when the dialer hangs up")
+                .err()
+                .unwrap_or_else(|| panic!("{case}: a stranger must not get our hello"));
+            assert_eq!(err, netutil::LINK_NOT_ACCEPTED, "{case}");
+            let refusal = tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .expect("handler ends")
                 .unwrap()
-                .unwrap();
+                .unwrap_err();
+            let want = if case == "blocked contact" {
+                raven_core::lan_dispatch::LINK_REFUSED_BLOCKED
+            } else {
+                raven_core::lan_dispatch::LINK_REFUSED_NOT_CONTACT
+            };
+            assert_eq!(refusal, want, "{case}");
+            let mut rest = Vec::new();
+            assert_eq!(scanner.read_to_end(&mut rest).await.unwrap_or(0), 0);
         }
+    }
+
+    /// The refusal is final: the dial path never retries it (a retry would only
+    /// repeat the refusal, and a refused send must fail fast).
+    #[tokio::test]
+    async fn not_accepted_is_not_retried_by_the_handshake_loop() {
+        let mut attempts = 0;
+        let err = netutil::with_handshake_retries(|| {
+            attempts += 1;
+            async { Err::<(), _>(netutil::LINK_NOT_ACCEPTED.to_string()) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(err, netutil::LINK_NOT_ACCEPTED);
+        assert!(!err.contains("closed the connection during the handshake"));
     }
 
     /// A full RIH1 session with the listener identity but no local state: a
@@ -985,6 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn inbound_session_uses_listener_identity_not_store() {
         let dir = tempfile::tempdir().unwrap();
+        write_contacts(dir.path(), &[&alice()]);
         let (mut dialer, server_side) = tokio::io::duplex(1 << 17);
         let responder = Arc::new(bob());
         let expected = responder.public_key_bytes();

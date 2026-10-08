@@ -17,6 +17,7 @@ pub mod ble_adapter;
 pub mod bootstrap;
 pub mod bridge;
 pub mod canon;
+pub mod carrier_admission;
 pub mod chat_history;
 pub mod contact_request;
 pub mod device_cert;

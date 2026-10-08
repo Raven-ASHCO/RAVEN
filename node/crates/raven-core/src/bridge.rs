@@ -33,6 +33,9 @@ pub enum DropReason {
     RateLimited,
     /// Relay custody (forward queue count or byte cap) is full (`STORE_FULL`).
     StoreFull,
+    /// Refused by the custody allow-list ([`crate::carrier_admission`]): not a
+    /// sealed indexed-session message or ACK (PairInit, demo cipher, plaintext).
+    NotAdmitted(crate::carrier_admission::CustodyRefusal),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

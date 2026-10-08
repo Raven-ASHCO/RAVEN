@@ -119,9 +119,9 @@ scan_raven_key_hex() {
 # seed lines followed by one non-allow-listed seed must yield EXACTLY one row, on the
 # last line; an all-allow-listed file must yield none.
 secret_scan_selftest() {
-  local f="$TMP/selftest.rs" i rows last
+  local f="$TMP/selftest.rs" rows last
   : >"$f"
-  for i in $(seq 1 25); do
+  for _ in $(seq 1 25); do
     echo 'let seed = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";' >>"$f"
   done
   : >"$HITS"

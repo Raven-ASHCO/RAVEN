@@ -31,7 +31,9 @@ import time
 created = int(time.time() * 1000)
 expires = created + 60 * 60 * 1000
 message_id = bytes.fromhex("42" * 16)
-body = b"opaque-network-ciphertext"
+# Custody admits only the sealed indexed-session shape (RVNA1 0x03 0x01
+# header ... tag); the bytes stay opaque to the store.
+body = b"RVNA1\0\0\0" + bytes([3, 1]) + b"opaque-network-ciphertext" + bytes(16)
 envelope = b"".join([
     b"RVN1", bytes([1, 1]), struct.pack(">H", 0),
     message_id, bytes.fromhex("99" * 16), struct.pack(">Q", 7),

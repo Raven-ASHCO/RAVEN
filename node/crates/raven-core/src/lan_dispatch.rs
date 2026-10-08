@@ -541,6 +541,39 @@ pub fn peer_is_trusted(data_dir: &Path, bundle: &LanBundle) -> Result<bool, Stri
     Ok(contacts.contains(&hex::encode(bundle.cert.user_ed_pub)))
 }
 
+/// Why a link responder closed a dialer before sending its own identity.
+/// Local log text only: the dialer sees nothing but the connection closing.
+pub const LINK_REFUSED_NOT_CONTACT: &str =
+    "inbound peer is not a local contact; link closed before our identity was sent";
+pub const LINK_REFUSED_BLOCKED: &str =
+    "inbound peer is blocked; link closed before our identity was sent";
+
+/// Responder-side link admission (LAN bind / Internet RIH1 hello), decided on
+/// the Ed25519 key the dialer's signed bind/hello bound to its Noise static,
+/// **before** this node reveals its own identity or RLB1 bundle.
+///
+/// The rule is the one [`peer_is_trusted`] applies to PairInit, messages and
+/// ACKs (the key is a local contact), plus the block list. The link layer
+/// requires the dialer's RLB1 to bind exactly this key as device key and
+/// signer ([`rlb1_matches_noise_identity`]), so contact-ness of the bound key
+/// equals `peer_is_trusted` of the bundle that follows. A stranger completes
+/// Noise XX only: it learns the responder's Noise static (which does not name
+/// the Raven ID) and that it was not accepted. Fail closed: an unreadable
+/// contact book or block list admits nobody.
+pub fn link_peer_admission(data_dir: &Path, noise_ed: &[u8; 32]) -> Result<(), &'static str> {
+    let key = hex::encode(noise_ed);
+    let contact = contact_pub_set(data_dir)
+        .map(|set| set.contains(&key))
+        .unwrap_or(false);
+    if !contact {
+        return Err(LINK_REFUSED_NOT_CONTACT);
+    }
+    match BlockList::load_checked(data_dir) {
+        Ok(blocks) if !blocks.is_blocked(&key) => Ok(()),
+        _ => Err(LINK_REFUSED_BLOCKED),
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2491,6 +2524,58 @@ mod tests {
             !peer_is_trusted(dir.path(), &bundle).unwrap(),
             "no contact yet"
         );
+    }
+
+    /// F4 link gate: same contact rule as `peer_is_trusted`, plus the block
+    /// list, keyed by the bound Noise identity; fails closed on unreadable files
+    /// and never names the key in its reason.
+    #[test]
+    fn link_admission_is_contact_and_not_blocked_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let friend = [0x41u8; 32];
+        let stranger = [0x42u8; 32];
+        assert_eq!(
+            link_peer_admission(dir.path(), &friend),
+            Err(LINK_REFUSED_NOT_CONTACT),
+            "no contact book"
+        );
+        std::fs::write(
+            dir.path().join("contacts.json"),
+            format!(
+                r#"[{{"pub_hex":"{}"}}]"#,
+                hex::encode(friend).to_uppercase()
+            ),
+        )
+        .unwrap();
+        assert_eq!(link_peer_admission(dir.path(), &friend), Ok(()));
+        assert_eq!(
+            link_peer_admission(dir.path(), &stranger),
+            Err(LINK_REFUSED_NOT_CONTACT)
+        );
+        let mut blocks = BlockList::default();
+        blocks.block(&hex::encode(friend));
+        blocks.save(dir.path()).unwrap();
+        assert_eq!(
+            link_peer_admission(dir.path(), &friend),
+            Err(LINK_REFUSED_BLOCKED)
+        );
+        std::fs::write(crate::chat_history::blocked_path(dir.path()), "{corrupt").unwrap();
+        assert_eq!(
+            link_peer_admission(dir.path(), &friend),
+            Err(LINK_REFUSED_BLOCKED),
+            "unreadable block list admits nobody"
+        );
+        std::fs::write(dir.path().join("contacts.json"), "not json").unwrap();
+        assert_eq!(
+            link_peer_admission(dir.path(), &friend),
+            Err(LINK_REFUSED_NOT_CONTACT),
+            "unreadable contact book admits nobody"
+        );
+        for reason in [LINK_REFUSED_NOT_CONTACT, LINK_REFUSED_BLOCKED] {
+            assert!(!reason.contains(&hex::encode(friend)));
+            // The smoke scripts grep the service log for this phrase.
+            assert!(reason.contains("not a local contact") || reason.contains("blocked"));
+        }
     }
 
     #[test]

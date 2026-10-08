@@ -1,5 +1,9 @@
 //! Direct LAN TCP: Noise XX + RLB1 + inbound PairInit/message/ACK dispatch.
 //!
+//! The dialer's signed bind comes first; the listener sends its own bind and
+//! RLB1 only to a dialer whose bind names a local, unblocked contact, and
+//! closes on anyone else before revealing its identity or prekey bundle.
+//!
 //! This path does not use `bridge_run` fanout. The listener loads the local
 //! identity once at start; unauthenticated connections never touch the
 //! identity lock / secret store, and all SQLite / file work for a connection
@@ -197,15 +201,24 @@ async fn initiator_session<S: AsyncRead + AsyncWrite + Unpin>(
     let remote_static = get_remote_static(&hs).map_err(|e| e.to_string())?;
     let mut t = into_transport(hs).map_err(|e| e.to_string())?;
     write_cipher(stream, &mut t, &encode_bind(identity, &local_pub)).await?;
-    let bind = read_cipher(stream, &mut t).await?;
+    // The responder answers only a dialer whose bind names one of its contacts;
+    // anyone else sees the connection close here, before any identity of the
+    // responder (see `responder_handshake`).
+    let bind = read_cipher(stream, &mut t)
+        .await
+        .map_err(netutil::closed_before_peer_identity)?;
     verify_bind(&bind, &remote_static, Some(expected)).map_err(|e| e.to_string())?;
     Ok(t)
 }
 
-async fn responder_session<S: AsyncRead + AsyncWrite + Unpin>(
+/// Responder: Noise XX, then the dialer's signed bind, which always comes
+/// first. Returns the dialer's bound Ed25519 key, the transport and our own
+/// bind, which is **not** sent yet: the caller decides first whether the
+/// dialer may learn who we are ([`raven_core::lan_dispatch::link_peer_admission`]).
+async fn responder_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     identity: &Identity,
-) -> Result<([u8; 32], NoiseTransport), String> {
+) -> Result<([u8; 32], NoiseTransport, Vec<u8>), String> {
     let secret = derive_noise_static(identity).map_err(|e| e.to_string())?;
     let local_pub = noise_static_public(&secret);
     let mut hs = build_responder(&secret).map_err(|e| e.to_string())?;
@@ -219,7 +232,17 @@ async fn responder_session<S: AsyncRead + AsyncWrite + Unpin>(
     let mut t = into_transport(hs).map_err(|e| e.to_string())?;
     let bind = read_cipher(stream, &mut t).await?;
     let remote_ed = verify_bind(&bind, &remote_static, None).map_err(|e| e.to_string())?;
-    write_cipher(stream, &mut t, &encode_bind(identity, &local_pub)).await?;
+    Ok((remote_ed, t, encode_bind(identity, &local_pub).to_vec()))
+}
+
+/// [`responder_handshake`] that answers every dialer (scripted test peers).
+#[cfg(test)]
+async fn responder_session<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    identity: &Identity,
+) -> Result<([u8; 32], NoiseTransport), String> {
+    let (remote_ed, mut t, ours) = responder_handshake(stream, identity).await?;
+    write_cipher(stream, &mut t, &ours).await?;
     Ok((remote_ed, t))
 }
 
@@ -235,14 +258,35 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     // must not be able to trigger identity-lock / secret-store work. The
     // network half of the handshake has its own short deadline; the local
     // blocking work below deliberately does not (a slow disk is not the
-    // peer's fault).
-    let handshake = tokio::time::timeout(limits.handshake_deadline, async {
-        let (remote_ed, mut transport) = responder_session(&mut stream, &identity).await?;
-        let peer_offer = read_cipher(&mut stream, &mut transport).await?;
-        Ok::<_, String>((remote_ed, transport, peer_offer))
+    // peer's fault), so the contact check's time is added back to it.
+    let mut deadline = tokio::time::Instant::now() + limits.handshake_deadline;
+    let (remote_ed, mut transport, our_bind) = match tokio::time::timeout_at(
+        deadline,
+        responder_handshake(&mut stream, &identity),
+    )
+    .await
+    {
+        Ok(done) => done?,
+        Err(_) => return Err(HANDSHAKE_TIMEOUT.into()),
+    };
+    // Contact gate before anything identifying leaves this node: a stranger
+    // (or a blocked key) gets the connection closed and nothing else, not our
+    // bind (Raven identity) and not our RLB1 (certificate + prekey bundle).
+    let gate_started = tokio::time::Instant::now();
+    {
+        let dd = data_dir.clone();
+        blocking(move || {
+            raven_core::lan_dispatch::link_peer_admission(&dd, &remote_ed).map_err(String::from)
+        })
+        .await?;
+    }
+    deadline += gate_started.elapsed();
+    let offer = tokio::time::timeout_at(deadline, async {
+        write_cipher(&mut stream, &mut transport, &our_bind).await?;
+        read_cipher(&mut stream, &mut transport).await
     })
     .await;
-    let (remote_ed, mut transport, peer_offer) = match handshake {
+    let peer_offer = match offer {
         Ok(done) => done?,
         Err(_) => return Err(HANDSHAKE_TIMEOUT.into()),
     };
@@ -600,12 +644,13 @@ mod tests {
         let responder = Arc::new(Identity::from_seed(&[0x51; 32]));
         let expected = responder.public_key_bytes();
         let data_dir = dir.path().to_path_buf();
+        let initiator = Identity::from_seed(&[0x52; 32]);
+        write_contacts(dir.path(), &[&initiator]);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut slot = test_slot();
             handle_inbound(data_dir, responder, stream, PRODUCTION_LIMITS, &mut slot).await
         });
-        let initiator = Identity::from_seed(&[0x52; 32]);
         let mut client = TcpStream::connect(addr).await.unwrap();
         let mut transport = initiator_session(&mut client, &initiator, &expected)
             .await
@@ -645,61 +690,141 @@ mod tests {
         held.len()
     }
 
+    fn write_contacts(dir: &Path, contacts: &[&Identity]) {
+        let rows: Vec<String> = contacts
+            .iter()
+            .map(|c| format!(r#"{{"pub_hex":"{}"}}"#, hex::encode(c.public_key_bytes())))
+            .collect();
+        std::fs::write(dir.join("contacts.json"), format!("[{}]", rows.join(","))).unwrap();
+    }
+
     /// An RLB1 offer proves the peer holds *a* key, nothing more: anyone can
     /// generate an identity and self-sign a bundle. Only a local contact (the
     /// only peer whose PairInit / messages / ACKs are accepted) may therefore
-    /// leave the pre-auth caps for a slot newcomers cannot displace; a stranger
-    /// that completes the handshake stays a displaceable pre-auth connection.
+    /// leave the pre-auth caps for a slot newcomers cannot displace. (A
+    /// stranger never gets that far: see `stranger_learns_nothing_but_not_accepted`.)
     #[tokio::test]
     async fn only_a_local_contact_earns_a_protected_slot() {
         if !lab_backend_available() {
             return;
         }
         let ip: std::net::IpAddr = "10.9.8.7".parse().unwrap();
-        for contact in [false, true] {
+        let resp_dir = tempfile::tempdir().unwrap();
+        let init_dir = tempfile::tempdir().unwrap();
+        let responder = Arc::new(Identity::from_seed(&[0x71; 32]));
+        let initiator = Identity::from_seed(&[0x72; 32]);
+        write_contacts(resp_dir.path(), &[&initiator]);
+        let admission = Admission::new(PRODUCTION_LIMITS);
+        let mut slot = admission.try_admit(ip).expect("slot");
+        let (mut client, server_side) = tokio::io::duplex(1 << 18);
+        let (data_dir, resp) = (resp_dir.path().to_path_buf(), responder.clone());
+        let server = tokio::spawn(async move {
+            handle_inbound(data_dir, resp, server_side, PRODUCTION_LIMITS, &mut slot).await
+        });
+        let mut t = initiator_session(&mut client, &initiator, &responder.public_key_bytes())
+            .await
+            .expect("Noise XX + bind");
+        let offer = encode_local_offer(init_dir.path(), &initiator).unwrap();
+        write_cipher(&mut client, &mut t, &offer).await.unwrap();
+        // The responder's own offer is written after it decided.
+        let theirs = read_cipher(&mut client, &mut t).await.unwrap();
+        assert!(parse_peer_offer(&theirs).is_ok(), "a contact gets our RLB1");
+        assert_eq!(
+            spare_preauth_slots(&admission, ip),
+            PRODUCTION_LIMITS.max_handshaking_per_ip,
+            "a contact no longer counts as pre-auth"
+        );
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("handler ends when the dialer hangs up")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// F4: a dialer that completes Noise XX with a key that is not a local
+    /// contact (or is blocked) gets the connection closed right after its own
+    /// bind. It never receives a single transport frame: not our bind (Raven
+    /// identity), not our RLB1 (certificate + prekey bundle). Its error is the
+    /// fixed `LINK_NOT_ACCEPTED`, never retried; the responder logs a fixed,
+    /// key-free reason.
+    #[tokio::test]
+    async fn stranger_learns_nothing_but_not_accepted() {
+        let responder = Arc::new(Identity::from_seed(&[0x75; 32]));
+        let stranger = Identity::from_seed(&[0x76; 32]);
+        let other = Identity::from_seed(&[0x77; 32]);
+        for case in [
+            "no contacts.json",
+            "other contact",
+            "blocked contact",
+            "corrupt book",
+        ] {
             let resp_dir = tempfile::tempdir().unwrap();
-            let init_dir = tempfile::tempdir().unwrap();
-            let responder = Arc::new(Identity::from_seed(&[0x71; 32]));
-            let initiator = Identity::from_seed(&[0x72; 32]);
-            if contact {
-                std::fs::write(
-                    resp_dir.path().join("contacts.json"),
-                    format!(
-                        r#"[{{"pub_hex":"{}"}}]"#,
-                        hex::encode(initiator.public_key_bytes())
-                    ),
-                )
-                .unwrap();
+            match case {
+                "other contact" => write_contacts(resp_dir.path(), &[&other]),
+                "blocked contact" => {
+                    write_contacts(resp_dir.path(), &[&stranger]);
+                    let mut blocks = raven_core::BlockList::default();
+                    blocks.block(&hex::encode(stranger.public_key_bytes()));
+                    blocks.save(resp_dir.path()).unwrap();
+                }
+                "corrupt book" => {
+                    std::fs::write(resp_dir.path().join("contacts.json"), "{not json").unwrap()
+                }
+                _ => {}
             }
-            let admission = Admission::new(PRODUCTION_LIMITS);
-            let mut slot = admission.try_admit(ip).expect("slot");
             let (mut client, server_side) = tokio::io::duplex(1 << 18);
             let (data_dir, resp) = (resp_dir.path().to_path_buf(), responder.clone());
             let server = tokio::spawn(async move {
+                let mut slot = test_slot();
                 handle_inbound(data_dir, resp, server_side, PRODUCTION_LIMITS, &mut slot).await
             });
-            let mut t = initiator_session(&mut client, &initiator, &responder.public_key_bytes())
+            let err = initiator_session(&mut client, &stranger, &responder.public_key_bytes())
                 .await
-                .expect("Noise XX + bind");
-            let offer = encode_local_offer(init_dir.path(), &initiator).unwrap();
-            write_cipher(&mut client, &mut t, &offer).await.unwrap();
-            // The responder's own offer is written after it decided.
-            let _theirs = read_cipher(&mut client, &mut t).await.unwrap();
-
-            let spare = spare_preauth_slots(&admission, ip);
-            let cap = PRODUCTION_LIMITS.max_handshaking_per_ip;
-            if contact {
-                assert_eq!(spare, cap, "a contact no longer counts as pre-auth");
-            } else {
-                assert_eq!(spare, cap - 1, "a stranger must stay a pre-auth slot");
-            }
-            drop(client);
-            tokio::time::timeout(Duration::from_secs(10), server)
+                .err()
+                .unwrap_or_else(|| panic!("{case}: stranger must not get our bind"));
+            assert_eq!(err, netutil::LINK_NOT_ACCEPTED, "{case}");
+            let refusal = tokio::time::timeout(Duration::from_secs(10), server)
                 .await
-                .expect("handler ends when the dialer hangs up")
+                .expect("handler ends")
                 .unwrap()
-                .unwrap();
+                .unwrap_err();
+            let want = if case == "blocked contact" {
+                raven_core::lan_dispatch::LINK_REFUSED_BLOCKED
+            } else {
+                raven_core::lan_dispatch::LINK_REFUSED_NOT_CONTACT
+            };
+            assert_eq!(refusal, want, "{case}");
+            assert!(!refusal.contains(&hex::encode(stranger.public_key_bytes())));
+            // Nothing but the close follows the handshake.
+            let mut rest = Vec::new();
+            let n = client.read_to_end(&mut rest).await.unwrap_or(0);
+            assert_eq!(n, 0, "{case}: no byte after the stranger's bind");
         }
+    }
+
+    /// The dialer authenticates first, so a contact that dials a responder
+    /// which has *it* as a contact still verifies the responder's bind.
+    #[tokio::test]
+    async fn contact_dialer_still_authenticates_the_responder() {
+        let resp_dir = tempfile::tempdir().unwrap();
+        let responder = Arc::new(Identity::from_seed(&[0x78; 32]));
+        let dialer = Identity::from_seed(&[0x79; 32]);
+        let mallory = Identity::from_seed(&[0x7a; 32]);
+        write_contacts(resp_dir.path(), &[&dialer]);
+        let (mut client, server_side) = tokio::io::duplex(1 << 18);
+        let (data_dir, resp) = (resp_dir.path().to_path_buf(), responder.clone());
+        let _server = tokio::spawn(async move {
+            let mut slot = test_slot();
+            handle_inbound(data_dir, resp, server_side, PRODUCTION_LIMITS, &mut slot).await
+        });
+        // Dialing the right listener but expecting someone else still fails on
+        // the responder's (now disclosed) bind.
+        let Err(err) = initiator_session(&mut client, &dialer, &mallory.public_key_bytes()).await
+        else {
+            panic!("wrong expected identity must fail");
+        };
+        assert_ne!(err, netutil::LINK_NOT_ACCEPTED, "{err}");
     }
 
     /// Regression: the pre-auth phase shared the 120 s session lifetime, so a

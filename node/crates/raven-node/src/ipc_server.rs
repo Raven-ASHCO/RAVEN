@@ -271,6 +271,19 @@ fn handle_req(req: IpcRequest, data_dir: &Path, forward: &Option<ForwardQueue>) 
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            // Custody allow-list (F3): both queues below hand these bytes to a
+            // relay or store, so only a sealed indexed-session message or ACK
+            // is accepted, never PairInit / PairResponse, demo or plaintext.
+            if let Err(refusal) = raven_core::carrier_admission::admit_relayable(&packed, now) {
+                return IpcResponse::Error {
+                    v,
+                    code: "IPC_NOT_RELAYABLE".into(),
+                    message: format!(
+                        "not a sealed indexed-session message or ACK; refused before custody \
+                         ({refusal:?})"
+                    ),
+                };
+            }
             let peer = peer_hint.unwrap_or_else(|| "ipc".into());
             // Prefer forward queue when available (always-on bridge); also mirror outbox.
             if let Some(q) = forward {
@@ -1252,25 +1265,67 @@ mod tests {
         }
     }
 
-    fn sealed_envelope_b64(id: u8) -> String {
+    fn wall_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// An envelope custody admits: sealed indexed-session shape, valid now.
+    fn sealed_envelope(id: u8, body: Vec<u8>) -> Vec<u8> {
         use raven_core::envelope::{EnvType, Envelope};
-        let packed = Envelope {
+        Envelope {
             env_type: EnvType::Message as u8,
             flags: 0,
             message_id: [id; 16],
             routing_tag: [0x44; 16],
             dest_device_hint: 0,
-            created_at: 1,
-            expires_at: u64::MAX / 2,
+            created_at: wall_ms(),
+            expires_at: wall_ms() + 60 * 60 * 1000,
             hop_limit: 4,
             replication_budget: 1,
             anti_replay_nonce: [0x55; 12],
             ratchet_header_ciphertext: vec![],
-            message_ciphertext: vec![id; 32],
+            message_ciphertext: body,
             sender_authentication: vec![0u8; 64],
         }
-        .pack();
-        b64_encode(&packed)
+        .pack()
+    }
+
+    fn sealed_envelope_b64(id: u8) -> String {
+        use raven_core::carrier_admission::{opaque_indexed_body_for_tests, RelayableKind};
+        b64_encode(&sealed_envelope(
+            id,
+            opaque_indexed_body_for_tests(RelayableKind::Message, &[id; 32]),
+        ))
+    }
+
+    /// F3: `EnqueueSealed` feeds the bridge custody queue and the legacy
+    /// outbox, so a wrapped PairInit or a plaintext body is refused before
+    /// either queue exists.
+    #[test]
+    fn enqueue_sealed_refuses_pairing_and_plaintext_before_custody() {
+        use raven_core::pair_init::{INIT_MAGIC, INIT_WIRE_LEN};
+        let dir = tempfile::tempdir().unwrap();
+        let mut init = INIT_MAGIC.to_vec();
+        init.resize(INIT_WIRE_LEN, 0x01);
+        for body in [init, b"plaintext hello".to_vec()] {
+            let req = IpcRequest::EnqueueSealed {
+                v: IPC_VERSION,
+                envelope_b64: b64_encode(&sealed_envelope(7, body)),
+                peer_hint: Some("peer".into()),
+            };
+            match handle_req(req, dir.path(), &None) {
+                IpcResponse::Error { code, .. } => assert_eq!(code, "IPC_NOT_RELAYABLE"),
+                other => panic!("must be refused: {other:?}"),
+            }
+        }
+        assert!(!dir.path().join("queue.sqlite").exists());
+        match handle_req(enqueue_req(8), dir.path(), &None) {
+            IpcResponse::Accepted { .. } => {}
+            other => panic!("a sealed object is accepted: {other:?}"),
+        }
     }
 
     fn enqueue_req(id: u8) -> IpcRequest {
