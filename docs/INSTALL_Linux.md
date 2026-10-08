@@ -90,6 +90,42 @@ RAVEN_LAN_LISTEN=<this-host-LAN-IP>:7420 bash scripts/install/linux_systemd_user
 sudo ufw allow from 192.168.0.0/16 to any port 7420 proto tcp
 ```
 
+**Internet direct is opt-in too (off by default).** It lets contacts who have
+your Internet address (`raven whoami --card --inet <public-ip-or-name>:7422`)
+reach this computer over TCP port **7422** (7421 is mock BLE's, 7423 is
+reserved for libp2p). Only your contacts get an answer: anyone else completes
+the Noise handshake and is disconnected before this node names itself, but a
+scanner still learns that something listens on that port. A build with
+Internet direct off (`INTERNET_DIRECT_PRODUCTION_ENABLED = false`, the state
+until its waiver is signed) keeps the port closed and logs `internet_direct
+failed: INTERNET_DIRECT_HOLD ...`; the debug lab unlock is `RAVEN_LAB_TEST_A=1`.
+`raven status` shows an `internet` row: `YES` only while the running service
+really has the listener up.
+
+```bash
+# at install time
+RAVEN_INTERNET_LISTEN=0.0.0.0:7422 bash scripts/install/linux_systemd_user.sh
+# or later (saved in node_policy.json, applied when the service restarts)
+raven node internet on --listen 0.0.0.0:7422
+systemctl --user restart raven-node
+raven node internet off          # closes it again at the next restart
+```
+
+The service reads `--internet-listen`, then `RAVEN_INTERNET_LISTEN`, then
+`node_policy.json`; a bare IP gets port 7422 and an empty value is off.
+Firewall: Linux shows no prompt, ufw / firewalld / nftables and cloud security
+groups decide. Open the port yourself, e.g. `sudo ufw allow 7422/tcp`
+(`firewall-cmd --add-port=7422/tcp --permanent` on firewalld), and forward TCP
+7422 on your router if the host is behind NAT. A VPS with a public IP or a home
+with global IPv6 (`[::]:7422`) needs no forwarding.
+
+Contacts: `raven contact add --card '<their card line>'` saves their routes,
+`raven contact set-addr <name> --internet HOST:PORT` (or `--lan`, `--clear
+internet`) edits them, and `raven send --contact <name>` tries their LAN
+address first, then their Internet address (`--carrier lan|internet` forces
+one). An address is only a hint: every connection still has to prove the
+contact's pinned key.
+
 ## Unsigned tarball
 
 ```bash

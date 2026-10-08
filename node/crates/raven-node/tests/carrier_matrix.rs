@@ -14,6 +14,16 @@
 //!   received B's RLB1 (S would have cached B's certificate, since B is S's
 //!   contact).
 //!
+//! - **C2 Internet direct (P1):** A and B with Internet direct listeners (A on
+//!   127.0.0.1, B on [::1] when the runner has IPv6 loopback) and contacts that
+//!   hold only Internet routes (one imported from a `raven whoami --card`, one
+//!   set with `raven contact set-addr`). `raven send --carrier auto` (the
+//!   default) reaches each other over Internet direct, names the carrier only in
+//!   verbose mode, and a stranger holding B's card is refused before B
+//!   identifies itself. Runs under the debug lab unlock (`RAVEN_LAB_TEST_A=1`)
+//!   while `INTERNET_DIRECT_PRODUCTION_ENABLED` is false, and without it once
+//!   the flag is flipped.
+//!
 //! Synchronisation is event driven: the harness reads each daemon's stderr and
 //! waits for its own "ipc: listening" / "lan_direct: listen <addr>" lines. Every
 //! wait and every child process has a bounded deadline; nothing sleeps to
@@ -104,6 +114,8 @@ struct Service {
     child: Child,
     log: Arc<Log>,
     lan_dial: String,
+    /// The bound Internet direct address (empty without `--internet-listen`).
+    internet_dial: String,
 }
 
 impl Drop for Service {
@@ -130,6 +142,10 @@ struct Profile {
     dir: PathBuf,
     address: String,
     pub_hex: String,
+    fingerprint: String,
+    /// Debug lab unlock for Internet direct (`RAVEN_LAB_TEST_A=1`) on every
+    /// process of this profile; the C1 profiles run without it.
+    lab_internet: bool,
 }
 
 impl Profile {
@@ -144,8 +160,16 @@ impl Profile {
             "RAVEN_LAB_TEST_A",
             "RAVEN_DATA_DIR",
             "ASH_DATA_DIR",
+            "RAVEN_INTERNET_LISTEN",
+            "RAVEN_PEER",
+            "ASH_LAN_DIAL",
+            "RAVEN_VERBOSE",
+            "ASH_VERBOSE",
         ] {
             cmd.env_remove(k);
+        }
+        if self.lab_internet {
+            cmd.env("RAVEN_LAB_TEST_A", "1");
         }
         cmd.env("RAVEN_IDENTITY_BACKEND", "locked-file")
             .env("RAVEN_CHAT_HISTORY_BACKEND", "locked-file")
@@ -159,8 +183,15 @@ impl Profile {
     }
 
     fn raven(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        self.raven_with(args, stdin, &[])
+    }
+
+    fn raven_with(&self, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(raven_bin());
         self.env(&mut cmd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         cmd.arg("--data-dir").arg(&self.dir).args(args);
         run_bounded(
             cmd,
@@ -171,6 +202,10 @@ impl Profile {
     }
 
     fn create(root: &Path, name: &'static str) -> Self {
+        Self::create_with(root, name, false)
+    }
+
+    fn create_with(root: &Path, name: &'static str, lab_internet: bool) -> Self {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let mut p = Profile {
@@ -178,6 +213,8 @@ impl Profile {
             dir,
             address: String::new(),
             pub_hex: String::new(),
+            fingerprint: String::new(),
+            lab_internet,
         };
         let init = p.raven(&["init"], None);
         assert!(init.ok, "{name} init failed:\n{}", init.all());
@@ -189,6 +226,7 @@ impl Profile {
         };
         p.address = field("address=");
         p.pub_hex = field("pub_hex=");
+        p.fingerprint = field("fingerprint=");
         let publish = p.raven(&["prekey", "publish"], None);
         assert!(publish.ok, "{name} prekey publish:\n{}", publish.all());
         p
@@ -196,13 +234,24 @@ impl Profile {
 
     /// Start the daemon and wait until its IPC endpoint and LAN listener are up.
     fn start_service(&self) -> Service {
+        self.start_service_with(None)
+    }
+
+    /// [`Self::start_service`], plus an Internet direct listener on `internet`
+    /// (waited for too) when given.
+    fn start_service_with(&self, internet: Option<&str>) -> Service {
         let mut cmd = Command::new(NODE);
         self.env(&mut cmd);
-        cmd.arg("service")
-            .arg("--data-dir")
-            .arg(&self.dir)
-            .args(["--lan-listen", "127.0.0.1:0", "--ble-listen", "127.0.0.1:0"])
-            .stdin(Stdio::null())
+        cmd.arg("service").arg("--data-dir").arg(&self.dir).args([
+            "--lan-listen",
+            "127.0.0.1:0",
+            "--ble-listen",
+            "127.0.0.1:0",
+        ]);
+        if let Some(addr) = internet {
+            cmd.args(["--internet-listen", addr]);
+        }
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().expect("spawn raven-node service");
@@ -212,6 +261,7 @@ impl Profile {
             child,
             log,
             lan_dial: String::new(),
+            internet_dial: String::new(),
         };
         let ipc = service
             .log
@@ -227,6 +277,19 @@ impl Profile {
             );
         };
         service.lan_dial = lan.rsplit(' ').next().unwrap().trim().to_string();
+        if internet.is_some() {
+            let inet = service.log.wait_for(READY_TIMEOUT, |l| {
+                l.contains("raven-node internet_direct: listen ")
+            });
+            let Some(inet) = inet else {
+                panic!(
+                    "{} internet listener did not come up within {READY_TIMEOUT:?}:\n{}",
+                    self.name,
+                    service.log.text()
+                );
+            };
+            service.internet_dial = inet.rsplit(' ').next().unwrap().trim().to_string();
+        }
         // The listener line is printed after bind; one positive ping proves the
         // CLI reaches this daemon (on Windows: this profile's own pipe).
         let ping = self.raven(&["ipc-ping"], None);
@@ -347,6 +410,22 @@ fn run_bounded(mut cmd: Command, stdin: Option<&str>, timeout: Duration, what: &
     }
 }
 
+/// `[::1]` when this runner has IPv6 loopback, else `127.0.0.1`.
+fn second_loopback() -> &'static str {
+    if std::net::TcpListener::bind("[::1]:0").is_ok() {
+        "[::1]:0"
+    } else {
+        eprintln!("note: no IPv6 loopback on this runner; C2 uses 127.0.0.1 for both nodes");
+        "127.0.0.1:0"
+    }
+}
+
+/// The Internet direct lab unlock is needed only while the P1 flag is off;
+/// after the flip C2 runs the production path unchanged.
+fn internet_lab_unlock() -> bool {
+    !raven_core::INTERNET_DIRECT_PRODUCTION_ENABLED
+}
+
 fn lab_ready() -> bool {
     if !cfg!(debug_assertions) {
         eprintln!("skipped: the lab locked-file backends need a debug build");
@@ -443,4 +522,191 @@ fn c1_lan_direct_both_ways_and_c3_stranger_is_not_accepted() {
     let again = a.send("bob", "c1 after the stranger");
     assert_delivered("a→b after c3", &again);
     assert!(b.inbox().contains("c1 after the stranger"));
+}
+
+/// C2: Internet direct between two services whose contacts hold only Internet
+/// routes, both ways, plus a stranger refused (lab gate; transports design
+/// §6.4 C2, §7.2).
+#[test]
+#[ignore = "multi-process harness: cargo build -p ash first, then run with --ignored"]
+fn c2_internet_direct_routes_both_ways_and_stranger_is_refused() {
+    if !lab_ready() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let a = Profile::create_with(root.path(), "ia", internet_lab_unlock());
+    let b = Profile::create_with(root.path(), "ib", internet_lab_unlock());
+    let a_svc = a.start_service_with(Some("127.0.0.1:0"));
+    let b_svc = b.start_service_with(Some(second_loopback()));
+    eprintln!(
+        "C2: a internet={} b internet={} (lab unlock: {})",
+        a_svc.internet_dial,
+        b_svc.internet_dial,
+        internet_lab_unlock()
+    );
+    assert!(
+        a_svc.log.text().contains("dial≠WAN"),
+        "missing the lab listen claim:\n{}",
+        a_svc.log.text()
+    );
+
+    // A imports B from B's card (Internet route only, fingerprint pinned).
+    let card = b.raven(&["whoami", "--card", "--inet", &b_svc.internet_dial], None);
+    assert!(card.ok, "b whoami --card:\n{}", card.all());
+    let card_line = card.stdout.trim();
+    assert_eq!(card.stdout.trim_end().lines().count(), 1, "{}", card.stdout);
+    assert!(card_line.starts_with("raven-card/1 "), "{card_line}");
+    let added = a.raven(
+        &[
+            "contact",
+            "add",
+            "--card",
+            card_line,
+            "--petname",
+            "bob",
+            "--tag",
+            "bob",
+            "--verify-fp",
+            &b.fingerprint,
+        ],
+        None,
+    );
+    assert!(added.ok, "a contact add --card:\n{}", added.all());
+    assert!(added.stdout.contains("contact saved"), "{}", added.all());
+    // B adds A the classic way, then saves A's Internet route with set-addr.
+    let added = b.raven(
+        &[
+            "contact",
+            "add",
+            "--address",
+            &a.address,
+            "--pub-hex",
+            &a.pub_hex,
+            "--petname",
+            "alice",
+            "--tag",
+            "alice",
+        ],
+        None,
+    );
+    assert!(added.ok, "b contact add:\n{}", added.all());
+    let set = b.raven(
+        &[
+            "contact",
+            "set-addr",
+            "@alice",
+            "--internet",
+            &a_svc.internet_dial,
+        ],
+        None,
+    );
+    assert!(set.ok, "b contact set-addr:\n{}", set.all());
+    let a_book = std::fs::read_to_string(a.dir.join("contacts.json")).unwrap();
+    assert!(
+        a_book.contains(&format!("\"internet_dial\": \"{}\"", b_svc.internet_dial))
+            && a_book.contains("\"lan_dial\": \"\""),
+        "a's contact for b must hold only the Internet route:\n{a_book}"
+    );
+
+    // No LAN route: `--carrier lan` refuses at once, nothing is dialled.
+    let lan_only = a.raven(
+        &["send", "--contact", "@bob", "--carrier", "lan"],
+        Some("c2 must not go out\n"),
+    );
+    assert!(!lan_only.ok, "{}", lan_only.all());
+    assert!(
+        lan_only.all().contains("no reachable lan_dial"),
+        "{}",
+        lan_only.all()
+    );
+
+    // Default carrier (auto) → Internet direct; the carrier is not named.
+    let sent = a.send("bob", "c2 hello over internet from a");
+    assert_delivered("a→b (internet)", &sent);
+    assert!(
+        !sent.stdout.contains("carrier="),
+        "auto must name the carrier only in verbose mode:\n{}",
+        sent.all()
+    );
+    assert!(
+        b.inbox().contains("c2 hello over internet from a"),
+        "b inbox misses a's Internet message"
+    );
+    // The other way, verbose: the carrier is named.
+    let sent = b.raven_with(
+        &["send", "--contact", "@alice"],
+        Some("c2 hello over internet from b\n"),
+        &[("RAVEN_VERBOSE", "1")],
+    );
+    assert_delivered("b→a (internet)", &sent);
+    assert!(
+        sent.stdout.contains("carrier=internet_dial"),
+        "verbose send must name the carrier:\n{}",
+        sent.all()
+    );
+    assert!(
+        a.inbox().contains("c2 hello over internet from b"),
+        "a inbox misses b's Internet message"
+    );
+    let status = b.raven(&["status"], None);
+    assert!(status.ok, "b status:\n{}", status.all());
+    let row = status
+        .stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("internet "))
+        .unwrap_or_else(|| panic!("no internet row in status:\n{}", status.stdout));
+    assert!(row.contains("YES"), "{row}");
+
+    // ── Stranger: S holds B's card, B does not know S ───────────────────
+    let s = Profile::create_with(root.path(), "is", internet_lab_unlock());
+    let _s_svc = s.start_service();
+    let added = s.raven(
+        &[
+            "contact",
+            "add",
+            "--card",
+            card_line,
+            "--petname",
+            "bob",
+            "--tag",
+            "bob",
+        ],
+        None,
+    );
+    assert!(added.ok, "s contact add --card:\n{}", added.all());
+    let refused = s.send("bob", "c2 stranger probe");
+    assert!(!refused.ok, "stranger send succeeded:\n{}", refused.all());
+    assert!(
+        !refused.stdout.to_lowercase().contains("delivered"),
+        "{}",
+        refused.all()
+    );
+    assert!(
+        refused.all().contains("LINK_NOT_ACCEPTED"),
+        "the stranger must see only the fixed refusal:\n{}",
+        refused.all()
+    );
+    let reason = b_svc
+        .log
+        .wait_for(LOG_TIMEOUT, |l| {
+            l.contains("internet_direct inbound") && l.contains("not a local contact")
+        })
+        .unwrap_or_else(|| panic!("b did not log the refusal:\n{}", b_svc.log.text()));
+    assert!(
+        !reason.contains(&s.pub_hex) && !reason.contains(&s.address),
+        "the refusal log names the stranger: {reason}"
+    );
+    let cache = std::fs::read_to_string(s.dir.join("peer_device_certs.json")).unwrap_or_default();
+    assert!(
+        !cache.contains(&b.pub_hex),
+        "the stranger received b's certificate:\n{cache}"
+    );
+    assert!(
+        !b.inbox().contains("c2 stranger probe"),
+        "b accepted the stranger's message"
+    );
+    // A still gets through after the refusal.
+    let again = a.send("bob", "c2 after the stranger");
+    assert_delivered("a→b after the stranger", &again);
+    assert!(b.inbox().contains("c2 after the stranger"));
 }

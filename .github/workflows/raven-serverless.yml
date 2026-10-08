@@ -258,9 +258,12 @@ jobs:
         run: ./scripts/lan_direct_two_node.sh
       # Portable carrier harness (transports design §6.4): two real raven-node
       # services + `raven send` each way + inbox (C1) and a stranger refused
-      # before the responder identifies itself (C3, F4). Rust, not bash, so the
-      # same scenario runs on all three runners (named-pipe IPC on Windows).
-      - name: Portable carrier harness (C1 LAN direct both ways + C3 contact gating)
+      # before the responder identifies itself (C3, F4); C2 does the same over
+      # Internet direct (listeners on 127.0.0.1 and [::1], contacts with only
+      # Internet routes, debug lab unlock while the P1 flag is off). Rust, not
+      # bash, so the same scenario runs on all three runners (named-pipe IPC on
+      # Windows).
+      - name: Portable carrier harness (C1 LAN direct + C2 Internet direct both ways + C3 contact gating)
         shell: bash
         run: |
           set -euo pipefail
@@ -497,9 +500,12 @@ jobs:
           RAVEN_LAB_TEST_A: "1"
       # Portable carrier harness (transports design §6.4): two real raven-node
       # services + `raven send` each way + inbox (C1) and a stranger refused
-      # before the responder identifies itself (C3, F4). Rust, not bash, so the
-      # same scenario runs on all three runners (named-pipe IPC on Windows).
-      - name: Portable carrier harness (C1 LAN direct both ways + C3 contact gating)
+      # before the responder identifies itself (C3, F4); C2 does the same over
+      # Internet direct (listeners on 127.0.0.1 and [::1], contacts with only
+      # Internet routes, debug lab unlock while the P1 flag is off). Rust, not
+      # bash, so the same scenario runs on all three runners (named-pipe IPC on
+      # Windows).
+      - name: Portable carrier harness (C1 LAN direct + C2 Internet direct both ways + C3 contact gating)
         shell: bash
         run: |
           set -euo pipefail
@@ -553,9 +559,12 @@ jobs:
         run: cargo test --locked -p raven-core --test bridge_v1
       # Portable carrier harness (transports design §6.4): two real raven-node
       # services + `raven send` each way + inbox (C1) and a stranger refused
-      # before the responder identifies itself (C3, F4). Rust, not bash, so the
-      # same scenario runs on all three runners (named-pipe IPC on Windows).
-      - name: Portable carrier harness (C1 LAN direct both ways + C3 contact gating)
+      # before the responder identifies itself (C3, F4); C2 does the same over
+      # Internet direct (listeners on 127.0.0.1 and [::1], contacts with only
+      # Internet routes, debug lab unlock while the P1 flag is off). Rust, not
+      # bash, so the same scenario runs on all three runners (named-pipe IPC on
+      # Windows).
+      - name: Portable carrier harness (C1 LAN direct + C2 Internet direct both ways + C3 contact gating)
         shell: bash
         run: |
           set -euo pipefail
@@ -650,14 +659,17 @@ jobs:
             if (-not (Test-Path -LiteralPath $ash)) { throw "ash.exe missing after upgrade over a locked copy" }
             $hold.Dispose()
             $hold = $null
-            & (Resolve-Path $script) -DataDir $dataDir -BinDir $binDir -TaskName $taskName -NoStart
+            & (Resolve-Path $script) -DataDir $dataDir -BinDir $binDir -TaskName $taskName -NoStart -InternetListen 127.0.0.1:7422
             $task = Get-ScheduledTask -TaskName $taskName
+            # -InternetListen is opt-in and lands on the task's command line verbatim.
+            $taskArgs = [string]$task.Actions[0].Arguments
+            if ($taskArgs -notmatch '--internet-listen 127\.0\.0\.1:7422') { throw "task arguments lack --internet-listen: $taskArgs" }
             $limit = [string]$task.Settings.ExecutionTimeLimit
             if ($limit -ne "PT0S") { throw "ExecutionTimeLimit is '$limit', expected PT0S (no limit)" }
             if ($task.Settings.StartWhenAvailable -ne $true) { throw "StartWhenAvailable is not set" }
             if ([int]$task.Settings.RestartCount -lt 3) { throw "RestartCount is $($task.Settings.RestartCount), expected restart-on-failure" }
             if ([string]$task.State -eq "Running") { throw "-NoStart started the task" }
-            Write-Host "logon task settings OK (PT0S, StartWhenAvailable, restart-on-failure)"
+            Write-Host "logon task settings OK (PT0S, StartWhenAvailable, restart-on-failure, -InternetListen)"
           } finally {
             if ($null -ne $hold) { $hold.Dispose() }
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue

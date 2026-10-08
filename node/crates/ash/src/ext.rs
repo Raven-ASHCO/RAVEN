@@ -918,6 +918,10 @@ struct LocalContactRow {
     pinned: bool,
     #[serde(default)]
     lan_dial: String,
+    /// Kept through the load → merge → save of a sync import (the CLI's
+    /// `Contact` writes it only when set; so does this row).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    internet_dial: String,
 }
 
 fn load_local_contacts(data_dir: &Path) -> Result<Vec<LocalContactRow>, String> {
@@ -1072,6 +1076,7 @@ fn device_sync_import_apply(data_dir: &Path, id: &Identity, wire: &[u8]) -> Resu
             pub_hex,
             pinned: sc.pinned,
             lan_dial: String::new(),
+            internet_dial: String::new(),
         });
         added += 1;
     }
@@ -1178,6 +1183,11 @@ pub(crate) struct SendCtx {
     pub(crate) data_dir: Option<PathBuf>,
     /// Chat transcript lines instead of `status ...` lines.
     pub(crate) chat: bool,
+    /// The user named the carrier (`--carrier internet`): the lab Internet
+    /// carrier then prints its evidence line (`carrier=internet_dial`) without
+    /// verbose mode. A carrier picked by `--carrier auto` is named only in
+    /// verbose mode.
+    pub(crate) show_carrier: bool,
 }
 
 /// `s` as one shell word in a hint: bare when plain, else quoted.
@@ -1277,6 +1287,7 @@ pub(crate) fn send_ctx(data_dir: &Path, petname: &str, tag: &str, peer_pub_hex: 
         dial: String::new(),
         data_dir: Some(data_dir.to_path_buf()),
         chat: false,
+        show_carrier: false,
     }
 }
 
@@ -1922,10 +1933,11 @@ impl SendCtx {
         })
     }
 
-    /// The lab Internet carrier is evidence-driven (`carrier=internet_dial` is
-    /// asserted by its smoke script); everyone else sees this on request.
+    /// The lab Internet carrier is evidence-driven when the user named it
+    /// (`--carrier internet`: `carrier=internet_dial` is asserted by its smoke
+    /// script); everyone else, `--carrier auto` included, sees this on request.
     fn delivery_detail_line(&self, carrier: &str, mid: &[u8; 16], verbose: bool) -> Option<String> {
-        (verbose || carrier == "internet_dial").then(|| {
+        (verbose || (self.show_carrier && carrier == "internet_dial")).then(|| {
             format!(
                 "{C_DIM}message {}… via carrier={carrier} peer={}{C_RESET}",
                 hex::encode(&mid[..4]),
@@ -2102,7 +2114,12 @@ pub fn run_send_secure_on(
     tag: &str,
     carrier: super::pair_init_lab::DialCarrier,
 ) -> Result<(), String> {
-    let ctx = send_ctx(data_dir, petname, tag, peer_pub_hex);
+    let ctx = SendCtx {
+        // The caller named this carrier: the lab Internet carrier keeps its
+        // evidence line (see `SendCtx::show_carrier`).
+        show_carrier: carrier == super::pair_init_lab::DialCarrier::Internet,
+        ..send_ctx(data_dir, petname, tag, peer_pub_hex)
+    };
     send_with(
         data_dir,
         id,
@@ -2113,6 +2130,30 @@ pub fn run_send_secure_on(
         &ctx,
         carrier,
     )
+}
+
+/// `raven send` over a contact's routes, in order (LAN first, then Internet;
+/// see `pair_init_lab::run_pair_init_and_send_routes`), and the route that was
+/// used. `show_carrier`: the user named the carrier (`--carrier internet`).
+pub fn run_send_secure_routes(
+    data_dir: &Path,
+    id: &Identity,
+    routes: &[super::pair_init_lab::DialRoute],
+    peer_pub_hex: &str,
+    text: &str,
+    show_carrier: bool,
+) -> Result<super::pair_init_lab::DialRoute, String> {
+    let first = routes.first().ok_or_else(|| {
+        "valid lan_dial host:port required — refusing LocalListenQueue / 127.0.0.1:0 fallback"
+            .to_string()
+    })?;
+    let ctx = SendCtx {
+        dial: first.dial.trim().to_string(),
+        show_carrier,
+        ..send_ctx(data_dir, "", "", peer_pub_hex)
+    };
+    deliver_routes(data_dir, id, routes, peer_pub_hex, text, &ctx)
+        .map_err(|e| translate_known(&e, &ctx).unwrap_or(e))
 }
 
 /// One send, whatever the carrier: every error that leaves it is the user's
@@ -2153,6 +2194,24 @@ fn deliver(
     ctx: &SendCtx,
     carrier: super::pair_init_lab::DialCarrier,
 ) -> Result<(), String> {
+    let route = super::pair_init_lab::DialRoute {
+        carrier,
+        dial: dial.to_string(),
+    };
+    deliver_routes(data_dir, id, &[route], peer_pub_hex, text, ctx).map(|_| ())
+}
+
+/// [`deliver`] over several routes (tried in order, see
+/// `pair_init_lab::run_pair_init_and_send_routes`). Every check runs before the
+/// local service is started or anything is dialled.
+fn deliver_routes(
+    data_dir: &Path,
+    id: &Identity,
+    routes: &[super::pair_init_lab::DialRoute],
+    peer_pub_hex: &str,
+    text: &str,
+    ctx: &SendCtx,
+) -> Result<super::pair_init_lab::DialRoute, String> {
     use super::pair_init_lab::DialCarrier;
     let path = resolve_terminal_messaging_path();
     assert_no_silent_fastapi(path)?;
@@ -2164,17 +2223,26 @@ fn deliver(
     if text.trim().is_empty() {
         return Err("message is empty".into());
     }
-    if !looks_like_host_port(dial) {
-        return Err(format!(
-            "valid {} host:port required — refusing LocalListenQueue / 127.0.0.1:0 fallback",
-            carrier.label()
-        ));
+    let Some(first) = routes.first() else {
+        return Err(
+            "valid lan_dial host:port required — refusing LocalListenQueue / 127.0.0.1:0 fallback"
+                .into(),
+        );
+    };
+    for route in routes {
+        if !looks_like_host_port(&route.dial) {
+            return Err(format!(
+                "valid {} host:port required — refusing LocalListenQueue / 127.0.0.1:0 fallback",
+                route.carrier.label()
+            ));
+        }
+        // The Internet carrier has its own (stricter) gate than LAN: refuse here,
+        // before ensure_mac_lan_daemon changes this machine's listening state.
+        if route.carrier == DialCarrier::Internet && !raven_core::internet_direct_live_enabled() {
+            return Err(super::pair_init_lab::INTERNET_DIRECT_HOLD.into());
+        }
     }
-    // The Internet carrier has its own (stricter) gate than LAN: refuse here,
-    // before ensure_mac_lan_daemon changes this machine's listening state.
-    if carrier == DialCarrier::Internet && !raven_core::internet_direct_live_enabled() {
-        return Err(super::pair_init_lab::INTERNET_DIRECT_HOLD.into());
-    }
+    let (dial, carrier) = (first.dial.as_str(), first.carrier);
 
     let mut message_id = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut message_id);
@@ -2217,13 +2285,12 @@ fn deliver(
         ctx.who(),
         sanitize_terminal_line(dial)
     ));
-    super::pair_init_lab::run_pair_init_and_send_on(
+    super::pair_init_lab::run_pair_init_and_send_routes(
         data_dir,
         id,
-        dial,
+        routes,
         peer_pub_hex,
         text,
-        carrier,
         ctx,
     )
 }
@@ -4846,6 +4913,7 @@ mod send_outcome_tests {
             dial: "192.168.0.14:7420".into(),
             data_dir: Some(PathBuf::from("/data")),
             chat: false,
+            show_carrier: false,
         }
     }
 
@@ -5357,8 +5425,17 @@ mod send_outcome_tests {
             verbose.contains("abababab") && verbose.contains("carrier=lan_dial"),
             "{verbose}"
         );
+        // `--carrier auto` names the carrier only in verbose mode, Internet too.
+        assert_eq!(ctx.delivery_detail_line("internet_dial", &mid, false), None);
+        // A carrier the user named (`--carrier internet`) keeps its lab evidence.
+        let named = SendCtx {
+            show_carrier: true,
+            ..bob()
+        };
+        assert_eq!(named.delivery_detail_line("lan_dial", &mid, false), None);
         let lab = plain(
-            &ctx.delivery_detail_line("internet_dial", &mid, false)
+            &named
+                .delivery_detail_line("internet_dial", &mid, false)
                 .unwrap(),
         );
         assert!(

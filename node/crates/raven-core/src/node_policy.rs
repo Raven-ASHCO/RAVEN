@@ -20,6 +20,13 @@ pub struct NodePolicy {
     /// AUTO policy marker — ash may set false when user overrides.
     #[serde(default = "default_true")]
     pub auto_policy: bool,
+    /// Internet direct listen address (`ip:port`) the service binds when it
+    /// starts without `--internet-listen` / `RAVEN_INTERNET_LISTEN` (`raven
+    /// node internet on|off`). Empty = off, the default: Internet exposure is
+    /// opt-in, like LAN exposure in the installers. Omitted from the file while
+    /// empty, so older files and older readers are unaffected.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub internet_listen: String,
 }
 
 fn default_true() -> bool {
@@ -37,6 +44,7 @@ impl Default for NodePolicy {
             relay: false,
             endpoint: true,
             auto_policy: true,
+            internet_listen: String::new(),
         }
     }
 }
@@ -45,7 +53,7 @@ impl NodePolicy {
     /// Applied when `node_policy.json` exists but cannot be read or parsed:
     /// offer no services to other peers (bridge / store / relay off) and drop
     /// the AUTO marker so nothing re-enables them implicitly. The node stays
-    /// the user's own chat endpoint.
+    /// the user's own chat endpoint, and opens no Internet listener.
     pub fn fail_closed() -> Self {
         Self {
             bridge: false,
@@ -53,8 +61,49 @@ impl NodePolicy {
             relay: false,
             endpoint: true,
             auto_policy: false,
+            internet_listen: String::new(),
         }
     }
+}
+
+/// Normalise an Internet direct listen address: `ip:port`, `[ipv6]:port`, a
+/// bare IP (`0.0.0.0`, `::`, `[::]`), which gets
+/// [`crate::paths::DEFAULT_INTERNET_PORT`], or `localhost[:port]`. Empty (after
+/// trimming) is `Ok(None)`: no Internet listener. Port 0 (OS-assigned) is kept
+/// for tests. Anything else is an error that says what is expected.
+pub fn normalize_internet_listen(raw: &str) -> Result<Option<String>, String> {
+    use std::net::{IpAddr, SocketAddr};
+    let s = raw.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let port = crate::paths::DEFAULT_INTERNET_PORT;
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Ok(Some(addr.to_string()));
+    }
+    let bare = s
+        .strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .unwrap_or(s);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(Some(SocketAddr::new(ip, port).to_string()));
+    }
+    if s.eq_ignore_ascii_case("localhost") {
+        return Ok(Some(format!("localhost:{port}")));
+    }
+    if let Some(p) = s
+        .strip_prefix("localhost:")
+        .or_else(|| s.strip_prefix("LOCALHOST:"))
+    {
+        if p.parse::<u16>().is_ok() {
+            return Ok(Some(format!("localhost:{p}")));
+        }
+    }
+    Err(format!(
+        "Internet listen address must be IP:PORT, e.g. 0.0.0.0:{port} (all IPv4 interfaces), \
+         [::]:{port} (IPv6) or 127.0.0.1:{port} (this computer only); got \"{}\"",
+        crate::sanitize::sanitize_terminal_line(s)
+    ))
 }
 
 #[derive(Error, Debug)]
@@ -218,6 +267,53 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("node_policy.json")]);
+    }
+
+    #[test]
+    fn internet_listen_is_opt_in_and_old_files_stay_compatible() {
+        let dir = tempdir().unwrap();
+        // A file written before the field existed loads with it off.
+        std::fs::write(
+            policy_path(dir.path()),
+            r#"{"bridge":true,"store":true,"relay":false,"endpoint":true,"auto_policy":true}"#,
+        )
+        .unwrap();
+        assert_eq!(try_load_policy(dir.path()).unwrap(), NodePolicy::default());
+        // Empty is not written at all (older readers see the same keys).
+        save_policy(dir.path(), &NodePolicy::default()).unwrap();
+        let raw = std::fs::read_to_string(policy_path(dir.path())).unwrap();
+        assert!(!raw.contains("internet_listen"), "{raw}");
+        let on = NodePolicy {
+            internet_listen: "0.0.0.0:7422".into(),
+            ..NodePolicy::default()
+        };
+        save_policy(dir.path(), &on).unwrap();
+        assert_eq!(try_load_policy(dir.path()).unwrap(), on);
+        assert!(NodePolicy::fail_closed().internet_listen.is_empty());
+    }
+
+    #[test]
+    fn internet_listen_normalises_bare_ips_to_the_default_port() {
+        let ok = |s: &str| normalize_internet_listen(s).unwrap();
+        assert_eq!(ok(""), None);
+        assert_eq!(ok("  "), None);
+        assert_eq!(ok("0.0.0.0:7422").as_deref(), Some("0.0.0.0:7422"));
+        assert_eq!(ok("0.0.0.0").as_deref(), Some("0.0.0.0:7422"));
+        assert_eq!(ok("::").as_deref(), Some("[::]:7422"));
+        assert_eq!(ok("[::]").as_deref(), Some("[::]:7422"));
+        assert_eq!(ok("[::1]:0").as_deref(), Some("[::1]:0"));
+        assert_eq!(ok("127.0.0.1:0").as_deref(), Some("127.0.0.1:0"));
+        assert_eq!(ok("localhost").as_deref(), Some("localhost:7422"));
+        assert_eq!(ok("localhost:9000").as_deref(), Some("localhost:9000"));
+        for bad in [
+            "example.com:7422",
+            "0.0.0.0:99999",
+            "1.2.3.4:x",
+            "[::1",
+            "on",
+        ] {
+            assert!(normalize_internet_listen(bad).is_err(), "{bad}");
+        }
     }
 
     #[cfg(unix)]

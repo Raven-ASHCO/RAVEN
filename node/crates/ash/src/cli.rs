@@ -317,8 +317,20 @@ enum Commands {
     Whoami {
         /// Machine-readable public card only (`address` / `fingerprint` / `pub_hex`).
         /// NON-RELEASE O6 M1 bind helper. No private key fields.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, conflicts_with = "card")]
         json: bool,
+        /// Print one copy-pasteable contact card line (address, key, fingerprint
+        /// and the addresses you pass). Your friend imports it with
+        /// `raven contact add --card '<line>'`.
+        #[arg(long, default_value_t = false)]
+        card: bool,
+        /// With --card: the Internet address friends dial (your public IP or DNS
+        /// name and the forwarded port, e.g. 203.0.113.7:7422).
+        #[arg(long, value_name = "HOST:PORT", requires = "card")]
+        inet: Option<String>,
+        /// With --card: the LAN address friends on your network dial.
+        #[arg(long, value_name = "HOST:PORT", requires = "card")]
+        lan: Option<String>,
     },
     /// Send one message to a contact (the text comes from stdin).
     ///
@@ -348,9 +360,11 @@ enum Commands {
         /// (inside: /help, /back).
         #[arg(long, default_value_t = false)]
         chat: bool,
-        /// `lan` (default, Noise XX) or `internet` (RIH1 lab path).
-        /// `internet` is localhost/indexed lab only — not WAN Proven.
-        #[arg(long, default_value = "lan", hide = true)]
+        /// How to reach the contact: `auto` (default: their saved LAN address
+        /// first, then their saved Internet address), `lan` or `internet`.
+        /// Internet direct needs INTERNET_DIRECT_PRODUCTION_ENABLED (or the
+        /// debug lab unlock); with --peer, `auto` means LAN.
+        #[arg(long, default_value = "auto", value_name = "auto|lan|internet")]
         carrier: String,
     },
     /// Show the messages you received.
@@ -477,6 +491,8 @@ enum ContactCommands {
     ///   ash contact add --address rvn1q… --pub-hex <64 hex> --petname "Poline" --tag poline --verify-fp XXXX-XXXX-XXXX
     ///
     ///   ash contact add --address rvn1q… --pub-hex <64 hex> --petname "Ahmad (Berlin)" --tag ahmad
+    ///
+    ///   ash contact add --card 'raven-card/1 address=rvn1q… pub_hex=… fingerprint=… inet=203.0.113.7:7422' --petname Bob --verify-fp XXXX-XXXX-XXXX
     #[command(after_help = "\
 Soft Unique Tags (Raven Tag V1):
   • Layer A — Raven address (rvn1…) is the durable identity
@@ -489,10 +505,25 @@ Interactive (recommended for first-timers):
   ash                  # menu → 5 Contacts → guided add
 ")]
     Add {
-        #[arg(long, help = "Raven address (rvn1… bech32m) from QR/OOB")]
-        address: String,
-        #[arg(long, help = "Ed25519 public key hex (64 chars) — never a seed")]
-        pub_hex: String,
+        #[arg(
+            long,
+            required_unless_present = "card",
+            conflicts_with = "card",
+            help = "Raven address (rvn1… bech32m) from QR/OOB"
+        )]
+        address: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "card",
+            conflicts_with = "card",
+            help = "Ed25519 public key hex (64 chars) — never a seed"
+        )]
+        pub_hex: Option<String>,
+        /// A contact card (`raven whoami --card` line) or a file holding one,
+        /// instead of --address / --pub-hex. Its addresses are saved as routes
+        /// (hints only); its key is checked against its address and fingerprint.
+        #[arg(long, value_name = "CARD|FILE")]
+        card: Option<String>,
         /// Layer C — unique on this device only (primary label).
         #[arg(long, default_value = "", help = "Local petname, e.g. Poline")]
         petname: String,
@@ -516,6 +547,10 @@ Interactive (recommended for first-timers):
             help = "Peer LAN listen host:port, e.g. 192.168.1.20:7420"
         )]
         lan_dial: String,
+        /// Optional Internet address (Internet direct route), e.g. 203.0.113.7:7422,
+        /// [2001:db8::7]:7422 or node.example.com:7422.
+        #[arg(long, default_value = "", value_name = "HOST:PORT", alias = "internet")]
+        internet_dial: String,
     },
     /// List contacts: petname first, @tag subtitle (never address-primary).
     List,
@@ -586,7 +621,36 @@ Interactive (recommended for first-timers):
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Set or clear a contact's saved addresses (LAN and Internet); keeps petname, tag and pin.
+    ///
+    ///   raven contact set-addr @bob --internet 203.0.113.7:7422
+    ///
+    ///   raven contact set-addr Bob --lan 192.168.1.31:7420 --clear internet
+    ///
+    /// An address is only a way to reach someone: who they are is their pinned
+    /// key, which RAVEN checks on every connection.
+    SetAddr {
+        /// The contact: name, @tag or rvn1 address (as for `raven send --contact`).
+        selector: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        petname: Option<String>,
+        #[arg(long)]
+        address: Option<String>,
+        /// LAN address, e.g. 192.168.1.31:7420.
+        #[arg(long, value_name = "HOST:PORT", alias = "lan-dial")]
+        lan: Option<String>,
+        /// Internet address: IPv4, [IPv6] or a DNS name with its port, e.g.
+        /// 203.0.113.7:7422 (7422 is RAVEN's Internet direct port).
+        #[arg(long, value_name = "HOST:PORT", alias = "internet-dial")]
+        internet: Option<String>,
+        /// Remove a saved address: `lan` or `internet` (repeatable).
+        #[arg(long, value_name = "lan|internet")]
+        clear: Vec<String>,
+    },
     /// Change the saved LAN dial (host:port) of one contact; keeps petname, tag and pin.
+    /// Same as `set-addr --lan`.
     SetDial {
         #[arg(long)]
         tag: Option<String>,
@@ -650,6 +714,19 @@ enum NodeCommands {
     Relay {
         #[command(subcommand)]
         state: OnOff,
+    },
+    /// Receive over the Internet (Internet direct listener; off by default).
+    ///
+    ///   raven node internet on --listen 0.0.0.0:7422
+    ///
+    ///   raven node internet off
+    ///
+    /// Saved in node_policy.json; raven-node applies it when it (re)starts.
+    /// Opening the port to the Internet is your decision: only your contacts
+    /// get an answer, but anyone can see that something listens there.
+    Internet {
+        #[command(subcommand)]
+        state: InternetState,
     },
     /// Add a custom bootstrap multiaddr (or --manual peer).
     AddBootstrap {
@@ -778,6 +855,18 @@ enum OnOff {
     Off,
 }
 
+#[derive(Subcommand, Debug, Clone)]
+enum InternetState {
+    /// Listen for Internet direct connections from your contacts.
+    On {
+        /// Local address to listen on (default 0.0.0.0:7422; a bare IP gets port 7422).
+        #[arg(long, default_value = "0.0.0.0:7422", value_name = "IP:PORT")]
+        listen: String,
+    },
+    /// Stop listening for Internet direct connections (after the next restart).
+    Off,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Contact {
     /// Layer C — device-local petname (primary UI label). Unique on MY device.
@@ -798,8 +887,17 @@ struct Contact {
     pinned: bool,
     /// Optional LAN listen `host:port` for this peer (saved after first send).
     /// Beginners pick a contact # — they should not re-type host:port every time.
+    /// This is the contact's LAN route; files written before routes existed
+    /// keep working unchanged.
     #[serde(default)]
     lan_dial: String,
+    /// Optional Internet direct route: `host:port` with an IPv4 address, a
+    /// bracketed IPv6 address or a DNS name (see [`parse_internet_dial`]). A
+    /// reachability hint only, never identity: every link still has to prove
+    /// the pinned `pub_hex` (Noise bind + RIH1 hello). Omitted from the file
+    /// while empty, so a book without Internet routes stays byte-identical.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    internet_dial: String,
 }
 
 impl Contact {
@@ -973,6 +1071,189 @@ fn public_whoami_card(id: &Identity) -> serde_json::Value {
         "fingerprint": device_fingerprint_v1(&id.public_key_bytes()),
         "pub_hex": hex::encode(id.public_key_bytes()),
     })
+}
+
+/// First token of a contact card (`raven whoami --card`, `raven contact add
+/// --card`). A new field set means a new version: v1 readers refuse unknown
+/// fields instead of guessing.
+const CARD_PREFIX: &str = "raven-card/1";
+/// Longest card line accepted (a v1 card with both routes is ~250 bytes).
+const CARD_MAX_LEN: usize = 1024;
+/// Largest card file `contact add --card <file>` reads.
+const CARD_FILE_MAX_BYTES: u64 = 4096;
+
+/// A parsed, self-consistent contact card. Public material only. The routes
+/// are hints for reaching the person; the identity is `pub_hex` (and the
+/// address it encodes to), which every link must prove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContactCard {
+    address: String,
+    pub_hex: String,
+    fingerprint: String,
+    /// Normalised Internet route, or empty.
+    internet: String,
+    /// LAN route, or empty.
+    lan: String,
+}
+
+/// One copy-pasteable line: `raven-card/1 address=… pub_hex=… fingerprint=…
+/// [inet=host:port] [lan=host:port]`. Never a seed or private key.
+fn format_card(id: &Identity, internet: &str, lan: &str) -> String {
+    let pub_bytes = id.public_key_bytes();
+    let mut card = format!(
+        "{CARD_PREFIX} address={} pub_hex={} fingerprint={}",
+        id.address(),
+        hex::encode(pub_bytes),
+        device_fingerprint_v1(&pub_bytes)
+    );
+    if !internet.is_empty() {
+        card.push_str(&format!(" inet={internet}"));
+    }
+    if !lan.is_empty() {
+        card.push_str(&format!(" lan={lan}"));
+    }
+    card
+}
+
+/// Strict parse of one card line: known fields only, each once; the address
+/// must be the one the key encodes to, and a fingerprint, when present, the
+/// key's own. Routes are validated like `contact set-addr` values.
+fn parse_card(line: &str) -> Result<ContactCard, String> {
+    let line = line.trim();
+    if line.len() > CARD_MAX_LEN || !line.chars().all(|c| c == ' ' || c.is_ascii_graphic()) {
+        return Err(format!(
+            "not a RAVEN card: a card is one line of at most {CARD_MAX_LEN} plain characters"
+        ));
+    }
+    let mut tokens = line.split(' ').filter(|t| !t.is_empty());
+    match tokens.next() {
+        Some(CARD_PREFIX) => {}
+        Some(t) if t.starts_with("raven-card/") => {
+            return Err(format!(
+            "card version \"{}\" is not supported: this raven reads {CARD_PREFIX} (update raven)",
+            sanitize_terminal_line(t)
+        ))
+        }
+        _ => {
+            return Err(format!(
+                "not a RAVEN card: it must start with {CARD_PREFIX} (ask your friend for the \
+                 line `raven whoami --card` prints)"
+            ))
+        }
+    }
+    let mut fields: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for token in tokens {
+        let (key, value) = token
+            .split_once('=')
+            .filter(|(_, v)| !v.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "card field \"{}\" is not key=value",
+                    sanitize_terminal_line(token)
+                )
+            })?;
+        if !matches!(key, "address" | "pub_hex" | "fingerprint" | "inet" | "lan") {
+            return Err(format!(
+                "card field \"{}\" is unknown to this raven (it reads address, pub_hex, \
+                 fingerprint, inet, lan): refusing the card",
+                sanitize_terminal_line(key)
+            ));
+        }
+        if fields.insert(key, value).is_some() {
+            return Err(format!(
+                "card field \"{key}\" appears twice: refusing the card"
+            ));
+        }
+    }
+    let pub_hex = fields.get("pub_hex").ok_or("card has no pub_hex")?;
+    let ed = parse_pub_hex(pub_hex)?;
+    let address =
+        raven_core::address::from_display(fields.get("address").ok_or("card has no address")?);
+    if decode_address(&address).is_none() {
+        return Err("card address is not a valid rvn1 address".into());
+    }
+    if encode_address(&ed) != address {
+        return Err("card address does not belong to its pub_hex: refusing the card".into());
+    }
+    let fingerprint = device_fingerprint_v1(&ed);
+    if let Some(fp) = fields.get("fingerprint") {
+        // Exact: the fingerprint is base64, so case is part of it.
+        if *fp != fingerprint {
+            return Err(
+                "card fingerprint does not match its key (altered or mistyped): refusing the card"
+                    .into(),
+            );
+        }
+    }
+    let internet = match fields.get("inet") {
+        Some(v) => parse_internet_dial(v).map_err(|e| format!("card inet: {e}"))?,
+        None => String::new(),
+    };
+    let lan = match fields.get("lan") {
+        Some(v) => parse_lan_dial(v).map_err(|e| format!("card lan: {e}"))?,
+        None => String::new(),
+    };
+    Ok(ContactCard {
+        address,
+        pub_hex: hex::encode(ed),
+        fingerprint,
+        internet,
+        lan,
+    })
+}
+
+/// `raven whoami --card`: exactly one line on stdout (scripts pipe it into a
+/// file or a chat); the addresses are validated like contact routes first.
+fn cmd_whoami_card(id: &Identity, inet: Option<&str>, lan: Option<&str>) -> Result<(), String> {
+    let inet = inet
+        .map(|v| parse_internet_dial(v).map_err(|e| format!("--inet: {e}")))
+        .transpose()?
+        .unwrap_or_default();
+    let lan = lan
+        .map(|v| parse_lan_dial(v).map_err(|e| format!("--lan: {e}")))
+        .transpose()?
+        .unwrap_or_default();
+    println!("{}", format_card(id, &inet, &lan));
+    if io::stderr().is_terminal() {
+        eprintln!(
+            "{C_DIM}Send this line to your friend; they run: raven contact add --card '<line>' \
+             (and compare the fingerprint with you before they pin it).{C_RESET}"
+        );
+    }
+    Ok(())
+}
+
+/// `--card` takes the card text itself or a file holding exactly one card
+/// line (blank lines aside), e.g. the output of `raven whoami --card > me.card`.
+fn read_card_arg(arg: &str) -> Result<ContactCard, String> {
+    let t = arg.trim();
+    if t.starts_with("raven-card/") {
+        return parse_card(t);
+    }
+    let path = Path::new(t);
+    let meta = std::fs::metadata(path).map_err(|e| {
+        format!(
+            "--card: \"{}\" is neither a card ({CARD_PREFIX} …) nor a readable file ({e})",
+            sanitize_terminal_line(t)
+        )
+    })?;
+    if !meta.is_file() || meta.len() > CARD_FILE_MAX_BYTES {
+        return Err(format!(
+            "--card: {} is not a card file (a regular file of at most {CARD_FILE_MAX_BYTES} bytes)",
+            sanitize_terminal_line(t)
+        ));
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("--card: read: {e}"))?;
+    let lines: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    match lines.as_slice() {
+        [one] => parse_card(one),
+        [] => Err("--card: the file is empty".into()),
+        _ => Err("--card: the file must hold exactly one card line".into()),
+    }
 }
 
 /// Static part of the welcome banner: public branding only, never identity
@@ -1525,17 +1806,29 @@ enum VerifyChoice {
     Pin,
 }
 
-/// Typed fingerprint vs the displayed one (case and separators ignored).
-fn fingerprint_matches(typed: &str, fp: &str) -> bool {
-    let norm = |s: &str| {
-        s.chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .collect::<String>()
-            .to_ascii_lowercase()
-    };
-    let typed = norm(typed);
-    !typed.is_empty() && typed == norm(fp)
+/// Fingerprint characters without the display dashes and spaces.
+fn fingerprint_chars(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
 }
+
+/// Typed fingerprint vs the displayed one: separators ignored, case NOT. The
+/// fingerprint is base64, where `a` and `A` are different characters; folding
+/// case would also accept the fingerprints of other keys (~9 of its ~71 bits
+/// gone), which is what an attacker grinding keys for a look-alike wants.
+fn fingerprint_matches(typed: &str, fp: &str) -> bool {
+    let typed = fingerprint_chars(typed);
+    !typed.is_empty() && typed == fingerprint_chars(fp)
+}
+
+/// Right characters, wrong upper/lower case: still not a match, but worth
+/// saying so instead of a bare "did not match".
+fn fingerprint_case_only_mismatch(typed: &str, fp: &str) -> bool {
+    let (typed, fp) = (fingerprint_chars(typed), fingerprint_chars(fp));
+    !typed.is_empty() && typed != fp && typed.eq_ignore_ascii_case(&fp)
+}
+
+const FINGERPRINT_CASE_HINT: &str =
+    "upper/lower case differs: a fingerprint is case-sensitive (If4x is not if4x)";
 
 /// First answer at the `[V]erify & pin / [C]ontinue unpinned / [A]bort`
 /// prompt. An empty answer aborts: a stray Enter (or a pasted blank line)
@@ -1565,9 +1858,11 @@ fn new_confirm_code<R: rand::Rng>(rng: &mut R) -> String {
         .collect()
 }
 
-/// Typed code vs the displayed one (case, spaces and dashes ignored).
+/// Typed code vs the displayed one (case, spaces and dashes ignored: the code
+/// alphabet has no lower-case letters, so folding loses nothing).
 fn confirm_code_matches(typed: &str, code: &str) -> bool {
-    fingerprint_matches(typed, code)
+    let typed = fingerprint_chars(typed);
+    !typed.is_empty() && typed.eq_ignore_ascii_case(&fingerprint_chars(code))
 }
 
 /// The fingerprint decision as a pure state machine over `next` (one answer per
@@ -1584,15 +1879,26 @@ fn verify_prompt_flow(
 ) -> Option<bool> {
     print!("[V]erify & pin  /  [C]ontinue unpinned  /  [A]bort (Enter aborts): ");
     let _ = io::stdout().flush();
-    let pin = match parse_verify_choice(&next()?, fp) {
-        VerifyChoice::Abort => return None,
+    let first = next()?;
+    let pin = match parse_verify_choice(&first, fp) {
+        VerifyChoice::Abort => {
+            if fingerprint_case_only_mismatch(&first, fp) {
+                println!("fingerprint did not match: {FINGERPRINT_CASE_HINT}");
+            }
+            return None;
+        }
         VerifyChoice::Unpinned => false,
         VerifyChoice::Pin => true,
         VerifyChoice::ConfirmFingerprint => {
             print!("Type the fingerprint shown above to pin it: ");
             let _ = io::stdout().flush();
-            if !fingerprint_matches(&next()?, fp) {
-                println!("fingerprint did not match");
+            let typed = next()?;
+            if !fingerprint_matches(&typed, fp) {
+                if fingerprint_case_only_mismatch(&typed, fp) {
+                    println!("fingerprint did not match: {FINGERPRINT_CASE_HINT}");
+                } else {
+                    println!("fingerprint did not match");
+                }
                 return None;
             }
             true
@@ -1931,6 +2237,121 @@ fn looks_like_lan_dial(s: &str) -> bool {
         return port.parse::<u16>().ok().is_some_and(|p| p != 0);
     }
     false
+}
+
+/// Default Internet direct port (RIH1 over TCP; 7421 is mock BLE's).
+const DEFAULT_INTERNET_PORT: u16 = raven_core::paths::DEFAULT_INTERNET_PORT;
+
+/// A contact's Internet route, strictly: `host:port` where host is an IPv4
+/// address, a bracketed IPv6 address (`[2001:db8::1]:7422`) or a DNS name.
+/// Returns the normalised text (lowercase name, canonical IP) or a sentence
+/// that says what is wrong. Loopback is allowed (lab and tests); an
+/// unspecified, multicast or broadcast address, a zone id, an unbracketed IPv6
+/// address and a missing or zero port are not: none of them can be dialled.
+fn parse_internet_dial(raw: &str) -> Result<String, String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let s = raw.trim();
+    let example = format!(
+        "e.g. 203.0.113.7:{p}, [2001:db8::7]:{p} or node.example.com:{p}",
+        p = DEFAULT_INTERNET_PORT
+    );
+    if s.is_empty() {
+        return Err(format!("Internet address is empty ({example})"));
+    }
+    if s.len() > 261 || !s.chars().all(|c| c.is_ascii_graphic()) {
+        return Err(format!(
+            "Internet address must be one host:port without spaces or control characters ({example})"
+        ));
+    }
+    if s.starts_with("rvn1") {
+        return Err(format!(
+            "that is a Raven ID (who someone is), not a network address ({example})"
+        ));
+    }
+    let ip_ok = |ip: IpAddr| -> Result<(), String> {
+        let bad = match ip {
+            IpAddr::V4(v4) => v4.is_unspecified() || v4.is_multicast() || v4 == Ipv4Addr::BROADCAST,
+            IpAddr::V6(v6) => v6.is_unspecified() || v6.is_multicast(),
+        };
+        if bad {
+            Err(format!(
+                "{ip} cannot be dialled (unspecified, multicast or broadcast) ({example})"
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let parse_port = |p: &str| -> Result<u16, String> {
+        match p.parse::<u16>() {
+            Ok(0) | Err(_) => Err(format!(
+                "Internet address needs a port from 1 to 65535 after the last ':' ({example})"
+            )),
+            Ok(port) => Ok(port),
+        }
+    };
+    if let Some(rest) = s.strip_prefix('[') {
+        let (inside, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("IPv6 address is missing its closing ']' ({example})"))?;
+        if inside.contains('%') {
+            return Err(format!(
+                "a zone id (%…) only works on the local network: use --lan for that ({example})"
+            ));
+        }
+        let ip: Ipv6Addr = inside
+            .parse()
+            .map_err(|_| format!("[{inside}] is not an IPv6 address ({example})"))?;
+        let port = after
+            .strip_prefix(':')
+            .ok_or_else(|| format!("Internet address needs :port after ']' ({example})"))
+            .and_then(parse_port)?;
+        ip_ok(IpAddr::V6(ip))?;
+        return Ok(format!("[{ip}]:{port}"));
+    }
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return Err(format!(
+            "Internet address needs a port, e.g. {s}:{DEFAULT_INTERNET_PORT} ({example})"
+        ));
+    };
+    if host.contains(':') {
+        return Err(format!(
+            "write an IPv6 address in brackets, e.g. [2001:db8::7]:{DEFAULT_INTERNET_PORT}"
+        ));
+    }
+    let port = parse_port(port)?;
+    if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        ip_ok(IpAddr::V4(v4))?;
+        return Ok(format!("{v4}:{port}"));
+    }
+    let name = host.to_ascii_lowercase();
+    let labels: Vec<&str> = name.split('.').collect();
+    let label_ok = |l: &&str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    let last_numeric = labels
+        .last()
+        .is_some_and(|l| l.chars().all(|c| c.is_ascii_digit()));
+    if name.len() > 253 || !labels.iter().all(label_ok) || last_numeric {
+        return Err(format!(
+            "\"{}\" is not an IPv4 address or a DNS name ({example})",
+            sanitize_terminal_line(host)
+        ));
+    }
+    Ok(format!("{name}:{port}"))
+}
+
+/// A LAN route as saved: [`looks_like_lan_dial`], or a sentence saying why not.
+fn parse_lan_dial(raw: &str) -> Result<String, String> {
+    let d = raw.trim();
+    if looks_like_lan_dial(d) {
+        Ok(d.to_string())
+    } else {
+        Err("lan_dial must look like host:port (e.g. 192.168.1.20:7420)".into())
+    }
 }
 
 fn update_contact_lan_dial(data_dir: &Path, pub_hex: &str, dial: &str) -> Result<(), String> {
@@ -3242,6 +3663,30 @@ fn add_contact(
     verify_fp: Option<&str>,
     lan_dial: &str,
 ) -> Result<(), String> {
+    add_contact_with_routes(
+        data_dir, address, pub_hex, petname, public_tag, verify_fp, lan_dial, "",
+    )
+}
+
+/// [`add_contact`] plus an optional Internet route. Both routes are hints: an
+/// empty one keeps what the contact already had, a non-empty one is validated
+/// before anything else is looked at and replaces it.
+#[allow(clippy::too_many_arguments)]
+fn add_contact_with_routes(
+    data_dir: &Path,
+    address: &str,
+    pub_hex: &str,
+    petname: &str,
+    public_tag: &str,
+    verify_fp: Option<&str>,
+    lan_dial: &str,
+    internet_dial: &str,
+) -> Result<(), String> {
+    let new_inet = if internet_dial.trim().is_empty() {
+        None
+    } else {
+        Some(parse_internet_dial(internet_dial)?)
+    };
     let ed = parse_pub_hex(pub_hex)?;
     let address_raw = extract_address_field(address).unwrap_or_else(|| address.trim().to_string());
     if address_raw.is_empty() {
@@ -3260,9 +3705,14 @@ fn add_contact(
     let fp = device_fingerprint_v1(&ed);
     let pin = if let Some(expected) = verify_fp {
         let exp = expected.trim();
-        if !exp.eq_ignore_ascii_case(&fp) {
+        if !fingerprint_matches(exp, &fp) {
+            let case = if fingerprint_case_only_mismatch(exp, &fp) {
+                format!(" ({FINGERPRINT_CASE_HINT})")
+            } else {
+                String::new()
+            };
             return Err(format!(
-                "fingerprint mismatch: got {fp}, expected {}",
+                "fingerprint mismatch: got {fp}, expected {}{case}",
                 sanitize_terminal_line(exp)
             ));
         }
@@ -3411,6 +3861,12 @@ fn add_contact(
     } else {
         prior_dial
     };
+    let inet = new_inet.unwrap_or_else(|| {
+        prior
+            .as_ref()
+            .map(|c| c.internet_dial.clone())
+            .unwrap_or_default()
+    });
     // Also drop unpinned rows claiming this address under another key: the
     // address is derived from the key, so such a row is an invalid binding.
     contacts.retain(|c| !c.pub_hex.eq_ignore_ascii_case(&ed_hex) && c.address != address);
@@ -3422,6 +3878,7 @@ fn add_contact(
         pub_hex: ed_hex,
         pinned: pin || prior_pinned,
         lan_dial: dial,
+        internet_dial: inet,
     });
     save_contacts(data_dir, &contacts)?;
     let saved = contacts.last().unwrap();
@@ -3445,6 +3902,12 @@ fn add_contact(
         println!(
             "{C_DIM}lan_dial{C_RESET}    {}",
             sanitize_terminal_line(&saved.lan_dial)
+        );
+    }
+    if !saved.internet_dial.is_empty() {
+        println!(
+            "{C_DIM}internet{C_RESET}    {}",
+            sanitize_terminal_line(&saved.internet_dial)
         );
     }
     println!("{C_DIM}fingerprint{C_RESET} {fp}");
@@ -3558,7 +4021,7 @@ fn cmd_contact_list(data_dir: &Path) -> Result<(), String> {
             format!("{0}○ unpinned{1}", c.dim, c.reset)
         };
         let fp = contact_fingerprint(ct);
-        let dial = if ct.lan_dial.is_empty() {
+        let mut dial = if ct.lan_dial.is_empty() {
             String::new()
         } else {
             format!(
@@ -3568,6 +4031,14 @@ fn cmd_contact_list(data_dir: &Path) -> Result<(), String> {
                 c.reset
             )
         };
+        if !ct.internet_dial.is_empty() {
+            dial.push_str(&format!(
+                "  {0}→ internet {1}{2}",
+                c.dim,
+                sanitize_terminal_line(&ct.internet_dial),
+                c.reset
+            ));
+        }
 
         println!(
             "  {i}. {name:<nw$}  {tag:<tw$}  {pin}{dial}",
@@ -4147,6 +4618,149 @@ fn cmd_contact_set_dial(
     Ok(())
 }
 
+/// What one `raven contact set-addr` changes, validated before the book is read.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RouteEdit {
+    /// `Some("")`: clear; `Some(v)`: set to the validated `v`; `None`: keep.
+    lan: Option<String>,
+    internet: Option<String>,
+}
+
+fn parse_route_edit(
+    lan: Option<&str>,
+    internet: Option<&str>,
+    clear: &[String],
+) -> Result<RouteEdit, String> {
+    let mut edit = RouteEdit::default();
+    let mut clear_lan = false;
+    let mut clear_inet = false;
+    for kind in clear {
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "lan" => clear_lan = true,
+            "internet" | "inet" => clear_inet = true,
+            other => {
+                return Err(format!(
+                    "--clear takes lan or internet, not \"{}\"",
+                    sanitize_terminal_line(other)
+                ))
+            }
+        }
+    }
+    if clear_lan && lan.is_some() {
+        return Err("--lan and --clear lan contradict each other: give one".into());
+    }
+    if clear_inet && internet.is_some() {
+        return Err("--internet and --clear internet contradict each other: give one".into());
+    }
+    if let Some(v) = lan {
+        edit.lan = Some(parse_lan_dial(v)?);
+    } else if clear_lan {
+        edit.lan = Some(String::new());
+    }
+    if let Some(v) = internet {
+        edit.internet = Some(parse_internet_dial(v)?);
+    } else if clear_inet {
+        edit.internet = Some(String::new());
+    }
+    if edit == RouteEdit::default() {
+        return Err(
+            "nothing to change: pass --lan HOST:PORT, --internet HOST:PORT or --clear \
+             lan|internet"
+                .into(),
+        );
+    }
+    Ok(edit)
+}
+
+/// The one contact a `set-addr` selector names: a positional name / @tag /
+/// rvn1 address, or the `--tag` / `--petname` / `--address` flags of the older
+/// commands (never both).
+fn select_contact_for_edit(
+    contacts: &[Contact],
+    selector: Option<&str>,
+    tag: Option<&str>,
+    petname: Option<&str>,
+    address: Option<&str>,
+) -> Result<Contact, String> {
+    let Some(sel) = selector.map(str::trim).filter(|s| !s.is_empty()) else {
+        return select_one_contact(contacts, tag, petname, address);
+    };
+    if tag.is_some() || petname.is_some() || address.is_some() {
+        return Err(
+            "name the contact once: either as the argument or with --tag / --petname / \
+             --address"
+                .into(),
+        );
+    }
+    let hits: Vec<&Contact> = if sel.starts_with("rvn1") {
+        let want = raven_core::address::from_display(sel);
+        contacts.iter().filter(|c| c.address == want).collect()
+    } else {
+        resolve_contact_arg(contacts, sel)
+    };
+    match hits.as_slice() {
+        [] => Err(no_contact_message(contacts, sel)),
+        [one] => Ok((*one).clone()),
+        many => Err(format!(
+            "contact {} is ambiguous ({} matches): use the @tag or the rvn1 address",
+            sanitize_terminal_line(sel),
+            many.len()
+        )),
+    }
+}
+
+/// `raven contact set-addr`: set or clear one contact's LAN and Internet
+/// routes in place (petname, tag and pin are untouched). Every value is checked
+/// before the book is read, so a typo changes nothing.
+#[allow(clippy::too_many_arguments)]
+fn cmd_contact_set_addr(
+    data_dir: &Path,
+    selector: Option<&str>,
+    tag: Option<&str>,
+    petname: Option<&str>,
+    address: Option<&str>,
+    lan: Option<&str>,
+    internet: Option<&str>,
+    clear: &[String],
+) -> Result<(), String> {
+    let edit = parse_route_edit(lan, internet, clear)?;
+    let mut contacts = load_contacts(data_dir)?;
+    let target = select_contact_for_edit(&contacts, selector, tag, petname, address)?;
+    let row = contacts
+        .iter_mut()
+        .find(|c| c.pub_hex.eq_ignore_ascii_case(&target.pub_hex))
+        .ok_or("contact not found for the address update")?;
+    if let Some(v) = &edit.lan {
+        row.lan_dial = v.clone();
+    }
+    if let Some(v) = &edit.internet {
+        row.internet_dial = v.clone();
+    }
+    let (lan_now, inet_now) = (row.lan_dial.clone(), row.internet_dial.clone());
+    save_contacts(data_dir, &contacts)?;
+    let show = |v: &str| {
+        if v.is_empty() {
+            "(none)".to_string()
+        } else {
+            sanitize_terminal_line(v)
+        }
+    };
+    println!(
+        "{C_GREEN}addresses updated{C_RESET} {}",
+        target.primary_label()
+    );
+    println!("{C_DIM}lan_dial{C_RESET}    {}", show(&lan_now));
+    println!("{C_DIM}internet{C_RESET}    {}", show(&inet_now));
+    if !inet_now.is_empty() && !target.pinned {
+        println!(
+            "{C_DIM}note: an address is only a way to reach them; RAVEN still checks their key \
+             on every connection. Compare fingerprints and pin them (contact add --verify-fp) \
+             before you rely on it.{C_RESET}"
+        );
+    }
+    Ok(())
+}
+
 fn cmd_prekey_publish(data_dir: &Path, device_id: &str, out: Option<&Path>) {
     let id = require_identity(data_dir);
     if let Err(e) = ext::cmd_prekey_publish_real(data_dir, &id, device_id, out) {
@@ -4487,6 +5101,14 @@ fn cmd_status(data_dir: &Path) -> Result<(), String> {
     }
     let reach = classify_node_reach(&daemon);
     kv("receiving", &node_reach_row(&reach));
+    kv(
+        "internet",
+        &internet_reach_row(
+            &daemon,
+            &policy.internet_listen,
+            raven_core::internet_direct_live_enabled(),
+        ),
+    );
     kv("forward_q", &forward_queue_line(&queue));
 
     let qpath = data_dir.join("queue.db");
@@ -4588,6 +5210,140 @@ fn set_node_flag(data_dir: &Path, which: &str, on: bool) {
         ok(policy.store),
         ok(policy.relay)
     );
+}
+
+/// How to restart the background service on this OS (the Internet listen
+/// setting is read when raven-node starts).
+fn service_restart_hint() -> &'static str {
+    if cfg!(windows) {
+        "Stop-ScheduledTask -TaskName RavenNodeBridge; Start-ScheduledTask -TaskName \
+         RavenNodeBridge (installed task), or stop raven-node and run `raven listen`"
+    } else if cfg!(target_os = "macos") {
+        "launchctl kickstart -k gui/$(id -u)/com.raven.raven-node (installed agent), or stop \
+         raven-node and run `raven listen`"
+    } else {
+        "systemctl --user restart raven-node (installed unit), or stop raven-node and run \
+         `raven listen`"
+    }
+}
+
+/// Inbound firewall rule for the Internet direct port, as text to run yourself
+/// (RAVEN never changes firewall settings).
+fn internet_firewall_hint(port: &str) -> String {
+    if cfg!(windows) {
+        format!(
+            "New-NetFirewallRule -DisplayName \"Raven node\" -Direction Inbound -Program \
+             <path to raven-node.exe> -Protocol TCP -LocalPort {port} -Profile Private \
+             (elevated PowerShell; never the Public profile)"
+        )
+    } else if cfg!(target_os = "macos") {
+        "if the macOS firewall is on: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add \
+         <path to raven-node> && sudo /usr/libexec/ApplicationFirewall/socketfilterfw \
+         --unblockapp <path to raven-node>"
+            .to_string()
+    } else {
+        format!("e.g. sudo ufw allow {port}/tcp (or your firewalld / nftables / cloud rule)")
+    }
+}
+
+/// `raven node internet on --listen IP:PORT | off`: saved in node_policy.json,
+/// applied by raven-node when it starts (it is never opened behind your back).
+fn cmd_node_internet(data_dir: &Path, listen: Option<&str>) -> Result<(), String> {
+    use raven_core::node_policy::normalize_internet_listen;
+    let addr = match listen {
+        Some(raw) => Some(normalize_internet_listen(raw)?.ok_or_else(|| {
+            format!(
+                "--listen needs an address, e.g. 0.0.0.0:{DEFAULT_INTERNET_PORT} (or use \
+                 `raven node internet off`)"
+            )
+        })?),
+        None => None,
+    };
+    // An unreadable policy would otherwise be saved over with the fail-closed
+    // one, silently turning the user's other flags off: refuse and say so.
+    let mut policy = try_load_policy(data_dir).map_err(|e| {
+        format!(
+            "node_policy.json is unreadable ({}); fix or move it aside first (nothing changed)",
+            sanitize_terminal_line(&e.to_string())
+        )
+    })?;
+    policy.internet_listen = addr.clone().unwrap_or_default();
+    save_policy(data_dir, &policy).map_err(|e| format!("save policy failed: {e}"))?;
+    match &addr {
+        Some(a) => {
+            let port = a.rsplit(':').next().unwrap_or("7422");
+            println!(
+                "{C_GREEN}ok{C_RESET} internet listen={a} saved in {}",
+                data_dir.join("node_policy.json").display()
+            );
+            println!(
+                "{C_DIM}raven-node opens it when it (re)starts: {}{C_RESET}",
+                service_restart_hint()
+            );
+            println!(
+                "{C_DIM}only your contacts get an answer, but anyone who scans that port can see \
+                 that a RAVEN node listens there. Allow inbound TCP {port}: {}{C_RESET}",
+                internet_firewall_hint(port)
+            );
+            if !raven_core::internet_direct_live_enabled() {
+                println!(
+                    "{C_PURPLE}note{C_RESET}: Internet direct is not enabled in this build \
+                     (INTERNET_DIRECT_PRODUCTION_ENABLED=false): raven-node keeps the port \
+                     closed until it is."
+                );
+            }
+        }
+        None => {
+            println!(
+                "{C_GREEN}ok{C_RESET} internet listen=off saved in {}",
+                data_dir.join("node_policy.json").display()
+            );
+            println!(
+                "{C_DIM}a running raven-node closes the port when it restarts: {}{C_RESET}",
+                service_restart_hint()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `internet` row of `raven status`: whether this computer receives over
+/// the Internet, from the running service's own Status (`internet_direct` is
+/// listed only while that listener is bound) and what node_policy.json asks.
+fn internet_reach_row(
+    status: &Result<IpcResponse, String>,
+    configured: &str,
+    internet_live: bool,
+) -> String {
+    let configured = sanitize_terminal_line(configured);
+    match status {
+        Ok(IpcResponse::Status { capabilities, .. })
+            if capabilities.iter().any(|c| c == "internet_direct") =>
+        {
+            "YES \u{2014} the Internet listener is up (contacts who have your Internet address \
+             can reach you)"
+                .into()
+        }
+        Ok(IpcResponse::Status { .. }) if configured.is_empty() => {
+            format!("off (opt-in: raven node internet on --listen 0.0.0.0:{DEFAULT_INTERNET_PORT})")
+        }
+        Ok(IpcResponse::Status { .. }) if !internet_live => format!(
+            "NO \u{2014} configured ({configured}) but Internet direct is not enabled in this \
+             build (INTERNET_DIRECT_PRODUCTION_ENABLED=false)"
+        ),
+        Ok(IpcResponse::Status { .. }) => format!(
+            "NO \u{2014} configured ({configured}) but the listener is down (busy port, or \
+             raven-node started before it was configured: restart it); see \
+             raven-node-service.log in your Raven folder"
+        ),
+        Err(e) if ipc_client::error_means_not_running(e) && configured.is_empty() => {
+            "off (raven-node is not running)".into()
+        }
+        Err(e) if ipc_client::error_means_not_running(e) => {
+            format!("off \u{2014} configured ({configured}), raven-node is not running")
+        }
+        _ => "unknown \u{2014} raven-node does not answer; run `ash doctor`".into(),
+    }
 }
 
 /// Guided Send / Chat. Every lane — picked contact or advanced host:port —
@@ -5014,14 +5770,100 @@ fn resolve_or_reuse_lan_dial_with(
     }
 }
 
-/// Where `ash send` dials. `save_dial_after_success`: the dial came from the
-/// environment, so it is written to the contact only once a delivery worked.
+/// Where `ash send` dials: the routes to try in order, the key every one of
+/// them must prove, and the LAN dial taken from `RAVEN_PEER` / `ASH_LAN_DIAL`
+/// (written to the contact only once a delivery over it worked).
 #[derive(Debug, PartialEq, Eq)]
 struct SendTarget {
-    peer: String,
+    routes: Vec<pair_init_lab::DialRoute>,
     pub_hex: String,
     listen: String,
-    save_dial_after_success: bool,
+    env_lan_dial: Option<String>,
+}
+
+fn lan_route(dial: &str) -> pair_init_lab::DialRoute {
+    pair_init_lab::DialRoute {
+        carrier: pair_init_lab::DialCarrier::Lan,
+        dial: dial.to_string(),
+    }
+}
+
+fn internet_route(dial: &str) -> pair_init_lab::DialRoute {
+    pair_init_lab::DialRoute {
+        carrier: pair_init_lab::DialCarrier::Internet,
+        dial: dial.to_string(),
+    }
+}
+
+/// `raven contact set-addr <selector> --internet …` for hints.
+fn set_addr_hint(c: &Contact, flag: &str) -> String {
+    let sel = match c.tag_subtitle() {
+        Some(tag) => tag,
+        None => sanitize_terminal_line(&c.address),
+    };
+    format!("raven contact set-addr {sel} {flag} HOST:PORT")
+}
+
+/// The routes `choice` allows for contact `c`, LAN first (transports design
+/// §2.3). `env` is the `RAVEN_PEER` / `ASH_LAN_DIAL` LAN dial; `internet_live`
+/// is the Internet direct gate. `auto` never plans a held carrier, and a LAN-only
+/// contact gets exactly the LAN send it always got.
+fn plan_contact_routes(
+    c: &Contact,
+    choice: CarrierChoice,
+    env: Option<String>,
+    internet_live: bool,
+) -> Result<(Vec<pair_init_lab::DialRoute>, Option<String>), String> {
+    let inet = parse_internet_dial(&c.internet_dial).ok();
+    let want_lan = choice != CarrierChoice::Internet;
+    let lan_possible = resolve_lan_peer_parts(&c.lan_dial, env.as_deref()).is_some();
+    let mut routes = Vec::new();
+    let mut env_lan = None;
+    // The LAN line ("LAN dial … (saved · Bob)") and the "no LAN address" hint are
+    // printed only when LAN is what this send relies on.
+    if want_lan && (lan_possible || inet.is_none() || choice == CarrierChoice::Lan) {
+        match resolve_or_reuse_lan_dial_with(c, env) {
+            Some((ResolvedLanPeer::Dial(dial), from_env)) => {
+                if from_env {
+                    env_lan = Some(dial.clone());
+                }
+                routes.push(lan_route(&dial));
+            }
+            None if choice == CarrierChoice::Lan || inet.is_none() => {
+                return Err(format!(
+                    "contact {} has no reachable lan_dial — set host:port (not LocalListenQueue)",
+                    c.primary_label()
+                ));
+            }
+            None => {}
+        }
+    }
+    if choice != CarrierChoice::Lan {
+        match inet {
+            Some(addr) if internet_live || choice == CarrierChoice::Internet => {
+                routes.push(internet_route(&addr));
+            }
+            Some(_) if routes.is_empty() => {
+                return Err(format!(
+                    "{} — {} has only an Internet address saved; to reach them on your network \
+                     save a LAN one: {}",
+                    pair_init_lab::INTERNET_DIRECT_HOLD,
+                    c.primary_label(),
+                    set_addr_hint(c, "--lan")
+                ));
+            }
+            Some(_) => {}
+            None if choice == CarrierChoice::Internet => {
+                return Err(format!(
+                    "contact {} has no Internet address saved; save one with: {}",
+                    c.primary_label(),
+                    set_addr_hint(c, "--internet")
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok((routes, env_lan))
 }
 
 fn resolve_send_target(
@@ -5030,6 +5872,7 @@ fn resolve_send_target(
     peer: &str,
     peer_pub_hex: &str,
     listen: &str,
+    choice: CarrierChoice,
 ) -> Result<SendTarget, String> {
     if !contact.trim().is_empty() {
         let contacts = load_contacts(data_dir)?;
@@ -5045,27 +5888,33 @@ fn resolve_send_target(
             ));
         }
         let c = hits[0];
-        return match resolve_or_reuse_lan_dial(c) {
-            Some((ResolvedLanPeer::Dial(dial), from_env)) => Ok(SendTarget {
-                peer: dial,
-                pub_hex: c.pub_hex.clone(),
-                listen: listen.to_string(),
-                save_dial_after_success: from_env,
-            }),
-            None => Err(format!(
-                "contact {} has no reachable lan_dial — set host:port (not LocalListenQueue)",
-                c.primary_label()
-            )),
-        };
+        let (routes, env_lan_dial) = plan_contact_routes(
+            c,
+            choice,
+            env_peer_lan_dial(),
+            raven_core::internet_direct_live_enabled(),
+        )?;
+        return Ok(SendTarget {
+            routes,
+            pub_hex: c.pub_hex.clone(),
+            listen: listen.to_string(),
+            env_lan_dial,
+        });
     }
     if peer_pub_hex.trim().is_empty() || !looks_like_lan_dial(peer) {
         return Err("send requires --contact @tag or --peer host:port plus --peer-pub-hex".into());
     }
+    // An explicit --peer is a LAN dial unless `--carrier internet` says otherwise.
+    let route = if choice == CarrierChoice::Internet {
+        internet_route(peer)
+    } else {
+        lan_route(peer)
+    };
     Ok(SendTarget {
-        peer: peer.to_string(),
+        routes: vec![route],
         pub_hex: peer_pub_hex.to_string(),
         listen: listen.to_string(),
-        save_dial_after_success: false,
+        env_lan_dial: None,
     })
 }
 
@@ -5208,39 +6057,68 @@ fn format_inbox_row(
     )
 }
 
-fn parse_send_carrier(s: &str) -> Result<pair_init_lab::DialCarrier, String> {
+/// What `raven send --carrier` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarrierChoice {
+    /// The contact's saved LAN route first, then its Internet route.
+    Auto,
+    Lan,
+    Internet,
+}
+
+fn parse_send_carrier(s: &str) -> Result<CarrierChoice, String> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "lan" | "" => Ok(pair_init_lab::DialCarrier::Lan),
-        "internet" => Ok(pair_init_lab::DialCarrier::Internet),
+        "auto" | "" => Ok(CarrierChoice::Auto),
+        "lan" => Ok(CarrierChoice::Lan),
+        "internet" => Ok(CarrierChoice::Internet),
         other => Err(format!(
-            "unknown --carrier {other} (lan | internet). internet is localhost/indexed lab only — not WAN Proven"
+            "unknown --carrier {} (auto | lan | internet)",
+            sanitize_terminal_line(other)
         )),
     }
 }
 
 fn run_send(
     data_dir: &Path,
-    peer: &str,
-    peer_pub_hex: &str,
-    listen: &str,
+    target: &SendTarget,
     text: &str,
-    carrier: pair_init_lab::DialCarrier,
-) -> Result<(), String> {
+    choice: CarrierChoice,
+) -> Result<pair_init_lab::DialRoute, String> {
     let id = require_identity(data_dir);
-    match carrier {
-        pair_init_lab::DialCarrier::Lan => {
-            ext::run_send_secure(data_dir, &id, peer, peer_pub_hex, listen, text, "", "")
-        }
-        pair_init_lab::DialCarrier::Internet => ext::run_send_secure_on(
+    match target.routes.as_slice() {
+        // One LAN route (`--peer`, or a contact with only a LAN address): the
+        // path every LAN send has always taken, `--listen` fallback included.
+        [only] if only.carrier == pair_init_lab::DialCarrier::Lan => ext::run_send_secure(
             data_dir,
             &id,
-            peer,
-            peer_pub_hex,
-            listen,
+            &only.dial,
+            &target.pub_hex,
+            &target.listen,
             text,
             "",
             "",
-            carrier,
+        )
+        .map(|()| only.clone()),
+        // `--peer … --carrier internet`: the lab Internet path as before.
+        [only] if choice == CarrierChoice::Internet => ext::run_send_secure_on(
+            data_dir,
+            &id,
+            &only.dial,
+            &target.pub_hex,
+            &target.listen,
+            text,
+            "",
+            "",
+            only.carrier,
+        )
+        .map(|()| only.clone()),
+        routes => ext::run_send_secure_routes(
+            data_dir,
+            &id,
+            routes,
+            &target.pub_hex,
+            text,
+            choice == CarrierChoice::Internet,
         ),
     }
 }
@@ -5265,10 +6143,11 @@ fn cmd_send_cli(
     };
     let no_target = contact.trim().is_empty() && peer.trim().is_empty();
     if chat {
-        if carrier == pair_init_lab::DialCarrier::Internet {
+        if carrier == CarrierChoice::Internet {
             eprintln!(
-                "ash send --chat --carrier internet is not in this slice \
-                 (localhost indexed send-only; not WAN Proven)"
+                "ash send --chat --carrier internet is not in this slice: live chat uses the \
+                 contact's LAN address (send single messages over the Internet with \
+                 `raven send --contact NAME`)"
             );
             std::process::exit(1);
         }
@@ -5331,7 +6210,7 @@ fn cmd_send_cli(
     if no_target && stdin_is_tty() {
         // The guided picker only speaks LAN: an explicit `--carrier internet`
         // must not silently end up there (lab evidence on the wrong carrier).
-        if carrier != pair_init_lab::DialCarrier::Lan {
+        if carrier == CarrierChoice::Internet {
             eprintln!(
                 "ash send --carrier internet requires --contact @tag or --peer host:port plus --peer-pub-hex"
             );
@@ -5367,23 +6246,21 @@ fn cmd_send_cli(
             std::process::exit(1);
         }
     }
-    match resolve_send_target(data_dir, contact, peer, peer_pub_hex, listen) {
+    match resolve_send_target(data_dir, contact, peer, peer_pub_hex, listen, carrier) {
         Ok(target) => {
-            if let Err(error) = run_send(
-                data_dir,
-                &target.peer,
-                &target.pub_hex,
-                &target.listen,
-                &text,
-                carrier,
-            ) {
-                eprintln!("{}", pair_init_lab::send_failure_line(&error));
-                std::process::exit(1);
-            }
-            if target.save_dial_after_success {
+            let used = match run_send(data_dir, &target, &text, carrier) {
+                Ok(used) => used,
+                Err(error) => {
+                    eprintln!("{}", pair_init_lab::send_failure_line(&error));
+                    std::process::exit(1);
+                }
+            };
+            let env_dial_used = used.carrier == pair_init_lab::DialCarrier::Lan
+                && target.env_lan_dial.as_deref() == Some(used.dial.as_str());
+            if env_dial_used {
                 // The dial came from RAVEN_PEER and just reached (and
                 // authenticated) this contact: only now is it worth keeping.
-                match update_contact_lan_dial(data_dir, &target.pub_hex, &target.peer) {
+                match update_contact_lan_dial(data_dir, &target.pub_hex, &used.dial) {
                     Ok(()) => println!("{C_DIM}Saved lan_dial on contact for next Send.{C_RESET}"),
                     Err(e) => eprintln!("could not save dial: {}", sanitize_terminal_line(&e)),
                 }
@@ -5858,9 +6735,16 @@ pub fn run() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Whoami { json }) => match try_load_identity(&data_dir) {
+        Some(Commands::Whoami {
+            json,
+            card,
+            inet,
+            lan,
+        }) => match try_load_identity(&data_dir) {
             Ok(Some(id)) => {
-                if json {
+                if card {
+                    exit_on_err(cmd_whoami_card(&id, inet.as_deref(), lan.as_deref()));
+                } else if json {
                     println!("{}", public_whoami_card(&id));
                 } else {
                     print_public_identity(&id);
@@ -5869,6 +6753,10 @@ pub fn run() {
             Ok(None) => {
                 if json {
                     eprintln!("{{\"error\":\"no_identity\"}}");
+                    std::process::exit(1);
+                }
+                if card {
+                    eprintln!("no identity — run `raven init` first");
                     std::process::exit(1);
                 }
                 println!("no identity — run init");
@@ -5924,6 +6812,10 @@ pub fn run() {
             NodeCommands::Relay { state } => {
                 set_node_flag(&data_dir, "relay", matches!(state, OnOff::On))
             }
+            NodeCommands::Internet { state } => exit_on_err(match state {
+                InternetState::On { listen } => cmd_node_internet(&data_dir, Some(&listen)),
+                InternetState::Off => cmd_node_internet(&data_dir, None),
+            }),
             NodeCommands::AddBootstrap { multiaddr, manual } => {
                 ext::cmd_bootstrap_add(&data_dir, &multiaddr, manual)
             }
@@ -6013,21 +6905,61 @@ pub fn run() {
             ContactCommands::Add {
                 address,
                 pub_hex,
+                card,
                 petname,
                 tag,
                 alias,
                 verify_fp,
                 prekey_file,
                 lan_dial,
+                internet_dial,
             } => {
                 let public_tag = if !tag.trim().is_empty() { tag } else { alias };
+                // A card is parsed (strictly) before anything else: a bad one
+                // changes nothing and creates no file.
+                let card = card.as_deref().map(read_card_arg).transpose();
+                let card = match card {
+                    Ok(card) => card,
+                    Err(e) => {
+                        eprintln!("{}", sanitize_terminal_line(&e));
+                        std::process::exit(1);
+                    }
+                };
+                let (address, pub_hex, lan_dial, internet_dial) = match &card {
+                    // Explicit route flags win over the card's hints.
+                    Some(c) => (
+                        c.address.clone(),
+                        c.pub_hex.clone(),
+                        if lan_dial.trim().is_empty() {
+                            c.lan.clone()
+                        } else {
+                            lan_dial
+                        },
+                        if internet_dial.trim().is_empty() {
+                            c.internet.clone()
+                        } else {
+                            internet_dial
+                        },
+                    ),
+                    None => (
+                        address.unwrap_or_default(),
+                        pub_hex.unwrap_or_default(),
+                        lan_dial,
+                        internet_dial,
+                    ),
+                };
                 exit_on_err(require_identity_before_state(&data_dir, "contact add"));
                 if is_own_pub_hex(&data_dir, &pub_hex) {
                     eprintln!(
                         "warning: this is YOUR OWN identity, not a friend's. Nobody else can be reached with it; ask your friend for THEIR invite (`ash whoami`)."
                     );
                 }
-                if let Err(e) = add_contact(
+                if card.is_some() {
+                    println!(
+                        "{C_DIM}card read: key and address match; its addresses are only hints for reaching them{C_RESET}"
+                    );
+                }
+                if let Err(e) = add_contact_with_routes(
                     &data_dir,
                     &address,
                     &pub_hex,
@@ -6035,6 +6967,7 @@ pub fn run() {
                     &public_tag,
                     verify_fp.as_deref(),
                     &lan_dial,
+                    &internet_dial,
                 ) {
                     eprintln!("{}", sanitize_terminal_line(&e));
                     std::process::exit(1);
@@ -6088,6 +7021,24 @@ pub fn run() {
                 petname.as_deref(),
                 address.as_deref(),
                 yes,
+            )),
+            ContactCommands::SetAddr {
+                selector,
+                tag,
+                petname,
+                address,
+                lan,
+                internet,
+                clear,
+            } => exit_on_err(cmd_contact_set_addr(
+                &data_dir,
+                selector.as_deref(),
+                tag.as_deref(),
+                petname.as_deref(),
+                address.as_deref(),
+                lan.as_deref(),
+                internet.as_deref(),
+                &clear,
             )),
             ContactCommands::SetDial {
                 tag,
@@ -7055,16 +8006,17 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
     }
 
     #[test]
-    fn send_carrier_parses_lan_and_internet_refuses_wan() {
-        assert_eq!(
-            parse_send_carrier("lan").unwrap(),
-            pair_init_lab::DialCarrier::Lan
-        );
+    fn send_carrier_parses_auto_lan_and_internet_refuses_wan() {
+        assert_eq!(parse_send_carrier("auto").unwrap(), CarrierChoice::Auto);
+        assert_eq!(parse_send_carrier("").unwrap(), CarrierChoice::Auto);
+        assert_eq!(parse_send_carrier("lan").unwrap(), CarrierChoice::Lan);
+        assert_eq!(parse_send_carrier("LAN").unwrap(), CarrierChoice::Lan);
         assert_eq!(
             parse_send_carrier("internet").unwrap(),
-            pair_init_lab::DialCarrier::Internet
+            CarrierChoice::Internet
         );
         assert!(parse_send_carrier("wan").is_err());
+        assert!(parse_send_carrier("bluetooth").is_err());
     }
 
     #[test]
@@ -7510,7 +8462,9 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             VerifyChoice::ConfirmFingerprint
         );
         assert_eq!(parse_verify_choice(fp, fp), VerifyChoice::Pin);
-        assert_eq!(parse_verify_choice("if4x36fuomfi", fp), VerifyChoice::Pin);
+        assert_eq!(parse_verify_choice("If4x36FUomFi", fp), VerifyChoice::Pin);
+        // Base64 case is part of the fingerprint.
+        assert_eq!(parse_verify_choice("if4x36fuomfi", fp), VerifyChoice::Abort);
         assert_eq!(parse_verify_choice("C", fp), VerifyChoice::Unpinned);
         assert_eq!(parse_verify_choice("continue", fp), VerifyChoice::Unpinned);
         // An empty answer (stray Enter / pasted blank line) is NOT a decision.
@@ -7646,7 +8600,15 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
     fn typed_fingerprint_must_match_the_whole_thing() {
         let fp = "If4x-36FU-omFi";
         assert!(fingerprint_matches("If4x-36FU-omFi", fp));
-        assert!(fingerprint_matches("  if4x 36fu omfi ", fp));
+        assert!(fingerprint_matches("  If4x 36FU omFi ", fp));
+        assert!(fingerprint_matches("If4x36FUomFi", fp));
+        // Base64: case is part of the fingerprint, never folded away.
+        assert!(!fingerprint_matches("if4x-36fu-omfi", fp));
+        assert!(!fingerprint_matches("IF4X-36FU-OMFI", fp));
+        assert!(fingerprint_case_only_mismatch("if4x 36fu omfi", fp));
+        assert!(!fingerprint_case_only_mismatch("If4x-36FU-omFi", fp));
+        assert!(!fingerprint_case_only_mismatch("If4x-36FU-omFj", fp));
+        assert!(!fingerprint_case_only_mismatch("", fp));
         assert!(!fingerprint_matches("", fp));
         assert!(!fingerprint_matches("---", fp));
         assert!(!fingerprint_matches("If4x-36FU", fp));
@@ -7858,6 +8820,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             pub_hex: hex::encode(id.public_key_bytes()),
             pinned: false,
             lan_dial: String::new(),
+            internet_dial: String::new(),
         };
         let book = vec![
             row(&a, "Ahmad (Berlin)", "ahmad"),
@@ -7915,6 +8878,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             pub_hex: hex::encode(a.public_key_bytes()),
             pinned: true,
             lan_dial: String::new(),
+            internet_dial: String::new(),
         }];
         let mid = [0xabu8; 16];
         let forged =
@@ -8166,6 +9130,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             pub_hex: hex::encode(id.public_key_bytes()),
             pinned: false,
             lan_dial: String::new(),
+            internet_dial: String::new(),
         }
     }
 
@@ -8384,7 +9349,8 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
         // `ash send --contact @` must not reach the petname-only contact.
         let dir = tempfile::tempdir().unwrap();
         save_contacts(dir.path(), &book).unwrap();
-        let err = resolve_send_target(dir.path(), "@", "", "", "127.0.0.1:0").unwrap_err();
+        let err = resolve_send_target(dir.path(), "@", "", "", "127.0.0.1:0", CarrierChoice::Auto)
+            .unwrap_err();
         assert!(err.contains("no contact for"), "{err}");
     }
 
@@ -8480,6 +9446,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             relay: true,
             endpoint: true,
             auto_policy: true,
+            internet_listen: String::new(),
         };
         save_policy(dir.path(), &p).unwrap();
         set_node_flag(dir.path(), "bridge", true);
@@ -8754,6 +9721,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             pub_hex: hex::encode(who.public_key_bytes()),
             pinned,
             lan_dial: String::new(),
+            internet_dial: String::new(),
         };
         let book = vec![mk("Alice", &a, false), mk("Bobby", &b, true)];
         let mid = [0xabu8; 16];
@@ -8834,6 +9802,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
                     pub_hex: hex::encode(id.public_key_bytes()),
                     pinned: false,
                     lan_dial: String::new(),
+                    internet_dial: String::new(),
                 }
             })
             .collect()
@@ -9081,6 +10050,415 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
         assert!(
             LISTEN_INVITE_HINT.contains("`ash whoami`"),
             "{LISTEN_INVITE_HINT}"
+        );
+    }
+
+    // ── Contact routes, set-addr, cards, carrier plan (transports P1) ────────
+
+    #[test]
+    fn internet_dial_accepts_ipv4_ipv6_and_names_and_says_what_is_wrong() {
+        let ok = |s: &str| parse_internet_dial(s).unwrap();
+        assert_eq!(ok("203.0.113.7:7422"), "203.0.113.7:7422");
+        assert_eq!(ok(" 127.0.0.1:9 "), "127.0.0.1:9");
+        assert_eq!(ok("[2001:DB8::7]:7422"), "[2001:db8::7]:7422");
+        assert_eq!(ok("[::1]:7422"), "[::1]:7422");
+        assert_eq!(ok("Node.Example.COM:7422"), "node.example.com:7422");
+        assert_eq!(ok("mac-mini.local:7422"), "mac-mini.local:7422");
+        let err = |s: &str| parse_internet_dial(s).unwrap_err();
+        assert!(err("").contains("empty"));
+        assert!(err("203.0.113.7").contains("needs a port"));
+        assert!(err("203.0.113.7:0").contains("port"));
+        assert!(err("203.0.113.7:70000").contains("port"));
+        assert!(err("2001:db8::7:7422").contains("brackets"));
+        assert!(err("[2001:db8::7]").contains(":port"));
+        assert!(err("[fe80::1%en0]:7422").contains("zone"));
+        assert!(err("[2001:db8::7:7422").contains("']'"));
+        assert!(err("0.0.0.0:7422").contains("cannot be dialled"));
+        assert!(err("[::]:7422").contains("cannot be dialled"));
+        assert!(err("224.0.0.1:7422").contains("cannot be dialled"));
+        assert!(err("255.255.255.255:7422").contains("cannot be dialled"));
+        assert!(err("rvn1qqqq:7422").contains("Raven ID"));
+        assert!(err("300.1.1.1:7422").contains("not an IPv4 address or a DNS name"));
+        assert!(err("bad_host:7422").contains("not an IPv4 address or a DNS name"));
+        assert!(err("-x.example:7422").contains("DNS name"));
+        assert!(err("a b:7422").contains("without spaces"));
+        assert!(err("evil\u{1b}[2J:7422").contains("control"));
+    }
+
+    #[test]
+    fn route_edits_are_validated_before_the_book_is_read() {
+        let e = parse_route_edit(Some("192.168.1.31:7420"), Some("203.0.113.7:7422"), &[]).unwrap();
+        assert_eq!(e.lan.as_deref(), Some("192.168.1.31:7420"));
+        assert_eq!(e.internet.as_deref(), Some("203.0.113.7:7422"));
+        let e = parse_route_edit(None, None, &["internet".into()]).unwrap();
+        assert_eq!(e.internet.as_deref(), Some(""));
+        assert_eq!(e.lan, None);
+        assert!(parse_route_edit(None, None, &[])
+            .unwrap_err()
+            .contains("nothing to change"));
+        assert!(parse_route_edit(None, None, &["wifi".into()])
+            .unwrap_err()
+            .contains("lan or internet"));
+        assert!(
+            parse_route_edit(Some("10.0.0.1:7420"), None, &["lan".into()])
+                .unwrap_err()
+                .contains("contradict")
+        );
+        assert!(parse_route_edit(None, Some("example.com"), &[])
+            .unwrap_err()
+            .contains("port"));
+        assert!(parse_route_edit(Some("not a dial"), None, &[])
+            .unwrap_err()
+            .contains("lan_dial"));
+    }
+
+    #[test]
+    fn set_addr_sets_and_clears_routes_and_keeps_labels_and_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_book(dir.path());
+        let before = std::fs::read(dir.path().join("contacts.json")).unwrap();
+        // An old book (no Internet routes) is written without the new key.
+        assert!(!String::from_utf8_lossy(&before).contains("internet_dial"));
+        cmd_contact_set_addr(
+            dir.path(),
+            Some("@alice"),
+            None,
+            None,
+            None,
+            None,
+            Some("[2001:db8::7]:7422"),
+            &[],
+        )
+        .unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        let alice = book.iter().find(|c| c.petname == "Alice").unwrap();
+        assert_eq!(alice.internet_dial, "[2001:db8::7]:7422");
+        assert_eq!(alice.lan_dial, "192.168.1.20:7420");
+        assert_eq!(alice.public_tag, "alice");
+        assert!(alice.pinned);
+        let raw = std::fs::read_to_string(dir.path().join("contacts.json")).unwrap();
+        assert_eq!(raw.matches("\"pub_hex\"").count(), 2, "{raw}");
+        // The flag selectors of set-dial work too; clearing removes the key again.
+        cmd_contact_set_addr(
+            dir.path(),
+            None,
+            None,
+            Some("Alice"),
+            None,
+            None,
+            None,
+            &["internet".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("contacts.json")).unwrap(),
+            before
+        );
+        // Bad values, unknown or ambiguous selectors change nothing.
+        for (sel, inet) in [
+            (Some("@alice"), Some("0.0.0.0:7422")),
+            (Some("Zed"), Some("203.0.113.7:7422")),
+            (Some("@"), Some("203.0.113.7:7422")),
+        ] {
+            assert!(
+                cmd_contact_set_addr(dir.path(), sel, None, None, None, None, inet, &[]).is_err()
+            );
+        }
+        assert!(cmd_contact_set_addr(
+            dir.path(),
+            Some("Alice"),
+            Some("alice"),
+            None,
+            None,
+            None,
+            Some("203.0.113.7:7422"),
+            &[],
+        )
+        .unwrap_err()
+        .contains("name the contact once"));
+        assert_eq!(
+            std::fs::read(dir.path().join("contacts.json")).unwrap(),
+            before
+        );
+        // By rvn1 address.
+        let a = ident(0x0a);
+        cmd_contact_set_addr(
+            dir.path(),
+            Some(&a.address()),
+            None,
+            None,
+            None,
+            Some("192.168.1.40:7420"),
+            None,
+            &[],
+        )
+        .unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert_eq!(
+            book.iter().find(|c| c.petname == "Alice").unwrap().lan_dial,
+            "192.168.1.40:7420"
+        );
+    }
+
+    #[test]
+    fn contacts_json_without_internet_routes_still_loads_and_keeps_unknown_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ident(0x0a);
+        // A book written before routes existed (no internet_dial key at all).
+        let old = format!(
+            "[\n  {{\n    \"petname\": \"Alice\",\n    \"public_tag\": \"alice\",\n    \"alias\": \"alice\",\n    \"address\": \"{}\",\n    \"pub_hex\": \"{}\",\n    \"pinned\": true,\n    \"lan_dial\": \"192.168.1.20:7420\"\n  }}\n]",
+            a.address(),
+            hex::encode(a.public_key_bytes())
+        );
+        std::fs::write(dir.path().join("contacts.json"), &old).unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert_eq!(book[0].lan_dial, "192.168.1.20:7420");
+        assert!(book[0].internet_dial.is_empty());
+        // Saving it unchanged reproduces the old bytes.
+        save_contacts(dir.path(), &book).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("contacts.json")).unwrap(),
+            old
+        );
+    }
+
+    #[test]
+    fn cards_round_trip_and_parse_strictly() {
+        let a = ident(0x0a);
+        let card = format_card(&a, "203.0.113.7:7422", "192.168.1.20:7420");
+        assert!(card.starts_with("raven-card/1 address=rvn1"), "{card}");
+        assert!(!card.contains('\n'));
+        for forbidden in ["seed", "private", "secret"] {
+            assert!(!card.to_lowercase().contains(forbidden), "{card}");
+        }
+        let parsed = parse_card(&card).unwrap();
+        assert_eq!(parsed.address, a.address());
+        assert_eq!(parsed.pub_hex, hex::encode(a.public_key_bytes()));
+        assert_eq!(
+            parsed.fingerprint,
+            device_fingerprint_v1(&a.public_key_bytes())
+        );
+        assert_eq!(parsed.internet, "203.0.113.7:7422");
+        assert_eq!(parsed.lan, "192.168.1.20:7420");
+        let bare = parse_card(&format_card(&a, "", "")).unwrap();
+        assert!(bare.internet.is_empty() && bare.lan.is_empty());
+
+        let b = ident(0x0b);
+        let pub_a = hex::encode(a.public_key_bytes());
+        let swap_addr = card.replace(&a.address(), &b.address());
+        let cases: Vec<(String, &str)> = vec![
+            ("hello".into(), "must start with raven-card/1"),
+            (
+                card.replace("raven-card/1", "raven-card/2"),
+                "not supported",
+            ),
+            (swap_addr, "does not belong"),
+            (
+                card.replace(
+                    &device_fingerprint_v1(&a.public_key_bytes()),
+                    "AAAA-BBBB-CCCC",
+                ),
+                "fingerprint does not match",
+            ),
+            (format!("{card} via=/ip4/1.2.3.4"), "unknown"),
+            (format!("{card} inet=198.51.100.1:7422"), "twice"),
+            (
+                card.replace("inet=203.0.113.7:7422", "inet=0.0.0.0:7422"),
+                "card inet",
+            ),
+            (
+                card.replace("lan=192.168.1.20:7420", "lan=nope"),
+                "card lan",
+            ),
+            (
+                card.replace(&format!("pub_hex={pub_a}"), "pub_hex="),
+                "key=value",
+            ),
+            (card.replace(&format!(" pub_hex={pub_a}"), ""), "no pub_hex"),
+            (format!("{card} \u{1b}[2J"), "plain characters"),
+            (
+                card.replace(
+                    &device_fingerprint_v1(&a.public_key_bytes()),
+                    &device_fingerprint_v1(&a.public_key_bytes()).to_ascii_lowercase(),
+                ),
+                "fingerprint does not match",
+            ),
+            ("x".repeat(2000), "plain characters"),
+        ];
+        for (text, want) in cases {
+            let err = parse_card(&text).unwrap_err();
+            assert!(err.contains(want), "{text:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn card_arg_reads_text_or_one_line_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ident(0x0a);
+        let card = format_card(&a, "203.0.113.7:7422", "");
+        assert_eq!(read_card_arg(&card).unwrap().internet, "203.0.113.7:7422");
+        let file = dir.path().join("bob.card");
+        std::fs::write(&file, format!("\n{card}\n\n")).unwrap();
+        assert_eq!(
+            read_card_arg(file.to_str().unwrap()).unwrap().address,
+            a.address()
+        );
+        std::fs::write(&file, format!("{card}\n{card}\n")).unwrap();
+        assert!(read_card_arg(file.to_str().unwrap())
+            .unwrap_err()
+            .contains("exactly one"));
+        std::fs::write(&file, "").unwrap();
+        assert!(read_card_arg(file.to_str().unwrap())
+            .unwrap_err()
+            .contains("empty"));
+        assert!(read_card_arg(dir.path().join("missing").to_str().unwrap())
+            .unwrap_err()
+            .contains("neither a card"));
+    }
+
+    fn contact_with(lan: &str, inet: &str) -> Contact {
+        let a = ident(0x0a);
+        Contact {
+            petname: "Alice".into(),
+            public_tag: "alice".into(),
+            alias: "alice".into(),
+            address: a.address(),
+            pub_hex: hex::encode(a.public_key_bytes()),
+            pinned: true,
+            lan_dial: lan.into(),
+            internet_dial: inet.into(),
+        }
+    }
+
+    fn plan(
+        c: &Contact,
+        choice: CarrierChoice,
+        env: Option<&str>,
+        live: bool,
+    ) -> Result<Vec<String>, String> {
+        plan_contact_routes(c, choice, env.map(str::to_string), live).map(|(routes, _)| {
+            routes
+                .iter()
+                .map(|r| format!("{}={}", r.carrier.label(), r.dial))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn auto_plans_lan_first_then_internet_and_never_a_held_carrier() {
+        let both = contact_with("192.168.1.20:7420", "203.0.113.7:7422");
+        let lan_only = contact_with("192.168.1.20:7420", "");
+        let inet_only = contact_with("", "203.0.113.7:7422");
+        let none = contact_with("", "");
+        let auto = CarrierChoice::Auto;
+        assert_eq!(
+            plan(&both, auto, None, true).unwrap(),
+            [
+                "lan_dial=192.168.1.20:7420",
+                "internet_dial=203.0.113.7:7422"
+            ]
+        );
+        // Internet direct held: auto silently keeps LAN only.
+        assert_eq!(
+            plan(&both, auto, None, false).unwrap(),
+            ["lan_dial=192.168.1.20:7420"]
+        );
+        assert_eq!(
+            plan(&lan_only, auto, None, true).unwrap(),
+            ["lan_dial=192.168.1.20:7420"]
+        );
+        assert_eq!(
+            plan(&inet_only, auto, None, true).unwrap(),
+            ["internet_dial=203.0.113.7:7422"]
+        );
+        assert!(plan(&inet_only, auto, None, false)
+            .unwrap_err()
+            .starts_with("INTERNET_DIRECT_HOLD"));
+        assert!(plan(&none, auto, None, true)
+            .unwrap_err()
+            .contains("no reachable lan_dial"));
+        // An env LAN dial counts as a LAN route (and is reported for saving).
+        let (routes, env) =
+            plan_contact_routes(&inet_only, auto, Some("10.0.0.5:7420".into()), true).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(env.as_deref(), Some("10.0.0.5:7420"));
+        // Explicit carriers use exactly that route.
+        assert_eq!(
+            plan(&both, CarrierChoice::Lan, None, true).unwrap(),
+            ["lan_dial=192.168.1.20:7420"]
+        );
+        assert!(plan(&inet_only, CarrierChoice::Lan, None, true)
+            .unwrap_err()
+            .contains("no reachable lan_dial"));
+        assert_eq!(
+            plan(&both, CarrierChoice::Internet, None, true).unwrap(),
+            ["internet_dial=203.0.113.7:7422"]
+        );
+        // `--carrier internet` while held still plans it: the send path then
+        // refuses with INTERNET_DIRECT_HOLD before any daemon is started.
+        assert_eq!(
+            plan(&both, CarrierChoice::Internet, None, false).unwrap(),
+            ["internet_dial=203.0.113.7:7422"]
+        );
+        let err = plan(&lan_only, CarrierChoice::Internet, None, true).unwrap_err();
+        assert!(
+            err.contains("no Internet address")
+                && err.contains("raven contact set-addr @alice --internet"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn status_internet_row_says_what_the_running_node_does() {
+        let status = |caps: &[&str]| -> Result<IpcResponse, String> {
+            Ok(IpcResponse::Status {
+                v: IPC_VERSION,
+                bridge: false,
+                store: false,
+                relay: false,
+                forward_pending: 0,
+                capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            })
+        };
+        let up = internet_reach_row(&status(&["ipc", "internet_direct"]), "", true);
+        assert!(up.starts_with("YES"), "{up}");
+        let off = internet_reach_row(&status(&["ipc"]), "", true);
+        assert!(
+            off.starts_with("off") && off.contains("raven node internet on"),
+            "{off}"
+        );
+        let held = internet_reach_row(&status(&["ipc"]), "0.0.0.0:7422", false);
+        assert!(held.starts_with("NO") && held.contains("INTERNET_DIRECT_PRODUCTION_ENABLED"));
+        let down = internet_reach_row(&status(&["ipc"]), "0.0.0.0:7422", true);
+        assert!(down.starts_with("NO") && down.contains("restart"), "{down}");
+        for row in [&up, &off, &held, &down] {
+            let l = row.to_lowercase();
+            assert!(
+                !l.contains("seed") && !l.contains("private") && !l.contains("transports"),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_internet_on_off_round_trips_through_the_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        cmd_node_internet(dir.path(), Some("0.0.0.0")).unwrap();
+        assert_eq!(load_policy(dir.path()).internet_listen, "0.0.0.0:7422");
+        // The other flags are untouched.
+        assert_eq!(load_policy(dir.path()).bridge, NodePolicy::default().bridge);
+        cmd_node_internet(dir.path(), None).unwrap();
+        assert!(load_policy(dir.path()).internet_listen.is_empty());
+        assert!(cmd_node_internet(dir.path(), Some("example.com:7422")).is_err());
+        assert!(cmd_node_internet(dir.path(), Some("")).is_err());
+        // An unreadable policy is never overwritten.
+        std::fs::write(dir.path().join("node_policy.json"), "{broken").unwrap();
+        assert!(cmd_node_internet(dir.path(), Some("0.0.0.0:7422"))
+            .unwrap_err()
+            .contains("unreadable"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("node_policy.json")).unwrap(),
+            "{broken"
         );
     }
 }

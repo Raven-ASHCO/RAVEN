@@ -52,7 +52,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const DIAL_DEADLINE: Duration = Duration::from_secs(40);
 const READ_TIMEOUT: &str = "internet frame read timeout";
 const HANDSHAKE_TIMEOUT: &str = "internet handshake deadline exceeded";
-const HOLD: &str = "INTERNET_DIRECT_HOLD: indexed InternetTransport is lab-only \
+pub(crate) const HOLD: &str = "INTERNET_DIRECT_HOLD: indexed InternetTransport is lab-only \
     (debug RAVEN_LAB_TEST_A=1); INTERNET_DIRECT_PRODUCTION_ENABLED=false; \
     localhost ≠ WAN Proven";
 
@@ -627,7 +627,11 @@ mod tests {
 
     #[test]
     fn hold_without_lab_when_flag_false() {
-        if raven_core::pair_init::lab_test_a_enabled() {
+        // Only meaningful while the P1 flag is off (and without the lab
+        // unlock): flipping the flag must not need this test rewritten.
+        if raven_core::pair_init::lab_test_a_enabled()
+            || raven_core::INTERNET_DIRECT_PRODUCTION_ENABLED
+        {
             return;
         }
         assert!(!internet_direct_live_enabled());

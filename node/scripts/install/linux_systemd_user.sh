@@ -5,6 +5,12 @@
 # 127.0.0.1:7420 unless RAVEN_LAN_LISTEN is set, e.g.
 #   RAVEN_LAN_LISTEN=192.168.1.20:7420 bash node/scripts/install/linux_systemd_user.sh
 #
+# Internet direct exposure is opt-in the same way (no listener by default):
+#   RAVEN_INTERNET_LISTEN=0.0.0.0:7422 bash node/scripts/install/linux_systemd_user.sh
+# (a bare IP gets port 7422). Without it, `raven node internet on --listen
+# 0.0.0.0:7422` turns it on later (applied when the service restarts). Opening
+# the port in a firewall stays your decision; the installer only prints the rule.
+#
 # Lifetime: a `systemd --user` manager is torn down when the user's last
 # session ends, so on a headless / SSH-managed host (Raspberry Pi bridge node)
 # the daemon would stop at logout and not start at boot. Lingering fixes that
@@ -43,6 +49,12 @@ resolve_data_dir() {
 }
 DATA_DIR="$(resolve_data_dir)"
 LAN_LISTEN="${RAVEN_LAN_LISTEN:-127.0.0.1:7420}"
+INTERNET_LISTEN="${RAVEN_INTERNET_LISTEN:-}"
+# IP[:port] / [IPv6][:port] characters only; raven-node validates the rest.
+if [[ -n "$INTERNET_LISTEN" && ! "$INTERNET_LISTEN" =~ ^[][0-9A-Za-z.:]+$ ]]; then
+  echo "RAVEN_INTERNET_LISTEN must look like 0.0.0.0:7422 or [::]:7422" >&2
+  exit 1
+fi
 PASSPHRASE_FILE="${RAVEN_KEYSTORE_PASSPHRASE_FILE:-}"
 if [[ -n "${RAVEN_KEYSTORE_PASSPHRASE:-}" ]]; then
   echo "RAVEN_KEYSTORE_PASSPHRASE is refused: put the passphrase in a 0600 file and set RAVEN_KEYSTORE_PASSPHRASE_FILE" >&2
@@ -88,6 +100,12 @@ sd_quote() {
   s=${s//\$/\$\$}
   printf '"%s"' "$s"
 }
+# Internet direct listener: only when asked for (empty = no flag, so a later
+# `raven node internet on` in node_policy.json decides).
+internet_listen_args() {
+  [[ -n "$INTERNET_LISTEN" ]] || return 0
+  printf ' --internet-listen %s' "$(sd_quote "$INTERNET_LISTEN")"
+}
 # Passphrase vault: hand the service the passphrase *file* (never its contents).
 keystore_unit_lines() {
   [[ -n "$PASSPHRASE_FILE" ]] || return 0
@@ -119,7 +137,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$(sd_quote "${BIN_DIR}/raven-node") service --data-dir $(sd_quote "${DATA_DIR}") --lan-listen $(sd_quote "${LAN_LISTEN}") --ble-listen 127.0.0.1:7421 --timeout-secs 0
+ExecStart=$(sd_quote "${BIN_DIR}/raven-node") service --data-dir $(sd_quote "${DATA_DIR}") --lan-listen $(sd_quote "${LAN_LISTEN}") --ble-listen 127.0.0.1:7421$(internet_listen_args) --timeout-secs 0
 Restart=on-failure
 RestartSec=3
 # Sandboxing that works in a --user manager without a mount namespace (the
@@ -176,4 +194,19 @@ case "$LAN_LISTEN" in
   *)
     echo "Exposed on ${LAN_LISTEN}: allow inbound TCP only from your LAN (e.g. ufw allow from 192.168.0.0/16 to any port 7420 proto tcp)." ;;
 esac
+if [[ -n "$INTERNET_LISTEN" ]]; then
+  # "[v6]:port" or "v4:port"; a bare IP (IPv6 included) means the default port.
+  case "$INTERNET_LISTEN" in
+    \[*\]:*) INTERNET_PORT="${INTERNET_LISTEN##*:}" ;;
+    *:*:*) INTERNET_PORT=7422 ;;
+    *:*) INTERNET_PORT="${INTERNET_LISTEN##*:}" ;;
+    *) INTERNET_PORT=7422 ;;
+  esac
+  echo "Internet listen: ${INTERNET_LISTEN} (only your contacts get an answer; anyone can see that the port is open)"
+  echo "  Allow it yourself if you want it reachable: ufw allow ${INTERNET_PORT}/tcp (or firewalld / nftables / your cloud security group),"
+  echo "  and forward TCP ${INTERNET_PORT} on your router if this host is behind NAT."
+  echo "  A build with Internet direct off (INTERNET_DIRECT_PRODUCTION_ENABLED=false) keeps the port closed and logs INTERNET_DIRECT_HOLD; check: raven status (internet row)."
+else
+  echo "Internet listen: off (opt-in: re-run with RAVEN_INTERNET_LISTEN=0.0.0.0:7422, or 'raven node internet on' and restart the unit)"
+fi
 echo "export PATH=\"${BIN_DIR}:\$PATH\""

@@ -2,6 +2,10 @@
 # -SkipScheduledTask: build + copy binaries only (CI / no persistent logon task). See WINDOWS_SERVICE.md.
 # -LanListen: LAN exposure is opt-in and identical on every OS installer
 #   (default 127.0.0.1:7420; pass e.g. -LanListen 192.168.1.20:7420 to accept LAN peers).
+# -InternetListen: Internet direct exposure is opt-in too (default: no listener; pass e.g.
+#   -InternetListen 0.0.0.0:7422, a bare IP gets port 7422). Without it,
+#   `raven node internet on --listen 0.0.0.0:7422` turns it on later (applied at the next
+#   task start). The installer never changes the firewall: it prints the rule to run elevated.
 # -TaskName / -NoStart: CI hooks (register a uniquely named task without launching the daemon).
 # Re-running is the upgrade path: the running daemon is stopped before its binaries are
 # replaced and the task is re-registered with the current settings.
@@ -26,12 +30,18 @@ param(
     }),
     [string]$BinDir = $(Join-Path $env:LOCALAPPDATA "RavenNode"),
     [string]$LanListen = "127.0.0.1:7420",
+    [string]$InternetListen = "",
     [string]$TaskName = "RavenNodeBridge",
     [switch]$SkipScheduledTask,
     [switch]$NoStart
 )
 
 $ErrorActionPreference = "Stop"
+# IP[:port] / [IPv6][:port] characters only (it lands on the task's command line);
+# raven-node validates the rest.
+if ($InternetListen -and ($InternetListen -notmatch '^[\[\]0-9A-Za-z.:]+$')) {
+    throw "-InternetListen must look like 0.0.0.0:7422 or [::]:7422"
+}
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
@@ -80,6 +90,9 @@ Install-Binary "$Root\target\release\ash.exe" (Join-Path $BinDir "ash.exe")
 
 # Do not use $args - automatic/read-only in pwsh 7.
 $serviceArgs = "service --data-dir `"$DataDir`" --lan-listen $LanListen --ble-listen 127.0.0.1:7421 --timeout-secs 0"
+if ($InternetListen) {
+    $serviceArgs = "$serviceArgs --internet-listen $InternetListen"
+}
 
 if ($SkipScheduledTask) {
     Write-Host "SkipScheduledTask: binaries copied; logon task not registered"
@@ -109,6 +122,20 @@ Write-Host "CLI: raven.exe / ash.exe find this profile by default (RAVEN_DATA_DI
 Write-Host "lan-listen=$LanListen"
 if ($LanListen -like "127.*" -or $LanListen -like "localhost:*") {
     Write-Host "LAN peers cannot reach this node (loopback only). Re-run with -LanListen <LAN-IP>:7420 and allow TCP 7420 in Windows Firewall to accept LAN peers."
+}
+if ($InternetListen) {
+    $inetPort = "7422"
+    # "[v6]:port" or "v4:port"; a bare IP (IPv6 included) means the default port.
+    if (($InternetListen -match '^\[[^\]]*\]:(\d+)$') -or ($InternetListen -match '^[^:\[\]]+:(\d+)$')) {
+        $inetPort = $Matches[1]
+    }
+    Write-Host "internet-listen=$InternetListen (only your contacts get an answer; anyone can see that the port is open)"
+    Write-Host "To let contacts reach it, run in an ELEVATED PowerShell yourself (Private profile only, never Public):"
+    Write-Host "  New-NetFirewallRule -DisplayName `"Raven node`" -Direction Inbound -Program `"$exe`" -Protocol TCP -LocalPort $inetPort -Profile Private"
+    Write-Host "and forward TCP $inetPort on your router if this PC is behind NAT. Outbound needs no rule."
+    Write-Host "A build with Internet direct off (INTERNET_DIRECT_PRODUCTION_ENABLED=false) keeps the port closed and logs INTERNET_DIRECT_HOLD; check: raven.exe status (internet row)."
+} else {
+    Write-Host "internet-listen=off (opt-in: re-run with -InternetListen 0.0.0.0:7422, or run 'raven node internet on' and restart the task)"
 }
 Write-Host "bin-dir=$BinDir (raven.exe / ash.exe)"
 $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value

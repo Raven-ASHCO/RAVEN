@@ -283,10 +283,21 @@ pub fn ensure_lab_local_material(data_dir: &Path, id: &Identity) -> Result<(), S
     raven_core::ensure_local_prekey(data_dir, id)
 }
 
+/// One way to dial a peer for one send: a carrier and its `host:port`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialRoute {
+    pub carrier: DialCarrier,
+    pub dial: String,
+}
+
 /// PairInit + indexed send over one-connection LanDial or InternetDial, on a
-/// named carrier. Internet is lab-only (not WAN). `ctx` names the recipient for
-/// every line this prints (see `ext::SendCtx`): success lines go to stdout, and
-/// every `Err` is already the user's sentence (queued / not sent / unconfirmed).
+/// named carrier. `ctx` names the recipient for every line this prints (see
+/// `ext::SendCtx`): success lines go to stdout, and every `Err` is already the
+/// user's sentence (queued / not sent / unconfirmed). Production sends go
+/// through [`run_pair_init_and_send_routes`]; this single-route form is kept
+/// for the tests (Unix-only ones).
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn run_pair_init_and_send_on(
     data_dir: &Path,
     id: &Identity,
@@ -296,57 +307,124 @@ pub fn run_pair_init_and_send_on(
     carrier: DialCarrier,
     ctx: &SendCtx,
 ) -> Result<(), String> {
+    let route = DialRoute {
+        carrier,
+        dial: peer.to_string(),
+    };
+    run_pair_init_and_send_routes(data_dir, id, &[route], peer_pub_hex, text, ctx).map(|_| ())
+}
+
+/// [`run_pair_init_and_send_on`] over the first of `routes` (in order: LAN,
+/// then Internet) whose RLB1 probe answers, and returns the route it used.
+///
+/// Only the probe moves on to the next route. It carries no message frame and
+/// stages nothing, so trying another route can never send or queue a second
+/// copy. Everything stateful (pairing, the retry of an earlier queued message,
+/// staging and dialing this one) runs once, on the chosen route. When no route
+/// answers, the send behaves exactly like a single-route send on the first
+/// route (queued for retry if a confirmed session exists, else NOT SENT).
+pub fn run_pair_init_and_send_routes(
+    data_dir: &Path,
+    id: &Identity,
+    routes: &[DialRoute],
+    peer_pub_hex: &str,
+    text: &str,
+    ctx: &SendCtx,
+) -> Result<DialRoute, String> {
     if !trace_delivery::live_pair_init_outbound_ready() {
         return Err(trace_delivery::production_gate_status().into());
     }
-    if carrier == DialCarrier::Internet && !raven_core::internet_direct_live_enabled() {
-        return Err(INTERNET_DIRECT_HOLD.into());
-    }
-    if !peer.contains(':')
-        || peer.eq_ignore_ascii_case("local-listen")
-        || peer.eq_ignore_ascii_case("local")
-    {
-        return Err(format!(
-            "valid {} host:port required — refusing LocalListenQueue fallback",
-            carrier.label()
-        ));
+    let first = routes
+        .first()
+        .ok_or_else(|| "no host:port to dial — refusing LocalListenQueue fallback".to_string())?;
+    for route in routes {
+        if route.carrier == DialCarrier::Internet && !raven_core::internet_direct_live_enabled() {
+            return Err(INTERNET_DIRECT_HOLD.into());
+        }
+        let peer = route.dial.as_str();
+        if !peer.contains(':')
+            || peer.eq_ignore_ascii_case("local-listen")
+            || peer.eq_ignore_ascii_case("local")
+        {
+            return Err(format!(
+                "valid {} host:port required — refusing LocalListenQueue fallback",
+                route.carrier.label()
+            ));
+        }
     }
     ensure_lab_local_material(data_dir, id)?;
     let peer_pub = parse_pub_hex(peer_pub_hex)?;
     let (local_cert, registry) = ensure_local_device_cert(data_dir, id)?;
 
-    let probe =
-        ipc_carrier_dial_patient(data_dir, carrier, peer, peer_pub_hex, &[]).and_then(|replies| {
-            replies
-                .iter()
-                .find_map(|f| parse_peer_offer(f).ok())
-                .ok_or_else(|| "peer did not return an RLB1 bundle".to_string())
-        });
+    let mut probe_errors: Vec<String> = Vec::new();
+    let mut answered: Option<(DialRoute, raven_core::LanBundle)> = None;
+    for (i, route) in routes.iter().enumerate() {
+        let probe =
+            ipc_carrier_dial_patient(data_dir, route.carrier, &route.dial, peer_pub_hex, &[])
+                .and_then(|replies| {
+                    replies
+                        .iter()
+                        .find_map(|f| parse_peer_offer(f).ok())
+                        .ok_or_else(|| "peer did not return an RLB1 bundle".to_string())
+                });
+        match probe {
+            Ok(bundle) => {
+                answered = Some((route.clone(), bundle));
+                break;
+            }
+            Err(e) => {
+                if let Some(next) = routes.get(i + 1).filter(|_| super::ext::verbose()) {
+                    eprintln!(
+                        "{C_DIM}{} {} did not answer; trying {} {}{C_RESET}",
+                        route.carrier.label(),
+                        sanitize_terminal_line(&route.dial),
+                        next.carrier.label(),
+                        sanitize_terminal_line(&next.dial)
+                    );
+                }
+                probe_errors.push(if routes.len() > 1 {
+                    format!("{} {}: {e}", route.carrier.label(), route.dial)
+                } else {
+                    e
+                });
+            }
+        }
+    }
     // From here on the send reads and writes per-peer session state: serialise it
     // with every other `ash send` to this peer (see `PeerSendLock`). After the
     // probe, so an unreachable peer's timeouts are not serialised.
     let _send_lock = PeerSendLock::acquire(data_dir, &peer_pub)?;
-    let peer_bundle = match probe {
-        Ok(bundle) => bundle,
-        // Peer asleep / unreachable: the RLB1 probe is not needed to stage a
-        // message into an already-confirmed session, so do that instead of
-        // dropping the text.
-        Err(probe_err) => {
+    let (route, peer_bundle) = match answered {
+        Some(hit) => hit,
+        // Peer asleep / unreachable on every route: the RLB1 probe is not needed
+        // to stage a message into an already-confirmed session, so do that (on
+        // the first route) instead of dropping the text.
+        None => {
+            let ctx = SendCtx {
+                dial: first.dial.trim().to_string(),
+                ..ctx.clone()
+            };
             return send_when_peer_unreachable(
                 data_dir,
                 id,
                 &registry,
                 &local_cert,
-                peer,
+                &first.dial,
                 peer_pub_hex,
                 &peer_pub,
                 text,
-                carrier,
-                probe_err,
-                ctx,
-            );
+                first.carrier,
+                probe_errors.join("; "),
+                &ctx,
+            )
+            .map(|()| first.clone());
         }
     };
+    let ctx = &SendCtx {
+        dial: route.dial.trim().to_string(),
+        ..ctx.clone()
+    };
+    let (peer, carrier) = (route.dial.as_str(), route.carrier);
     if peer_bundle.cert.user_ed_pub != peer_pub && peer_bundle.cert.device_ed_pub != peer_pub {
         return Err("RLB1 identity does not match --peer-pub-hex / contact".into());
     }
@@ -418,6 +496,7 @@ pub fn run_pair_init_and_send_on(
         None,
         ctx,
     )
+    .map(|()| route.clone())
 }
 
 /// Attempts at a dial the peer shed at the handshake, and the first back-off

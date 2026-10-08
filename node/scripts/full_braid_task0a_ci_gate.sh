@@ -136,6 +136,10 @@ print(f"primary-hold-ok {expected}", file=sys.stderr)
 PY
 }
 
+# --keep-going: both holds (raven-core's primary build.rs and the fork's
+# secondary) must run. Without it, whichever build script fails first stops
+# cargo, so the primary hold went missing whenever the dependency graph made
+# libsqlite3-sys-raven's build script finish first.
 expect_release_hold_failure() {
   local log
   log="$(mktemp "${TMPDIR:-/tmp}/raven-0a5-hold-XXXXXX")"
@@ -144,7 +148,7 @@ expect_release_hold_failure() {
     cd "$NODE"
     env RAVEN_EXPECT_SQLCIPHER_4_17_0=1 \
       CARGO_TERM_COLOR=never \
-      cargo build --release -p raven-core --features full-braid-durable-lab
+      cargo build --keep-going --release -p raven-core --features full-braid-durable-lab
   ) >"$log" 2>&1
   local rc=$?
   set -e

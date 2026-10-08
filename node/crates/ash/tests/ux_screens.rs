@@ -224,13 +224,10 @@ fn send_help_says_the_text_comes_from_stdin_and_shows_the_example() {
         "{help}"
     );
     assert!(help.contains("--contact <CONTACT>"), "{help}");
+    // How to reach the contact is a user choice now (transports P1): shown.
+    assert!(help.contains("--carrier <auto|lan|internet>"), "{help}");
     // The old developer-only wording and the unusable options are gone from view.
-    for old in [
-        "Forward send to raven-node",
-        "--listen",
-        "--carrier",
-        "--stdin-text",
-    ] {
+    for old in ["Forward send to raven-node", "--listen", "--stdin-text"] {
         assert!(!help.contains(old), "{old:?} in {help}");
     }
     // ... but they are still accepted (scripts pass them).

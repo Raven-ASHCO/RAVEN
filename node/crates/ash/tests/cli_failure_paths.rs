@@ -231,6 +231,38 @@ fn alias_publish_defaults_to_the_next_sequence_and_refuses_regressions() {
 }
 
 #[test]
+fn verify_fp_is_case_sensitive_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    plant_identity(dir.path());
+    let poline = ident(0x41);
+    let fp = device_fingerprint_v1(&poline.public_key_bytes());
+    assert_ne!(fp, fp.to_ascii_lowercase(), "vector must contain capitals");
+    let mut c = ash(dir.path());
+    add_contact_args(&mut c, &poline, "Poline", None, "192.168.1.20:7420");
+    c.args(["--verify-fp", &fp.to_ascii_lowercase()]);
+    let o = run(c, "");
+    assert_ne!(code(&o), 0, "a case-folded fingerprint must not pin");
+    let err = text(&o.stderr);
+    assert!(
+        err.contains("fingerprint mismatch") && err.contains("case-sensitive"),
+        "{err}"
+    );
+    assert!(
+        !dir.path().join("contacts.json").exists()
+            || !std::fs::read_to_string(dir.path().join("contacts.json"))
+                .unwrap()
+                .contains("Poline"),
+        "nothing saved on a mismatch"
+    );
+    // Dashes are display only: the bare characters pin.
+    let mut c = ash(dir.path());
+    add_contact_args(&mut c, &poline, "Poline", None, "192.168.1.20:7420");
+    c.args(["--verify-fp", &fp.replace('-', "")]);
+    let o = run(c, "");
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+}
+
+#[test]
 fn contact_set_dial_remove_and_unblock_are_explicit_and_local() {
     let dir = tempfile::tempdir().unwrap();
     // Contacts are profile state: they need the identity to exist first.

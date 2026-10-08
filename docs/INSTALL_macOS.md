@@ -52,6 +52,42 @@ RAVEN_LAN_LISTEN=<this-Mac-LAN-IP>:7420 bash scripts/install/macos_launchd.sh
 
 and allow `raven-node` in the macOS firewall for the local network only.
 
+**Internet direct is opt-in too (off by default).** It lets contacts who have
+your Internet address (`raven whoami --card --inet <public-ip-or-name>:7422`)
+reach this computer over TCP port **7422** (7421 is mock BLE's, 7423 is
+reserved for libp2p). Only your contacts get an answer: anyone else completes
+the Noise handshake and is disconnected before this node names itself, but a
+scanner still learns that something listens on that port. A build with
+Internet direct off (`INTERNET_DIRECT_PRODUCTION_ENABLED = false`, the state
+until its waiver is signed) keeps the port closed and logs `internet_direct
+failed: INTERNET_DIRECT_HOLD ...`; the debug lab unlock is `RAVEN_LAB_TEST_A=1`.
+`raven status` shows an `internet` row: `YES` only while the running service
+really has the listener up.
+
+```bash
+# at install time
+RAVEN_INTERNET_LISTEN=0.0.0.0:7422 bash scripts/install/macos_launchd.sh
+# or later (saved in node_policy.json, applied when the agent restarts)
+raven node internet on --listen 0.0.0.0:7422
+launchctl kickstart -k "gui/$(id -u)/com.raven.raven-node"
+raven node internet off          # closes it again at the next restart
+```
+
+Firewall: the macOS Application Firewall is off by default. When it is on it
+prompts per code identity (an unsigned rebuild prompts again), and "Block all
+incoming connections" drops the connections silently. Allow the agent yourself:
+
+```bash
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add ~/.local/bin/raven-node
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp ~/.local/bin/raven-node
+```
+
+Forward TCP 7422 on your router if the Mac is behind NAT. Contacts:
+`raven contact add --card '<their card line>'`, `raven contact set-addr <name>
+--internet HOST:PORT`, then `raven send --contact <name>` (LAN address first,
+then Internet; `--carrier lan|internet` forces one). An address is only a hint:
+every connection still has to prove the contact's pinned key.
+
 ## Option B — unsigned release tarball
 
 ```bash

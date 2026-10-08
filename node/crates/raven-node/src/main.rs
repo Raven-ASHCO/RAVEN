@@ -1836,10 +1836,12 @@ enum Commands {
         lan_listen: String,
         #[arg(long, default_value = raven_core::DEFAULT_BLE_LISTEN)]
         ble_listen: String,
-        /// Optional InternetTransport (RIH1) listen. Empty = disabled.
-        /// Lab-only until INTERNET_DIRECT_PRODUCTION_ENABLED. localhost ≠ WAN.
-        #[arg(long, default_value = "")]
-        internet_listen: String,
+        /// Internet direct (RIH1) listen address, e.g. 0.0.0.0:7422 (a bare IP
+        /// gets port 7422). Opt-in: without this flag RAVEN_INTERNET_LISTEN, then
+        /// node_policy.json (`raven node internet on`) decide; an empty value is
+        /// off. Needs INTERNET_DIRECT_PRODUCTION_ENABLED (or the debug lab unlock).
+        #[arg(long)]
+        internet_listen: Option<String>,
         #[arg(long, default_value_t = 0)]
         timeout_secs: u64,
     },
@@ -2915,6 +2917,26 @@ where
     }
 }
 
+/// The service's Internet direct listen address and where it came from,
+/// highest first: `--internet-listen` (an explicit empty value is off),
+/// `RAVEN_INTERNET_LISTEN` (likewise), then `internet_listen` in
+/// node_policy.json (`raven node internet on`). Unset everywhere is off:
+/// Internet exposure is opt-in, like LAN exposure in the installers.
+fn service_internet_listen(
+    flag: Option<&str>,
+    env: Option<&str>,
+    policy: impl FnOnce() -> Result<String, String>,
+) -> Result<Option<(String, &'static str)>, String> {
+    let (raw, source) = match (flag, env) {
+        (Some(f), _) => (f.to_string(), "--internet-listen"),
+        (None, Some(e)) => (e.to_string(), "RAVEN_INTERNET_LISTEN"),
+        (None, None) => (policy()?, "node_policy.json"),
+    };
+    raven_core::node_policy::normalize_internet_listen(&raw)
+        .map(|addr| addr.map(|a| (a, source)))
+        .map_err(|e| format!("{source}: {e}"))
+}
+
 /// Why `service` is stopping.
 #[cfg(any(unix, windows))]
 #[derive(Debug, PartialEq, Eq)]
@@ -3427,13 +3449,41 @@ async fn main() {
             let mut lan_task = tokio::spawn(supervise("lan_direct", None, move || {
                 lan_direct::run_listener(data_lan.clone(), lan_listen.clone())
             }));
-            let mut inet_task = if internet_listen.trim().is_empty() {
-                tokio::spawn(std::future::pending::<Infallible>())
-            } else {
-                let data_inet = data_dir.clone();
-                tokio::spawn(supervise("internet_direct", None, move || {
-                    internet_direct::run_listener(data_inet.clone(), internet_listen.clone())
-                }))
+            let internet_listen = service_internet_listen(
+                internet_listen.as_deref(),
+                std::env::var("RAVEN_INTERNET_LISTEN").ok().as_deref(),
+                || {
+                    raven_core::node_policy::try_load_policy(&data_dir)
+                        .map(|p| p.internet_listen)
+                        .map_err(|e| {
+                            format!("node_policy.json unreadable ({e}): no Internet listener")
+                        })
+                },
+            );
+            let mut inet_task = match internet_listen {
+                Ok(None) => tokio::spawn(std::future::pending::<Infallible>()),
+                // Held in this build: say so once instead of retrying a listener
+                // that can never start (the port stays closed).
+                Ok(Some((addr, source))) if !raven_core::internet_direct_live_enabled() => {
+                    eprintln!(
+                        "internet_direct failed: {} ({addr} from {source} stays closed)",
+                        internet_direct::HOLD
+                    );
+                    tokio::spawn(std::future::pending::<Infallible>())
+                }
+                Ok(Some((addr, source))) => {
+                    eprintln!("raven-node internet_direct: configured {addr} ({source})");
+                    let data_inet = data_dir.clone();
+                    tokio::spawn(supervise("internet_direct", None, move || {
+                        internet_direct::run_listener(data_inet.clone(), addr.clone())
+                    }))
+                }
+                // A bad value or an unreadable policy: no public listener (fail
+                // closed); IPC and LAN keep running.
+                Err(e) => {
+                    eprintln!("internet_direct failed: {e}");
+                    tokio::spawn(std::future::pending::<Infallible>())
+                }
             };
             // Expired sessions (protected K_root, outbox envelopes, inbox
             // rows) are destroyed on a timer, not only when a listener starts
@@ -3504,6 +3554,44 @@ async fn main() {
 mod lifecycle_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn internet_listen_is_opt_in_and_the_flag_wins() {
+        let none = || Ok(String::new());
+        let policy = || Ok("0.0.0.0".to_string());
+        let broken = || Err("node_policy.json unreadable".to_string());
+        // Nothing configured anywhere: off.
+        assert_eq!(service_internet_listen(None, None, none).unwrap(), None);
+        // The policy (`raven node internet on`) fills in the default port.
+        assert_eq!(
+            service_internet_listen(None, None, policy).unwrap(),
+            Some(("0.0.0.0:7422".into(), "node_policy.json"))
+        );
+        // The environment beats the policy; an empty value turns it off.
+        assert_eq!(
+            service_internet_listen(None, Some("127.0.0.1:0"), policy).unwrap(),
+            Some(("127.0.0.1:0".into(), "RAVEN_INTERNET_LISTEN"))
+        );
+        assert_eq!(
+            service_internet_listen(None, Some(""), policy).unwrap(),
+            None
+        );
+        // The flag beats both, and an explicit empty flag is off.
+        assert_eq!(
+            service_internet_listen(Some("[::1]:0"), Some("127.0.0.1:0"), policy).unwrap(),
+            Some(("[::1]:0".into(), "--internet-listen"))
+        );
+        assert_eq!(
+            service_internet_listen(Some(""), None, policy).unwrap(),
+            None
+        );
+        // An unreadable policy or a bad value is an error (no listener), and a
+        // flag or env value never needs the policy at all.
+        assert!(service_internet_listen(None, None, broken).is_err());
+        assert!(service_internet_listen(Some("0.0.0.0:7422"), None, broken).is_ok());
+        let bad = service_internet_listen(Some("example.com:7422"), None, none).unwrap_err();
+        assert!(bad.starts_with("--internet-listen: "), "{bad}");
+    }
 
     /// Regression: `unwrap()` on `duration_since(UNIX_EPOCH)` panicked the
     /// daemon on a clock set before 1970.

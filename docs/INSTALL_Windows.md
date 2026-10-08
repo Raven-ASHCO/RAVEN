@@ -26,6 +26,43 @@ and allow TCP 7420 for the local subnet in Windows Firewall to accept LAN peers.
 A bare `raven-node.exe service` without `--lan-listen` binds `0.0.0.0:7420`, so
 always pass an explicit address when you start it by hand.
 
+**Internet direct is opt-in too (off by default).** It lets contacts who have
+your Internet address (`raven whoami --card --inet <public-ip-or-name>:7422`)
+reach this computer over TCP port **7422** (7421 is mock BLE's, 7423 is
+reserved for libp2p). Only your contacts get an answer: anyone else completes
+the Noise handshake and is disconnected before this node names itself, but a
+scanner still learns that something listens on that port. A build with
+Internet direct off (`INTERNET_DIRECT_PRODUCTION_ENABLED = false`, the state
+until its waiver is signed) keeps the port closed and logs `internet_direct
+failed: INTERNET_DIRECT_HOLD ...`; the debug lab unlock is `RAVEN_LAB_TEST_A=1`.
+`raven status` shows an `internet` row: `YES` only while the running service
+really has the listener up.
+
+```powershell
+# at install time
+.\node\scripts\install\windows_service.ps1 -InternetListen 0.0.0.0:7422
+# or later (saved in node_policy.json, applied when the task restarts)
+raven.exe node internet on --listen 0.0.0.0:7422
+Stop-ScheduledTask -TaskName RavenNodeBridge; Start-ScheduledTask -TaskName RavenNodeBridge
+raven.exe node internet off      # closes it again at the next restart
+```
+
+Firewall: on the first non-loopback listen Defender Firewall may show "Windows
+Security Alert"; allowing needs an administrator and dismissing it creates a
+block rule. The installer prints, and never runs, the rule to add in an
+elevated PowerShell (Private profile only, never Public; outbound needs no rule):
+
+```powershell
+New-NetFirewallRule -DisplayName "Raven node" -Direction Inbound `
+  -Program "$env:LOCALAPPDATA\RavenNode\raven-node.exe" -Protocol TCP -LocalPort 7422 -Profile Private
+```
+
+Forward TCP 7422 on your router if the PC is behind NAT. The logon task runs only
+while you are signed in, so a Windows PC is reachable only then. Contacts:
+`raven contact add --card "<their card line>"`, `raven contact set-addr <name>
+--internet HOST:PORT`, then `raven send --contact <name>` (LAN address first,
+then Internet; `--carrier lan|internet` forces one).
+
 **Toolchain:** install Rust with [rustup](https://rustup.rs) (current stable);
 older compilers fail at dependency resolution (rustc 1.83.0: the locked graph
 needs edition 2024; its highest declared `rust-version` is 1.88). CI is validated

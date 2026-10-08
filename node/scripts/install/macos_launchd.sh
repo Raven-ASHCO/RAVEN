@@ -4,6 +4,11 @@
 # LAN exposure is opt-in and identical on every OS installer: the service binds
 # 127.0.0.1:7420 unless RAVEN_LAN_LISTEN is set, e.g.
 #   RAVEN_LAN_LISTEN=192.168.1.20:7420 bash node/scripts/install/macos_launchd.sh
+#
+# Internet direct exposure is opt-in the same way (no listener by default):
+#   RAVEN_INTERNET_LISTEN=0.0.0.0:7422 bash node/scripts/install/macos_launchd.sh
+# (a bare IP gets port 7422). Without it, `raven node internet on --listen
+# 0.0.0.0:7422` turns it on later (applied when the agent restarts).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN_DIR="${RAVEN_BIN_DIR:-$HOME/.local/bin}"
@@ -25,6 +30,12 @@ resolve_data_dir() {
 }
 DATA_DIR="$(resolve_data_dir)"
 LAN_LISTEN="${RAVEN_LAN_LISTEN:-127.0.0.1:7420}"
+INTERNET_LISTEN="${RAVEN_INTERNET_LISTEN:-}"
+# IP[:port] / [IPv6][:port] characters only; raven-node validates the rest.
+if [[ -n "$INTERNET_LISTEN" && ! "$INTERNET_LISTEN" =~ ^[][0-9A-Za-z.:]+$ ]]; then
+  echo "RAVEN_INTERNET_LISTEN must look like 0.0.0.0:7422 or [::]:7422" >&2
+  exit 1
+fi
 LABEL="com.raven.raven-node"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 
@@ -47,6 +58,12 @@ xml_escape() {
   s=${s//'<'/'&lt;'}
   s=${s//'>'/'&gt;'}
   printf '%s' "$s"
+}
+# Internet direct listener: only when asked for (no flag otherwise, so a later
+# `raven node internet on` in node_policy.json decides).
+internet_listen_plist_args() {
+  [[ -n "$INTERNET_LISTEN" ]] || return 0
+  printf '    <string>--internet-listen</string>\n    <string>%s</string>\n' "$(xml_escape "$INTERNET_LISTEN")"
 }
 # --locked: build exactly the audited Cargo.lock.
 cargo build --locked -p raven-node -p ash --release --manifest-path "$ROOT/Cargo.toml"
@@ -76,6 +93,7 @@ cat >"$PLIST" <<EOF
     <string>$(xml_escape "${LAN_LISTEN}")</string>
     <string>--ble-listen</string>
     <string>127.0.0.1:7421</string>
+$(internet_listen_plist_args)
     <string>--timeout-secs</string>
     <string>0</string>
   </array>
@@ -108,4 +126,14 @@ case "$LAN_LISTEN" in
   *)
     echo "Exposed on ${LAN_LISTEN}: allow inbound TCP 7420 on the LAN only (System Settings → Network → Firewall)." ;;
 esac
+if [[ -n "$INTERNET_LISTEN" ]]; then
+  echo "Internet listen: ${INTERNET_LISTEN} (only your contacts get an answer; anyone can see that the port is open)"
+  echo "  If the macOS firewall is on, allow raven-node yourself:"
+  echo "    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add ${BIN_DIR}/raven-node"
+  echo "    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp ${BIN_DIR}/raven-node"
+  echo "  (an unsigned rebuild may need this again) and forward the TCP port on your router if you are behind NAT."
+  echo "  A build with Internet direct off (INTERNET_DIRECT_PRODUCTION_ENABLED=false) keeps the port closed and logs INTERNET_DIRECT_HOLD; check: raven status (internet row)."
+else
+  echo "Internet listen: off (opt-in: re-run with RAVEN_INTERNET_LISTEN=0.0.0.0:7422, or 'raven node internet on' and restart the agent)"
+fi
 echo "PATH tip: export PATH=\"${BIN_DIR}:\$PATH\""
