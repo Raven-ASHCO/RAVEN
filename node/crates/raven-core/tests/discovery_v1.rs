@@ -4,6 +4,8 @@
 
 use raven_core::alias_record::{AliasClaimStore, AliasPublishQuota, AliasRecord};
 use raven_core::bootstrap::BootstrapConfig;
+use raven_core::bridge::DropReason;
+use raven_core::carrier_admission::CustodyRefusal;
 use raven_core::chat_history::BlockList;
 use raven_core::contact_request::{
     ContactAcceptV1, ContactRequestInbox, ContactRequestInner, RavenContactRequestV1,
@@ -488,11 +490,15 @@ fn a10_contact_request_offline_store() {
         },
         true,
     ) {
-        RouterOutcome::QueuedForForward { message_id, .. } => {
-            assert_eq!(message_id, [10u8; 16]);
-        }
-        other => panic!("expected store queue: {other:?}"),
+        // F3 custody allow-list: a legacy contact-request blob is not a sealed
+        // indexed-session object, so no relay stores it (the legacy entry
+        // points are fail-closed anyway).
+        RouterOutcome::Dropped {
+            reason: DropReason::NotAdmitted(CustodyRefusal::NotSealedIndexed),
+        } => {}
+        other => panic!("contact request must not enter custody: {other:?}"),
     }
+    assert_eq!(q.count_all().unwrap(), 0);
 }
 
 /// 11 Ciphertext-only store
@@ -559,22 +565,19 @@ fn a12_ble_bridge_internet_contact_request() {
         },
         true,
     ) {
-        RouterOutcome::ForwardNow {
-            packed,
-            egress,
-            identity,
-        } => {
-            assert_eq!(egress, TransportKind::Lan);
-            assert_eq!(identity.message_id, [12u8; 16]);
-            let fwd = Envelope::unpack(&packed).unwrap();
-            // Wire body carries outer metadata + opaque ciphertext; plaintext note absent.
-            assert!(!String::from_utf8_lossy(&fwd.message_ciphertext).contains("via bridge"));
-            let decoded = RavenContactRequestV1::decode_wire(&fwd.message_ciphertext).unwrap();
-            assert_eq!(decoded.ciphertext, req.ciphertext);
-            assert!(decoded.is_ciphertext_only());
-        }
+        // F3: refused before custody (see a10); the blob itself stays
+        // ciphertext-only for the out-of-band file path that still exists.
+        RouterOutcome::Dropped {
+            reason: DropReason::NotAdmitted(CustodyRefusal::NotSealedIndexed),
+        } => {}
         other => panic!("case12: {other:?}"),
     }
+    let wire = Envelope::unpack(&env.pack()).unwrap().message_ciphertext;
+    assert!(!String::from_utf8_lossy(&wire).contains("via bridge"));
+    let decoded = RavenContactRequestV1::decode_wire(&wire).unwrap();
+    assert_eq!(decoded.ciphertext, req.ciphertext);
+    assert!(decoded.is_ciphertext_only());
+    assert_eq!(q.count_all().unwrap(), 0);
 }
 
 /// 13 Bridge cannot decrypt
@@ -648,7 +651,13 @@ fn a14_multi_transport_dedup() {
         },
         true,
     );
-    assert!(matches!(first, RouterOutcome::ForwardNow { .. }));
+    // F3: never admitted, on any ingress; nothing to dedup against later.
+    assert!(matches!(
+        first,
+        RouterOutcome::Dropped {
+            reason: DropReason::NotAdmitted(_)
+        }
+    ));
     let second = router.handle_inbound(
         &q,
         InboundEnvelope {
@@ -833,9 +842,22 @@ fn contact_accept_and_intro_lane() {
         .unwrap();
     assert_eq!(opened_note, b"meet poline");
     let mut inbox = IntroductionInbox::default();
-    inbox.add(intro_rec, now()).unwrap();
+    inbox
+        .add(intro_rec, &recipient.address(), &[intro.address()], now())
+        .unwrap();
     let ctx = DiscoveryContext {
         intros: inbox,
+        // The introducer is a (non-blocked) contact: that is what makes its
+        // introductions count at query time.
+        contacts: vec![LocalContactRow {
+            raven_id: intro.address(),
+            pub_hex: hex::encode(intro.public_key_bytes()),
+            petname: "Introducer".into(),
+            public_tag: String::new(),
+            display_name: "Introducer".into(),
+            pinned: false,
+            directly_verified: false,
+        }],
         now_ms: now(),
         ..Default::default()
     };
@@ -854,6 +876,86 @@ fn contact_accept_and_intro_lane() {
     .sign(&recipient)
     .unwrap();
     accept.verify().unwrap();
+}
+
+/// An introduction is admitted only from a trusted contact, but admission is a
+/// point-in-time check: a later block (or removal) of the introducer must
+/// stop its introductions from surfacing as INTRODUCED.
+#[test]
+fn introductions_are_rechecked_against_the_current_introducer() {
+    let introducer = Identity::from_seed(&[0x61; 32]);
+    let subject = Identity::from_seed(&[0x62; 32]);
+    let recipient = Identity::from_seed(&[0x63; 32]);
+    let rec = RavenIntroductionV1 {
+        intro_id: [0x77; 16],
+        introducer_raven_id: String::new(),
+        subject_raven_id: subject.address(),
+        recipient_raven_id: recipient.address(),
+        subject_display_name: "Bob".into(),
+        subject_aliases: vec!["bob".into()],
+        created_at: now(),
+        expires_at: now() + 60_000,
+        note_ciphertext: vec![1],
+        signature: [0u8; 64],
+        introducer_pub: [0u8; 32],
+    }
+    .sign(&introducer)
+    .unwrap();
+    let mut inbox = IntroductionInbox::default();
+    inbox
+        .add(rec, &recipient.address(), &[introducer.address()], now())
+        .unwrap();
+    let contact = LocalContactRow {
+        raven_id: introducer.address(),
+        pub_hex: hex::encode(introducer.public_key_bytes()),
+        petname: "Friend".into(),
+        public_tag: String::new(),
+        display_name: "Friend".into(),
+        pinned: false,
+        directly_verified: false,
+    };
+    let mut ctx = DiscoveryContext {
+        intros: inbox,
+        contacts: vec![contact],
+        now_ms: now(),
+        ..Default::default()
+    };
+    let search = |ctx: &DiscoveryContext| {
+        DiscoveryResolver::v1().search("@bob", DiscoveryScope::MyNetwork, ctx)
+    };
+    let introduced = |hits: &[raven_core::discovery_resolver::DiscoveryResult]| {
+        hits.iter()
+            .any(|h| h.verification_state == VerificationState::Introduced)
+    };
+    assert!(introduced(&search(&ctx)), "trusted introducer vouches");
+
+    // The introducer is blocked afterwards: nothing is INTRODUCED any more.
+    ctx.blocked
+        .block(&hex::encode(introducer.public_key_bytes()));
+    assert!(!introduced(&search(&ctx)));
+
+    // Unblocked again: the held intro counts again.
+    ctx.blocked = BlockList::default();
+    assert!(introduced(&search(&ctx)));
+
+    // Removed from contacts: no longer a trusted introducer.
+    ctx.contacts.clear();
+    assert!(!introduced(&search(&ctx)));
+    assert!(search(&ctx).is_empty());
+
+    // Blocked without ever being a contact row (block list only) also counts.
+    ctx.contacts = vec![LocalContactRow {
+        raven_id: introducer.address(),
+        pub_hex: "00".into(),
+        petname: "Friend".into(),
+        public_tag: String::new(),
+        display_name: "Friend".into(),
+        pinned: false,
+        directly_verified: false,
+    }];
+    ctx.blocked
+        .block(&hex::encode(introducer.public_key_bytes()));
+    assert!(!introduced(&search(&ctx)));
 }
 
 /// Contact-request inbox: accept binds petname + raven_id, emits ContactAcceptV1
@@ -1064,4 +1166,141 @@ fn nearby_confirm_requires_safety_phrase() {
     )
     .unwrap();
     assert_eq!(near.confirmed.len(), 1);
+}
+
+fn contact_row(id: &Identity, petname: &str) -> LocalContactRow {
+    LocalContactRow {
+        raven_id: id.address(),
+        pub_hex: hex::encode(id.public_key_bytes()),
+        petname: petname.into(),
+        public_tag: petname.to_lowercase(),
+        display_name: petname.into(),
+        pinned: false,
+        directly_verified: false,
+    }
+}
+
+/// Exact-ID hit with no signed profile must not claim PUBLIC_SIGNED_PROFILE.
+#[test]
+fn exact_id_without_profile_is_unverified() {
+    let id = Identity::generate();
+    let ctx = DiscoveryContext {
+        now_ms: now(),
+        ..Default::default()
+    };
+    let resolver = DiscoveryResolver::v1();
+    let hits = resolver.search(&id.address(), DiscoveryScope::ExactId, &ctx);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].raven_id, id.address());
+    assert_eq!(hits[0].verification_state, VerificationState::Unverified);
+    // Display form resolves to the same canonical ID.
+    let disp = raven_core::address::to_display(&id.address());
+    let hits = resolver.search(&disp, DiscoveryScope::ExactId, &ctx);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].raven_id, id.address());
+    let json = serde_json::to_string(&hits[0]).unwrap();
+    assert!(json.contains("\"UNVERIFIED\""), "{json}");
+}
+
+/// Exact-ID lookup of a known contact reports the contact trust, not UNVERIFIED.
+#[test]
+fn exact_id_of_contact_without_profile_is_trusted_contact() {
+    let id = Identity::generate();
+    let ctx = DiscoveryContext {
+        contacts: vec![contact_row(&id, "Ada")],
+        now_ms: now(),
+        ..Default::default()
+    };
+    let hits = DiscoveryResolver::v1().search(&id.address(), DiscoveryScope::ExactId, &ctx);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].verification_state,
+        VerificationState::TrustedContact
+    );
+    assert!(hits[0].source_set.contains(&DiscoverySource::LocalContacts));
+}
+
+/// A string that merely starts with `rvn1` is not a Raven ID.
+#[test]
+fn exact_id_rejects_bad_checksum_and_garbage() {
+    let id = Identity::generate();
+    let mut bad = id.address();
+    let last = bad.pop().unwrap();
+    bad.push(if last == 'q' { 'p' } else { 'q' });
+    let ctx = DiscoveryContext {
+        now_ms: now(),
+        ..Default::default()
+    };
+    let resolver = DiscoveryResolver::v1();
+    for q in [bad.as_str(), "rvn1notarealaddress", "rvn1qqqqqqqqqqqqqq"] {
+        assert!(
+            resolver.search(q, DiscoveryScope::ExactId, &ctx).is_empty(),
+            "{q}"
+        );
+    }
+}
+
+/// Blocking is by key: a blocked identity that is not a contact is still
+/// reported BLOCKED on the exact-ID and alias lanes.
+#[test]
+fn exact_id_and_alias_of_blocked_non_contact_are_blocked() {
+    let id = Identity::generate();
+    let mut blocked = BlockList::default();
+    blocked.block(&hex::encode(id.public_key_bytes()));
+    let mut ctx = DiscoveryContext {
+        blocked,
+        now_ms: now(),
+        ..Default::default()
+    };
+    ctx.profiles
+        .put(
+            make_profile(&id, "Spam", &["spammer"], 1, now() + 60_000),
+            now(),
+        )
+        .unwrap();
+    ctx.aliases
+        .put(make_alias(&id, "spammer", 1, now() + 60_000), now())
+        .unwrap();
+    let resolver = DiscoveryResolver::v1();
+    let hits = resolver.search(&id.address(), DiscoveryScope::ExactId, &ctx);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].verification_state, VerificationState::Blocked);
+    let hits = resolver.search("@spammer", DiscoveryScope::Public, &ctx);
+    assert!(!hits.is_empty());
+    assert!(hits
+        .iter()
+        .all(|h| h.verification_state == VerificationState::Blocked));
+}
+
+/// Blocked contacts are reported only when they match the query; a search for
+/// someone else must not list (and rank first) every blocked contact.
+#[test]
+fn local_search_does_not_leak_unrelated_blocked_contacts() {
+    let good = Identity::generate();
+    let bad = Identity::generate();
+    let mut blocked = BlockList::default();
+    blocked.block(&hex::encode(bad.public_key_bytes()));
+    let ctx = DiscoveryContext {
+        contacts: vec![contact_row(&good, "Alice"), contact_row(&bad, "Mallory")],
+        blocked,
+        now_ms: now(),
+        ..Default::default()
+    };
+    let resolver = DiscoveryResolver::v1();
+    for scope in [
+        DiscoveryScope::Local,
+        DiscoveryScope::MyNetwork,
+        DiscoveryScope::All,
+    ] {
+        let hits = resolver.search("alice", scope, &ctx);
+        assert_eq!(hits.len(), 1, "{scope:?}");
+        assert_eq!(hits[0].raven_id, good.address());
+        assert_eq!(
+            hits[0].verification_state,
+            VerificationState::TrustedContact
+        );
+    }
+    let hits = resolver.search("mallory", DiscoveryScope::Local, &ctx);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].verification_state, VerificationState::Blocked);
 }

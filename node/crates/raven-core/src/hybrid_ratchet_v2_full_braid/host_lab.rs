@@ -11,7 +11,9 @@ use crate::hybrid_ratchet_v2_full_braid::wire_rvqi1::{
     decode_rvqi1, encode_rvqi1, Rvqi1, RVQI1_STATUS_QUARANTINED,
 };
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
+use zeroize::{Zeroize, Zeroizing};
 
 pub type ObjectDigest = [u8; 32];
 pub type TransitionId = [u8; 32];
@@ -70,20 +72,46 @@ struct StoredRvor {
     retention_expiry_ms: u64,
 }
 
-#[derive(Debug, Clone)]
+/// The journaled RVBJ1 embeds the complete candidate session state: wiped on
+/// drop, redacted from `Debug`.
+#[derive(Clone)]
 struct JournalRecord {
     object_digest: ObjectDigest,
     intent_bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for JournalRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JournalRecord")
+            .field("object_digest", &self.object_digest)
+            .field("intent_len", &self.intent_bytes.len())
+            .finish()
+    }
+}
+
+impl Drop for JournalRecord {
+    fn drop(&mut self) {
+        self.intent_bytes.zeroize();
+    }
+}
+
+#[derive(Clone)]
 struct RepairSuccessor {
     transition_id: TransitionId,
     /// Exact repair RVBJ1 retained as A–F evidence (not caller IDs alone).
     intent_bytes: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
+impl fmt::Debug for RepairSuccessor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RepairSuccessor")
+            .field("transition_id", &self.transition_id)
+            .field("intent_len", &self.intent_bytes.len())
+            .finish()
+    }
+}
+
+#[derive(Default)]
 struct HostLabState {
     dedup: HashMap<ObjectDigest, DedupRecord>,
     rvors: HashMap<TransitionId, StoredRvor>,
@@ -92,6 +120,45 @@ struct HostLabState {
     live_states: HashMap<ObjectDigest, Vec<u8>>,
     repair_successors: HashMap<TransitionId, RepairSuccessor>,
     clear_call_count: u64,
+}
+
+/// Counts only: `live_states` holds every session's ratchet secrets.
+impl fmt::Debug for HostLabState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostLabState")
+            .field("dedup", &self.dedup.len())
+            .field("rvors", &self.rvors.len())
+            .field("rvqis", &self.rvqis.len())
+            .field("journals", &self.journals.len())
+            .field("live_states", &self.live_states.len())
+            .field("repair_successors", &self.repair_successors.len())
+            .field("clear_call_count", &self.clear_call_count)
+            .finish()
+    }
+}
+
+impl HostLabState {
+    /// Store a live session state, wiping the one it replaces.
+    fn put_live_state(&mut self, object_digest: ObjectDigest, state_bytes: Vec<u8>) {
+        if let Some(mut old) = self.live_states.insert(object_digest, state_bytes) {
+            old.zeroize();
+        }
+    }
+
+    /// Drop a live session state, wiping it.
+    fn remove_live_state(&mut self, object_digest: &ObjectDigest) {
+        if let Some(mut old) = self.live_states.remove(object_digest) {
+            old.zeroize();
+        }
+    }
+}
+
+impl Drop for HostLabState {
+    fn drop(&mut self) {
+        for live in self.live_states.values_mut() {
+            live.zeroize();
+        }
+    }
 }
 
 /// Cloneable handle whose mutation methods execute under one exclusive mutex lease.
@@ -213,20 +280,20 @@ impl MutationLease<'_> {
         if journal.object_digest != object_digest {
             return Err(HostLabError::TransitionMismatch);
         }
-        let live = self
-            .state
-            .live_states
-            .get(&object_digest)
-            .cloned()
-            .ok_or(HostLabError::MissingLiveState)?;
+        let live = Zeroizing::new(
+            self.state
+                .live_states
+                .get(&object_digest)
+                .cloned()
+                .ok_or(HostLabError::MissingLiveState)?,
+        );
         let promoted = pipeline::promote_state(&live, &journal.intent_bytes)
             .map_err(HostLabError::Pipeline)?;
         if promoted.meta.transition_id != transition_id || promoted.meta.pending_phase != 2 {
             return Err(HostLabError::TransitionMismatch);
         }
         self.state
-            .live_states
-            .insert(object_digest, promoted.state_bytes.clone());
+            .put_live_state(object_digest, promoted.state_bytes.clone());
         Ok(promoted.state_bytes)
     }
 
@@ -431,12 +498,13 @@ impl MutationLease<'_> {
         let transition_id = mapping
             .transition_id
             .ok_or(HostLabError::TransitionMismatch)?;
-        let live = self
-            .state
-            .live_states
-            .get(&object_digest)
-            .cloned()
-            .ok_or(HostLabError::MissingLiveState)?;
+        let live = Zeroizing::new(
+            self.state
+                .live_states
+                .get(&object_digest)
+                .cloned()
+                .ok_or(HostLabError::MissingLiveState)?,
+        );
         let live_state = decode_rvfb1(&live).map_err(|_| HostLabError::InvalidWire)?;
         if live_state.prefix.pending_phase != 2
             || live_state.prefix.pending_transition_id != transition_id
@@ -474,8 +542,7 @@ impl MutationLease<'_> {
         }
 
         self.state
-            .live_states
-            .insert(object_digest, cleared.state_bytes.clone());
+            .put_live_state(object_digest, cleared.state_bytes.clone());
         let record = self
             .state
             .dedup
@@ -647,6 +714,10 @@ impl MutationLease<'_> {
         self.state.dedup.remove(&object_digest);
         self.state.rvqis.remove(&transition_id);
         self.state.repair_successors.remove(&transition_id);
+        // The GC'd digest can be reserved again, and `mark_pending_inner` refuses
+        // an object whose live state still exists (`StoreConflict`). Every
+        // pending reference was ruled out above, so the stale state is garbage.
+        self.state.remove_live_state(&object_digest);
         Ok(())
     }
 }
@@ -715,8 +786,7 @@ impl ReservationGuard<'_> {
                 },
             );
             self.state
-                .live_states
-                .insert(self.object_digest, live_state_bytes);
+                .put_live_state(self.object_digest, live_state_bytes);
         }
         let record = self
             .state
@@ -888,8 +958,9 @@ mod tests {
     }
 
     fn conflict_repair_intent(original_intent: &[u8], now_ms: u64) -> PipelineResult {
+        // A different state at the intent's own generation is a real conflict.
         let mut conflict = decode_rvfb1(&before_bytes()).unwrap();
-        conflict.prefix.generation = 99;
+        conflict.prefix.auth_root[0] ^= 1;
         let conflict_live = encode_rvfb1(&conflict).unwrap();
         terminalize_conflict(&conflict_live, original_intent, now_ms).unwrap()
     }
@@ -1343,6 +1414,65 @@ mod tests {
             .unwrap();
         assert!(host.dedup_record(OBJECT).is_none());
         assert!(!host.has_rvqi(prepared.meta.transition_id));
+    }
+
+    #[test]
+    fn gc_reclaims_live_state_so_the_digest_can_be_readmitted() {
+        let host = HostLab::new();
+        let endpoint_expiry = 900_000_000;
+        let prepared = prepare_after_reservation(&host, OBJECT, OWNER, endpoint_expiry, 5_500);
+        promote_and_insert_rvor(&host, OBJECT, &prepared);
+        host.with_lease(|lease| lease.clear_barrier(OBJECT, 5_501))
+            .unwrap();
+        let blocked = host
+            .with_lease(|lease| {
+                lease.quarantine_or_repair_block(OBJECT, prepared.meta.transition_id, 6_000)
+            })
+            .unwrap();
+        let horizon_ms = blocked.horizon_ms.unwrap();
+        host.with_lease(|lease| lease.evict_rvor(prepared.meta.transition_id, horizon_ms))
+            .unwrap();
+        assert!(host.live_state(OBJECT).is_some());
+        host.with_lease(|lease| lease.joint_gc(OBJECT, horizon_ms, blocked.cas_generation))
+            .unwrap();
+        assert!(host.dedup_record(OBJECT).is_none());
+        // The stale per-object session state is gone with the mapping ...
+        assert!(host.live_state(OBJECT).is_none());
+
+        // ... so the same digest is admitted again instead of `StoreConflict`.
+        let again = prepare_after_reservation(&host, OBJECT, OWNER + 1, endpoint_expiry, 9_000);
+        assert_ne!(again.meta.transition_id, prepared.meta.transition_id);
+        assert_eq!(
+            host.dedup_record(OBJECT).unwrap().transition_id,
+            Some(again.meta.transition_id)
+        );
+        assert!(host.live_state(OBJECT).is_some());
+    }
+
+    #[test]
+    fn debug_output_never_prints_session_state() {
+        let host = HostLab::new();
+        let prepared = prepare_after_reservation(&host, OBJECT, OWNER, 900_000_000, 1_000);
+        let live = host.live_state(OBJECT).unwrap();
+        let shown = format!("{host:?}");
+        assert!(shown.contains("live_states: 1"), "{shown}");
+        assert!(shown.contains("journals: 1"), "{shown}");
+        // Raw byte lists (`[82, 86, ...]`) of the state / journal never appear.
+        let state_prefix = format!("{:?}", &live[..16]);
+        let intent_prefix = format!("{:?}", &prepared.intent_bytes[..16]);
+        let shown_state = state_prefix.trim_matches(|c| c == '[' || c == ']');
+        let shown_intent = intent_prefix.trim_matches(|c| c == '[' || c == ']');
+        assert!(!shown.contains(shown_state), "{shown}");
+        assert!(!shown.contains(shown_intent), "{shown}");
+        let journal = host
+            .lock_state()
+            .journals
+            .get(&prepared.meta.transition_id)
+            .cloned()
+            .unwrap();
+        let shown = format!("{journal:?}");
+        assert!(shown.contains("intent_len"), "{shown}");
+        assert!(!shown.contains(shown_intent), "{shown}");
     }
 
     #[test]

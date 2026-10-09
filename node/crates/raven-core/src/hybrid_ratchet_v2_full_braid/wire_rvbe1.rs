@@ -3,6 +3,10 @@
 //! Optional `admitted_trust` (0|128 bytes) is part of the RVBE1 encoding and therefore
 //! bound into `execution_digest`. Host trust admission supplies it before FFI.
 
+use std::fmt;
+
+use zeroize::Zeroize;
+
 use crate::hybrid_ratchet_v2_full_braid::constants::BRAID_MAX_CANONICAL_STATE_BYTES;
 use crate::hybrid_ratchet_v2_full_braid::tr_confirm::AdmittedTrustEvidence;
 use crate::hybrid_ratchet_v2_full_braid::wire_util::{
@@ -22,7 +26,8 @@ pub const BRAID_MAX_REPLAY_ENTRIES: u32 = 64;
 pub const BRAID_MAX_REPLAY_BYTES: u32 = 8192;
 pub const ADMITTED_TRUST_LEN: usize = 128;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Seeds/coins are secret key material: wiped on drop, redacted from Debug.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Rvbe1 {
     pub clock: u64,
     pub cap_payload: u32,
@@ -35,6 +40,31 @@ pub struct Rvbe1 {
     pub ec_dh_seed: Vec<u8>,
     /// Host-admitted cert/identity evidence (digest-bound via execution_digest).
     pub admitted_trust: Option<AdmittedTrustEvidence>,
+}
+
+impl fmt::Debug for Rvbe1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rvbe1")
+            .field("clock", &self.clock)
+            .field("cap_payload", &self.cap_payload)
+            .field("cap_chunks", &self.cap_chunks)
+            .field("cap_state", &self.cap_state)
+            .field("cap_replay_entries", &self.cap_replay_entries)
+            .field("cap_replay_bytes", &self.cap_replay_bytes)
+            .field("keygen_seed_len", &self.keygen_seed.len())
+            .field("encaps_coins_len", &self.encaps_coins.len())
+            .field("ec_dh_seed_len", &self.ec_dh_seed.len())
+            .field("admitted_trust", &self.admitted_trust)
+            .finish()
+    }
+}
+
+impl Drop for Rvbe1 {
+    fn drop(&mut self) {
+        self.keygen_seed.zeroize();
+        self.encaps_coins.zeroize();
+        self.ec_dh_seed.zeroize();
+    }
 }
 
 impl Rvbe1 {

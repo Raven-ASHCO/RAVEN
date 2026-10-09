@@ -55,6 +55,192 @@ def vec(name, desc, inputs, expected, **extra):
     }
 
 
+def write_pair_init_v2_002(
+    *,
+    alice_addr: str,
+    bob_addr: str,
+    alice_dev: Ed25519PrivateKey,
+    bob_dev: Ed25519PrivateKey,
+    alice_dev_priv: bytes,
+    bob_dev_priv: bytes,
+    mlkem_ek: bytes,
+    mlkem_ct: bytes,
+    z_pq: bytes,
+) -> None:
+    """Trust-binding PairInit V2 KAT: every derived value follows from the wire.
+
+    - `responder_prekey_bundle_hash` digests a real RavenPrekeyBundleV1 signed by
+      Bob's identity key (not an ad-hoc SPK||OTP||EK string signed by a device).
+    - `Z_X = X25519(alice_eph, bob_otp)` over exactly the wire keys (§0.3).
+    - Device certs carry dedicated device X25519 keys (never the ephemeral).
+    - The ML-KEM ek/ct/Z_PQ triple is the hybrid KAT's consistent triple.
+    """
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+
+    from raven_protocol import device_cert, prekey
+
+    def x25519_priv(label: bytes) -> X25519PrivateKey:
+        return X25519PrivateKey.from_private_bytes(hashlib.sha256(label).digest())
+
+    def raw_priv(key: X25519PrivateKey) -> bytes:
+        from cryptography.hazmat.primitives import serialization
+
+        return key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+
+    alice_eph = x25519_priv(b"atsam-v2/002/alice-eph-x")
+    alice_dev_x = x25519_priv(b"atsam-v2/002/alice-device-x")
+    bob_dev_x = x25519_priv(b"atsam-v2/002/bob-device-x")
+    bob_spk = x25519_priv(b"atsam-v2/002/bob-spk-x")
+    bob_otp = x25519_priv(b"atsam-v2/002/bob-otp-x")
+    alice_eph_pub = alice_eph.public_key().public_bytes_raw()
+    bob_spk_pub = bob_spk.public_key().public_bytes_raw()
+    bob_otp_pub = bob_otp.public_key().public_bytes_raw()
+    alice_dev_pub = alice_dev.public_key().public_bytes_raw()
+    bob_dev_pub = bob_dev.public_key().public_bytes_raw()
+
+    def signed_cert(identity_priv: bytes, identity_pub: bytes, dev_pub: bytes, dev_x, device_id):
+        cert = device_cert.DeviceCert(
+            device_ed_pub=dev_pub,
+            device_x_pub=dev_x.public_key().public_bytes_raw(),
+            device_id=device_id,
+            not_before=EPOCH_MS,
+            not_after=EPOCH_MS + 365 * 86400_000,
+            capabilities=0,
+        )
+        cert.signature = Ed25519PrivateKey.from_private_bytes(identity_priv).sign(
+            device_cert.signing_bytes(cert)
+        )
+        digest = pair_init.device_certificate_hash(
+            identity_pub, device_cert.signing_bytes(cert), cert.signature
+        )
+        return cert, digest
+
+    alice_cert, alice_cert_hash = signed_cert(
+        ALICE_ED_PRIV, ALICE_ED_PUB, alice_dev_pub, alice_dev_x, "alice-device-v2"
+    )
+    bob_cert, bob_cert_hash = signed_cert(
+        BOB_ED_PRIV, BOB_ED_PUB, bob_dev_pub, bob_dev_x, "bob-device-v2"
+    )
+    assert alice_cert.device_x_pub != alice_eph_pub
+
+    bundle = prekey.PrekeyBundle(
+        identity_ed25519_pub=BOB_ED_PUB,
+        device_id="bob-device-v2",
+        x25519_pub=bob_spk_pub,
+        mlkem768_ek=mlkem_ek,
+        signed_prekey_id=42,
+        one_time_prekey_id=7,
+        one_time_x25519_pub=bob_otp_pub,
+        created_at_ms=EPOCH_MS - 86400_000,
+        expires_at_ms=EPOCH_MS + 30 * 86400_000,
+    )
+    bundle_sb = prekey.signing_bytes(bundle)
+    bundle.signature = Ed25519PrivateKey.from_private_bytes(BOB_ED_PRIV).sign(bundle_sb)
+    assert prekey.verify(bundle)
+    prekey_hash = pair_init.prekey_bundle_hash(bundle_sb, bundle.signature)
+
+    # §0.3: Z_X over the wire's ephemeral × OTP (OTP present); both sides agree.
+    z_x = alice_eph.exchange(X25519PublicKey.from_public_bytes(bob_otp_pub))
+    assert z_x == bob_otp.exchange(X25519PublicKey.from_public_bytes(alice_eph_pub))
+
+    init_id = bytes(range(0x30, 0x40))
+    pairing_nonce = bytes(range(0x40, 0x60))
+    pair = piv2.PairInitV2(
+        initiator_address=alice_addr,
+        responder_address=bob_addr,
+        init_id=init_id,
+        pairing_nonce=pairing_nonce,
+        initiator_device_ed_pub=alice_dev_pub,
+        responder_device_ed_pub=bob_dev_pub,
+        initiator_ephemeral_x25519_pub=alice_eph_pub,
+        responder_signed_x25519_pub=bob_spk_pub,
+        responder_one_time_x25519_pub=bob_otp_pub,
+        initiator_device_cert_hash=alice_cert_hash,
+        responder_device_cert_hash=bob_cert_hash,
+        responder_prekey_bundle_hash=prekey_hash,
+        signed_prekey_id=bundle.signed_prekey_id,
+        one_time_prekey_id=bundle.one_time_prekey_id,
+        responder_mlkem768_ek=mlkem_ek,
+        mlkem768_ciphertext=mlkem_ct,
+        created_at_ms=EPOCH_MS,
+        expires_at_ms=EPOCH_MS + 7 * 86400_000,
+    )
+    pair.signature = alice_dev.sign(piv2.init_signing_bytes(pair))
+    wire = piv2.encode_init(pair)
+    assert piv2.verify_init_signature(pair)
+    expand = piv2.pair_expand(z_x, z_pq, wire)
+    tag = piv2.confirmation_tag(expand.k_confirm, expand.init_hash_v2)
+    resp = piv2.PairResponseV2(
+        init_id=init_id,
+        init_hash=expand.init_hash_v2,
+        responder_device_ed_pub=bob_dev_pub,
+        created_at_ms=EPOCH_MS + 1000,
+        expires_at_ms=EPOCH_MS + 7 * 86400_000,
+        confirmation_tag=tag,
+    )
+    resp.signature = bob_dev.sign(piv2.response_signing_bytes(resp))
+    resp_wire = piv2.encode_response(resp)
+
+    write(
+        "atsam/pair_init_v2_002.json",
+        vec(
+            "PairInit V2 trust-binding KAT (transcript-derivable)",
+            "Z_X = X25519(eph, OTP) over wire keys; real identity-signed "
+            "RavenPrekeyBundleV1 digest; dedicated device X keys; supersedes "
+            "pair_init_v2_001 for trust binding (001 stays codec + expand only)",
+            {
+                "z_pq_hex": z_pq.hex(),
+                "mlkem_source_vector": "atsam/mlkem768_hybrid_kat_001.json",
+                "initiator_identity_ed_pub_hex": ALICE_ED_PUB.hex(),
+                "responder_identity_ed_pub_hex": BOB_ED_PUB.hex(),
+                "initiator_device_ed_priv_hex": alice_dev_priv.hex(),
+                "responder_device_ed_priv_hex": bob_dev_priv.hex(),
+                "initiator_ephemeral_x25519_priv_hex": raw_priv(alice_eph).hex(),
+                "responder_spk_x25519_priv_hex": raw_priv(bob_spk).hex(),
+                "responder_otp_x25519_priv_hex": raw_priv(bob_otp).hex(),
+                "initiator_device_cert": {
+                    "signing_bytes_hex": device_cert.signing_bytes(alice_cert).hex(),
+                    "signature_hex": alice_cert.signature.hex(),
+                },
+                "responder_device_cert": {
+                    "signing_bytes_hex": device_cert.signing_bytes(bob_cert).hex(),
+                    "signature_hex": bob_cert.signature.hex(),
+                },
+                "responder_prekey_bundle": {
+                    "signing_bytes_hex": bundle_sb.hex(),
+                    "signature_hex": bundle.signature.hex(),
+                    "signed_prekey_id": bundle.signed_prekey_id,
+                    "one_time_prekey_id": bundle.one_time_prekey_id,
+                },
+            },
+            {
+                "z_x_hex": z_x.hex(),
+                "initiator_device_cert_hash_hex": alice_cert_hash.hex(),
+                "responder_device_cert_hash_hex": bob_cert_hash.hex(),
+                "responder_prekey_bundle_hash_hex": prekey_hash.hex(),
+                "pair_init_wire_hex": wire.hex(),
+                "pair_init_wire_len": len(wire),
+                "offsets": piv2.wire_offsets(),
+                "transcript_hash_hex": expand.transcript_hash.hex(),
+                "init_hash_v2_hex": expand.init_hash_v2.hex(),
+                "session_id_hex": expand.session_id.hex(),
+                "sk_ec_hex": expand.sk_ec.hex(),
+                "sk_scka_hex": expand.sk_scka.hex(),
+                "k_route_master_hex": expand.k_route_master.hex(),
+                "k_confirm_hex": expand.k_confirm.hex(),
+                "confirmation_tag_hex": tag.hex(),
+                "pair_response_wire_hex": resp_wire.hex(),
+                "pair_response_wire_len": len(resp_wire),
+            },
+            supersedes={"pair_init_v2_001": "trust binding (001 = codec + expand only)"},
+        ),
+    )
+
+
 def main() -> None:
     hybrid = json.loads((OUT / "atsam/mlkem768_hybrid_kat_001.json").read_text())
     z_x = bytes.fromhex(hybrid["expected"]["z_x_hex"])
@@ -86,20 +272,11 @@ def main() -> None:
     bob_spk_pub = bob_spk.public_key().public_bytes_raw()
     bob_otp_pub = bob_otp.public_key().public_bytes_raw()
 
-    # Cert digests (reuse V1 hashing domains via pair_init helpers)
-    alice_cert_sb = (
-        b"rvn1/devcert"
-        + b"\x00\x20"
-        + alice_dev_pub
-        + b"\x00\x20"
-        + bytes(32)
-        + b"\x00\x0ealice-device-v2"
-        + (EPOCH_MS).to_bytes(8, "big")
-        + (EPOCH_MS + 365 * 86400_000).to_bytes(8, "big")
-        + bytes(8)
-    )
-    # Use real device_cert module style via pair_init.device_certificate_hash on stub
-    # Prefer hashing with identity + signing bytes + signature like V1 generator.
+    # Cert digests: identity-signed device certs hashed like the V1 generator.
+    # NOTE (_001 only): Alice's cert reuses her ephemeral as device_x_pub, the
+    # prekey hash below is not a RavenPrekeyBundleV1 digest, and Z_X comes from
+    # the hybrid KAT rather than the wire keys. `_001` is therefore a codec +
+    # expand KAT only; `pair_init_v2_002` (below) is the trust-binding KAT.
     from raven_protocol import device_cert
 
     alice_cert = device_cert.DeviceCert(
@@ -213,6 +390,18 @@ def main() -> None:
                 "pair_response_signing_bytes_hex": piv2.response_signing_bytes(resp).hex(),
             },
         ),
+    )
+
+    write_pair_init_v2_002(
+        alice_addr=alice_addr,
+        bob_addr=bob_addr,
+        alice_dev=alice_dev,
+        bob_dev=bob_dev,
+        alice_dev_priv=alice_dev_priv,
+        bob_dev_priv=bob_dev_priv,
+        mlkem_ek=mlkem_ek,
+        mlkem_ct=mlkem_ct,
+        z_pq=z_pq,
     )
 
     # Negative: V1 wire rejected by V2 decoder

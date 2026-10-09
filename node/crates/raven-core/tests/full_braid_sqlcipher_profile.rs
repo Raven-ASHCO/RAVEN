@@ -8,16 +8,17 @@
 
 use raven_core::full_braid_durable_lab::{
     probe_sqlcipher_lab_linkage, run_temp_store_probe, scan_profile_files_for_plaintext,
-    RavenSqlCipherConnection, RavenSqlCipherFirstInstallProof, RavenSqlCipherRawKey,
-    EXPECTED_CIPHER_VERSION, EXPECTED_CIPHER_VERSION_COMMUNITY, EXPECTED_SQLITE_VERSION,
-    RAVEN_SQLCIPHER_APP_GROUP_PLAINTEXT_HEADER_SIZE, RAVEN_SQLCIPHER_BUSY_TIMEOUT_MS,
-    RAVEN_SQLCIPHER_HMAC_ALGORITHM, RAVEN_SQLCIPHER_KDF_ALGORITHM, RAVEN_SQLCIPHER_PAGE_SIZE,
-    RAVEN_SQLCIPHER_TERMINAL_PLAINTEXT_HEADER_SIZE,
+    RavenSqlCipherConnection, RavenSqlCipherFirstInstallProof, RavenSqlCipherOpenError,
+    RavenSqlCipherRawKey, EXPECTED_CIPHER_VERSION, EXPECTED_CIPHER_VERSION_COMMUNITY,
+    EXPECTED_SQLITE_VERSION, RAVEN_SQLCIPHER_APP_GROUP_PLAINTEXT_HEADER_SIZE,
+    RAVEN_SQLCIPHER_BUSY_TIMEOUT_MS, RAVEN_SQLCIPHER_HMAC_ALGORITHM, RAVEN_SQLCIPHER_KDF_ALGORITHM,
+    RAVEN_SQLCIPHER_PAGE_SIZE, RAVEN_SQLCIPHER_TERMINAL_PLAINTEXT_HEADER_SIZE,
 };
 use rusqlite::config::DbConfig;
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 // SQLCipher cipher_memory_security and temp-directory controls have process-
 // global provider state. Keep this profile integration suite serialized.
@@ -49,7 +50,7 @@ fn sqlcipher_4_17_0_lab_linkage_probe() {
 }
 
 fn profile_key() -> RavenSqlCipherRawKey {
-    RavenSqlCipherRawKey::ios_app_group([0x41; 32], [0x53; 16])
+    RavenSqlCipherRawKey::ios_app_group(&[0x41; 32], [0x53; 16])
 }
 
 fn raw_key_sql(key: u8, salt: u8) -> String {
@@ -147,7 +148,7 @@ fn terminal_profile_uses_key_only_and_an_encrypted_header() {
     let _guard = test_lock();
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("terminal.db");
-    let key = RavenSqlCipherRawKey::terminal([0x31; 32]);
+    let key = RavenSqlCipherRawKey::terminal(&[0x31; 32]);
     let proof = RavenSqlCipherFirstInstallProof::acquire(&path).expect("first install proof");
     let opened = RavenSqlCipherConnection::create(proof, &key).expect("terminal create");
     assert_eq!(
@@ -174,7 +175,7 @@ fn terminal_profile_uses_key_only_and_an_encrypted_header() {
     drop(reopened);
 
     let before = fs::read(&path).expect("terminal before mismatch");
-    let app_group_key = RavenSqlCipherRawKey::ios_app_group([0x31; 32], [0x41; 16]);
+    let app_group_key = RavenSqlCipherRawKey::ios_app_group(&[0x31; 32], [0x41; 16]);
     assert!(RavenSqlCipherConnection::open_existing(&path, &app_group_key).is_err());
     assert_eq!(fs::read(&path).expect("terminal after mismatch"), before);
 }
@@ -194,6 +195,331 @@ fn first_install_proof_is_single_use_and_existing_open_never_creates() {
     assert!(!missing.exists());
 }
 
+/// The SQLCipher profile never loads extensions: the dlopen-based code is
+/// compiled out (not merely disabled per connection), so there is nothing for
+/// a later caller or injected SQL to switch back on.
+#[test]
+fn extension_loading_is_compiled_out_of_the_sqlcipher_profile() {
+    let _guard = test_lock();
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("noext.db");
+    let key = RavenSqlCipherRawKey::terminal(&[0x88; 32]);
+    let opened = RavenSqlCipherConnection::create(
+        RavenSqlCipherFirstInstallProof::acquire(&path).expect("proof"),
+        &key,
+    )
+    .expect("create");
+    let options = &opened.report().compile_options;
+    assert!(
+        options.iter().any(|option| option == "OMIT_LOAD_EXTENSION"),
+        "compile options: {options:?}"
+    );
+    assert!(
+        !options
+            .iter()
+            .any(|option| option.contains("ENABLE_LOAD_EXTENSION")),
+        "compile options: {options:?}"
+    );
+    let error = opened
+        .connection_for_lab()
+        .query_row("SELECT load_extension('/nonexistent/raven')", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect_err("load_extension must not exist");
+    assert!(
+        error.to_string().contains("no such function"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A truncated store must not be re-initialised by `open_existing`: only
+/// `create` may turn an empty file into a database.
+#[test]
+fn zero_byte_and_sub_page_existing_files_are_refused_without_mutation() {
+    let _guard = test_lock();
+    let root = tempfile::tempdir().expect("tempdir");
+    let terminal = RavenSqlCipherRawKey::terminal(&[0x31; 32]);
+    let app_group = profile_key();
+    for (key_name, key) in [("terminal", &terminal), ("app_group", &app_group)] {
+        for (size, reason) in [(0usize, "empty"), (100, "short"), (4095, "short")] {
+            let path = root.path().join(format!("{key_name}-{size}.db"));
+            let content = vec![0xA5u8; size];
+            fs::write(&path, &content).expect("fixture");
+            let result = RavenSqlCipherConnection::open_existing(&path, key);
+            assert!(
+                matches!(&result, Err(RavenSqlCipherOpenError::PathRejected(got)) if *got == reason),
+                "{key_name} {size}: expected PathRejected({reason}), got {:?}",
+                result.err()
+            );
+            assert_eq!(fs::read(&path).expect("untouched"), content);
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = root.path().join(format!("{key_name}-{size}.db{suffix}"));
+                assert!(!sidecar.exists(), "{key_name} {size}: {suffix} created");
+            }
+        }
+    }
+}
+
+/// `-shm` is volatile and SQLite rebuilds it from the WAL, so an `-shm` that
+/// never got its header onto disk must not make a recoverable store
+/// unopenable. (A valid-looking but foreign `-shm` stays rejected: see the
+/// swapped-sidecar test.)
+#[test]
+fn uninitialised_shm_next_to_a_valid_wal_does_not_block_reopen() {
+    let _guard = test_lock();
+    let root = tempfile::tempdir().expect("tempdir");
+    let source = root.path().join("source.db");
+    let key = RavenSqlCipherRawKey::terminal(&[0x44; 32]);
+    let opened = RavenSqlCipherConnection::create(
+        RavenSqlCipherFirstInstallProof::acquire(&source).expect("proof"),
+        &key,
+    )
+    .expect("create");
+    opened
+        .connection_for_lab()
+        .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+        .expect("preserve wal");
+    opened
+        .connection_for_lab()
+        .execute_batch(
+            "CREATE TABLE payload(v BLOB); INSERT INTO payload VALUES(randomblob(24000));",
+        )
+        .expect("write wal");
+    let wal = fs::read(root.path().join("source.db-wal")).expect("wal bytes");
+    assert!(wal.len() > 32, "fixture needs a non-empty WAL");
+    let main = fs::read(&source).expect("main bytes");
+    drop(opened);
+
+    for (name, shm) in [
+        ("shm-missing", None),
+        ("shm-empty", Some(Vec::new())),
+        ("shm-short", Some(vec![0x5Au8; 95])),
+        ("shm-zeroed", Some(vec![0u8; 32768])),
+    ] {
+        let path = root.path().join(format!("{name}.db"));
+        fs::write(&path, &main).expect("main copy");
+        fs::write(root.path().join(format!("{name}.db-wal")), &wal).expect("wal copy");
+        if let Some(shm) = shm {
+            fs::write(root.path().join(format!("{name}.db-shm")), shm).expect("shm fixture");
+        }
+        let reopened = RavenSqlCipherConnection::open_existing(&path, &key)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let rows: i64 = reopened
+            .connection_for_lab()
+            .query_row("SELECT count(*) FROM payload", [], |row| row.get(0))
+            .expect("recovered wal");
+        assert_eq!(rows, 1, "{name}");
+    }
+
+    // Same for an empty WAL next to a header-less `-shm`.
+    let path = root.path().join("empty-wal.db");
+    fs::write(&path, &main).expect("main copy");
+    fs::write(root.path().join("empty-wal.db-wal"), b"").expect("empty wal");
+    fs::write(root.path().join("empty-wal.db-shm"), [0u8; 10]).expect("short shm");
+    RavenSqlCipherConnection::open_existing(&path, &key)
+        .expect("empty WAL with a header-less -shm reopens");
+}
+
+#[test]
+fn checkpoint_truncate_fails_closed_while_a_reader_blocks_it() {
+    let _guard = test_lock();
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("busy.db");
+    let key = RavenSqlCipherRawKey::terminal(&[0x55; 32]);
+    let writer = RavenSqlCipherConnection::create(
+        RavenSqlCipherFirstInstallProof::acquire(&path).expect("proof"),
+        &key,
+    )
+    .expect("create");
+    writer
+        .connection_for_lab()
+        .execute_batch("CREATE TABLE busy(v INTEGER); INSERT INTO busy VALUES(1);")
+        .expect("seed");
+    let reader = RavenSqlCipherConnection::open_existing(&path, &key).expect("second connection");
+    reader
+        .connection_for_lab()
+        .execute_batch("BEGIN; SELECT count(*) FROM busy;")
+        .expect("hold a read snapshot");
+    writer
+        .connection_for_lab()
+        .execute_batch("INSERT INTO busy VALUES(2);")
+        .expect("advance the WAL past the reader");
+    // The 5 s profile timeout would only slow this down; the result is the same.
+    writer
+        .connection_for_lab()
+        .busy_timeout(Duration::ZERO)
+        .expect("no wait");
+    assert!(
+        matches!(
+            writer.checkpoint_truncate(),
+            Err(RavenSqlCipherOpenError::Sqlite {
+                stage: "checkpoint_busy",
+                ..
+            })
+        ),
+        "a blocked checkpoint must not read as success"
+    );
+    reader
+        .connection_for_lab()
+        .execute_batch("COMMIT;")
+        .expect("release the reader");
+    writer
+        .checkpoint_truncate()
+        .expect("checkpoint succeeds once unblocked");
+}
+
+#[test]
+fn plaintext_scan_fails_closed_on_unreadable_inputs() {
+    let _guard = test_lock();
+    let root = tempfile::tempdir().expect("tempdir");
+    let temp = root.path().join("temp");
+    fs::create_dir(&temp).expect("temp");
+    let path = root.path().join("scan.db");
+    let key = RavenSqlCipherRawKey::terminal(&[0x66; 32]);
+    let opened = RavenSqlCipherConnection::create(
+        RavenSqlCipherFirstInstallProof::acquire(&path).expect("proof"),
+        &key,
+    )
+    .expect("create");
+    opened.checkpoint_truncate().expect("checkpoint");
+    drop(opened);
+    let sentinel = b"RAVEN_SCAN_FAIL_CLOSED_SENTINEL_0123456789ABCDEF";
+
+    scan_profile_files_for_plaintext(&path, &temp, sentinel)
+        .expect("existing database, absent sidecars and an empty temp dir are a clean scan");
+    assert!(matches!(
+        scan_profile_files_for_plaintext(&root.path().join("absent.db"), &temp, sentinel),
+        Err(RavenSqlCipherOpenError::PathRejected("scan_missing"))
+    ));
+    assert!(matches!(
+        scan_profile_files_for_plaintext(&path, &root.path().join("absent-temp"), sentinel),
+        Err(RavenSqlCipherOpenError::TempDirectoryRejected)
+    ));
+    // A directory where the database should be is unreadable, not "clean".
+    assert!(matches!(
+        scan_profile_files_for_plaintext(&temp, &temp, sentinel),
+        Err(RavenSqlCipherOpenError::PathRejected("scan_read"))
+    ));
+    // Spill in a nested temp directory is found, not skipped as a non-file.
+    let nested = temp.join("a").join("b");
+    fs::create_dir_all(&nested).expect("nested temp");
+    fs::write(nested.join("leak.tmp"), sentinel).expect("nested leak");
+    assert!(matches!(
+        scan_profile_files_for_plaintext(&path, &temp, sentinel),
+        Err(RavenSqlCipherOpenError::PlaintextSentinelFound)
+    ));
+}
+
+/// `cipher_memory_security` is process-global and sticky, so the order can
+/// only be observed in a fresh process: a wrong-key open never reaches the
+/// post-integrity step, yet the flag must already be on because it is set
+/// before the key is applied.
+#[test]
+fn memory_security_is_enabled_before_the_key_is_applied() {
+    let _guard = test_lock();
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("memsec.db");
+    let key = RavenSqlCipherRawKey::terminal(&[0x01; 32]);
+    drop(
+        RavenSqlCipherConnection::create(
+            RavenSqlCipherFirstInstallProof::acquire(&path).expect("proof"),
+            &key,
+        )
+        .expect("create"),
+    );
+    let executable = std::env::current_exe().expect("current test executable");
+    let status = std::process::Command::new(&executable)
+        .args(["--exact", "memory_security_wrong_key_helper", "--nocapture"])
+        .env("RAVEN_MEMSEC_CHILD_PATH", &path)
+        .status()
+        .expect("spawn memory-security child");
+    assert!(status.success(), "child observed memory security off");
+}
+
+#[test]
+fn memory_security_wrong_key_helper() {
+    let Some(path) = std::env::var_os("RAVEN_MEMSEC_CHILD_PATH") else {
+        return;
+    };
+    let wrong_key = RavenSqlCipherRawKey::terminal(&[0x02; 32]);
+    assert!(RavenSqlCipherConnection::open_existing(Path::new(&path), &wrong_key).is_err());
+    let probe = rusqlite::Connection::open_in_memory().expect("probe connection");
+    let state: String = probe
+        .query_row("PRAGMA cipher_memory_security", [], |row| row.get(0))
+        .expect("read cipher_memory_security");
+    assert_eq!(state, "1", "memory security must precede the key");
+}
+
+/// macOS/iOS: plain fsync does not flush the drive cache, so durability needs
+/// F_FULLFSYNC for both commits and checkpoints.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn apple_profile_requests_full_fsync_for_commits_and_checkpoints() {
+    let _guard = test_lock();
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("fullfsync.db");
+    let key = RavenSqlCipherRawKey::terminal(&[0x77; 32]);
+    let opened = RavenSqlCipherConnection::create(
+        RavenSqlCipherFirstInstallProof::acquire(&path).expect("proof"),
+        &key,
+    )
+    .expect("create");
+    for pragma in ["fullfsync", "checkpoint_fullfsync"] {
+        let value: i64 = opened
+            .connection_for_lab()
+            .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))
+            .expect("read pragma");
+        assert_eq!(value, 1, "{pragma}");
+    }
+    opened
+        .reverify_profile_for_lab()
+        .expect("reverify requires both");
+}
+
+#[test]
+fn planted_empty_file_after_proof_is_refused_not_adopted() {
+    let _guard = test_lock();
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("profile.db");
+    let proof = RavenSqlCipherFirstInstallProof::acquire(&path).expect("proof");
+    // Another local process races the proof with an empty, permissive file.
+    fs::write(&path, b"").expect("plant empty file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod");
+    }
+    let key = profile_key();
+    assert!(matches!(
+        RavenSqlCipherConnection::create(proof, &key),
+        Err(raven_core::full_braid_durable_lab::RavenSqlCipherOpenError::FirstInstallProofStale)
+    ));
+    assert_eq!(fs::read(&path).expect("planted file untouched"), b"");
+}
+
+#[cfg(unix)]
+#[test]
+fn created_database_and_sidecars_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = test_lock();
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("profile.db");
+    let proof = RavenSqlCipherFirstInstallProof::acquire(&path).expect("proof");
+    let key = profile_key();
+    let opened = RavenSqlCipherConnection::create(proof, &key).expect("create");
+    opened
+        .connection_for_lab()
+        .execute_batch("CREATE TABLE owner_only(v INTEGER); INSERT INTO owner_only VALUES(1);")
+        .expect("write");
+    let mode = |p: &Path| fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = root.path().join(format!("profile.db{suffix}"));
+        assert!(sidecar.exists(), "{suffix} expected in WAL mode");
+        assert_eq!(mode(&sidecar), 0o600, "{suffix}");
+    }
+}
+
 #[test]
 fn wrong_key_and_plaintext_database_fail_closed_without_recreation() {
     let _guard = test_lock();
@@ -210,7 +536,7 @@ fn wrong_key_and_plaintext_database_fail_closed_without_recreation() {
     drop(opened);
     let before = fs::read(&path).expect("before");
 
-    let wrong_key = RavenSqlCipherRawKey::ios_app_group([0x42; 32], [0x53; 16]);
+    let wrong_key = RavenSqlCipherRawKey::ios_app_group(&[0x42; 32], [0x53; 16]);
     assert!(RavenSqlCipherConnection::open_existing(&path, &wrong_key).is_err());
     assert_eq!(fs::read(&path).expect("after wrong key"), before);
 
@@ -238,7 +564,7 @@ fn wrong_salt_and_nonstandard_cipher_profiles_are_rejected() {
         .expect("good write");
     good.checkpoint_truncate().expect("checkpoint");
     drop(good);
-    let wrong_salt = RavenSqlCipherRawKey::ios_app_group([0x41; 32], [0x54; 16]);
+    let wrong_salt = RavenSqlCipherRawKey::ios_app_group(&[0x41; 32], [0x54; 16]);
     assert!(RavenSqlCipherConnection::open_existing(&good_path, &wrong_salt).is_err());
 
     for (name, profile) in [
@@ -363,8 +689,8 @@ fn independently_swapped_wal_and_shm_are_rejected_without_mutation() {
     let root = tempfile::tempdir().expect("tempdir");
     let a = root.path().join("a.db");
     let b = root.path().join("b.db");
-    let key_a = RavenSqlCipherRawKey::ios_app_group([0x71; 32], [0x72; 16]);
-    let key_b = RavenSqlCipherRawKey::ios_app_group([0x81; 32], [0x82; 16]);
+    let key_a = RavenSqlCipherRawKey::ios_app_group(&[0x71; 32], [0x72; 16]);
+    let key_b = RavenSqlCipherRawKey::ios_app_group(&[0x81; 32], [0x82; 16]);
 
     let opened_a = RavenSqlCipherConnection::create(
         RavenSqlCipherFirstInstallProof::acquire(&a).expect("a proof"),
@@ -453,7 +779,7 @@ fn crash_writer_helper() {
     };
     let boundary = std::env::var("RAVEN_0A4_CRASH_BOUNDARY").expect("crash boundary");
     let path = std::path::PathBuf::from(path);
-    let key = RavenSqlCipherRawKey::ios_app_group([0x91; 32], [0x92; 16]);
+    let key = RavenSqlCipherRawKey::ios_app_group(&[0x91; 32], [0x92; 16]);
     let opened = RavenSqlCipherConnection::create(
         RavenSqlCipherFirstInstallProof::acquire(&path).expect("crash proof"),
         &key,
@@ -505,7 +831,7 @@ fn crash_after_transaction_boundaries_reopens_only_valid_state() {
             .status()
             .expect("spawn crash child");
         assert_eq!(status.code(), Some(86), "boundary={boundary}");
-        let key = RavenSqlCipherRawKey::ios_app_group([0x91; 32], [0x92; 16]);
+        let key = RavenSqlCipherRawKey::ios_app_group(&[0x91; 32], [0x92; 16]);
         let reopened = RavenSqlCipherConnection::open_existing(&path, &key)
             .unwrap_or_else(|error| panic!("boundary={boundary}: {error}"));
         let rows: i64 = reopened
@@ -529,7 +855,7 @@ fn commoncrypto_openssl_reciprocal_interop_phase() {
     let phase = std::env::var("RAVEN_0A4_INTEROP_PHASE").expect("RAVEN_0A4_INTEROP_PHASE");
     let swift_path = directory.join("swift-commoncrypto.db");
     let rust_path = directory.join("rust-openssl.db");
-    let key = RavenSqlCipherRawKey::ios_app_group([0x61; 32], [0x73; 16]);
+    let key = RavenSqlCipherRawKey::ios_app_group(&[0x61; 32], [0x73; 16]);
     let sentinel = b"RAVEN-0A4-HIGH-ENTROPY-SENTINEL-04f65e46b7d8803a9c0289d9c70663d9";
 
     match phase.as_str() {
@@ -596,4 +922,61 @@ fn commoncrypto_openssl_reciprocal_interop_phase() {
         }
         other => panic!("unsupported RAVEN_0A4_INTEROP_PHASE={other}"),
     }
+}
+
+/// storage-durable#6 negative test (the "CI grep" for `ALG_PLAIN`). The lab
+/// Secret Service client still opens a `plain` session instead of the audited
+/// fork's DH-only session. Keep code and audit docs in sync: while any plain
+/// session code exists, it must stay inside the lab, the Linux lab must stay
+/// `PRODUCTION_ENABLED = false`, and the module docs must say it misses hard
+/// stop #1. No other raven-core source may open a plain session.
+#[test]
+fn secret_service_plain_session_stays_confined_to_the_held_lab() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lab = src.join("full_braid_durable_lab");
+    let ss_client = fs::read_to_string(lab.join("protected_anchor_linux_ss.rs")).unwrap();
+    let linux_lab = fs::read_to_string(lab.join("protected_anchor_linux.rs")).unwrap();
+
+    let plain_markers = [
+        "EncryptionType::Plain",
+        "ALG_PLAIN",
+        "open_session(\"plain\"",
+    ];
+    if plain_markers
+        .iter()
+        .any(|marker| ss_client.contains(marker))
+    {
+        assert!(
+            linux_lab.contains("pub const PRODUCTION_ENABLED: bool = false;"),
+            "plain Secret Service session requires the Linux lab to stay production-disabled"
+        );
+        assert!(
+            ss_client.contains("does NOT meet hard stop #1"),
+            "plain-session module docs must record the hard stop #1 gap"
+        );
+    }
+
+    let mut stack = vec![src.clone()];
+    let mut offenders = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path != lab {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = fs::read_to_string(&path).unwrap();
+                if plain_markers.iter().any(|marker| text.contains(marker)) {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "plain Secret Service session outside the held lab: {offenders:?}"
+    );
 }

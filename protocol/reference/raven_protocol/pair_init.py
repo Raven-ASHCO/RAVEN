@@ -10,10 +10,12 @@ from dataclasses import dataclass, field
 import hashlib
 import hmac
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
 
-from . import address, indexed_session
+from . import address, ed25519_strict, indexed_session
 
 
 VERSION = 1
@@ -41,6 +43,11 @@ MLKEM768_CT_LEN = 1088
 SIGNATURE_LEN = 64
 ADDRESS_LEN = 44
 PROFILE_LEN = len(PROFILE_ID)
+# Bounded peer clock skew (RAVEN_PAIR_INIT_V1.md §1, §5; Rust
+# `prekey_lifecycle::MAX_PREKEY_FUTURE_SKEW_MS`). It relaxes only START bounds
+# (signed creation instants compared with the verifier's clock or with the
+# other peer's trust records); every expiry bound stays exact.
+MAX_PEER_CLOCK_SKEW_MS = 300_000
 
 INIT_SIGNED_PREFIX_LEN = (
     8 + 1 + 1 + 1 + 1 + PROFILE_LEN + ADDRESS_LEN * 2 + INIT_ID_LEN
@@ -117,6 +124,21 @@ def _address_bytes(value: str, field_name: str) -> bytes:
     return encoded
 
 
+# Any scalar works: clamped X25519 scalars are cofactor multiples smaller than
+# both prime orders, so the agreement is all-zero exactly for small-order
+# inputs, whatever the responder's real private key is.
+_CONTRIBUTORY_PROBE = X25519PrivateKey.from_private_bytes(bytes([0x5A]) * 32)
+
+
+def is_contributory_x25519(public: bytes) -> bool:
+    """False for low-order (non-contributory) X25519 public keys."""
+    try:
+        _CONTRIBUTORY_PROBE.exchange(X25519PublicKey.from_public_bytes(public))
+    except ValueError:
+        return False
+    return True
+
+
 def _validate_time(created_at_ms: int, expires_at_ms: int) -> None:
     _u64(created_at_ms)
     _u64(expires_at_ms)
@@ -183,6 +205,8 @@ def _validate_init(value: PairInit, require_signature: bool) -> None:
     )
     if value.initiator_ephemeral_x25519_pub == bytes(X25519_KEY_LEN):
         raise ValueError("initiator_ephemeral_x25519_pub must not be all-zero")
+    if not is_contributory_x25519(value.initiator_ephemeral_x25519_pub):
+        raise ValueError("initiator_ephemeral_x25519_pub must not be a low-order point")
     _require_bytes(
         value.responder_signed_x25519_pub,
         X25519_KEY_LEN,
@@ -403,17 +427,19 @@ def verify_init(
         if value.responder_mlkem768_ek != _require_bytes(expected_responder_mlkem768_ek, MLKEM768_EK_LEN, "expected_responder_mlkem768_ek"):
             return False
         if (
-            value.created_at_ms < expected_trust_not_before_ms
+            value.created_at_ms + MAX_PEER_CLOCK_SKEW_MS < expected_trust_not_before_ms
             or value.expires_at_ms > expected_trust_not_after_ms
         ):
             return False
-        if not value.created_at_ms <= now_ms < value.expires_at_ms:
+        if (
+            value.created_at_ms > now_ms + MAX_PEER_CLOCK_SKEW_MS
+            or now_ms >= value.expires_at_ms
+        ):
             return False
-        Ed25519PublicKey.from_public_bytes(value.initiator_device_ed_pub).verify(
-            value.signature, init_signing_bytes(value)
+        return ed25519_strict.verify(
+            value.initiator_device_ed_pub, value.signature, init_signing_bytes(value)
         )
-        return True
-    except (InvalidSignature, ValueError):
+    except ValueError:
         return False
 
 
@@ -530,15 +556,17 @@ def verify_response(
             or value.expires_at_ms > accepted_init.expires_at_ms
         ):
             return False
-        if not value.created_at_ms <= now_ms < value.expires_at_ms:
+        if (
+            value.created_at_ms > now_ms + MAX_PEER_CLOCK_SKEW_MS
+            or now_ms >= value.expires_at_ms
+        ):
             return False
         if not hmac.compare_digest(
             value.confirmation_tag, confirmation_tag(root, digest)
         ):
             return False
-        Ed25519PublicKey.from_public_bytes(value.responder_device_ed_pub).verify(
-            value.signature, response_signing_bytes(value)
+        return ed25519_strict.verify(
+            value.responder_device_ed_pub, value.signature, response_signing_bytes(value)
         )
-        return True
-    except (InvalidSignature, ValueError):
+    except ValueError:
         return False

@@ -5,9 +5,9 @@ Status legend: `NOT STARTED` · `IN PROGRESS` · `BLOCKED` · `DONE` · `WAIVED`
 | Deliverable | Owner (role) | Status | Evidence / notes |
 |-------------|--------------|--------|------------------|
 | Architecture map | #1 | DONE | Architect deliverable: [`architecture-dependency-map.md`](architecture-dependency-map.md) (PR cites Cargo.toml, ADRs 0001–0003, MESH/SERVERLESS, THREAT_MODEL, RDAP `main`). **Lock accepted;** founder try-phase **executed evidence** required before any pathway is “proven” (§2.1). Pass = **Delivered + ACK + dedup + opaque** on a **named** path; **≥2 OS** or Architecture **and** Security **WAIVE**; labels **per OS × path**. Aligns SRE honesty bar ([PR #29](https://github.com/Raven-ASHCO/RAVEN/pull/29) `terminal-path-reliability.md`). **Bridge:** sealed-ACK-only / opaque — no decrypt, no mint endpoint ACKs. |
-| Trust boundaries | #1, #17, #6 | DONE | Architect draft: [`trust-boundaries.md`](trust-boundaries.md). **OPEN-ID-P0:** Identity docs [PR#5](https://github.com/Raven-ASHCO/RAVEN/pull/5) (`SPRINT0_IDENTITY_THREAT_MODEL.md` §3.2 P0 + G5); Architect ack on §2.4 + P0 note; **code held.** **#17 + #6 countersign still requested** (not a self-approval of the assurance artifact). |
+| Trust boundaries | #1, #17, #6 | DONE | Architect draft: [`trust-boundaries.md`](trust-boundaries.md). **OPEN-ID-P0:** Identity docs [PR#5](https://github.com/Raven-ASHCO/RAVEN/pull/5) (`SPRINT0_IDENTITY_THREAT_MODEL.md` §3.2 P0 + G5); Architect ack on §2.4 + P0 note; code since mitigated in the authz paths (`BlockList` fail-closed via `load_checked`; see the 2026-10-05 update in `trust-boundaries.md`). **#17 + #6 countersign still requested** (not a self-approval of the assurance artifact). |
 | Component ownership | Domain leads #2–#20 | NOT STARTED | Role charters drafted in `03-role-charters.md` |
-| CODEOWNERS | #20, #1 | BLOCKED | Draft in `artifacts/`; **blocked on GitHub Org** (see audit) |
+| CODEOWNERS | #20, #1 | DONE (per [`github-org-plan.md`](github-org-plan.md), status 2026-09-04) | Org, teams, CODEOWNERS and `main` protection are recorded as live there; this row was previously “blocked on GitHub Org” and is not re-verified from this tree |
 | PR risk classification | #17, #1 | IN PROGRESS | Classes defined in `01-risk-classes.md`; not yet enforced in PR template |
 | Required review matrix | #17 | IN PROGRESS | `04-approval-matrix.md` drafted; not enforced in branch protection |
 | CI required checks | #20 | NOT STARTED | Workflows exist (`raven-serverless.yml`, `selftest.yml`); not required on `main` |
@@ -24,4 +24,4 @@ All rows **DONE** or **WAIVED** (waiver requires Architecture Board + Security B
 
 ## Blocker
 
-- [ ] Create GitHub org `Raven-ASHCO` (blocked on founder action in GitHub UI)
+- [x] Create GitHub org `Raven-ASHCO` — done per [`github-org-plan.md`](github-org-plan.md) (status 2026-09-04: org live, teams live, repos transferred); not re-verified from this tree

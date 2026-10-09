@@ -5,14 +5,11 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ._canon import lp, u64
 from . import address as raven_address
+from . import ed25519_strict
 from .pair_init import device_certificate_hash
 
 MAGIC = b"RVDR1\0\0\0"
@@ -120,6 +117,14 @@ def _read_lp(buf: bytes, off: int) -> tuple[bytes, int]:
     return buf[off : off + n], off + n
 
 
+def _take(buf: bytes, off: int, n: int) -> tuple[bytes, int]:
+    """Bounds-checked fixed-size read (the length floor assumes 1-byte ids)."""
+    end = off + n
+    if end > len(buf):
+        raise ValueError("truncated field")
+    return buf[off:end], end
+
+
 def decode(wire: bytes) -> DeviceRevocationV1:
     if not isinstance(wire, (bytes, bytearray)):
         raise ValueError("wire must be bytes")
@@ -139,23 +144,18 @@ def decode(wire: bytes) -> DeviceRevocationV1:
         raise ValueError("identity_address not ASCII") from e
     _require_address(identity_address)
     device_id, off = _read_lp(wire, off)
-    device_ed = wire[off : off + PUB_LEN]
-    off += PUB_LEN
-    device_x = wire[off : off + PUB_LEN]
-    off += PUB_LEN
-    cert_hash = wire[off : off + HASH_LEN]
-    off += HASH_LEN
+    device_ed, off = _take(wire, off, PUB_LEN)
+    device_x, off = _take(wire, off, PUB_LEN)
+    cert_hash, off = _take(wire, off, HASH_LEN)
     issuer_id, off = _read_lp(wire, off)
-    issuer_seq = int.from_bytes(wire[off : off + 8], "big")
-    off += 8
-    rev_id = wire[off : off + REVOCATION_ID_LEN]
-    off += REVOCATION_ID_LEN
-    reason = wire[off]
-    off += 1
-    created = int.from_bytes(wire[off : off + 8], "big")
-    off += 8
-    sig = wire[off : off + SIGNATURE_LEN]
-    off += SIGNATURE_LEN
+    seq_raw, off = _take(wire, off, 8)
+    issuer_seq = int.from_bytes(seq_raw, "big")
+    rev_id, off = _take(wire, off, REVOCATION_ID_LEN)
+    reason_raw, off = _take(wire, off, 1)
+    reason = reason_raw[0]
+    created_raw, off = _take(wire, off, 8)
+    created = int.from_bytes(created_raw, "big")
+    sig, off = _take(wire, off, SIGNATURE_LEN)
     if off != len(wire):
         raise ValueError("trailing bytes")
     if rev_id == bytes(REVOCATION_ID_LEN):
@@ -201,11 +201,8 @@ def verify(r: DeviceRevocationV1, identity_ed_pub: bytes) -> bool:
     if raven_address.encode(identity_ed_pub) != r.identity_address:
         return False
     try:
-        Ed25519PublicKey.from_public_bytes(identity_ed_pub).verify(
-            r.signature, signing_bytes(r)
-        )
-        return True
-    except (InvalidSignature, ValueError):
+        return ed25519_strict.verify(identity_ed_pub, r.signature, signing_bytes(r))
+    except ValueError:
         return False
 
 

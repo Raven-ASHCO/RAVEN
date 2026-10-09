@@ -13,14 +13,21 @@ export RAVEN_IDENTITY_BACKEND=locked-file
 export RAVEN_CHAT_HISTORY_BACKEND=locked-file
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../../scripts/lib/harness_util.sh
+source "$ROOT/../scripts/lib/harness_util.sh"
 BIN="$ROOT/target/debug"
 ASH="$BIN/ash"
 NODE="$BIN/raven-node"
-WORKDIR="/tmp/raven-lan-direct-$$"
+# mktemp (0700, never pre-existing): a predictable /tmp name could be pre-created
+# or symlinked by another user. Short /tmp prefix keeps AF_UNIX sun_path in range.
+WORKDIR="$(mktemp -d /tmp/raven-lan-direct-XXXXXX)"
 A="$WORKDIR/a"
 B="$WORKDIR/b"
-A_PORT="${A_PORT:-$((18000 + $$ % 500))}"
-B_PORT="${B_PORT:-$((18500 + $$ % 500))}"
+# Listeners bind port 0 and the harness reads the bound address back from the
+# node log, so a busy fixed port can never fail the run. A_PORT/B_PORT/C_PORT
+# stay as optional overrides (default 0 = OS-assigned).
+A_PORT="${A_PORT:-0}"
+B_PORT="${B_PORT:-0}"
 A_PID=""
 B_PID=""
 C_PID=""
@@ -71,7 +78,7 @@ B_PID=$!
 
 # IPC can come up before LAN preflight (session/prekey/history) finishes bind.
 for _ in $(seq 1 150); do
-  if [[ -S "$A/raven-node.sock" && -S "$B/raven-node.sock" ]] \
+  if raven_ipc_up "$ASH" "$A" && raven_ipc_up "$ASH" "$B" \
     && grep -q "lan_direct: listen" "$WORKDIR/a.node.log" \
     && grep -q "lan_direct: listen" "$WORKDIR/b.node.log"; then
     break
@@ -84,8 +91,8 @@ for _ in $(seq 1 150); do
   fi
   sleep 0.1
 done
-if [[ ! -S "$A/raven-node.sock" || ! -S "$B/raven-node.sock" ]]; then
-  echo "daemons failed to create IPC sockets" >&2
+if ! raven_ipc_up "$ASH" "$A" || ! raven_ipc_up "$ASH" "$B"; then
+  echo "daemons did not answer IPC (ash ipc-ping)" >&2
   cat "$WORKDIR/a.node.log" "$WORKDIR/b.node.log" >&2 || true
   exit 1
 fi
@@ -96,19 +103,26 @@ if ! grep -q "lan_direct: listen" "$WORKDIR/a.node.log" || ! grep -q "lan_direct
   cat "$WORKDIR/a.node.log" "$WORKDIR/b.node.log" >&2 || true
   exit 1
 fi
-echo "A_PORT=$A_PORT B_PORT=$B_PORT"
+A_DIAL="$(raven_listen_addr "$WORKDIR/a.node.log" lan_direct)"
+B_DIAL="$(raven_listen_addr "$WORKDIR/b.node.log" lan_direct)"
+if [[ -z "$A_DIAL" || -z "$B_DIAL" ]]; then
+  echo "could not read the bound lan_direct address from the node logs" >&2
+  cat "$WORKDIR/a.node.log" "$WORKDIR/b.node.log" >&2 || true
+  exit 1
+fi
+echo "A_LAN=$A_DIAL B_LAN=$B_DIAL"
 
 echo "=== contact add (address + pub_hex + lan_dial) ==="
 "$ASH" --data-dir "$A" contact add \
   --address "$B_ADDR" --pub-hex "$B_PUB" --petname "Bob" --tag bob \
-  --lan-dial "127.0.0.1:${B_PORT}"
+  --lan-dial "$B_DIAL"
 "$ASH" --data-dir "$B" contact add \
   --address "$A_ADDR" --pub-hex "$A_PUB" --petname "Alice" --tag alice \
-  --lan-dial "127.0.0.1:${A_PORT}"
+  --lan-dial "$A_DIAL"
 
 echo "=== ash send --contact @bob (no --peer / no lab import) ==="
 set +e
-printf '%s\n' "hello from a" | "$ASH" --data-dir "$A" send --contact @bob \
+printf '%s\n' "hello from a" | raven_timeout 90 "$ASH" --data-dir "$A" send --contact @bob \
   >"$WORKDIR/a.send.out" 2>"$WORKDIR/a.send.err"
 SEND_RC=$?
 set -e
@@ -136,13 +150,10 @@ set +e
 CHAT_OUT="$WORKDIR/a.chat.out"
 CHAT_ERR="$WORKDIR/a.chat.err"
 # Require exact 'left chat' and exit 0 only — timeout (124) is a failure.
-if command -v timeout >/dev/null 2>&1; then
-  timeout 8s bash -c "printf '' | \"$ASH\" --data-dir \"$A\" send --contact @bob --chat" \
-    >"$CHAT_OUT" 2>"$CHAT_ERR"
-else
-  printf '' | "$ASH" --data-dir "$A" send --contact @bob --chat \
-    >"$CHAT_OUT" 2>"$CHAT_ERR"
-fi
+# raven_timeout works on stock macOS too (no `timeout` binary there), so a
+# busy-looping ash fails here instead of hanging the harness.
+printf '' | raven_timeout 8 "$ASH" --data-dir "$A" send --contact @bob --chat \
+  >"$CHAT_OUT" 2>"$CHAT_ERR"
 CHAT_RC=$?
 set -e
 if ! grep -Fq 'left chat' "$CHAT_OUT"; then
@@ -158,7 +169,7 @@ fi
 
 echo "=== stranger PairInit refused (node C → B, no contact on B) ==="
 C="$WORKDIR/c"
-C_PORT="${C_PORT:-$((19000 + $$ % 500))}"
+C_PORT="${C_PORT:-0}"
 mkdir -p "$C"
 "$ASH" --data-dir "$C" init | tee "$WORKDIR/c.init"
 C_ADDR=$(grep '^address=' "$WORKDIR/c.init" | cut -d= -f2)
@@ -169,22 +180,29 @@ test -n "$C_ADDR" && test -n "$C_PUB"
   >"$WORKDIR/c.node.log" 2>&1 &
 C_PID=$!
 for _ in $(seq 1 80); do
-  if [[ -S "$C/raven-node.sock" ]]; then
+  if raven_ipc_up "$ASH" "$C"; then
     break
   fi
   sleep 0.1
 done
-if [[ ! -S "$C/raven-node.sock" ]]; then
-  echo "stranger daemon failed to create IPC socket" >&2
+if ! raven_ipc_up "$ASH" "$C"; then
+  echo "stranger daemon did not answer IPC (ash ipc-ping)" >&2
   cat "$WORKDIR/c.node.log" >&2 || true
   exit 1
 fi
 # C knows B; B does NOT know C — PairInit must be refused on B.
 "$ASH" --data-dir "$C" contact add \
   --address "$B_ADDR" --pub-hex "$B_PUB" --petname "Bob" --tag bob \
-  --lan-dial "127.0.0.1:${B_PORT}"
+  --lan-dial "$B_DIAL"
+# B must be up and listening when the probe arrives; otherwise a failed send
+# could only mean "connection refused", not "B refused the stranger".
+if ! kill -0 "$B_PID" 2>/dev/null; then
+  echo "B daemon exited before the stranger probe" >&2
+  cat "$WORKDIR/b.node.log" >&2 || true
+  exit 1
+fi
 set +e
-printf '%s\n' "stranger probe" | "$ASH" --data-dir "$C" send --contact @bob \
+printf '%s\n' "stranger probe" | raven_timeout 90 "$ASH" --data-dir "$C" send --contact @bob \
   >"$WORKDIR/c.send.out" 2>"$WORKDIR/c.send.err"
 C_SEND_RC=$?
 set -e
@@ -208,11 +226,26 @@ if [[ -f "$B/peer_cache.stage.json" ]]; then
   echo "peer cache stage left behind" >&2
   exit 1
 fi
-if ! grep -Eqi 'not a local contact|pair init refused' "$WORKDIR/b.node.log" \
-  && ! grep -Eqi 'not a local contact|pair init refused|failed|error|refused' \
-    "$WORKDIR/c.send.err" "$WORKDIR/c.send.out"; then
-  echo "expected stranger PairInit refusal in logs" >&2
+# The refusal must be B's own diagnostic (lan_direct.rs logs
+# "pair init refused: peer is not a local contact" on stderr -> b.node.log).
+# C's generic send error text is not evidence: it also matches connection
+# refused / bind failures where B never evaluated the stranger at all.
+REFUSED=0
+for _ in $(seq 1 30); do
+  if grep -Eqi 'pair init refused|not a local contact' "$WORKDIR/b.node.log"; then
+    REFUSED=1
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$REFUSED" -ne 1 ]]; then
+  echo "expected B to log the stranger PairInit refusal (pair init refused / not a local contact)" >&2
   cat "$WORKDIR/c.send.out" "$WORKDIR/c.send.err" "$WORKDIR/b.node.log" >&2 || true
+  exit 1
+fi
+if ! kill -0 "$B_PID" 2>/dev/null; then
+  echo "B daemon died while refusing the stranger probe" >&2
+  cat "$WORKDIR/b.node.log" >&2 || true
   exit 1
 fi
 

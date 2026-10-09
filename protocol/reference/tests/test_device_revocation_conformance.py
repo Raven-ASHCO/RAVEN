@@ -111,6 +111,8 @@ def test_quota_machine_001():
 def test_corrupt_journal_matrix():
     cases = [
         ("corrupt_journal_truncated_001.json", "truncated", 1),
+        # >= 54 bytes but not one complete RVDR1 record: same frozen code as Rust.
+        ("corrupt_journal_malformed_001.json", "truncated", 1),
         ("corrupt_journal_digest_mismatch_001.json", "digest_mismatch", 2),
         ("corrupt_journal_bad_signature_001.json", "bad_signature", 3),
     ]

@@ -42,7 +42,9 @@ impl RavenProfileRecordV1 {
         out.push(self.version);
         out.extend(lp(self.raven_id.as_bytes())?);
         out.extend(lp(self.display_name.as_bytes())?);
-        out.extend_from_slice(&(self.public_aliases.len() as u16).to_be_bytes());
+        let alias_count = u16::try_from(self.public_aliases.len())
+            .map_err(|_| "too many profile aliases".to_string())?;
+        out.extend_from_slice(&alias_count.to_be_bytes());
         for a in &self.public_aliases {
             out.extend(lp(a.as_bytes())?);
         }
@@ -147,5 +149,27 @@ mod tests {
         store.put(rec, 50).unwrap();
         assert!(store.get(&id.address(), 50).is_some());
         assert!(store.get(&id.address(), 101).is_none());
+    }
+
+    #[test]
+    fn oversized_alias_count_fails_closed() {
+        let id = Identity::from_seed(&[0x33; 32]);
+        let rec = RavenProfileRecordV1 {
+            version: 1,
+            raven_id: id.address(),
+            display_name: String::new(),
+            public_aliases: vec![String::new(); usize::from(u16::MAX) + 1],
+            profile_image_digest: [0u8; 32],
+            device_set_commitment: [0u8; 32],
+            prekey_bundle_reference: [0u8; 32],
+            sequence: 1,
+            issued_at: 1,
+            expires_at: 100,
+            visibility: 0,
+            signature: [0u8; 64],
+            ed25519_pub: id.public_key_bytes(),
+        };
+        assert!(rec.signing_bytes().is_err());
+        assert!(rec.sign(&id).is_err());
     }
 }

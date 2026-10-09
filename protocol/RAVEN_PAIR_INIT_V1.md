@@ -6,7 +6,8 @@
 
 **Negotiated profile:** `ATSAM/indexed-session/v1`
 
-**Status:** additive byte contract; **production disabled**
+**Status:** additive byte contract; **production disabled** (one recorded
+owner exception: the LAN-direct slice, §7)
 
 This document freezes an offline-capable, signed session-establishment
 transcript for
@@ -46,15 +47,47 @@ Before accepting a PairInit, an implementation MUST possess and validate:
    and between its opaque `device_id` and Bob's certificate `device_id`.
 
 The PairInit validity interval MUST be contained in the intersection of both
-certificate validity intervals and Bob's prekey-bundle validity interval. The
-initiator device signature is verified only after structural, trust-record,
+certificate validity intervals and Bob's prekey-bundle validity interval, with
+one bounded clock-skew allowance. `created_at_ms` is stamped by the
+initiator's clock, while the certificate `not_before_ms`, the prekey
+`created_at_ms`, and the verifier's `now_ms` come from other clocks. START
+bounds therefore tolerate exactly `MAX_PEER_CLOCK_SKEW_MS = 300000` (5 minutes;
+Rust `prekey_lifecycle::MAX_PREKEY_FUTURE_SKEW_MS`), and every expiry bound is
+exact:
+
+```
+trust_not_before = max(initiator cert not_before_ms,
+                       responder cert not_before_ms, prekey created_at_ms)
+trust_not_after  = min(initiator cert not_after_ms,
+                       responder cert not_after_ms, prekey expires_at_ms)
+
+accept only if   created_at_ms + MAX_PEER_CLOCK_SKEW_MS >= trust_not_before
+            and  expires_at_ms <= trust_not_after
+            and  created_at_ms <= now_ms + MAX_PEER_CLOCK_SKEW_MS
+            and  now_ms < expires_at_ms
+```
+
+The certificates and the prekey bundle are additionally valid at `now_ms`
+under their own rules (certificate `not_before_ms <= now_ms <= not_after_ms`;
+prekey per [`RAVEN_PREKEY_BUNDLE_V1.md`](RAVEN_PREKEY_BUNDLE_V1.md) §4). The
+session windows of the negotiated profile use the same start-bound tolerance
+against the session's signed PairInit `created_at_ms` and keep their expiry
+bounds exact ([`ATSAM_ENDPOINT_TRANSACTION_V1.md`](ATSAM_ENDPOINT_TRANSACTION_V1.md)
+§1). Boundary vectors: `shared-vectors/rvn1/atsam/pair_init_v1_clock_skew_001.json`.
+The initiator device signature is verified only after structural, trust-record,
 identity, role, profile, suite, time, and resource checks.
 
-V1 has no signed global device-revocation record. Consequently, PairInit can
-bind the exact certificates and can require a verifier's local denylist, but it
-cannot prove that a partitioned verifier has the latest revocation state. This
-is a protocol limitation, not a field that implementations may replace with an
-unsigned "revocation hash."
+Signed device revocation is defined separately by `RavenDeviceRevocationV1`
+(RVDR1, [`RAVEN_DEVICE_REVOCATION_V1.md`](RAVEN_DEVICE_REVOCATION_V1.md)): an
+identity-signed record that verifiers apply as a sticky local deny decision;
+PairInit preflight consults only the local deny set, before any OTP claim
+(that document's §7.2 and §9). RVDR1 propagates eventually: there is no instant
+global revoke (its §7.3), and PairInit carries no revocation-freshness field.
+Consequently, PairInit can bind the exact certificates and can require the
+verifier's local revocation decision (local denylist plus every RVDR1 claim it
+has applied), but it cannot prove that a partitioned verifier has the latest
+revocation state. This is a protocol limitation, not a field that
+implementations may replace with an unsigned "revocation hash."
 
 ## 2. Exact trust-record digests
 
@@ -121,6 +154,14 @@ signed X25519 key otherwise. The initiator ephemeral key, selected responder
 key, ML-KEM key, ciphertext, three record digests, nonce, and `init_id` MUST
 not be all zero. X25519 agreement MUST additionally reject a non-contributory
 (all-zero) shared result.
+
+Decoders and verifiers MUST also reject, before any signature check, state
+mutation, journal, or claim, an initiator ephemeral X25519 key in the
+small-order torsion (for example `u = 1`, the two order-8 points, `p - 1`,
+`p`, `p + 1`, and their encodings with bit 255 set). For every clamped
+responder scalar the agreement with such a key is all-zero, so the check is
+exactly "X25519(any fixed scalar, key) is all-zero". A signed PairInit carrying
+one is a hard reject, not a deferred DH failure.
 
 The signature input is exactly:
 
@@ -191,6 +232,15 @@ index `0`, and the profile's route derivation to seal and durably queue message
 hybrid encrypted to Bob's identity-signed prekey, but Bob has not yet confirmed
 receipt and possession of the corresponding private material.
 
+**Session lifetime (informative).** The PairInit validity interval is also the
+session's lifetime, and the negotiated profile has no forward secrecy or
+post-compromise security inside a session
+([`ATSAM_INDEXED_SESSION_PROFILE_V1.md`](ATSAM_INDEXED_SESSION_PROFILE_V1.md)
+§2.4). Initiators SHOULD therefore keep `expires_at_ms - created_at_ms` short.
+This implementation initiates 24-hour sessions
+(`lan_dispatch::LAN_SESSION_LIFETIME_MS`) and, as responder, still accepts the
+7-day maximum of [`RAVEN_PREKEY_LIFECYCLE_V1.md`](RAVEN_PREKEY_LIFECYCLE_V1.md) §4.
+
 ## 5. PairResponse wire (exactly 228 bytes)
 
 Bob returns this only after the accepted PairInit and provisional session have
@@ -228,11 +278,17 @@ The signature input is:
 ```
 
 The response signer MUST equal the responder device key bound in PairInit and
-its certificate. Response creation must fall inside the PairInit interval, its
-expiry must not exceed PairInit expiry, and verification uses
-`created_at_ms <= now_ms < expires_at_ms`. Verification requires the exact
-accepted PairInit, exact root tag (constant-time comparison), and signature.
-Only then may Alice change session state from `provisional` to `confirmed`.
+its certificate. Response creation must fall inside the PairInit interval
+(`init.created_at_ms <= created_at_ms < init.expires_at_ms`, exact) and its
+expiry must not exceed PairInit expiry (exact). Against the verifier's clock the
+§1 rule applies: the start bound tolerates `MAX_PEER_CLOCK_SKEW_MS` and expiry
+is exact, i.e. `created_at_ms <= now_ms + MAX_PEER_CLOCK_SKEW_MS` and
+`now_ms < expires_at_ms`. Because the containment is exact, a responder whose
+clock is behind the initiator's MUST NOT stamp `created_at_ms` earlier than the
+PairInit's (Rust stamps `max(now_ms, init.created_at_ms)`). Verification
+requires the exact accepted PairInit, exact root tag (constant-time
+comparison), and signature. Only then may Alice change session state from
+`provisional` to `confirmed`.
 
 ## 6. Replay, idempotency, and one-time prekeys
 
@@ -293,6 +349,15 @@ Production remains disabled until, at minimum:
   state transitions; and
 - external protocol/security review approves the transcript and state machine.
 
+**Recorded owner exception.** The LAN-direct slice runs PairInit V1 /
+PairResponse live in default and release builds under the owner waiver
+[`WAIVER-LAN-DIRECT-2026-10-07`](../docs/WAIVER_LAN_DIRECT_INDEXED_SESSION_2026-10-07.md):
+LAN direct TCP between two `raven-node` services inside a Noise XX channel bound
+to the Raven identity, PairInits accepted only from local contacts. The waiver
+does not satisfy the gates above; it accepts that scope's listed residual risks
+until its review-by date. Every other carrier and every other use of PairInit
+(including PairInit V2) remains disabled.
+
 ## 8. Reference and vectors
 
 - Python: `protocol/reference/raven_protocol/pair_init.py`
@@ -300,6 +365,12 @@ Production remains disabled until, at minimum:
 - Rust split hybrid primitive: `node/crates/raven-core/src/atsam_mlkem.rs`
 - Swift: `ios-native/RAVEN/RAVEN/Core/Security/ATSAM/ATSAMPairInitV1.swift`
 - KAT: `shared-vectors/rvn1/atsam/pair_init_v1_001.json`
+- Clock-skew boundaries (§1, §5): `shared-vectors/rvn1/atsam/pair_init_v1_clock_skew_001.json`
+- Structural negatives: `shared-vectors/rvn1/atsam/negative/pair_init_v1_*.json`
+  (including `pair_init_v1_small_order_ephemeral_001`, validly signed but with a
+  small-order initiator ephemeral)
+- Strict Ed25519 (every signature above): `shared-vectors/rvn1/negative/ed25519_weak_key_forgery_001.json`
 
-All implementations are codec/KDF/verification support only. The live
-endpoint and relay classifiers intentionally do not recognize these records.
+Outside the LAN-direct slice under the §7 waiver (`raven_core::lan_dispatch`),
+all implementations are codec/KDF/verification support only, and relay and
+other live classifiers intentionally do not recognize these records.

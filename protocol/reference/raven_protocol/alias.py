@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from ._canon import lp, u64
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.exceptions import InvalidSignature
+from . import ed25519_strict
 
 @dataclass
 class AliasRecord:
@@ -14,7 +13,6 @@ def signing_bytes(r: AliasRecord) -> bytes:
 
 def verify(r: AliasRecord, identity_ed_pub: bytes) -> bool:
     try:
-        Ed25519PublicKey.from_public_bytes(identity_ed_pub).verify(r.signature, signing_bytes(r))
-        return True
-    except (InvalidSignature, ValueError):
+        return ed25519_strict.verify(identity_ed_pub, r.signature, signing_bytes(r))
+    except ValueError:
         return False

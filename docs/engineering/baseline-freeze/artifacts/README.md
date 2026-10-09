@@ -1,6 +1,6 @@
 # Baseline-freeze harvest dumps
 
-Timestamped stdout from [`node/scripts/harvest_perf_baseline.sh`](../../../node/scripts/harvest_perf_baseline.sh).
+Timestamped stdout from [`node/scripts/harvest_perf_baseline.sh`](../../../../node/scripts/harvest_perf_baseline.sh).
 
 | Directory | Toolchain | Verdict |
 |-----------|-----------|---------|

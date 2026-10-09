@@ -16,10 +16,14 @@ export RAVEN_CHAT_HISTORY_BACKEND=locked-file
 export RAVEN_ALLOW_EPHEMERAL_DATA_DIR="${RAVEN_ALLOW_EPHEMERAL_DATA_DIR:-1}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../../scripts/lib/harness_util.sh
+source "$ROOT/../scripts/lib/harness_util.sh"
 BIN="$ROOT/target/debug"
 NODE="$BIN/raven-node"
 ASH="$BIN/ash"
-WORKDIR="${TMPDIR:-/tmp}/raven-bridge-abc-$$"
+# mktemp: 0700 and never pre-existing (a predictable name can be pre-created or
+# symlinked by another user).
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/raven-bridge-abc-XXXXXX")"
 mkdir -p "$WORKDIR/a" "$WORKDIR/b" "$WORKDIR/c"
 cleanup() {
   [[ -n "${BPID:-}" ]] && kill "$BPID" 2>/dev/null || true
@@ -52,6 +56,14 @@ echo "C pub (public only) ok"
 "$ASH" --data-dir "$WORKDIR/b" status | tee "$WORKDIR/ash_status.txt"
 grep -q 'bridge' "$WORKDIR/ash_status.txt"
 
+# The bridge writes its --write-lan-addr/--write-ble-addr files with
+# create+truncate then write, so wait for NON-EMPTY files and fail fast (dumping
+# the bridge log) if it dies or never listens. $1 = bridge log.
+wait_bridge_ready() {
+  raven_wait_file "$WORKDIR/b.lan" "$BPID" 15 "$1"
+  raven_wait_file "$WORKDIR/b.ble" "$BPID" 15 "$1"
+}
+
 run_happy() {
   local round=$1
   rm -f "$WORKDIR/b.lan" "$WORKDIR/b.ble"
@@ -65,10 +77,7 @@ run_happy() {
     --timeout-secs 40 \
     >"$WORKDIR/b.log" 2>&1 &
   BPID=$!
-  for _ in $(seq 1 80); do
-    [[ -f "$WORKDIR/b.lan" && -f "$WORKDIR/b.ble" ]] && break
-    sleep 0.05
-  done
+  wait_bridge_ready "$WORKDIR/b.log"
   local B_LAN B_BLE
   B_LAN=$(cat "$WORKDIR/b.lan")
   B_BLE=$(cat "$WORKDIR/b.ble")
@@ -84,7 +93,11 @@ run_happy() {
     --timeout-secs 35 \
     >"$WORKDIR/c.log" 2>&1 &
   CPID=$!
-  sleep 0.3
+  # C must be connected to B's mock_ble listener before A sends. B subscribes a
+  # peer only after its 400 ms classify window, so a frame can still land first
+  # and be queued then flushed: the delivery assertion below accepts either
+  # forward-now or flush, in the lan->mock_ble direction only.
+  raven_wait_log "$WORKDIR/b.log" 'BRIDGE accept mock_ble' "$BPID" 15
 
   # A: Internet/LAN only — seal to C, dial B lan, wait for C's ACK via B
   printf '%s\n' "bridge-abc-round-$round" | "$NODE" run \
@@ -107,12 +120,19 @@ run_happy() {
 
   grep -q 'ACK delivered' "$WORKDIR/a.log"
   grep -q 'DELIVERED bytes=' "$WORKDIR/c.log"
-  grep -q 'BRIDGE forward' "$WORKDIR/b.log"
+  # Direction-specific: a bare 'BRIDGE forward' is also satisfied by the ACK
+  # travelling back mock_ble->lan, so it cannot show A's message reached C.
+  grep -Eq 'BRIDGE (forward lan→mock_ble|flush → mock_ble)' "$WORKDIR/b.log"
   # Same message_id on A send and C deliver path
   local MID
   MID=$(grep 'ENVELOPE_FP mid=' "$WORKDIR/a.log" | head -1 | sed -n 's/.*mid=\([0-9a-f]*\).*/\1/p')
   [[ -n "$MID" ]]
-  grep -q "$MID" "$WORKDIR/b.log"
+  # B logs only a 4-byte message-id prefix (log hygiene; never the full id).
+  grep -q "mid=${MID:0:8}" "$WORKDIR/b.log"
+  if grep -q "$MID" "$WORKDIR/b.log"; then
+    echo "FAIL: bridge log carries the full message id" >&2
+    exit 1
+  fi
   echo "round $round OK mid=${MID:0:8}…"
 }
 
@@ -132,10 +152,7 @@ rm -f "$WORKDIR/b.lan" "$WORKDIR/b.ble"
   --timeout-secs 45 \
   >"$WORKDIR/b_scf.log" 2>&1 &
 BPID=$!
-for _ in $(seq 1 80); do
-  [[ -f "$WORKDIR/b.lan" && -f "$WORKDIR/b.ble" ]] && break
-  sleep 0.05
-done
+wait_bridge_ready "$WORKDIR/b_scf.log"
 B_LAN=$(cat "$WORKDIR/b.lan")
 B_BLE=$(cat "$WORKDIR/b.ble")
 
@@ -152,7 +169,10 @@ printf '%s\n' "store-carry-msg" | "$NODE" run \
   --timeout-secs 40 \
   >"$WORKDIR/a_scf.log" 2>&1 &
 APID=$!
-sleep 0.8
+# Start C only once B has logged that it queued A's frame (no mock_ble peer
+# yet). A fixed sleep here let a slow sender start after C had attached, which
+# turned this stage into a plain live forward.
+raven_wait_log "$WORKDIR/b_scf.log" 'BRIDGE (queued waiting|store-carry)' "$BPID" 15
 # Now C appears on mock BLE
 "$NODE" run \
   --data-dir "$WORKDIR/c" \
@@ -172,6 +192,12 @@ BPID=""
 CPID=""
 grep -q 'ACK delivered' "$WORKDIR/a_scf.log"
 grep -q 'DELIVERED bytes=' "$WORKDIR/c_scf.log"
+# The queued frame must have been flushed to C once it attached.
+if ! grep -Eq 'BRIDGE flush → mock_ble' "$WORKDIR/b_scf.log"; then
+  echo "FAIL: store-carry delivered without a BRIDGE flush to mock_ble" >&2
+  cat "$WORKDIR/b_scf.log" >&2 || true
+  exit 1
+fi
 echo "store-carry OK"
 
 echo "=== reverse C→B→A (BLE→LAN message; A dials B first) ==="
@@ -185,10 +211,7 @@ rm -f "$WORKDIR/b.lan" "$WORKDIR/b.ble"
   --timeout-secs 40 \
   >"$WORKDIR/b_rev.log" 2>&1 &
 BPID=$!
-for _ in $(seq 1 80); do
-  [[ -f "$WORKDIR/b.lan" && -f "$WORKDIR/b.ble" ]] && break
-  sleep 0.05
-done
+wait_bridge_ready "$WORKDIR/b_rev.log"
 B_LAN=$(cat "$WORKDIR/b.lan")
 B_BLE=$(cat "$WORKDIR/b.ble")
 
@@ -203,7 +226,8 @@ B_BLE=$(cat "$WORKDIR/b.ble")
   --timeout-secs 35 \
   >"$WORKDIR/a_rev.log" 2>&1 &
 APID=$!
-sleep 0.4
+# Same readiness rule as the happy path: A must be connected to B first.
+raven_wait_log "$WORKDIR/b_rev.log" 'BRIDGE accept lan' "$BPID" 15
 printf '%s\n' "reverse-c-to-a" | "$NODE" run \
   --data-dir "$WORKDIR/c" \
   --listen "127.0.0.1:0" \
@@ -221,13 +245,39 @@ wait "$BPID" 2>/dev/null || true
 BPID=""
 APID=""
 grep -q 'DELIVERED' "$WORKDIR/a_rev.log"
-grep -q 'BRIDGE forward' "$WORKDIR/b_rev.log"
+# Direction-specific (mock_ble->lan): the ACK forward is lan->mock_ble here.
+grep -Eq 'BRIDGE (forward mock_ble→lan|flush → lan)' "$WORKDIR/b_rev.log"
 grep -q 'ACK delivered' "$WORKDIR/c_rev.log"
 echo "reverse path OK (software mock_ble)"
+
+echo "=== bridge B never records plaintext (logs + persisted state) ==="
+# Lab cipher caveat: unsafe-interim derives its key from the two PUBLIC keys, so
+# this shows B does not log/store the plaintext — not that B could not derive
+# the key. Bridge blindness under ATSAM sessions is not exercised here.
+for marker in bridge-abc-round-1 bridge-abc-round-2 bridge-abc-round-3 \
+  store-carry-msg reverse-c-to-a; do
+  if grep -qF "$marker" "$WORKDIR"/b.log "$WORKDIR"/b_scf.log "$WORKDIR"/b_rev.log \
+    "$WORKDIR"/b.status.json; then
+    echo "FAIL: plaintext marker '$marker' found in bridge log" >&2
+    exit 1
+  fi
+  if grep -rqaF "$marker" "$WORKDIR/b"; then
+    echo "FAIL: plaintext marker '$marker' found in bridge data-dir state" >&2
+    exit 1
+  fi
+done
+echo "bridge logs hold no plaintext (lab cipher; see comment)"
 
 echo "=== ash status still safe ==="
 "$ASH" --data-dir "$WORKDIR/b" status | tee "$WORKDIR/ash_status2.txt"
 grep -q 'forward_q' "$WORKDIR/ash_status2.txt"
-! grep -qiE 'seed|private.key|plaintext' "$WORKDIR/ash_status2.txt"
+# Explicit if/exit: errexit never fires on a `!`-negated command. The only
+# allowed mention is the fixed safety banner "(public bits only — never a seed)".
+STATUS_SCRUBBED=$(grep -viF 'never a seed' "$WORKDIR/ash_status2.txt" || true)
+if grep -qiE 'seed|private.key|plaintext' <<<"$STATUS_SCRUBBED"; then
+  echo "FAIL: ash status leaks seed/private-key/plaintext wording" >&2
+  grep -iE 'seed|private.key|plaintext' <<<"$STATUS_SCRUBBED" >&2 || true
+  exit 1
+fi
 
 echo "=== ALL BRIDGE A-B-C CHECKS PASSED ==="

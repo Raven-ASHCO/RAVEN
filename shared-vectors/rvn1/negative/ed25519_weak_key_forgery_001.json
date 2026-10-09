@@ -1,0 +1,31 @@
+{
+  "description": "public key A and signature R are both the identity encoding 01 00..00 (order 1) and s = 0, so the cofactorless equation holds for every message and plain OpenSSL verification accepts it; strict verification (reject a small-order A or R by the 7-entry blocklist compared with the sign bit masked, reject s >= L) MUST reject it for every message, including the signing bytes of a real envelope claiming this key as its signer",
+  "deterministic": true,
+  "expected": {
+    "envelope_unpack_result": "accept",
+    "envelope_verify_result": "reject",
+    "small_order_rule": "reject a public key or R whose encoding, with bit 255 masked, equals any small_order_encodings_hex entry",
+    "verify_result": "reject"
+  },
+  "inputs": {
+    "envelope_packed_hex": "52564e310101000000000000000000000000000000000001611432077911411fb5470eb80f1ff11900000000000000000000018bcfe568000000018bd50bc4000803000000000000000000000001001400000019004052564e41312d6865616465722d6669787475726552564e53312d7365616c65642d626f64792d6669787475726501000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "messages_hex": [
+      "",
+      "72766e31207765616b2d6b657920666f7267657279",
+      "52564e310101000000000000000000000000000000000001611432077911411fb5470eb80f1ff11900000000000000000000018bcfe568000000018bd50bc400000000000000000000000000000100140000001900406c8c84feac1e4c159da89c0e9d7da20dff18587214458324b155a0c8879cccbf9f9391b61377c597c1b4cae8177ac26b0c449dd8aea61384296a5077c5a34145"
+    ],
+    "public_key_hex": "0100000000000000000000000000000000000000000000000000000000000000",
+    "signature_hex": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "small_order_encodings_hex": [
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "0100000000000000000000000000000000000000000000000000000000000000",
+      "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+      "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+      "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+    ]
+  },
+  "name": "Ed25519 weak-key forgery (A = R = identity, s = 0) must be rejected",
+  "protocol_version": "rvn1"
+}

@@ -1,7 +1,7 @@
 # Multi-Device Sync + Partition Revocation (V1 software subset)
 
 **Checklist:** §39  
-**Branch:** `feature/raven-serverless-v1`  
+**Branch (historical):** authored on `feature/raven-serverless-v1`; this file now lives on `main` and is a dated snapshot, not a statement about an open branch  
 **Code:** `raven-core::device_cert`, `raven-core::device_sync`
 
 ## What V1 implements (software)
@@ -17,7 +17,7 @@
 
 ## What V1 does **not** claim
 
-- Live DHT / gossip push of revocation to all contacts (no frozen revocation record type on the wire yet).
+- Live DHT / gossip push of revocation to all contacts. (A frozen wire record, `RavenDeviceRevocationV1` / RVDR1, now exists: [`protocol/RAVEN_DEVICE_REVOCATION_V1.md`](../protocol/RAVEN_DEVICE_REVOCATION_V1.md) is APPROVED but **production-disabled**, with a Rust implementation in `raven_core::device_revocation`.)
 - Automatic contact warning UX on every material device change (stub: operator must exchange records).
 - Physical phone + terminal under one identity (needs **BLOCKED_HARDWARE** / human devices).
 

@@ -6,6 +6,13 @@
 
 #![cfg(feature = "full-braid-durable-lab")]
 
+// Second release-hold layer. build.rs only sees `PROFILE`; a custom or
+// tweaked profile that turns debug assertions off is treated as release too.
+// (libsqlite3-sys-raven additionally holds `bundled-sqlcipher*` release builds
+// for dependents that enable it without this feature.)
+#[cfg(not(debug_assertions))]
+compile_error!("FULL_BRAID_SQLCIPHER_NOT_APPROVED");
+
 pub mod protected_anchor;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod protected_anchor_linux;

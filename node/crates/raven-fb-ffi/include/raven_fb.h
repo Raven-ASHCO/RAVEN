@@ -10,6 +10,29 @@
  * Measure/write C ABI for Hybrid Ratchet V2 Full Braid (design §8).
  * Every buffer is caller-owned pointer + length/capacity. On error or
  * caught panic, non-null outputs are zeroed within their capacity caps.
+ *
+ * Output buffers and out-parameters MUST NOT overlap any input or each other
+ * (inputs may share memory). An overlapping call returns RAVEN_FB_ERR_PARSE
+ * and writes nothing, so never pass the live state buffer as an output.
+ * Input lengths above RAVEN_FB_MAX_RVBJ1 return RAVEN_FB_ERR_PARSE.
+ *
+ * Sizing: every *_measure call fills a RavenFbSizes; size each output buffer
+ * from the field named below and pass that as the matching *_cap of the
+ * *_write call. Fields a call does not produce are 0 (not "unknown"):
+ *
+ *   measure call                         fields populated
+ *   raven_fb_init_measure                candidate_len
+ *   raven_fb_transition_measure          candidate_len, outputs_len, intent_len
+ *   raven_fb_promote_measure             candidate_len
+ *   raven_fb_rvor_materialize_measure    outputs_len   (the RVOR1 record; NOT candidate_len)
+ *   raven_fb_clear_pending_measure       candidate_len
+ *   raven_fb_recover_measure             candidate_len
+ *   raven_fb_terminalize_conflict_measure  candidate_len, intent_len
+ *   raven_fb_terminalize_expired_measure   candidate_len, intent_len
+ *
+ * "candidate_len" is the size of the (single) RVFB1 state output; for the
+ * terminalize calls it is the terminal candidate and intent_len the repair
+ * RVBJ1. A binder must not assume candidate_len for every single-output call.
  */
 
 #ifdef __cplusplus
@@ -33,11 +56,12 @@ enum {
     RAVEN_FB_ERR_INTERNAL = 10
 };
 
+/* Which fields a given *_measure fills is tabled in the header comment above. */
 typedef struct RavenFbSizes {
-    uint32_t candidate_len;
-    uint32_t outputs_len;
-    uint32_t intent_len;
-    uint32_t reserved0;
+    uint32_t candidate_len; /* RVFB1 state output (terminal candidate for terminalize_*) */
+    uint32_t outputs_len;   /* transition: RVBO1; rvor_materialize: the RVOR1 record */
+    uint32_t intent_len;    /* transition / terminalize_*: RVBJ1 */
+    uint32_t reserved0;     /* always 0 */
 } RavenFbSizes;
 
 typedef struct RavenFbResultMeta {

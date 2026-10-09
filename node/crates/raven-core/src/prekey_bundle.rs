@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 pub const PREKEY_DOMAIN: &[u8] = b"rvn1/prekey";
 pub const MLKEM768_EK_LEN: usize = 1184;
+/// Spec §2: `device_id` is UTF-8 of at most 64 bytes.
+pub const MAX_DEVICE_ID_BYTES: usize = 64;
 const PREKEY_DHT_DOMAIN: &[u8] = b"rvn1/prekey-key";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +83,9 @@ impl PrekeyBundle {
     }
 
     pub fn verify(&self, now_ms: u64) -> Result<(), String> {
+        if self.device_id.len() > MAX_DEVICE_ID_BYTES {
+            return Err("PREKEY_DEVICE_ID_TOO_LONG".into());
+        }
         if self.expires_at_ms <= self.created_at_ms {
             return Err("PREKEY_EXPIRED".into());
         }
@@ -254,8 +259,16 @@ impl PrekeyStore {
     pub fn publish(&mut self, bundle: &PrekeyBundle, now_ms: u64) -> Result<(), String> {
         bundle.verify(now_ms)?;
         let key = hex::encode(PrekeyBundle::store_key(&bundle.identity_ed25519_pub));
-        if let Some(existing_j) = self.bundles.get(&key) {
-            let existing = PrekeyBundle::from_json(existing_j)?;
+        // Rollback/equivocation only protect a bundle that is still usable. An
+        // existing entry that no longer verifies (expired, unreadable) is
+        // absent for every reader (`fetch_valid`), so it must not wedge
+        // re-publication after the publisher reset its counter (reinstall).
+        let existing = self
+            .bundles
+            .get(&key)
+            .and_then(|j| PrekeyBundle::from_json(j).ok())
+            .filter(|b| b.verify(now_ms).is_ok());
+        if let Some(existing) = existing {
             if bundle.signed_prekey_id < existing.signed_prekey_id {
                 return Err("PREKEY_ROLLBACK".into());
             }
@@ -276,6 +289,13 @@ impl PrekeyStore {
         Ok(())
     }
 
+    /// Forget the bundle pinned for `ed_pub` (an explicit re-pin: the user removed
+    /// the contact). Returns whether one was pinned.
+    pub fn remove(&mut self, ed_pub: &[u8; 32]) -> bool {
+        let key = hex::encode(PrekeyBundle::store_key(ed_pub));
+        self.bundles.remove(&key).is_some()
+    }
+
     /// Drop bundles that fail verify at `now_ms` (expired / bad). Returns removed count.
     pub fn retain_valid(&mut self, now_ms: u64) -> usize {
         let before = self.bundles.len();
@@ -293,6 +313,13 @@ impl PrekeyStore {
 
     pub fn is_empty(&self) -> bool {
         self.bundles.is_empty()
+    }
+
+    /// Like [`Self::fetch`], but an expired, corrupt, or otherwise invalid
+    /// entry is reported as absent. Publishers use this to decide rotation;
+    /// peers that must distinguish "invalid" from "missing" use `fetch`.
+    pub fn fetch_valid(&self, ed_pub: &[u8; 32], now_ms: u64) -> Option<PrekeyBundle> {
+        self.fetch(ed_pub, now_ms).ok().flatten()
     }
 
     pub fn fetch(&self, ed_pub: &[u8; 32], now_ms: u64) -> Result<Option<PrekeyBundle>, String> {
@@ -440,6 +467,96 @@ mod tests {
         );
         // Exact replay is idempotent.
         store.publish(&first, 3_000).unwrap();
+    }
+
+    #[test]
+    fn publish_treats_expired_existing_bundle_as_absent() {
+        let id = Identity::generate();
+        let mut old = demo_bundle(&id);
+        old.signed_prekey_id = 5;
+        old.expires_at_ms = 10_000_000;
+        let old = old.sign(&id).unwrap();
+        // The publisher reset its counter (reinstall): id 1 again.
+        let mut reset = demo_bundle(&id);
+        reset.created_at_ms = 3_000;
+        reset.x25519_pub = [8u8; 32];
+        let reset = reset.sign(&id).unwrap();
+        let mut store = PrekeyStore::default();
+        store.publish(&old, 2_000).unwrap();
+        // Still valid: the rollback guard applies.
+        assert_eq!(store.publish(&reset, 3_000).unwrap_err(), "PREKEY_ROLLBACK");
+        // Past expiry plus the verify skew grace the old bundle pins nothing.
+        let later = old.expires_at_ms + 5 * 60 * 1000 + 1;
+        assert!(store.fetch_valid(&id.public_key_bytes(), later).is_none());
+        store.publish(&reset, later).unwrap();
+        assert_eq!(
+            store
+                .fetch(&id.public_key_bytes(), later)
+                .unwrap()
+                .unwrap()
+                .signed_prekey_id,
+            1
+        );
+    }
+
+    #[test]
+    fn publish_overwrites_corrupt_existing_entry() {
+        let id = Identity::generate();
+        let good = demo_bundle(&id).sign(&id).unwrap();
+        let mut broken = good.to_json();
+        broken.signature_hex = "00".repeat(64);
+        let key = hex::encode(PrekeyBundle::store_key(&id.public_key_bytes()));
+        let mut store = PrekeyStore::default();
+        store.bundles.insert(key, broken);
+        store.publish(&good, 2_000).unwrap();
+        assert!(store
+            .fetch(&id.public_key_bytes(), 2_000)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn device_id_longer_than_64_bytes_is_rejected() {
+        let id = Identity::generate();
+        let mut at_limit = demo_bundle(&id);
+        at_limit.device_id = "d".repeat(MAX_DEVICE_ID_BYTES);
+        at_limit.sign(&id).unwrap().verify(2_000).unwrap();
+
+        // Signing stays structural; every verifier rejects the oversized id
+        // even under a valid identity signature.
+        let mut too_long = demo_bundle(&id);
+        too_long.device_id = "d".repeat(MAX_DEVICE_ID_BYTES + 1);
+        let too_long = too_long.sign(&id).unwrap();
+        assert_eq!(
+            too_long.verify(2_000).unwrap_err(),
+            "PREKEY_DEVICE_ID_TOO_LONG"
+        );
+        let mut store = PrekeyStore::default();
+        assert_eq!(
+            store.publish(&too_long, 2_000).unwrap_err(),
+            "PREKEY_DEVICE_ID_TOO_LONG"
+        );
+    }
+
+    #[test]
+    fn fetch_valid_treats_expired_local_bundle_as_absent() {
+        let id = Identity::generate();
+        let mut bundle = demo_bundle(&id);
+        bundle.expires_at_ms = 10_000_000;
+        let bundle = bundle.sign(&id).unwrap();
+        let mut store = PrekeyStore::default();
+        store.publish(&bundle, 2_000).unwrap();
+        assert!(store.fetch_valid(&id.public_key_bytes(), 2_000).is_some());
+        let after_expiry = bundle.expires_at_ms + 60 * 60 * 1000;
+        assert_eq!(
+            store
+                .fetch(&id.public_key_bytes(), after_expiry)
+                .unwrap_err(),
+            "PREKEY_EXPIRED"
+        );
+        assert!(store
+            .fetch_valid(&id.public_key_bytes(), after_expiry)
+            .is_none());
     }
 
     #[test]

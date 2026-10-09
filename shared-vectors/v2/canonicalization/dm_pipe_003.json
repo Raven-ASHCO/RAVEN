@@ -1,0 +1,62 @@
+{
+  "name": "DM v2 signing input — `|` and `\\` inside fields",
+  "description": "Free-text fields containing `|` and `\\` are carried verbatim: length prefixes, not delimiters, separate fields, so no escaping is needed and no field can spill into another. (v1 forbids `|` in signed fields — MESH_PROTOCOL.md §I.13.)",
+  "protocol_version": "v2-draft",
+  "spec_reference": "MESH_PROTOCOL_v2.md §2",
+  "created_at": "2026-05-15T00:00:00Z",
+  "deterministic": true,
+  "inputs": {
+    "envelope": {
+      "clientMessageId": "dm-003",
+      "roomId": "room:alice-bob",
+      "senderId": "alice",
+      "senderName": "Al|ce \\ admin",
+      "recipientId": "bob",
+      "type": 0,
+      "nonceB64": "ABEiM0RVZneImaq7zN3u/w==",
+      "senderPublicKeyB64": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+      "timestampMs": 1700000000000,
+      "originDeviceId": "alice-device-1",
+      "text": "a|b\\|c",
+      "mediaUrl": null,
+      "thumbnailUrl": null,
+      "fileName": null,
+      "mimeType": null,
+      "fileSize": null,
+      "audioDurationSec": null,
+      "replyToMessageId": "dm-000",
+      "replyToTextPreview": "x|y",
+      "replyToSenderName": "Bob|",
+      "geoFence": null
+    },
+    "signer": "alice"
+  },
+  "expected": {
+    "fields": [
+      "dm-003",
+      "room:alice-bob",
+      "alice",
+      "Al|ce \\ admin",
+      "bob",
+      "0",
+      "ABEiM0RVZneImaq7zN3u/w==",
+      "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+      "1700000000000",
+      "alice-device-1",
+      "a|b\\|c",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "dm-000",
+      "x|y",
+      "Bob|"
+    ],
+    "signing_bytes_hex": "ff52564d4553483201001400000006646d2d3030330000000e726f6f6d3a616c6963652d626f6200000005616c6963650000000d416c7c6365205c2061646d696e00000003626f62000000013000000018414245694d3052565a6e65496d6171377a4e33752f773d3d0000002c3131715941594b7843726656532f3754795751484f6737686376506170694d6c727749616150634855526f3d0000000d313730303030303030303030300000000e616c6963652d6465766963652d3100000006617c625c7c6300000000000000000000000000000000000000000000000000000006646d2d30303000000003787c7900000004426f627c",
+    "signature_hex": "4c4741a963fe30405dde12f0aa091d56395588c38753c53f4a245bbb46eedfd3508d02b5e8a1bca9f8727b4de863f651ac3c4eb2d66fb7a8b521503faa124607",
+    "signature_b64": "TEdBqWP+MEBd3hLwqgkdVjlViMOHU8U/SiRbu0bu39NQjQK16KG8qfhye03oY/ZRrDxOstZvt6i1IVA/qhJGBw=="
+  },
+  "notes": "DRAFT (docs/MESH_PROTOCOL_v2.md): no port ships v2 yet; frozen once v2 is adopted."
+}

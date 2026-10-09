@@ -29,6 +29,11 @@ LABEL_MSG_KEY = b"ATSAM/v2/msg-key"
 SALT_MSG_SEAL = b"ATSAM/v2/msg-seal/salt"
 AAD_DOMAIN = b"ATSAM/v1/msg-seal/aad"
 
+# Stateless helpers re-derive from CK_0 and do O(index) HKDF work (in open_ack
+# before authentication). They have no counter, so skips are bounded relative
+# to index 0; stateful receivers bound jumps relative to their own counter.
+MAX_STATELESS_CHAIN_INDEX = 4_096
+
 DIRECTION_INITIATOR_TO_RESPONDER = 0
 DIRECTION_RESPONDER_TO_INITIATOR = 1
 ACK_PLAINTEXT_LEN = 101
@@ -123,6 +128,8 @@ def lane_message_key(chain_key: bytes, sender: str, recipient: str) -> bytes:
 def chain_key_at_index(root: bytes, sender: str, recipient: str, index: int) -> bytes:
     if not 0 <= index <= 0xFFFFFFFF:
         raise ValueError("index must fit u32")
+    if index > MAX_STATELESS_CHAIN_INDEX:
+        raise ValueError("chain index exceeds the stateless derivation bound")
     chain_key = initial_chain_key(root, sender, recipient)
     for _ in range(index):
         chain_key = advance_chain_key(chain_key)
@@ -336,6 +343,8 @@ def open_ack(
     if wire[:8] != RVNA1_MAGIC or wire[8] != RVNA1_PROTO or wire[9] != RVNA1_SUITE:
         raise ValueError("unsupported sealed ACK header")
     index = int.from_bytes(wire[10:14], "big")
+    if index > MAX_STATELESS_CHAIN_INDEX:
+        raise ValueError("chain index exceeds the stateless derivation bound")
     nonce = wire[14:26]
     sender, recipient = _endpoints(initiator_address, responder_address, direction)
     key = ack_key_at_index(root, initiator_address, responder_address, direction, index)

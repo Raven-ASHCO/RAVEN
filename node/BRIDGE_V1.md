@@ -22,7 +22,7 @@ Conceptual credit: MIT DTN store-carry-forward, Spray-and-Wait replication budge
 ```bash
 cd /path/to/hybrid_messenger/node
 cargo build -p raven-core -p raven-node -p ash
-cargo test -p raven-core --test bridge_v1          # cases 1–9
+cargo test -p raven-core --test bridge_v1          # case01–case15, case10b, e2ee_survives_bridge_hop
 ./scripts/two_node_demo.sh
 ./scripts/lan_path_smoke.sh
 ./scripts/bridge_abc_demo.sh                       # A–B–C + store-carry + ash status
@@ -40,6 +40,14 @@ cargo test -p raven-core --test bridge_v1          # cases 1–9
 8. Expired offline → never forward
 9. Per-peer rate limit (noisy hop dropped; quiet hop still forwards)
 10. Recipient ACK reverse (BLE→LAN sealed and opaque, with no acknowledged-ID peek); destination dispatch remains separate from authenticated endpoint acceptance
+    - `case10b`: destination ingest. When the local node is an endpoint (not a forced bridge), the envelope is dispatched for endpoint delivery with its ciphertext untouched
+11. Replay after the bounded seen-cache evicts the object is still a duplicate (the forward tombstone outlives the cache)
+12. Full relay custody is reported as `STORE_FULL`, not as malformed input
+13. Relay custody is clamped to `MAX_FORWARD_TTL_MS`: a far-future envelope expiry cannot squat a pending slot
+14. Forwarded rows keep no ciphertext and are garbage-collected
+15. Far-future replay after the custody period is still a duplicate (the tombstone lasts until the envelope's own expiry)
+
+`e2ee_survives_bridge_hop`: the endpoint can still unseal the A↔C body after a bridge hop.
 
 ## Abuse limits (V1 defaults)
 
@@ -95,7 +103,7 @@ DATA=$(mktemp -d)
 ./target/debug/ash --data-dir "$DATA" banner
 ```
 
-Interactive menu → **4 Status** shows the same Bridge / transports / forward_q lines.
+Interactive menu → **3 Status** shows the same Bridge / transports / forward_q lines.
 
 ## Run bridge daemon (B)
 

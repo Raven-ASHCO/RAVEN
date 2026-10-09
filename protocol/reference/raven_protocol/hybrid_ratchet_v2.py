@@ -11,10 +11,9 @@ from dataclasses import dataclass, field
 import hashlib
 import hmac
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
+from . import ed25519_strict
 from .pair_init_v2 import hkdf_sha256
 
 PROFILE = b"ATSAM/hybrid-ratchet/v2"
@@ -111,10 +110,25 @@ class SpqrHeader:
 
 
 def encode_composite_header(ec: EcHeader, spqr: SpqrHeader) -> bytes:
+    """Frozen pre-Full-Braid stub header (u32 epoch/counter fields).
+
+    Normative Braid epochs are u64be (§5.1; Full Braid RVCH1/RVBC1). This stub
+    keeps its frozen width, so out-of-range values fail closed rather than
+    truncating or wrapping.
+    """
     if len(ec.dh_pub) != 32:
         raise ValueError("dh_pub")
     if len(spqr.kem_ct_digest) != 32:
         raise ValueError("kem_ct_digest")
+    for name, value in (
+        ("pn", ec.pn),
+        ("n", ec.n),
+        ("sending_epoch", spqr.sending_epoch),
+        ("receiving_epoch", spqr.receiving_epoch),
+        ("send_ctr", spqr.send_ctr),
+    ):
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError(f"composite header {name} out of u32 range")
     return b"".join(
         (
             HEADER_DOMAIN,
@@ -263,11 +277,8 @@ def sign_ack(ack: AckV2, device_ed_priv: bytes) -> AckV2:
 
 def verify_ack(ack: AckV2, device_ed_pub: bytes) -> bool:
     try:
-        Ed25519PublicKey.from_public_bytes(device_ed_pub).verify(
-            ack.signature, ack_signing_bytes(ack)
-        )
-        return True
-    except (InvalidSignature, ValueError):
+        return ed25519_strict.verify(device_ed_pub, ack.signature, ack_signing_bytes(ack))
+    except ValueError:
         return False
 
 

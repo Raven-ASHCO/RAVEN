@@ -3,13 +3,14 @@
 //! Finding a name ≠ verifying a person. `@alias` is NOT identity; `rvn1…` is.
 //! Spec: `docs/RAVEN_DISCOVERY_V1.md`.
 
+use crate::address::{decode_address, encode_address, from_display, ADDRESS_VERSION};
 use crate::alias_record::{normalize_alias, AliasClaimStore, AliasRecord};
 use crate::chat_history::BlockList;
 use crate::introduction::IntroductionInbox;
 use crate::nearby::NearbyRegistry;
 use crate::profile_record::{ProfileStore, RavenProfileRecordV1};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -35,6 +36,9 @@ pub enum VerificationState {
     AliasConflict,
     ExpiredOrStale,
     Blocked,
+    /// Well-formed Raven ID with no signed profile, contact or introduction
+    /// behind it. Exact-ID search can still offer it; nothing is verified.
+    Unverified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -136,10 +140,6 @@ impl DiscoveryProvider for LocalContactsProvider {
         let q = query.trim().trim_start_matches('@').to_lowercase();
         let mut out = Vec::new();
         for c in &ctx.contacts {
-            if ctx.blocked.is_blocked(&c.pub_hex) {
-                out.push(blocked_result(&c.raven_id));
-                continue;
-            }
             let pet = c.petname.to_lowercase();
             let tag = c.public_tag.to_lowercase();
             let disp = c.display_name.to_lowercase();
@@ -149,35 +149,41 @@ impl DiscoveryProvider for LocalContactsProvider {
                     || tag == q
                     || disp.contains(&q)
                     || c.raven_id.to_lowercase().contains(&q));
-            if id_match || local_match {
-                let state = if c.directly_verified || c.pinned {
-                    VerificationState::DirectlyVerified
-                } else {
-                    VerificationState::TrustedContact
-                };
-                out.push(DiscoveryResult {
-                    raven_id: c.raven_id.clone(),
-                    display_name: if !c.petname.is_empty() {
-                        c.petname.clone()
-                    } else if !c.display_name.is_empty() {
-                        c.display_name.clone()
-                    } else {
-                        c.public_tag.clone()
-                    },
-                    aliases: if c.public_tag.is_empty() {
-                        vec![]
-                    } else {
-                        vec![c.public_tag.clone()]
-                    },
-                    profile_digest: String::new(),
-                    source_set: vec![DiscoverySource::LocalContacts],
-                    verification_state: state,
-                    introductions: vec![],
-                    conflict_count: 0,
-                    sequence: 0,
-                    expires_at: u64::MAX,
-                });
+            if !(id_match || local_match) {
+                continue;
             }
+            // Only a blocked contact that matches the query is reported.
+            if ctx.blocked.is_blocked(&c.pub_hex) {
+                out.push(blocked_result(&c.raven_id));
+                continue;
+            }
+            let state = if c.directly_verified || c.pinned {
+                VerificationState::DirectlyVerified
+            } else {
+                VerificationState::TrustedContact
+            };
+            out.push(DiscoveryResult {
+                raven_id: c.raven_id.clone(),
+                display_name: if !c.petname.is_empty() {
+                    c.petname.clone()
+                } else if !c.display_name.is_empty() {
+                    c.display_name.clone()
+                } else {
+                    c.public_tag.clone()
+                },
+                aliases: if c.public_tag.is_empty() {
+                    vec![]
+                } else {
+                    vec![c.public_tag.clone()]
+                },
+                profile_digest: String::new(),
+                source_set: vec![DiscoverySource::LocalContacts],
+                verification_state: state,
+                introductions: vec![],
+                conflict_count: 0,
+                sequence: 0,
+                expires_at: u64::MAX,
+            });
         }
         out
     }
@@ -188,34 +194,43 @@ impl DiscoveryProvider for ExactRavenIdProvider {
         DiscoverySource::ExactRavenId
     }
     fn search(&self, ctx: &DiscoveryContext, query: &str) -> Vec<DiscoveryResult> {
-        let q = query.trim();
-        if !q.starts_with("rvn1") {
+        let Some(id) = canonical_raven_id(query) else {
             return vec![];
+        };
+        if blocked_raven_ids(ctx).contains(&id) {
+            return vec![blocked_result(&id)];
         }
-        if let Some(c) = ctx.contacts.iter().find(|c| c.raven_id == q) {
-            if ctx.blocked.is_blocked(&c.pub_hex) {
-                return vec![blocked_result(q)];
-            }
-        }
-        if let Some(prof) = ctx.profiles.get(q, ctx.now_ms) {
-            return vec![profile_to_result(prof, DiscoverySource::ExactRavenId, 0)];
-        }
-        // Valid-looking ID with no profile: still return candidate (exact ID path).
-        if q.len() > 10 {
-            return vec![DiscoveryResult {
-                raven_id: q.to_string(),
+        let mut r = if let Some(prof) = ctx.profiles.get(&id, ctx.now_ms) {
+            profile_to_result(prof, DiscoverySource::ExactRavenId, 0)
+        } else {
+            // Checksum-valid ID with no profile: offer it, but never as verified.
+            DiscoveryResult {
+                raven_id: id,
                 display_name: String::new(),
                 aliases: vec![],
                 profile_digest: String::new(),
                 source_set: vec![DiscoverySource::ExactRavenId],
-                verification_state: VerificationState::PublicSignedProfile,
+                verification_state: VerificationState::Unverified,
                 introductions: vec![],
                 conflict_count: 0,
                 sequence: 0,
                 expires_at: 0,
-            }];
+            }
+        };
+        // A local (unblocked) contact row is stronger than either state above.
+        if let Some(c) = ctx
+            .contacts
+            .iter()
+            .find(|c| c.raven_id.eq_ignore_ascii_case(&r.raven_id))
+        {
+            r.verification_state = if c.directly_verified || c.pinned {
+                VerificationState::DirectlyVerified
+            } else {
+                VerificationState::TrustedContact
+            };
+            r.source_set.push(DiscoverySource::LocalContacts);
         }
-        vec![]
+        vec![r]
     }
 }
 
@@ -284,8 +299,23 @@ impl DiscoveryProvider for SocialIntroductionProvider {
     }
     fn search(&self, ctx: &DiscoveryContext, query: &str) -> Vec<DiscoveryResult> {
         let intros = ctx.intros.for_subject_alias(query, ctx.now_ms);
+        // Admission only proved the introducer was a trusted contact *then*.
+        // INTRODUCED results are ranked above signed public profiles, so trust
+        // is re-checked at query time: an introducer who has since been
+        // blocked, or is no longer a (non-blocked) contact, vouches for no one.
+        let blocked = blocked_raven_ids(ctx);
+        let introducer_trusted = |introducer: &str| {
+            !blocked.contains(&introducer.to_lowercase())
+                && ctx.contacts.iter().any(|c| {
+                    c.raven_id.eq_ignore_ascii_case(introducer)
+                        && !ctx.blocked.is_blocked(&c.pub_hex)
+                })
+        };
         let mut by_subject: HashMap<String, DiscoveryResult> = HashMap::new();
         for i in intros {
+            if !introducer_trusted(&i.introducer_raven_id) {
+                continue;
+            }
             let entry = by_subject
                 .entry(i.subject_raven_id.clone())
                 .or_insert_with(|| DiscoveryResult {
@@ -333,6 +363,41 @@ impl DiscoveryProvider for LegacyServerProvider {
         // Intentionally empty stub — FastAPI search must not be required.
         vec![]
     }
+}
+
+/// Canonical `rvn1…` address when `query` is a well-formed RavenAddressV1
+/// (bech32m checksum, `rvn` HRP, version 1). Display form is accepted.
+fn canonical_raven_id(query: &str) -> Option<String> {
+    let q = query.trim();
+    if !q.to_ascii_lowercase().starts_with("rvn1") {
+        return None;
+    }
+    let canon = from_display(q);
+    match decode_address(&canon)? {
+        (_, ADDRESS_VERSION) => Some(canon),
+        _ => None,
+    }
+}
+
+/// Raven IDs the local block list covers: blocked contacts plus the address of
+/// every blocked key, so a blocked identity is caught whichever lane (exact
+/// ID, alias, nearby, introduction) surfaces it — contact row or not.
+fn blocked_raven_ids(ctx: &DiscoveryContext) -> HashSet<String> {
+    let mut out: HashSet<String> = ctx
+        .contacts
+        .iter()
+        .filter(|c| ctx.blocked.is_blocked(&c.pub_hex))
+        .map(|c| c.raven_id.to_lowercase())
+        .collect();
+    for h in &ctx.blocked.pub_hex {
+        let Ok(raw) = hex::decode(h.trim()) else {
+            continue;
+        };
+        if let Ok(ed) = <[u8; 32]>::try_from(raw.as_slice()) {
+            out.insert(encode_address(&ed));
+        }
+    }
+    out
 }
 
 fn blocked_result(raven_id: &str) -> DiscoveryResult {
@@ -528,6 +593,18 @@ impl DiscoveryResolver {
             }
         }
 
+        // Block list wins over every lane's own verdict.
+        let blocked = blocked_raven_ids(ctx);
+        for r in &mut out {
+            if r.verification_state != VerificationState::Blocked
+                && blocked.contains(&r.raven_id.to_lowercase())
+            {
+                let sources = std::mem::take(&mut r.source_set);
+                *r = blocked_result(&r.raven_id);
+                r.source_set = sources;
+            }
+        }
+
         out.sort_by(|a, b| {
             rank(a.verification_state)
                 .cmp(&rank(b.verification_state))
@@ -585,6 +662,7 @@ fn rank(s: VerificationState) -> u8 {
         VerificationState::PublicSignedProfile => 6,
         VerificationState::AliasConflict => 7,
         VerificationState::ExpiredOrStale => 8,
+        VerificationState::Unverified => 9,
     }
 }
 

@@ -1,13 +1,13 @@
 # DONE_CHECKLIST (software slice — honest)
 
-Companion to `docs/MASTER_CHECKLIST_STATUS.md`. This is **not** Final DoD §60.
+Companion to `docs/MASTER_CHECKLIST_STATUS.md`. This is **not** Final DoD §60. RVN1 messaging is under a production **HOLD** with no external review (`protocol/SECURITY_ERRATA_RVN1_2026-08-13.md`, `docs/THREAT_MODEL.md`); a ✅ here is a software/lab statement, not a security or release claim.
 
 ## P0 Cross-device reliability
 
 | Item | Status | Evidence |
 |------|--------|----------|
-| senderUserId mapping (flag ON) | ✅ software | `RavenEnvelopeSenderResolver` + Bridge publish + PeerKeyDirectory reverse |
-| Endpoint ingest → sealer + Delivered | ✅ software | ChatWire + tests |
+| senderUserId mapping (flag ON) | 🟡 unverified / absent on `main` | iOS/Swift tree (`RavenEnvelopeSenderResolver`, PeerKeyDirectory) is not in this repository (**OFF-MAIN**); old ✅ was not reproducible from this tree |
+| Endpoint ingest → sealer + Delivered | 🟡 unverified / absent on `main` | iOS ChatWire is **OFF-MAIN**; endpoint acceptance is production-disabled per `docs/THREAT_MODEL.md` |
 | A↔B↔C automated | ✅ | `bridge_abc_demo` + §59 harness |
 | iOS hardware 3-phone | ❌ BLOCKED_HARDWARE | `docs/PHYSICAL_BLE_THREE_DEVICE.md` |
 
@@ -16,9 +16,9 @@ Companion to `docs/MASTER_CHECKLIST_STATUS.md`. This is **not** Final DoD §60.
 | Item | Status | Evidence |
 |------|--------|----------|
 | ATSAM beyond 0x7F | ✅ subset | `atsam_root` + `atsam_kdf` + `atsam_aead` + shared vectors |
-| ML-KEM full stack | ❌ gap | iOS primary; Rust known-root/X25519 |
+| ML-KEM full stack | 🟡 partial | Rust implements the ML-KEM-768 + X25519 hybrid (`raven_core::atsam_mlkem`, `pair_init`); PairInit is production-disabled globally (live only on the unreviewed LAN-direct slice, which is CI/lab-verified); full PQ ratchet and iOS parity (OFF-MAIN) still pending |
 | KATs shared | ✅ | `shared-vectors/rvn1/atsam/*` |
-| External review packet | ✅ ready | `docs/EXTERNAL_REVIEW_PACKET.md` |
+| External review packet | ✅ written (no review has happened) | `docs/EXTERNAL_REVIEW_PACKET.md` — independent review is BLOCKED_HUMAN |
 
 ## P2 Networking / services
 
@@ -55,16 +55,16 @@ Companion to `docs/MASTER_CHECKLIST_STATUS.md`. This is **not** Final DoD §60.
 | Item | Status | Evidence |
 |------|--------|----------|
 | Serverless without FastAPI | ✅ | §59 harness + demos |
-| Rate/TTL/hop/dedup/restart | ✅ | bridge_v1 + demos |
-| §59 automated proof | ✅ GREEN | `AUTOMATED_PROOF_GREEN` |
+| Rate/TTL/hop/dedup/restart | ✅ (lab) | bridge_v1 + demos; hop/replication budgets are unauthenticated cooperative limits only (errata rule 8) |
+| §59 automated proof | ⚠️ RE-RUN | earlier `AUTOMATED_PROOF_GREEN` runs were false-green (only each step's last command counted); harness fixed 2026-09-29 |
 
 ## Suites last green (this machine)
 
-- `scripts/final_serverless_proof.sh` (17/17)
+- `scripts/final_serverless_proof.sh` — earlier "17/17" invalidated; the fixed harness has 16 enforced steps (re-run)
 - `cargo test -p raven-core` / `ash` / bridge_v1 / fuzz_smoke
 - bridge_abc, two_node, lan, internet, swarm, mailbox, manual bootstrap
 
 ## READY FOR YOUR FULL TEST?
 
 **NO** (marketing READY) — hardware + external review remain.  
-**IMPLEMENTATION + PROOF HARNESS COMPLETE** — yes for automatable software.
+Harness fixed 2026-09-29; a fresh enforced run of `final_serverless_proof.sh` / `reliability_matrix_20.sh` is pending, so **IMPLEMENTATION + PROOF HARNESS COMPLETE** is not currently asserted. Any future green run is lab evidence only and does not lift the RVN1 production HOLD.

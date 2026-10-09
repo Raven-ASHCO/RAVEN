@@ -22,13 +22,14 @@ historical snapshot.
 
 | Area | Current verdict | Evidence / remaining gate |
 |---|---|---|
-| Content confidentiality | **Fail-closed, not production-enabled** | Public-material demo sealers are disabled and plaintext carrier admission is rejected. A transcript-bound, persisted ATSAM session is not yet active. |
-| Message/ACK endpoint acceptance | **Fail-closed, production-disabled** | Rust and Swift reference actors now verify PairInit-bound device certificates, route/AAD/AEAD, exact inbox/outstanding rows, sealed ACKs, replay state, and recoverable message/ACK journals. Swift concrete Keychain/SQLCipher/queue adapters, a bound ACK sender, live wiring, and external review remain gates. |
+| Content confidentiality | **Fail-closed, not production-enabled** (except the LAN-direct slice, see its row below) | Public-material demo sealers are disabled and plaintext carrier admission is rejected. Outside the LAN-direct slice, a transcript-bound, persisted ATSAM session is not yet active. |
+| Message/ACK endpoint acceptance | **Fail-closed, production-disabled** | Rust and Swift (**OFF-MAIN**, unverified from this tree) reference actors now verify PairInit-bound device certificates, route/AAD/AEAD, exact inbox/outstanding rows, sealed ACKs, replay state, and recoverable message/ACK journals. Swift concrete Keychain/SQLCipher/queue adapters, a bound ACK sender, live wiring, and external review remain gates; the Rust actors are wired live only for the LAN-direct slice below. |
 | Relay/store opacity | **Partially implemented** | Queues store immutable opaque envelopes and deduplicate by authenticated-object digest. Production route/mailbox keys still require the authenticated session actor. |
-| Replay/dedup | **Implemented in disabled reference actors** | Relay cache poisoning by attacker-chosen IDs is contained. Rust and Swift reference actors commit authenticated object/logical-ID/ACK-nonce replay state with their ratchets; live paths remain disabled until concrete adapters and integration pass review. |
+| Replay/dedup | **Implemented in disabled reference actors** | Relay cache poisoning by attacker-chosen IDs is contained. Rust and Swift (**OFF-MAIN**) reference actors commit authenticated object/logical-ID/ACK-nonce replay state with their ratchets; live paths remain disabled (except the LAN-direct slice below) until concrete adapters and integration pass review. |
 | Resource exhaustion | **Bounded at audited wire boundaries** | Go bridge and raw Rust TCP handlers cap streams/handlers, declared bytes, frame size, and deadlines before allocation. The gated NAT profile also caps pending/established/per-peer connections and AutoNAT candidates. Peer scoring/Sybil resistance remains future work. |
 | Hop/replication ceilings | **Cooperative-policy only** | RVN1 does not authenticate mutable hop fields. No Byzantine forwarding bound is claimed until a versioned custody wrapper exists. |
 | Revocation freshness | **Partition-limited** | Local deny lists and certificate expiry work; V1 has no globally fresh signed revocation distribution guarantee. |
+| LAN-direct slice (terminal to terminal) | **Live in default builds; unreviewed; not a release claim** | `raven_core::lan_gate::LAN_DIRECT_PRODUCTION_ENABLED = true` runs Noise XX, RLB1 identity binding, PairInit V1, indexed-session v1 and sealed ACKs between `raven-node service` daemons on a LAN; the four global `PRODUCTION_ENABLED` flags (PairInit, session store, prekey lifecycle, ATSAM indexed session) stay `false`. **Trust model:** the local contact book only (`peer_is_trusted`: any `contacts.json` key, pinned or not; fingerprint pinning is not enforced) plus the Noise-to-RLB1 identity binding. **Known limits:** no one-time prekeys are installed, so first-contact forward secrecy is bounded by signed-prekey rotation alone ([`RAVEN_PREKEY_LIFECYCLE_V1.md`](../protocol/RAVEN_PREKEY_LIFECYCLE_V1.md) §6); IP addresses, timing and sizes are visible on the wire (§3.4, §3.17); the in-tree CI proof is Linux-only and uses the debug `locked-file` identity override (`scripts/lan_direct_two_node.sh`). **Errata gates still open for it:** monotonic one-time-prekey consumption, Rust/Swift fixture exchange (Swift is off-main), the real-device matrix and the external review; the other release-gate items have not been assessed for this slice here, so their omission is not a pass. |
 | Release status | **HOLD** | iOS Release hard-disables RVN1, default Rust origination requires an authenticated session, and the external security review/real-device matrix has not happened. |
 
 This document explains, in plain language, what RAVEN is designed to protect
@@ -45,7 +46,11 @@ its job. Overclaiming is the actual defect.
 
 Every citation below points at a committed, frozen spec in `protocol/` or a
 byte-exact test vector in `shared-vectors/rvn1/`, or at a specific shipped
-source file. If a citation and the shipped code ever disagree, the code is
+source file — except citations tagged **OFF-MAIN** (the `ios-native/…`
+Swift/Go paths), which refer to a tree that is not in this repository and are
+unverified-from-main: they are not evidence for this checkout (same convention
+as [`crypto/ATSAM_KAT_CONSUMER_MATRIX_V1.md`](crypto/ATSAM_KAT_CONSUMER_MATRIX_V1.md)).
+If a citation and the shipped code ever disagree, the code is
 wrong until proven otherwise — see §4.
 
 ---
@@ -212,14 +217,17 @@ network operator, an ISP, or a Wi-Fi hotspot operator — for internet-bridge
 
 **Verdict: Partially protected.**
 
-**Why (protected sub-case):** The libp2p bridge host is configured with
-`libp2p.DefaultSecurity` (Noise + TLS transport security) —
-`ios-native/RAVEN/Libp2pBridge/bridge.go:135`. This means an on-path ISP
-sees an encrypted transport stream, not `RavenEnvelopeV1` bytes in the
-clear: it cannot read the routing tag, the ciphertext, or the magic bytes
-without breaking the transport-layer Noise handshake. This is on top of, and
-independent from, the message-level E2EE described in §3.1 — two layers, as
-stated in §1's asset list.
+**Why (protected sub-case):** On the Rust side, the libp2p smoke host
+(`node/crates/raven-swarm`) secures TCP with Noise and QUIC with libp2p's own
+TLS-based transport security (not Noise), and the LAN-direct carrier is Noise
+XX (`raven_core::lan_noise`). An on-path ISP therefore sees an encrypted
+transport stream, not `RavenEnvelopeV1` bytes in the clear: it cannot read the
+routing tag, the ciphertext, or the magic bytes without breaking the
+transport-layer handshake. The original claim that the iOS/Go libp2p bridge
+host uses `libp2p.DefaultSecurity` (Noise + TLS) cites
+`ios-native/RAVEN/Libp2pBridge/bridge.go:135` (**OFF-MAIN**, unverified from
+this tree). This is on top of, and independent from, the message-level E2EE
+described in §3.1 — two layers, as stated in §1's asset list.
 
 **Why (out-of-scope sub-case):** Transport encryption hides *content*, not
 *shape*. An ISP still observes which IP addresses a device connects to, at
@@ -245,7 +253,7 @@ on-path party from altering those exact authenticated records unnoticed.
 
 **Current boundary:** PairInit V1 now byte-binds the two device certificates,
 responder prekey, hybrid contributions, roles, profile, and suite. It is
-byte-for-byte verified by Python, Rust, and Swift but remains
+byte-for-byte verified by Python, Rust, and Swift (Swift is **OFF-MAIN**, unverified from this tree) but remains
 production-disabled pending a confidential carrier, protected durable endpoint
 state, one-time-prekey lifecycle, and external review. Older ad-hoc
 pairing code is not evidence that every live message path has this binding.
@@ -257,7 +265,7 @@ successfully impersonates a contact during the in-person QR exchange itself
 (e.g. a fake QR code, a compromised video-call impersonation) defeats
 pairing at the human layer, not the cryptographic layer. This is explicitly
 the user's responsibility, matching the pre-pivot model's §3.4. We also note
-`SafetyNumberView.swift`'s own comment marks automated QR-based safety
+`SafetyNumberView.swift`'s (**OFF-MAIN**) own comment marks automated QR-based safety
 number re-verification as a TODO; today the safety-number check is a manual
 compare-in-person-or-by-call flow, not an automated re-scan.
 
@@ -269,9 +277,14 @@ locked (passcode/biometric not entered).
 **Verdict: Partially protected; platform-dependent.**
 
 **Why:** iOS roots are Keychain-backed, device-only, and excluded from
-backup. Rust identity/session storage uses Keychain on macOS, Secret Service
-on Linux, and DPAPI on Windows, and refuses the protected session store when
-no supported backend exists.
+backup. Rust identity/session storage uses Keychain on macOS and DPAPI on
+Windows. On Linux, existing glibc Secret Service identities load, but identity
+**creation is disabled in Release builds pending R1** (musl and other Unix
+targets have no protected identity backend), so a Release Linux install cannot
+create an identity today. The `0600` `locked-file` seed
+(`RAVEN_IDENTITY_BACKEND=locked-file`) is a debug/lab/CI-only override that
+Release builds refuse; it is not an approved fallback. The protected session
+store is refused when no supported backend exists.
 
 **Limit:** the current iOS root accessibility is
 `AfterFirstUnlockThisDeviceOnly`. After the first unlock following boot, that
@@ -456,7 +469,7 @@ stripping a post-quantum-hybrid or delivery-authentication bit).
 **Current protection:** `protocol/RAVEN_CAPABILITIES_V1.md` replaces the legacy unsigned
 BLE `Capabilities` advertisement — which any on-path relay could read or
 alter without either side detecting it (§2, citing
-`ios-native/RAVEN/RAVEN/Core/Mesh/RUMProtocolV2.swift:155-218`) — with a
+`ios-native/RAVEN/RAVEN/Core/Mesh/RUMProtocolV2.swift:155-218`, **OFF-MAIN**) — with a
 self-signed, identity-bound, time-bound record. A verifier caches the
 freshest signed capability set seen for a given identity and refuses to
 silently accept a lower-capability claim unless that claim is itself

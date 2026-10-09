@@ -5,6 +5,14 @@
 **Risk class:** R0 (docs / governance only)  
 **Repo:** [Raven-ASHCO/RAVEN](https://github.com/Raven-ASHCO/RAVEN)
 
+> **Status-wording note (2026-10-05):** this document is a dated 2026-09-04
+> snapshot. Its "in flight" / "pending" labels for PR #16, #17 and #26 predate
+> their landing: `.github/workflows/raven-serverless.yml` on `main` already runs
+> `ash_menu_smoke.sh` in the Linux, macOS and Windows jobs and named `bridge_v1`
+> on macOS and Windows. Treat those labels as historical and re-check the
+> workflow before relying on any "in-flight" row; this note does not upgrade any
+> row to Proven.
+
 This one-pager freezes **how a path may be claimed**. It does not add CI, does not change product behavior, and **does not invent metrics**. Tiers live in [`reliability-evidence-bar.md`](reliability-evidence-bar.md) (**Proven** / **PASS_SOFTWARE_SUBSTITUTE** / **Blocked**). Harvest numbers and draft soft budgets live in [`perf-baseline-2026-09-04.md`](perf-baseline-2026-09-04.md) / [PR #14](https://github.com/Raven-ASHCO/RAVEN/pull/14).
 
 Org chart [`org-structure.md`](org-structure.md) still uses freeze titles (#19 Release Engineering Lead). This file follows the Sprint 0 assignment (**Role #19 SRE Perf**).

@@ -1,7 +1,7 @@
 # RAVEN Protocol Version Inventory
 
 **Status:** Living inventory (docs only). Not a wire change.
-**Updated:** 2026-09-06
+**Updated:** 2026-10-08
 **Audience:** protocol owners, ports, CI readers.
 
 This page lists which protocol families are frozen, which are draft / production-disabled, and which CI jobs in `.github/workflows/raven-serverless.yml` (workflow display name: **Raven Serverless Node**) and `.github/workflows/raven-b1-always-on.yml` (workflow display name: **Raven B1 Always-On**) can be cited as evidence on the current serverless `main` tree.
@@ -95,6 +95,7 @@ Cite present-tree evidence first. The six names in **RAVEN Serverless B1** above
 |---|---|---|
 | **Rust + vectors (Linux)** | **protocol vectors (python)** | Intended `rvn1` vector regen/drift gate (`pytest` + `generate_rvn1.py` + `git diff --exit-code` on `shared-vectors/rvn1`). Parent job is **main-green verified** on `e0a317aa` (pin not enabled). |
 | **Rust + vectors (Linux)** | **experimental mailbox/NAT tests (still production-disabled)** | Intended fail-closed hold: experimental binaries must refuse to run without explicit opt-in. Parent job is **main-green verified** on `e0a317aa` (pin not enabled). Profile remains production-disabled. |
+| **Harness self-tests + protocol freeze** | **Protocol freeze hashes (docs/PROTOCOL_FREEZE_HASHES_V1.md)** | `scripts/freeze_protocol_hashes.sh --check`: any change / addition / removal under `protocol/` or `shared-vectors/rvn1/` fails unless the manifest is regenerated in the same change. New job; not a B1 name. |
 | **.NET / C# rvn1 shared-vector consumer** | — | **NOT YET.** No smoke gate in `raven-serverless.yml`. Do not invent a C# harness. |
 
 Jobs that remain **skip-when-absent / N/A** on this serverless `main` (not B1 candidates; not required gates):
@@ -109,3 +110,88 @@ Jobs that remain **skip-when-absent / N/A** on this serverless `main` (not B1 ca
 Watch jobs remain **N/A** on this serverless tree (no `RAVEN-WatchApp/` paths). Other lab job display names (not claimed as RAVEN B1 here): **ML-KEM-768 incremental (portable)**, **ML-KEM-768 incremental (AVX2)**, **ML-KEM-768 incremental (NEON)**, **Full Braid Slice 2 lab**, **Full Braid Task 0A provenance (0A.1)**, **Full Braid Task 0A Linux (0A.2/0A.4/0A.5)**, **Full Braid Task 0A Windows MSVC (0A.2/0A.4)**.
 
 Platform vector consumers outside this workflow: see [`../shared-vectors/README.md`](../shared-vectors/README.md). **.NET / C# `rvn1` CI consumer is NOT YET.**
+
+---
+
+## Freeze record changes (2026-10-08)
+
+Owner-approved spec maintenance. **No wire format, key derivation, signature
+input or vector changed.**
+
+- **`dest_device_hint = 0` erratum.** `ATSAM_ENDPOINT_TRANSACTION_V1.md` §4.1
+  step 2 now requires `dest_device_hint=0` for new indexed-session messages
+  and ACKs instead of the recipient-derived hint
+  `SHA-256("rvn1/device-hint/v1" || device_pub)[:8]`, which any holder of the
+  recipient's public key could match. Stored-object revalidation and receivers
+  accept `0` or the legacy value (§1 step 4); `RAVEN_ENVELOPE_V1.md` §5 says
+  why. Rust: `raven_core::indexed_session_store::OUTBOUND_DEST_DEVICE_HINT`.
+- **Contact-gated responder.** `RAVEN_TRANSPORT_INTERFACE_V1.md` §3 now states
+  that a responder sends its hello and RLB1 only to an initiator whose hello
+  names a local contact, and otherwise closes (same frames and order as
+  before; the initiator always authenticated first).
+
+## Freeze record changes (2026-10-07)
+
+Owner-approved (2026-10-07) normative clarifications. **No wire format, key
+derivation or signature input changed**; every pre-existing vector is
+byte-identical. Docs / reference / additive vectors only:
+
+- **Clock skew made normative.** `RAVEN_PAIR_INIT_V1.md` §1 / §5 name
+  `MAX_PEER_CLOCK_SKEW_MS = 300000` (Rust `MAX_PREKEY_FUTURE_SKEW_MS`) for
+  START bounds only (signed creation vs `now_ms`, and vs the trust-window
+  start); expiry bounds are exact. The indexed-session windows use the same
+  start-bound tolerance, applied after step-4 candidate selection
+  (`ATSAM_ENDPOINT_TRANSACTION_V1.md` §1). `RAVEN_PREKEY_BUNDLE_V1.md` §4 now
+  states the bundle's inclusive ±300000 ms window exactly as Rust and the
+  `bundle_signing_00{1,2}` clock cases already did.
+- **Other clarifications.** PairInit §1 now cites signed revocation (RVDR1)
+  precisely instead of saying none exists; 24 h initiator session lifetime
+  (informative, PairInit §4 and profile §2.4); `ATSAM_PRIMITIVE_MAPPING_V1.md`
+  duplicate §3.4 heading fixed (root is §3.5) and the RVNA1 v1/v2 AAD string
+  encodings specified as implemented; `ATSAM_HYBRID_RATCHET_V2.md` rev 11
+  (§0.4 V2 signature domains, 227-byte PairResponse V2, reused V1 digest
+  labels; §3.3 OTP / ML-KEM DK retention per the prekey lifecycle; §13.1
+  known vector/spec discrepancies, vectors unchanged).
+- **Owner waiver referenced.** The live LAN-direct indexed-session slice runs
+  under [`WAIVER-LAN-DIRECT-2026-10-07`](../docs/WAIVER_LAN_DIRECT_INDEXED_SESSION_2026-10-07.md),
+  now cited from umbrella §9.1 / §11, PairInit §7-§8, profile §7 and primitive
+  mapping §3.4 as the only exception; everything else stays disabled.
+- **Python reference.** One strict Ed25519 helper
+  (`raven_protocol/ed25519_strict.py`: small-order A / R blocklist with the
+  sign bit masked, canonical `s < L`) behind every reference signature check;
+  PairInit V1 skew rule; PairInit V2 structural hard rejects aligned with V1;
+  `prekey.verify(bundle, now_ms)` time window (old one-argument call kept).
+- **Additive negative vectors** (generated by `generate_rvn1.py`):
+  `negative/ed25519_weak_key_forgery_001.json`,
+  `atsam/negative/pair_init_v1_small_order_ephemeral_001.json` (validly
+  re-signed; only the structural rule fails) and
+  `atsam/pair_init_v1_clock_skew_001.json`. Consumers:
+  `protocol/reference/tests/` and
+  `node/crates/raven-core/tests/rvn1_strict_vectors.rs`.
+
+## Freeze record changes (2026-09-29)
+
+No wire format, key derivation or signature input changed. Docs / vectors only:
+
+- **Freeze manifest re-baselined.** `docs/PROTOCOL_FREEZE_HASHES_V1.md` (last
+  generated 2026-08-12 at `7acbef7`) no longer matched the tree: 15 of its 68
+  entries had changed — `SPEC.md`, `RAVEN_ENVELOPE_V1.md`, `RAVEN_ACK_V1.md`,
+  `RAVEN_PREKEY_BUNDLE_V1.md`, `RAVEN_ROUTING_TAG_V1.md`,
+  `RAVEN_STORE_OBJECT_V1.md`, `RAVEN_TRANSPORT_INTERFACE_V1.md`,
+  `RAVEN_ALIAS_V1.md`, `RAVEN_INTEROPERABILITY_MATRIX.md`,
+  `ATSAM_PRIMITIVE_MAPPING_V1.md`, `generate_rvn1.py`, `raven_protocol/__init__.py`,
+  `raven_protocol/envelope.py` and two reference tests — mostly the post-freeze
+  strict-decoder tightening and the security errata. The manifest is now a pure
+  function of the tree (no timestamp header), covers **every** file under
+  `protocol/` and `shared-vectors/rvn1/`, and CI enforces it with `--check`.
+- **Additive vectors** (new files; no committed vector changed):
+  `prekey/bundle_signing_001.json` / `_002.json`, `negative/prekey_bad_sig_002.json`,
+  `negative/envelope_expired_002.json`, strict-decoder negatives
+  `negative/envelope_{expires_not_after_created,auth_len_63,reserved_flag,env_type_0,env_type_5,trailing_byte,truncated,bad_version}_001.json`,
+  and PairInit V1 structural negatives `atsam/negative/pair_init_v1_*.json`.
+  Rust consumer: `node/crates/raven-core/tests/rvn1_strict_vectors.rs`; the
+  generator asserts the Python reference agrees.
+- `RAVEN_ENVELOPE_V1.md` §6.1 now states the `expires_at > created_at` decode
+  rule both reference decoders already enforced. `SPEC.md` marks the
+  formats that have no byte-level contract as **implementation-defined**.
+

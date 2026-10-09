@@ -25,15 +25,37 @@ default = []
 # integration tests and operators, but it is absent from production/default
 # builds until the authenticated session actor is enabled end to end.
 experimental-offline-mailbox = ["dep:async-trait", "libp2p/request-response"]
-# Security hold: NAT traversal is available only in a separate operator-facing
-# experiment. Default Raven binaries do not compile or advertise these
-# protocols, and the experimental binary requires an additional runtime opt-in.
+# Security hold: this NAT traversal experiment is available only in a separate
+# operator-facing binary, which requires an additional runtime opt-in. The
+# `raven-swarm` binary does not compile or advertise these protocols. (The P3
+# carrier below compiles the same protocols into raven-node, held at runtime.)
 experimental-nat-connectivity = [
     "dep:rand",
     "libp2p/autonat",
     "libp2p/dcutr",
     "libp2p/relay",
 ]
+# Transports P3 (libp2p relay + hole punching): the endpoint host and the relay
+# server (`raven_swarm::host`). Off in this crate's default build, so the
+# `raven-swarm` smoke binary still compiles none of these protocols. Only
+# raven-node enables it, and raven-node never instantiates it unless its
+# runtime gate is open (`raven_core::p2p_live_enabled`:
+# P2P_PRODUCTION_ENABLED=false, or the debug lab unlock), the same way the
+# compiled-in Internet direct carrier is held by
+# INTERNET_DIRECT_PRODUCTION_ENABLED. With the gate closed nothing listens,
+# dials, reserves or advertises.
+p2p-host = [
+    "dep:rand",
+    "dep:libp2p-stream",
+    "libp2p/autonat",
+    "libp2p/dcutr",
+    "libp2p/relay",
+    "libp2p/upnp",
+]
+# No `libp2p/dns`: it would make hickory-proto buildable, which carries open
+# RustSec advisories (scripts/rustsec-inactive-advisories.json accepts them only
+# while no Raven graph can build it). raven-node resolves `/dns*/` route names
+# with the system resolver itself before it hands an address to libp2p.
 
 [dependencies]
 raven-core = { workspace = true }
@@ -44,6 +66,9 @@ sha2 = { workspace = true }
 futures = "0.3"
 async-trait = { version = "0.1", optional = true }
 rand = { workspace = true, optional = true }
+# `/raven/link/1.0.0` streams (P3). 0.4.0-alpha is the release for
+# libp2p-swarm 0.47 / libp2p 0.56 (the facade has no `stream` feature).
+libp2p-stream = { version = "=0.4.0-alpha", optional = true }
 libp2p = { version = "0.56", features = [
     "tokio",
     "tcp",

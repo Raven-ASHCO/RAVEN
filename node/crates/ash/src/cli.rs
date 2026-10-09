@@ -3,8 +3,32 @@
 //! This is the **product** CLI in `node/` — not Cursor/ash-autonomous automation.
 //! Never prints private keys, seeds, session keys, recovery secrets, or plaintext.
 
+// ── stdout that survives a closed pipe ───────────────────────────────────────
+// Rust sets SIGPIPE to "ignore", so a write to a pipe whose reader has gone
+// (`ash inbox | head -1`, `ash inbox | grep -q x`) returns EPIPE, and std's
+// `println!` answers with a panic: exit 101 and "failed printing to stdout:
+// Broken pipe". These shadow std's `print!` / `println!` for this file and the
+// child modules declared below it (textual macro scope). A broken pipe is the
+// reader saying it has seen enough: the rest of the output is dropped and the
+// command still runs to completion, so an operation is never abandoned half-way
+// (a send after its PairInit, say). Any other write error panics as before.
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::ash_cli::print_stdout(format_args!($($arg)*))
+    };
+}
+macro_rules! println {
+    () => {
+        $crate::ash_cli::print_stdout(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::ash_cli::print_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
 mod ext;
 mod ipc_client;
+mod p2p_cli;
 mod pair_init_lab;
 mod trace_delivery;
 
@@ -17,7 +41,7 @@ use raven_core::address::{decode_address, encode_address};
 use raven_core::alias_record::{normalize_alias, AliasClaimStore, AliasRecord};
 use raven_core::chat_history::BlockList;
 use raven_core::contact_request::{
-    ContactRequestInbox, ContactRequestInner, RavenContactRequestV1,
+    ContactAcceptOutcome, ContactRequestInbox, ContactRequestInner, RavenContactRequestV1,
 };
 use raven_core::discovery_resolver::{
     DiscoveryContext, DiscoveryResolver, DiscoveryResult, DiscoveryScope, LocalContactRow,
@@ -31,18 +55,46 @@ use raven_core::messaging_path::{
     assert_no_silent_fastapi, resolve_terminal_messaging_path, MessagingPath,
 };
 use raven_core::nearby::{NearbyAdvertisement, NearbyRegistry};
-use raven_core::node_policy::{load_policy, save_policy, BridgeStatusSnapshot, NodePolicy};
+use raven_core::node_policy::{load_policy, save_policy, try_load_policy, NodePolicy};
 use raven_core::prekey_bundle::{PrekeyBundle, PrekeyBundleJson, PrekeyStore};
 use raven_core::profile_record::ProfileStore;
 use raven_core::queue::{DeliveryState, OutgoingQueue};
-use raven_core::sanitize::sanitize_terminal_text;
+use raven_core::sanitize::{sanitize_terminal_line, sanitize_terminal_text};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::sync::OnceLock;
 
+/// Set once stdout reported a broken pipe: later output is dropped quietly.
+#[cfg(not(test))]
+static STDOUT_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Backend of the shadowed `print!` / `println!` (see the top of this file).
+/// Unit tests keep std's macros so libtest still captures their output; the
+/// broken-pipe behaviour is exercised against the real binary (tests/).
+#[cfg(test)]
+pub(crate) fn print_stdout(args: std::fmt::Arguments<'_>) {
+    std::print!("{args}");
+}
+
+/// Backend of the shadowed `print!` / `println!` (see the top of this file).
+#[cfg(not(test))]
+pub(crate) fn print_stdout(args: std::fmt::Arguments<'_>) {
+    use std::sync::atomic::Ordering;
+    if STDOUT_CLOSED.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Err(e) = io::stdout().lock().write_fmt(args) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            STDOUT_CLOSED.store(true, Ordering::Relaxed);
+            return;
+        }
+        panic!("failed printing to stdout: {e}");
+    }
+}
+
 /// Monochrome terminal style (bold / dim only — no cyan/purple/green).
-/// Empty strings when NO_COLOR is set or TERM=dumb.
+/// Empty strings when NO_COLOR is set, TERM=dumb, or stdout is not a terminal.
 #[derive(Clone, Copy)]
 struct Style {
     bold: &'static str,
@@ -50,12 +102,35 @@ struct Style {
     reset: &'static str,
 }
 
+/// Pure colour decision (NO_COLOR spec: set and non-empty disables colour).
+fn color_enabled_for(no_color_set: bool, term_dumb: bool, stdout_is_tty: bool) -> bool {
+    !no_color_set && !term_dumb && stdout_is_tty
+}
+
 fn color_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("NO_COLOR").is_none()
-            && !std::env::var_os("TERM").is_some_and(|t| t == "dumb")
+        color_enabled_for(
+            std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
+            std::env::var_os("TERM").is_some_and(|t| t == "dumb"),
+            io::stdout().is_terminal(),
+        )
     })
+}
+
+/// One SGR escape that renders only when [`color_enabled`] (checked at format
+/// time), so `{C_DIM}` in a format string honours NO_COLOR / pipes everywhere.
+#[derive(Clone, Copy)]
+struct Sgr(&'static str);
+
+impl std::fmt::Display for Sgr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if color_enabled() {
+            f.write_str(self.0)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn style() -> Style {
@@ -74,13 +149,14 @@ fn style() -> Style {
     }
 }
 
-// Brand palette. Honors NO_COLOR / TERM=dumb via `style()`.
-const C_BOLD: &str = "\x1b[1m";
-const C_DIM: &str = "\x1b[2m";
-const C_RESET: &str = "\x1b[0m";
-const C_CYAN: &str = "\x1b[1;36m";
-const C_PURPLE: &str = "\x1b[1;35m";
-const C_GREEN: &str = "\x1b[1;32m";
+// Palette shared by cli / ext / pair_init_lab. Honors NO_COLOR / TERM=dumb /
+// non-TTY stdout through `Sgr`'s Display impl.
+const C_BOLD: Sgr = Sgr("\x1b[1m");
+const C_DIM: Sgr = Sgr("\x1b[2m");
+const C_RESET: Sgr = Sgr("\x1b[0m");
+const C_CYAN: Sgr = Sgr("\x1b[1;36m");
+const C_PURPLE: Sgr = Sgr("\x1b[1;35m");
+const C_GREEN: Sgr = Sgr("\x1b[1;32m");
 
 fn c() -> Colors {
     if color_enabled() {
@@ -120,8 +196,9 @@ struct Colors {
     red: &'static str,
 }
 
-fn default_ash_data_dir() -> PathBuf {
-    raven_core::default_raven_data_dir()
+/// The default profile, or why there is none (no override and no usable HOME).
+fn default_ash_data_dir() -> Result<PathBuf, String> {
+    raven_core::paths::try_default_raven_data_dir()
 }
 
 fn is_ephemeral_data_dir(p: &Path) -> bool {
@@ -131,38 +208,58 @@ fn is_ephemeral_data_dir(p: &Path) -> bool {
         || (s.contains("/var/folders/") && s.contains("/T/tmp"))
 }
 
-fn resolve_data_dir(raw: &str) -> PathBuf {
+/// An explicit `--data-dir` is always honoured (never silently remapped onto
+/// the real ~/.raven profile). A mktemp-looking path only earns a warning —
+/// its identity changes every run, so a phone must re-pin each time.
+fn resolve_data_dir(raw: &str) -> Result<PathBuf, String> {
+    resolve_data_dir_with(raw, default_ash_data_dir)
+}
+
+/// [`resolve_data_dir`] with the default profile injected, so the "no profile
+/// can be determined" path is testable without touching the process environment.
+fn resolve_data_dir_with(
+    raw: &str,
+    default: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
     let t = raw.trim();
-    let p = if t.is_empty() {
-        default_ash_data_dir()
-    } else {
-        PathBuf::from(t)
-    };
-    let explicit_ephemeral = std::env::var_os("RAVEN_ALLOW_EPHEMERAL_DATA_DIR")
-        .map(|value| value == "1")
-        .unwrap_or(false);
-    if !is_ephemeral_data_dir(&p) || explicit_ephemeral {
-        return p;
+    if t.is_empty() {
+        return default();
     }
-    let stable = default_ash_data_dir();
-    eprintln!(
-        "{C_PURPLE}WARN{C_RESET}: ephemeral data-dir detected — switching to stable {}",
-        stable.display()
-    );
-    eprintln!(
-        "{C_DIM}FA:{C_RESET} mktemp هویت مک را هر بار عوض می‌کند و آیفون وصل نمی‌شود. از ~/.raven استفاده می‌کنیم."
-    );
-    eprintln!(
-        "{C_DIM}EN:{C_RESET} Stop using DATA=$(mktemp -d). Using ~/.raven so Mac whoami stays stable."
-    );
-    let _ = std::fs::create_dir_all(&stable);
-    // Best-effort: bring contacts along once.
-    let from_c = p.join("contacts.json");
-    let to_c = stable.join("contacts.json");
-    if from_c.is_file() && !to_c.is_file() {
-        let _ = std::fs::copy(&from_c, &to_c);
+    let p = PathBuf::from(t);
+    let quiet = std::env::var_os("RAVEN_ALLOW_EPHEMERAL_DATA_DIR").is_some_and(|v| v == "1");
+    if is_ephemeral_data_dir(&p) && !quiet {
+        eprintln!(
+            "{C_PURPLE}note{C_RESET}: --data-dir looks ephemeral (mktemp) — this is a throwaway identity; peers must re-pin it every run."
+        );
+        eprintln!(
+            "{C_DIM}FA:{C_RESET} پوشهٔ mktemp هویت موقت است؛ برای هویت ثابت مک از ~/.raven (بدون --data-dir) استفاده کنید."
+        );
     }
-    stable
+    Ok(p)
+}
+
+/// Create the profile directory owner-only (0700) when it does not exist yet.
+/// Existing directories are left alone: `--data-dir` may point anywhere.
+fn create_private_data_dir(dir: &Path) -> std::io::Result<()> {
+    // The "no profile could be determined" placeholder must never be created
+    // (a root process on a minimal system could otherwise build its tree).
+    raven_core::paths::require_resolved_data_dir(dir)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if dir.is_dir() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
 }
 
 /// Public logo assets (no secrets) — credit raven-messager.com.
@@ -174,39 +271,40 @@ pub const LOGO_64_URL: &str = "https://raven-messager.com/raven_logo_64.png";
 #[derive(Parser, Debug)]
 #[command(
     name = "ash",
+    version,
     about = "RAVEN Node — Messaging Beyond Connectivity",
     long_about = "RAVEN — serverless mesh messaging, from your terminal.\n\
                   \n\
-                  Run with no subcommand for the interactive menu (recommended).\n\
-                  No central server: identity is a local keypair, contacts are\n\
-                  pinned by fingerprint, and messages ride LAN / bridge / mailbox.\n\
+                  Run `ash` with no arguments for the interactive menu (recommended;\n\
+                  menu 8 is a guided tutorial). There is no central server: your\n\
+                  identity is a key kept on this computer, and you talk directly to\n\
+                  the people who added you.\n\
                   \n\
-                  QUICKSTART\n\
-                    ash                      # menu → 8 Tutorial (guided)\n\
-                    ash init                 # create identity\n\
-                    ash whoami               # share these 3 lines with a friend\n\
+                  FIRST CHAT  (both people do steps 1-3)\n\
+                  \x20 1. ash init                  create your identity (once)\n\
+                  \x20 2. ash whoami                send your friend the `invite` line it prints\n\
+                  \x20 3. ash                       menu 5 Contacts, then a: paste your friend's\n\
+                  \x20                              invite line (they paste yours the same way)\n\
+                  \x20 4. ash listen                the receiving side keeps this window open\n\
+                  \x20 5. echo \"hello\" | ash send --contact Bob   (Bob = the name you gave them)\n\
                   \n\
-                  TWO-TERMINAL CHAT (direct LAN)\n\
-                    # receiver:\n\
-                    raven-node run --data-dir ~/.raven --listen 127.0.0.1:0 \\\n\
-                      --write-addr /tmp/a.addr --write-pub /tmp/a.pub \\\n\
-                      --exit-after-recv 1 --peer-pub-hex <sender pub_hex>\n\
-                    # sender:\n\
-                    echo hi | raven-node run --data-dir ~/.raven-b \\\n\
-                      --listen 127.0.0.1:0 --peer \"$(cat /tmp/a.addr)\" \\\n\
-                      --peer-pub-hex <receiver pub_hex> --send-stdin \\\n\
-                      --body-mode unsafe-interim --exit-after-ack\n\
+                  Messages only arrive between people who added each other, and the\n\
+                  computer that receives must be listening (step 4; a first `ash send`\n\
+                  on it also leaves a background receiver running).\n\
+                  The text of a message always comes from stdin, never from the command\n\
+                  line. Live chat: ash send --contact Bob --chat\n\
                   \n\
-                  VERIFY EVERYTHING\n\
-                    bash scripts/final_serverless_proof.sh   # → AUTOMATED_PROOF_GREEN\n\
+                  Problems?  ash doctor    (says what is wrong and what to do next)\n\
                   \n\
                   Never prints private keys. https://raven-messager.com/"
 )]
 struct Cli {
-    /// Stable local profile (default: ~/.raven, or ~/.raven-ash if that legacy
-    /// tree already exists). Do NOT use mktemp — phone must re-paste Mac whoami
-    /// every time the identity changes.
-    #[arg(long, global = true, default_value = "")]
+    /// Folder where Raven keeps your identity and contacts (default: ~/.raven).
+    /// Use the same folder every time.
+    ///
+    /// Do not use a throwaway folder (mktemp): the identity inside it is new
+    /// every time, so friends would have to add you again.
+    #[arg(long, global = true, default_value = "", hide_default_value = true)]
     data_dir: String,
     #[command(subcommand)]
     cmd: Option<Commands>,
@@ -220,58 +318,105 @@ enum Commands {
     Whoami {
         /// Machine-readable public card only (`address` / `fingerprint` / `pub_hex`).
         /// NON-RELEASE O6 M1 bind helper. No private key fields.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, conflicts_with = "card")]
         json: bool,
+        /// Print one copy-pasteable contact card line (address, key, fingerprint
+        /// and the addresses you pass). Your friend imports it with
+        /// `raven contact add --card '<line>'`.
+        #[arg(long, default_value_t = false)]
+        card: bool,
+        /// With --card: the Internet address friends dial (your public IP or DNS
+        /// name and the forwarded port, e.g. 203.0.113.7:7422).
+        #[arg(long, value_name = "HOST:PORT", requires = "card")]
+        inet: Option<String>,
+        /// With --card: the LAN address friends on your network dial.
+        #[arg(long, value_name = "HOST:PORT", requires = "card")]
+        lan: Option<String>,
+        /// With --card: a relay you reserve on (its multiaddr ending in
+        /// /p2p/<relay PeerId>), or your own direct libp2p address (repeatable,
+        /// at most 2). Adds p2p=<your PeerId> and via= (a raven-card/2); without
+        /// it the relays of `raven node p2p on` are used when p2p is on.
+        #[arg(long, value_name = "MULTIADDR", requires = "card")]
+        via: Vec<String>,
     },
-    /// Forward send to raven-node. Plaintext ONLY via stdin (never argv).
+    /// Send one message to a contact (the text comes from stdin).
+    ///
+    /// Pipe the message in, or type it and finish with Ctrl-D:
+    ///
+    ///   echo "hello" | ash send --contact @alice
+    ///
+    /// The text is never taken from the command line. With no options on a
+    /// terminal you get the guided contact picker; add --chat for a live chat.
     Send {
-        #[arg(long, default_value = "")]
+        /// Advanced: send straight to host:port instead of a saved contact
+        /// (needs --peer-pub-hex).
+        #[arg(long, default_value = "", hide_default_value = true)]
         peer: String,
-        #[arg(long, default_value = "")]
+        /// Advanced: the receiver's public key (64 hex characters, `ash whoami`).
+        #[arg(long, default_value = "", hide_default_value = true)]
         peer_pub_hex: String,
-        #[arg(long, default_value = "127.0.0.1:0")]
+        #[arg(long, default_value = "127.0.0.1:0", hide = true)]
         listen: String,
-        /// Resolve `@tag` from contacts.json (pub_hex + lan_dial).
-        #[arg(long, default_value = "")]
+        /// Who to send to: a contact name or @tag, as shown by `ash contact list`.
+        #[arg(long, default_value = "", hide_default_value = true)]
         contact: String,
-        /// Read message body from stdin (required — argv plaintext is refused).
-        #[arg(long, default_value_t = true)]
+        /// The message is read from stdin (this is always the case).
+        #[arg(long, default_value_t = true, hide = true)]
         stdin_text: bool,
-        /// Interactive chat session with /back /info /verify /block.
+        /// Open a live chat with --contact instead of sending one message
+        /// (inside: /help, /back).
         #[arg(long, default_value_t = false)]
         chat: bool,
-        /// `lan` (default, Noise XX) or `internet` (RIH1 lab path).
-        /// `internet` is localhost/indexed lab only — not WAN Proven.
-        #[arg(long, default_value = "lan")]
+        /// How to reach the contact: `auto` (default: their saved LAN address
+        /// first, then their Internet address, then p2p), `lan`, `internet` or
+        /// `p2p` (libp2p: direct, then through a relay, hole punching where the
+        /// NATs allow). Internet direct and p2p need their production flags (or
+        /// the debug lab unlock) and a verified contact; with --peer, `auto`
+        /// means LAN.
+        #[arg(long, default_value = "auto", value_name = "auto|lan|internet|p2p")]
         carrier: String,
     },
-    /// Show committed endpoint inbox (PairInit/LAN messages).
+    /// Show the messages you received.
     Inbox,
+    /// Messages raven-node is still trying to deliver (it retries them in the
+    /// background until they are confirmed or expire).
+    ///
+    ///   raven outbox                    # what is waiting
+    ///
+    ///   raven outbox status 1a2b3c4d    # one message (the id the list shows)
+    ///
+    ///   raven outbox retry 1a2b3c4d     # try again now
+    ///
+    ///   raven outbox cancel 1a2b3c4d    # stop trying (it may already have arrived)
+    Outbox {
+        #[command(subcommand)]
+        cmd: Option<OutboxCommands>,
+    },
     /// Print welcome banner only (safe — no secrets).
     Banner,
-    /// Receive: listen on the fixed LAN port for a pinned contact (no flags).
+    /// Stay online to receive messages from your contacts (keep this window open).
     Listen,
-    /// Show identity + Bridge/transports/forward queue (safe fields only).
+    /// Show your identity, contacts, and whether this computer can send and receive.
     Status,
-    /// Diagnose presence / ready / send_path (never one green "up" for send).
+    /// Check your setup and say what to do next (details follow the summary).
     Doctor {
         /// Exit 1 if `daemon_ready` is false. Does not claim send works.
         #[arg(long, default_value_t = false)]
         require_ready: bool,
     },
-    /// Ping raven-node UDS IPC (must be running: `raven-node ipc` / service).
+    /// Advanced: check that the local raven-node answers (it must be running).
     IpcPing,
-    /// Configure local raven-node policy / bootstrap (bridge/store/relay/peers).
+    /// Advanced: change what this computer's raven-node does (bridge/store/relay/peers).
     Node {
         #[command(subcommand)]
         cmd: NodeCommands,
     },
-    /// Local friendship plane — contacts + fingerprint verify (never FastAPI).
+    /// Manage your contacts: add, list, verify, remove (stored on this computer only).
     Contact {
         #[command(subcommand)]
         cmd: ContactCommands,
     },
-    /// Multi-lane discovery (DiscoveryResolver — no central Raven DB / no FastAPI).
+    /// Advanced: look a person up among your contacts (there is no central directory).
     Find {
         /// Query: `rvn1…`, `@alias`, or local petname/tag text.
         query: String,
@@ -288,32 +433,67 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         all: bool,
     },
-    /// Nearby BLE ephemeral scan (software mock — no permanent ID in adv).
+    /// Demo only: a software mock of Bluetooth discovery (this computer only).
     Nearby,
-    /// Publish / manage signed Alias V1 claims (community DHT stand-in).
+    /// Advanced: sign a short @alias claim for your address (kept on this computer).
     Alias {
         #[command(subcommand)]
         cmd: AliasCommands,
     },
-    /// Signed prekey publish/fetch via local untrusted store (OOB/DHT stand-in).
+    /// Relay for your friends (p2p, off by default): who may use this node or a
+    /// dedicated relay folder (`--data-dir`) as their relay.
+    ///
+    ///   raven relay allow @bob          raven relay deny @bob
+    ///
+    ///   raven relay status              raven relay card --host 203.0.113.7
+    Relay {
+        #[command(subcommand)]
+        cmd: RelayCommands,
+    },
+    /// Advanced: manage the signed key bundle a friend needs to start a chat with you.
     Prekey {
         #[command(subcommand)]
         cmd: PrekeyCommands,
     },
-    /// Multi-device encrypted contact sync + revocation (OOB sealed blobs).
+    /// Advanced: copy contacts to another device of yours, or revoke a device.
     Device {
         #[command(subcommand)]
         cmd: DeviceCommands,
     },
-    /// Offline opaque mailbox put/get (store_tag only — no usernames).
+    /// Advanced: a mailbox store on this computer only (it is not your inbox).
     Mailbox {
         #[command(subcommand)]
         cmd: MailboxCommands,
     },
     /// Test A lab helpers (requires debug + RAVEN_LAB_TEST_A=1 for live PairInit).
+    #[command(hide = true)]
     Lab {
         #[command(subcommand)]
         cmd: LabCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OutboxCommands {
+    /// What is waiting, and what finished recently.
+    List {
+        /// Only messages to this contact (name, @tag or rvn1 address).
+        #[arg(long)]
+        contact: Option<String>,
+    },
+    /// Where one message stands: state, carrier, attempts, next try, last error.
+    Status {
+        /// Message id (8+ hex characters, as `raven outbox list` shows it).
+        mid: String,
+    },
+    /// Try to deliver it again now.
+    Retry { mid: String },
+    /// Stop trying to deliver it (it may already have arrived).
+    Cancel {
+        mid: String,
+        /// Skip the typed confirmation (scripts).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
 }
 
@@ -368,6 +548,8 @@ enum ContactCommands {
     ///   ash contact add --address rvn1q… --pub-hex <64 hex> --petname "Poline" --tag poline --verify-fp XXXX-XXXX-XXXX
     ///
     ///   ash contact add --address rvn1q… --pub-hex <64 hex> --petname "Ahmad (Berlin)" --tag ahmad
+    ///
+    ///   ash contact add --card 'raven-card/1 address=rvn1q… pub_hex=… fingerprint=… inet=203.0.113.7:7422' --petname Bob --verify-fp XXXX-XXXX-XXXX
     #[command(after_help = "\
 Soft Unique Tags (Raven Tag V1):
   • Layer A — Raven address (rvn1…) is the durable identity
@@ -377,13 +559,28 @@ Soft Unique Tags (Raven Tag V1):
   Never pass seeds or private keys. Public hex + address only.
 
 Interactive (recommended for first-timers):
-  ash                  # menu → 3 Contacts → guided add
+  ash                  # menu → 5 Contacts → guided add
 ")]
     Add {
-        #[arg(long, help = "Raven address (rvn1… bech32m) from QR/OOB")]
-        address: String,
-        #[arg(long, help = "Ed25519 public key hex (64 chars) — never a seed")]
-        pub_hex: String,
+        #[arg(
+            long,
+            required_unless_present = "card",
+            conflicts_with = "card",
+            help = "Raven address (rvn1… bech32m) from QR/OOB"
+        )]
+        address: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "card",
+            conflicts_with = "card",
+            help = "Ed25519 public key hex (64 chars) — never a seed"
+        )]
+        pub_hex: Option<String>,
+        /// A contact card (`raven whoami --card` line) or a file holding one,
+        /// instead of --address / --pub-hex. Its addresses are saved as routes
+        /// (hints only); its key is checked against its address and fingerprint.
+        #[arg(long, value_name = "CARD|FILE")]
+        card: Option<String>,
         /// Layer C — unique on this device only (primary label).
         #[arg(long, default_value = "", help = "Local petname, e.g. Poline")]
         petname: String,
@@ -396,7 +593,8 @@ Interactive (recommended for first-timers):
         /// Expected fingerprint. On match: pin Tag+key (DHT cannot overwrite).
         #[arg(long, help = "Confirm fingerprint to pin Tag+key locally")]
         verify_fp: Option<String>,
-        /// Optional OOB prekey JSON for first-message hybrid initiate.
+        /// Optional OOB prekey JSON: verified against --pub-hex and stored in
+        /// the local prekey store (like `ash prekey fetch --file`).
         #[arg(long)]
         prekey_file: Option<PathBuf>,
         /// Optional LAN listen host:port (saved for Send / Chat — beginners pick #, not dial).
@@ -406,6 +604,10 @@ Interactive (recommended for first-timers):
             help = "Peer LAN listen host:port, e.g. 192.168.1.20:7420"
         )]
         lan_dial: String,
+        /// Optional Internet address (Internet direct route), e.g. 203.0.113.7:7422,
+        /// [2001:db8::7]:7422 or node.example.com:7422.
+        #[arg(long, default_value = "", value_name = "HOST:PORT", alias = "internet")]
+        internet_dial: String,
     },
     /// List contacts: petname first, @tag subtitle (never address-primary).
     List,
@@ -454,6 +656,79 @@ Interactive (recommended for first-timers):
     Decline { request_id: String },
     /// Block sender of a pending request (local block list).
     Block { request_id: String },
+    /// Undo a block: remove a sender's public key from the local block list.
+    Unblock {
+        /// Ed25519 public key hex (64 chars) of the blocked sender.
+        #[arg(long)]
+        pub_hex: String,
+    },
+    /// Remove a contact (and its pin) from this device's book — local only.
+    ///
+    /// The way to deliberately replace a pinned key (see KEY-CHANGE WARNING):
+    /// verify the new fingerprint out-of-band, remove the old row, then
+    /// `ash contact add … --verify-fp <new fingerprint>`.
+    Remove {
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        petname: Option<String>,
+        #[arg(long)]
+        address: Option<String>,
+        /// Skip the typed confirmation (scripts).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+    /// Set or clear a contact's saved addresses (LAN, Internet, p2p); keeps petname, tag and pin.
+    ///
+    ///   raven contact set-addr @bob --internet 203.0.113.7:7422
+    ///
+    ///   raven contact set-addr Bob --lan 192.168.1.31:7420 --clear internet
+    ///
+    ///   raven contact set-addr @bob --p2p 12D3KooW… --via /ip4/198.51.100.7/tcp/7423/p2p/12D3KooW…
+    ///
+    /// An address is only a way to reach someone: who they are is their pinned
+    /// key, which RAVEN checks on every connection.
+    SetAddr {
+        /// The contact: name, @tag or rvn1 address (as for `raven send --contact`).
+        selector: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        petname: Option<String>,
+        #[arg(long)]
+        address: Option<String>,
+        /// LAN address, e.g. 192.168.1.31:7420.
+        #[arg(long, value_name = "HOST:PORT", alias = "lan-dial")]
+        lan: Option<String>,
+        /// Internet address: IPv4, [IPv6] or a DNS name with its port, e.g.
+        /// 203.0.113.7:7422 (7422 is RAVEN's Internet direct port).
+        #[arg(long, value_name = "HOST:PORT", alias = "internet-dial")]
+        internet: Option<String>,
+        /// p2p route: the contact's libp2p PeerId (12D3KooW…, the p2p= of
+        /// their card). A changed PeerId drops the old --via addresses.
+        #[arg(long, value_name = "PEER_ID")]
+        p2p: Option<String>,
+        /// A relay the contact reserves on (multiaddr ending in /p2p/<relay
+        /// PeerId>), or their own direct libp2p address (repeatable, at most 2;
+        /// replaces the saved ones).
+        #[arg(long, value_name = "MULTIADDR")]
+        via: Vec<String>,
+        /// Remove a saved address: `lan`, `internet` or `p2p` (repeatable).
+        #[arg(long, value_name = "lan|internet|p2p")]
+        clear: Vec<String>,
+    },
+    /// Change the saved LAN dial (host:port) of one contact; keeps petname, tag and pin.
+    /// Same as `set-addr --lan`.
+    SetDial {
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        petname: Option<String>,
+        #[arg(long)]
+        address: Option<String>,
+        #[arg(long, help = "Peer LAN listen host:port, e.g. 192.168.1.31:7420")]
+        lan_dial: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -462,8 +737,10 @@ enum AliasCommands {
     Publish {
         #[arg(long)]
         alias: String,
-        #[arg(long, default_value_t = 1)]
-        sequence: u64,
+        /// Claim sequence (default: stored sequence + 1, or 1 for a first claim).
+        /// Peers reject a claim whose sequence is not higher than the one they hold.
+        #[arg(long)]
+        sequence: Option<u64>,
         /// Expiry unix ms (default: now + 30d).
         #[arg(long)]
         expires_at: Option<u64>,
@@ -506,6 +783,41 @@ enum NodeCommands {
         #[command(subcommand)]
         state: OnOff,
     },
+    /// Receive over the Internet (Internet direct listener; off by default).
+    ///
+    ///   raven node internet on --listen 0.0.0.0:7422
+    ///
+    ///   raven node internet off
+    ///
+    /// Saved in node_policy.json; raven-node applies it when it (re)starts.
+    /// Opening the port to the Internet is your decision: only your contacts
+    /// get an answer, but anyone can see that something listens there.
+    Internet {
+        #[command(subcommand)]
+        state: InternetState,
+    },
+    /// Reach and be reached through libp2p: relays and hole punching (off by default).
+    ///
+    ///   raven node p2p on --relay /ip4/198.51.100.7/tcp/7423/p2p/12D3KooW…
+    ///
+    ///   raven node p2p on --relay @friend     (a friend whose node relays)
+    ///
+    ///   raven node p2p off
+    ///
+    /// Saved in node_policy.json; raven-node applies it when it (re)starts.
+    /// Only your verified contacts get a Raven link, but the relays you use
+    /// learn your PeerId, your IP and when you talk.
+    P2p {
+        #[command(subcommand)]
+        state: P2pState,
+    },
+    /// Let raven-node open its p2p port on your router (UPnP / NAT-PMP).
+    ///
+    /// `raven node p2p on` asks once on a terminal; this changes the answer.
+    Upnp {
+        #[command(subcommand)]
+        state: OnOff,
+    },
     /// Add a custom bootstrap multiaddr (or --manual peer).
     AddBootstrap {
         multiaddr: String,
@@ -527,7 +839,9 @@ enum NodeCommands {
 enum DeviceCommands {
     /// Export sealed contact/petname sync blob (hex) for another authorized device.
     SyncExport {
-        #[arg(long, default_value = "ash-device")]
+        /// Must be a device the importing registry authorizes (default: this
+        /// profile's primary device certificate).
+        #[arg(long, default_value = raven_core::PRIMARY_DEVICE_ID)]
         device_id: String,
         #[arg(long)]
         out: PathBuf,
@@ -546,12 +860,19 @@ enum DeviceCommands {
     },
 }
 
+/// The mailbox routing key (k_route) derives every rotating mailbox_tag /
+/// store_tag, so it is read from `RAVEN_K_ROUTE_HEX` or stdin — never argv.
 #[derive(Subcommand, Debug)]
 enum MailboxCommands {
     /// Deposit opaque envelope under rotating mailbox → store_tag index.
+    /// k_route: `RAVEN_K_ROUTE_HEX=<hex>` or `--k-route-stdin`.
     Put {
-        #[arg(long)]
-        k_route_hex: String,
+        /// REFUSED (argv is visible via ps / shell history).
+        #[arg(long, hide = true)]
+        k_route_hex: Option<String>,
+        /// Read k_route hex from the first line of stdin.
+        #[arg(long, default_value_t = false)]
+        k_route_stdin: bool,
         #[arg(long, default_value_t = 1)]
         epoch: u64,
         #[arg(long, default_value_t = 0)]
@@ -560,9 +881,14 @@ enum MailboxCommands {
         envelope_hex: String,
     },
     /// Retrieve by opaque rotating tags (current + previous epoch).
+    /// k_route: `RAVEN_K_ROUTE_HEX=<hex>` or `--k-route-stdin`.
     Get {
-        #[arg(long)]
-        k_route_hex: String,
+        /// REFUSED (argv is visible via ps / shell history).
+        #[arg(long, hide = true)]
+        k_route_hex: Option<String>,
+        /// Read k_route hex from the first line of stdin.
+        #[arg(long, default_value_t = false)]
+        k_route_stdin: bool,
         #[arg(long, default_value_t = 1)]
         epoch: u64,
         #[arg(long, default_value_t = 0)]
@@ -570,9 +896,118 @@ enum MailboxCommands {
     },
 }
 
+/// Resolve k_route without ever taking it from argv.
+fn resolve_k_route_hex(
+    argv: Option<&str>,
+    from_stdin: bool,
+    env: Option<String>,
+    read_stdin_line: impl FnOnce() -> String,
+) -> Result<String, String> {
+    if argv.is_some() {
+        return Err(
+            "REFUSE: --k-route-hex puts the mailbox routing key on argv (visible via ps / \
+             shell history). Use RAVEN_K_ROUTE_HEX=<hex> or --k-route-stdin."
+                .into(),
+        );
+    }
+    let raw = if from_stdin {
+        read_stdin_line()
+    } else {
+        env.ok_or_else(|| {
+            "k_route required: set RAVEN_K_ROUTE_HEX or pass --k-route-stdin".to_string()
+        })?
+    };
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        return Err("k_route required: set RAVEN_K_ROUTE_HEX or pass --k-route-stdin".into());
+    }
+    Ok(raw)
+}
+
+fn k_route_or_exit(argv: Option<&str>, from_stdin: bool) -> String {
+    match resolve_k_route_hex(
+        argv,
+        from_stdin,
+        std::env::var("RAVEN_K_ROUTE_HEX").ok(),
+        read_line,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[derive(Subcommand, Debug, Clone, Copy)]
 enum OnOff {
     On,
+    Off,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum P2pState {
+    /// Run raven-node's libp2p host (P3) after its next restart.
+    On {
+        /// A port (every interface, IPv4 + IPv6, TCP + QUIC), IP:PORT, or
+        /// `relay` (no listening port: reached only through your relays).
+        #[arg(long, default_value = "7423", value_name = "PORT|IP:PORT|relay")]
+        listen: String,
+        /// A relay to keep a reservation on: its multiaddr (a friend's `raven
+        /// relay card` line without `via=`) or @contact (their card's own
+        /// address). Repeatable, at most 2; replaces the saved ones.
+        #[arg(long, value_name = "MULTIADDR|@CONTACT")]
+        relay: Vec<String>,
+        /// Map the port on your router (UPnP / NAT-PMP) without asking.
+        #[arg(long, default_value_t = false, conflicts_with = "no_upnp")]
+        upnp: bool,
+        /// Never map the port on your router, without asking.
+        #[arg(long, default_value_t = false)]
+        no_upnp: bool,
+    },
+    /// Stop the libp2p host (after the next restart).
+    Off,
+}
+
+#[derive(Subcommand, Debug)]
+enum RelayCommands {
+    /// Let a friend reserve on this relay: a contact (@tag; its card's p2p=
+    /// PeerId), a PeerId, or --card with their card line.
+    Allow {
+        who: Option<String>,
+        #[arg(long, value_name = "CARD|FILE")]
+        card: Option<String>,
+        /// Your own note for this entry (never sent anywhere).
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// Stop letting a friend reserve (a running relay drops them in seconds).
+    Deny { who: String },
+    /// Who may reserve here, and what the relay is doing (counts only).
+    Status,
+    /// Print the via= line(s) friends need to use this relay.
+    Card {
+        /// The address friends reach this relay at: a public IP, an IPv6
+        /// address or a DNS name (default: the relay's listen addresses).
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long, default_value_t = raven_core::p2p_route::DEFAULT_P2P_PORT)]
+        port: u16,
+        /// Also print the QUIC (UDP) address.
+        #[arg(long, default_value_t = false)]
+        quic: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum InternetState {
+    /// Listen for Internet direct connections from your contacts.
+    On {
+        /// Local address to listen on (default 0.0.0.0:7422; a bare IP gets port 7422).
+        #[arg(long, default_value = "0.0.0.0:7422", value_name = "IP:PORT")]
+        listen: String,
+    },
+    /// Stop listening for Internet direct connections (after the next restart).
     Off,
 }
 
@@ -596,8 +1031,27 @@ struct Contact {
     pinned: bool,
     /// Optional LAN listen `host:port` for this peer (saved after first send).
     /// Beginners pick a contact # — they should not re-type host:port every time.
+    /// This is the contact's LAN route; files written before routes existed
+    /// keep working unchanged.
     #[serde(default)]
     lan_dial: String,
+    /// Optional Internet direct route: `host:port` with an IPv4 address, a
+    /// bracketed IPv6 address or a DNS name (see [`parse_internet_dial`]). A
+    /// reachability hint only, never identity: every link still has to prove
+    /// the pinned `pub_hex` (Noise bind + RIH1 hello). Omitted from the file
+    /// while empty, so a book without Internet routes stays byte-identical.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    internet_dial: String,
+    /// Optional p2p route (P3): the contact's libp2p PeerId (a card's `p2p=`,
+    /// `raven contact set-addr --p2p`). A reachability hint only, never
+    /// identity: every p2p link runs the Raven link inside and proves the
+    /// pinned `pub_hex`. Omitted from the file while empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    p2p: String,
+    /// At most two relay (or direct) multiaddrs for that PeerId (a card's
+    /// `via=`); see [`raven_core::p2p_route::parse_via`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    p2p_via: Vec<String>,
 }
 
 impl Contact {
@@ -616,7 +1070,7 @@ impl Contact {
     }
 
     fn primary_label(&self) -> String {
-        let p = sanitize_terminal_text(&self.petname);
+        let p = sanitize_terminal_line(&self.petname);
         if !p.is_empty() {
             return p;
         }
@@ -625,7 +1079,7 @@ impl Contact {
             return format!("@{t}");
         }
         // Address only as last resort — never preferred.
-        sanitize_terminal_text(&self.address)
+        sanitize_terminal_line(&self.address)
     }
 
     fn tag_subtitle(&self) -> Option<String> {
@@ -664,7 +1118,7 @@ fn contacts_or_die(data_dir: &Path) -> Vec<Contact> {
 }
 
 fn save_contacts(data_dir: &Path, contacts: &[Contact]) -> Result<(), String> {
-    std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
+    create_private_data_dir(data_dir).map_err(|e| e.to_string())?;
     let path = contacts_path(data_dir);
     let raw = serde_json::to_string_pretty(contacts).map_err(|e| e.to_string())?;
     raven_core::atomic_write_private(&path, raw.as_bytes())
@@ -721,6 +1175,30 @@ fn try_load_identity(data_dir: &Path) -> Result<Option<Identity>, String> {
     raven_core::load_identity(data_dir).map_err(|e| e.redacted_display())
 }
 
+/// Gate for commands that create profile state (contacts, the session store, the
+/// nearby registry): they must not run before the first identity exists. Whatever
+/// they leave behind makes the first `ash init` fail the first-install continuity
+/// check, whose recovery text then talks about identity theft. The check only
+/// reads (`load_identity` takes just the allow-listed identity lock), so asking
+/// creates nothing. `Ok(false)`: no identity yet; `Err`: the store is unreadable.
+fn identity_exists_before_state(data_dir: &Path, what: &str) -> Result<bool, String> {
+    match try_load_identity(data_dir) {
+        Ok(found) => Ok(found.is_some()),
+        Err(e) => Err(format!(
+            "{what}: identity store unavailable: {}",
+            sanitize_terminal_line(&e)
+        )),
+    }
+}
+
+/// [`identity_exists_before_state`] as one refusal text.
+fn require_identity_before_state(data_dir: &Path, what: &str) -> Result<(), String> {
+    match identity_exists_before_state(data_dir, what)? {
+        true => Ok(()),
+        false => Err(format!("{what} needs an identity first — run `ash init`")),
+    }
+}
+
 fn print_public_identity(id: &Identity) {
     kv("address", &id.address());
     kv(
@@ -749,29 +1227,390 @@ fn public_whoami_card(id: &Identity) -> serde_json::Value {
     })
 }
 
+/// First token of a contact card (`raven whoami --card`, `raven contact add
+/// --card`). A new field set means a new version: v1 readers refuse unknown
+/// fields instead of guessing.
+const CARD_PREFIX: &str = "raven-card/1";
+/// Longest card line accepted (a v1 card with both routes is ~250 bytes).
+/// Longest field values a card can hold (each validated like a contact
+/// route): an address (44 characters today), a fingerprint (14), a LAN or
+/// Internet dial ([`MAX_DIAL_TEXT`]), a PeerId (52) and two `via=` multiaddrs.
+const CARD_ADDRESS_MAX: usize = 64;
+const CARD_FINGERPRINT_MAX: usize = 16;
+/// The longest card a valid set of fields gives, so `raven whoami --card`
+/// can never print a card `raven contact add --card` refuses.
+const CARD_MAX_LEN: usize = CARD_PREFIX_V2.len()
+    + " address=".len()
+    + CARD_ADDRESS_MAX
+    + " pub_hex=".len()
+    + 64
+    + " fingerprint=".len()
+    + CARD_FINGERPRINT_MAX
+    + " inet=".len()
+    + MAX_DIAL_TEXT
+    + " lan=".len()
+    + MAX_DIAL_TEXT
+    + " p2p=".len()
+    + 52
+    + raven_core::p2p_route::MAX_VIA * (" via=".len() + raven_core::p2p_route::MAX_MULTIADDR_CHARS);
+/// Largest card file `contact add --card <file>` reads.
+const CARD_FILE_MAX_BYTES: u64 = 4096;
+
+/// A parsed, self-consistent contact card. Public material only. The routes
+/// are hints for reaching the person; the identity is `pub_hex` (and the
+/// address it encodes to), which every link must prove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContactCard {
+    address: String,
+    pub_hex: String,
+    fingerprint: String,
+    /// Normalised Internet route, or empty.
+    internet: String,
+    /// LAN route, or empty.
+    lan: String,
+    /// The p2p route of a `raven-card/2`, if any.
+    p2p: Option<P2pRoute>,
+}
+
+/// A validated p2p route: a canonical PeerId and at most two canonical
+/// `via=` multiaddrs (relays, or direct addresses naming the PeerId itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct P2pRoute {
+    peer_id: String,
+    via: Vec<String>,
+}
+
+impl P2pRoute {
+    fn parse(peer_id: &str, via: &[&str]) -> Result<Self, String> {
+        let peer_id = raven_core::p2p_route::normalize_peer_id(peer_id)?;
+        if via.len() > raven_core::p2p_route::MAX_VIA {
+            return Err(format!(
+                "at most {} via addresses",
+                raven_core::p2p_route::MAX_VIA
+            ));
+        }
+        let mut out = Vec::new();
+        for v in via {
+            let v = raven_core::p2p_route::parse_via(v)?;
+            if out.contains(&v.text) {
+                return Err("the same via address appears twice".into());
+            }
+            out.push(v.text);
+        }
+        Ok(Self { peer_id, via: out })
+    }
+}
+
+/// The card version with p2p fields (`p2p=`, `via=`); a card without them
+/// stays `raven-card/1`, so older readers keep reading it.
+const CARD_PREFIX_V2: &str = "raven-card/2";
+
+/// [`format_card_with`] without a p2p route (`raven-card/1`).
+#[cfg(test)]
+fn format_card(id: &Identity, internet: &str, lan: &str) -> String {
+    format_card_with(id, internet, lan, None)
+}
+
+/// One copy-pasteable line: `raven-card/1 address=… pub_hex=… fingerprint=…
+/// [inet=host:port] [lan=host:port]`, or with a p2p route `raven-card/2 …
+/// p2p=<PeerId> [via=<multiaddr>]…`. Never a seed or private key.
+fn format_card_with(id: &Identity, internet: &str, lan: &str, p2p: Option<&P2pRoute>) -> String {
+    let pub_bytes = id.public_key_bytes();
+    let mut card = format!(
+        "{} address={} pub_hex={} fingerprint={}",
+        if p2p.is_some() {
+            CARD_PREFIX_V2
+        } else {
+            CARD_PREFIX
+        },
+        id.address(),
+        hex::encode(pub_bytes),
+        device_fingerprint_v1(&pub_bytes)
+    );
+    if !internet.is_empty() {
+        card.push_str(&format!(" inet={internet}"));
+    }
+    if !lan.is_empty() {
+        card.push_str(&format!(" lan={lan}"));
+    }
+    if let Some(r) = p2p {
+        card.push_str(&format!(" p2p={}", r.peer_id));
+        for v in &r.via {
+            card.push_str(&format!(" via={v}"));
+        }
+    }
+    card
+}
+
+/// Strict parse of one card line: known fields only, each once; the address
+/// must be the one the key encodes to, and a fingerprint, when present, the
+/// key's own. Routes are validated like `contact set-addr` values.
+fn parse_card(line: &str) -> Result<ContactCard, String> {
+    let line = line.trim();
+    if line.len() > CARD_MAX_LEN || !line.chars().all(|c| c == ' ' || c.is_ascii_graphic()) {
+        return Err(format!(
+            "not a RAVEN card: a card is one line of at most {CARD_MAX_LEN} plain characters"
+        ));
+    }
+    let mut tokens = line.split(' ').filter(|t| !t.is_empty());
+    let v2 = match tokens.next() {
+        Some(CARD_PREFIX) => false,
+        Some(CARD_PREFIX_V2) => true,
+        Some(t) if t.starts_with("raven-card/") => {
+            return Err(format!(
+                "card version \"{}\" is not supported: this raven reads {CARD_PREFIX} and \
+                 {CARD_PREFIX_V2} (update raven)",
+                sanitize_terminal_line(t)
+            ))
+        }
+        _ => {
+            return Err(format!(
+                "not a RAVEN card: it must start with {CARD_PREFIX} (ask your friend for the \
+                 line `raven whoami --card` prints)"
+            ))
+        }
+    };
+    let mut fields: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    let mut via: Vec<&str> = Vec::new();
+    for token in tokens {
+        let (key, value) = token
+            .split_once('=')
+            .filter(|(_, v)| !v.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "card field \"{}\" is not key=value",
+                    sanitize_terminal_line(token)
+                )
+            })?;
+        let known = matches!(key, "address" | "pub_hex" | "fingerprint" | "inet" | "lan")
+            || (v2 && matches!(key, "p2p" | "via"));
+        if !known {
+            return Err(format!(
+                "card field \"{}\" is unknown to this raven (it reads address, pub_hex, \
+                 fingerprint, inet, lan{}): refusing the card",
+                sanitize_terminal_line(key),
+                if v2 { ", p2p, via" } else { "" }
+            ));
+        }
+        if key == "via" {
+            // The one repeatable field (at most MAX_VIA, checked below).
+            via.push(value);
+            continue;
+        }
+        if fields.insert(key, value).is_some() {
+            return Err(format!(
+                "card field \"{key}\" appears twice: refusing the card"
+            ));
+        }
+    }
+    let pub_hex = fields.get("pub_hex").ok_or("card has no pub_hex")?;
+    let ed = parse_pub_hex(pub_hex)?;
+    let address =
+        raven_core::address::from_display(fields.get("address").ok_or("card has no address")?);
+    if decode_address(&address).is_none() {
+        return Err("card address is not a valid rvn1 address".into());
+    }
+    if encode_address(&ed) != address {
+        return Err("card address does not belong to its pub_hex: refusing the card".into());
+    }
+    let fingerprint = device_fingerprint_v1(&ed);
+    if let Some(fp) = fields.get("fingerprint") {
+        // Exact: the fingerprint is base64, so case is part of it.
+        if *fp != fingerprint {
+            return Err(
+                "card fingerprint does not match its key (altered or mistyped): refusing the card"
+                    .into(),
+            );
+        }
+    }
+    let internet = match fields.get("inet") {
+        Some(v) => parse_internet_dial(v).map_err(|e| format!("card inet: {e}"))?,
+        None => String::new(),
+    };
+    let lan = match fields.get("lan") {
+        Some(v) => parse_lan_dial(v).map_err(|e| format!("card lan: {e}"))?,
+        None => String::new(),
+    };
+    let p2p = match fields.get("p2p") {
+        Some(peer) => Some(P2pRoute::parse(peer, &via).map_err(|e| format!("card p2p: {e}"))?),
+        None if !via.is_empty() => return Err("card via= needs a p2p= PeerId".into()),
+        None if v2 => return Err(format!("a {CARD_PREFIX_V2} card needs a p2p= PeerId")),
+        None => None,
+    };
+    Ok(ContactCard {
+        address,
+        pub_hex: hex::encode(ed),
+        fingerprint,
+        internet,
+        lan,
+        p2p,
+    })
+}
+
+/// The p2p part of this profile's card: its own PeerId, with `via` (or, when
+/// none is given, the relays node_policy.json reserves on), whenever `via`
+/// was given or p2p is turned on (`raven node p2p on`). `None`: a v1 card.
+fn own_card_p2p(
+    id: &Identity,
+    via: &[String],
+    policy: &NodePolicy,
+) -> Result<Option<P2pRoute>, String> {
+    if via.is_empty() && policy.p2p_listen.trim().is_empty() {
+        return Ok(None);
+    }
+    let via: Vec<&str> = if via.is_empty() {
+        policy.p2p_relays.iter().map(String::as_str).collect()
+    } else {
+        via.iter().map(String::as_str).collect()
+    };
+    P2pRoute::parse(&raven_core::p2p_route::local_peer_id(id), &via)
+        .map(Some)
+        .map_err(|e| format!("--via: {e}"))
+}
+
+/// `raven whoami --card`: exactly one line on stdout (scripts pipe it into a
+/// file or a chat); the addresses are validated like contact routes first.
+fn cmd_whoami_card(
+    data_dir: &Path,
+    id: &Identity,
+    inet: Option<&str>,
+    lan: Option<&str>,
+    via: &[String],
+) -> Result<(), String> {
+    let inet = inet
+        .map(|v| parse_internet_dial(v).map_err(|e| format!("--inet: {e}")))
+        .transpose()?
+        .unwrap_or_default();
+    let lan = lan
+        .map(|v| parse_lan_dial(v).map_err(|e| format!("--lan: {e}")))
+        .transpose()?
+        .unwrap_or_default();
+    // Without --via the card follows what the running raven-node does (an
+    // installer flag beats node_policy.json); with no service answering, the
+    // policy. An unreadable policy only matters then.
+    let policy = if via.is_empty() {
+        let daemon = ipc_client::ipc_request_timeout(
+            data_dir,
+            &IpcRequest::Status { v: IPC_VERSION },
+            Duration::from_millis(1500),
+        );
+        match p2p_cli::service_p2p(&daemon) {
+            Some(info) => NodePolicy {
+                p2p_listen: info.listen_setting.clone(),
+                p2p_relays: info.relays.clone(),
+                ..NodePolicy::default()
+            },
+            None => try_load_policy(data_dir).unwrap_or_default(),
+        }
+    } else {
+        NodePolicy::default()
+    };
+    let p2p = own_card_p2p(id, via, &policy)?;
+    let card = format_card_with(id, &inet, &lan, p2p.as_ref());
+    // Cannot happen with validated fields; never print a card `contact add`
+    // would refuse.
+    if card.len() > CARD_MAX_LEN {
+        return Err(format!(
+            "this card would be {} characters, more than the {CARD_MAX_LEN} a card may have: \
+             use shorter addresses",
+            card.len()
+        ));
+    }
+    println!("{card}");
+    if io::stderr().is_terminal() {
+        eprintln!(
+            "{C_DIM}Send this line to your friend; they run: raven contact add --card '<line>' \
+             (and compare the fingerprint with you before they pin it).{C_RESET}"
+        );
+    }
+    Ok(())
+}
+
+/// `--card` takes the card text itself or a file holding exactly one card
+/// line (blank lines aside), e.g. the output of `raven whoami --card > me.card`.
+fn read_card_arg(arg: &str) -> Result<ContactCard, String> {
+    let t = arg.trim();
+    if t.starts_with("raven-card/") {
+        return parse_card(t);
+    }
+    let path = Path::new(t);
+    let meta = std::fs::metadata(path).map_err(|e| {
+        format!(
+            "--card: \"{}\" is neither a card ({CARD_PREFIX} …) nor a readable file ({e})",
+            sanitize_terminal_line(t)
+        )
+    })?;
+    if !meta.is_file() || meta.len() > CARD_FILE_MAX_BYTES {
+        return Err(format!(
+            "--card: {} is not a card file (a regular file of at most {CARD_FILE_MAX_BYTES} bytes)",
+            sanitize_terminal_line(t)
+        ));
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("--card: read: {e}"))?;
+    let lines: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    match lines.as_slice() {
+        [one] => parse_card(one),
+        [] => Err("--card: the file is empty".into()),
+        _ => Err("--card: the file must hold exactly one card line".into()),
+    }
+}
+
+/// Static part of the welcome banner: public branding only, never identity
+/// or key material (unit-tested). Monochrome, NO_COLOR aware. Every framed
+/// row is padded to the same width so the right border lines up.
+fn welcome_banner_text() -> String {
+    const INNER: usize = 50;
+    const ROWS: [&str; 11] = [
+        "",
+        "  R A V E N",
+        "  N O D E",
+        "",
+        "  Messaging Beyond Connectivity",
+        "",
+        "  \u{25c6} serverless \u{00b7} P2P \u{00b7} private",
+        "",
+        "  \"The Raven bears witness as the Phoenix",
+        "   rises from the ASH\"",
+        "",
+    ];
+    let c = c();
+    let (d, r) = (c.dim, c.reset);
+    let rule = "\u{2500}".repeat(INNER);
+    let mut s = format!("\n  \u{256d}{rule}\u{256e}\n");
+    for row in ROWS {
+        s.push_str(&format!("  \u{2502}{row:<INNER$}\u{2502}\n"));
+    }
+    s.push_str(&format!("  \u{2570}{rule}\u{256f}\n\n"));
+    s.push_str(&format!("{d}   https://raven-messager.com{r}\n"));
+    s
+}
+
+/// What the identity store said when the banner asked, so the interactive shell
+/// does not read it (identity lock + secure-store round trip) a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityState {
+    Ready,
+    Missing,
+    /// Unreadable store (continuity violation, locked, I/O error): not the
+    /// same as "no identity yet", and never an invitation to mint one.
+    Unavailable,
+}
+
 /// Raven Node welcome banner — monochrome.
 fn print_welcome(data_dir: &Path) {
+    if print_welcome_state(data_dir) == IdentityState::Missing {
+        println!("{C_DIM}Create one with: ash init{C_RESET}");
+    }
+}
+
+fn print_welcome_state(data_dir: &Path) -> IdentityState {
     let c = c();
     let (b, d, r) = (c.bold, c.dim, c.reset);
-    println!();
-    println!("  \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}");
-    println!("  \u{2502}                                                  \u{2502}");
-    println!("  \u{2502}  R A V E N                                      \u{2502}");
-    println!("  \u{2502}  N O D E                                        \u{2502}");
-    println!("  \u{2502}                                                  \u{2502}");
-    println!("  \u{2502}  Messaging Beyond Connectivity                  \u{2502}");
-    println!("  \u{2502}                                                  \u{2502}");
-    println!(
-        "  \u{2502}  \u{25c6} serverless \u{00b7} P2P \u{00b7} private                   \u{2502}"
-    );
-    println!("  \u{2502}                                                  \u{2502}");
-    println!("  \u{2502}  \"The Raven bears witness as the Phoenix        \u{2502}");
-    println!("  \u{2502}   rises from the ASH\"                          \u{2502}");
-    println!("  \u{2502}                                                  \u{2502}");
-    println!("  \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}");
-
-    println!();
-    println!("{d}   https://raven-messager.com{r}", d = d, r = r);
+    print!("{}", welcome_banner_text());
     println!(
         "{d}   profile: {path}{r}",
         d = d,
@@ -796,47 +1635,145 @@ fn print_welcome(data_dir: &Path) {
                 r = r
             );
             println!();
+            IdentityState::Ready
         }
         Ok(None) => {
-            println!(
-                "{b}First run \u{2014} no identity yet.{r} Create one below.\n",
-                b = b,
-                r = r
-            );
+            println!("{b}First run \u{2014} no identity yet.{r}\n", b = b, r = r);
+            IdentityState::Missing
         }
         Err(e) => {
-            println!("identity unavailable: {}", sanitize_terminal_text(&e));
+            println!("identity unavailable: {}", sanitize_terminal_line(&e));
+            IdentityState::Unavailable
         }
     }
 }
-/// Offer inline identity creation on first run; returns true when an identity
-/// exists afterwards. Used by the interactive shell so newcomers don't need to
-/// know the `init` subcommand at all.
-fn offer_first_run_identity(data_dir: &Path) -> bool {
-    if try_load_identity(data_dir).ok().flatten().is_some() {
-        return true;
+/// First-run "create identity?" answer. EOF / a read error never creates one
+/// (no human decided). On a terminal Enter takes the `[Y]` default; piped input
+/// must say yes explicitly, since an empty line there is not a decision.
+fn first_run_answer_accepts(answer: Option<&str>, interactive: bool) -> bool {
+    match answer {
+        None => false,
+        Some("") => interactive,
+        Some(a) => a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes"),
+    }
+}
+
+/// An answer that is neither yes nor no ("ok", the letters a Persian keyboard
+/// layout produces, ...). On a terminal that is worth asking again; EOF and an
+/// empty line are not "unclear" (EOF is no answer, Enter takes the default).
+fn first_run_answer_is_unclear(answer: Option<&str>) -> bool {
+    match answer {
+        None | Some("") => false,
+        Some(a) => !["y", "yes", "n", "no"]
+            .iter()
+            .any(|w| a.eq_ignore_ascii_case(w)),
+    }
+}
+
+/// How often a terminal user is asked again after an answer that is neither
+/// yes nor no. Piped input is never asked again (it would eat the next line of
+/// someone's script); it simply does not create an identity.
+const FIRST_RUN_REASKS: usize = 2;
+
+/// What an identity is, in two plain sentences (EN + FA), shown before the
+/// question: the person has to decide something they have not been told about.
+fn print_identity_explainer() {
+    let c = c();
+    println!(
+        "{0}Your identity is a private key that stays on this computer. It gives you a public\n\
+         address (rvn1\u{2026}) that friends use to add you: no account, no phone number, no server.{1}",
+        c.dim, c.reset
+    );
+    println!(
+        "{0}FA:{1} \u{200f}هویت شما یک کلید خصوصی است که فقط روی همین کامپیوتر می\u{200c}ماند؛ دوستانتان با آدرس عمومی شما (rvn1\u{2026}) شما را اضافه می\u{200c}کنند.",
+        c.dim, c.reset
+    );
+    if cfg!(target_os = "macos") {
+        println!(
+            "{0}macOS may ask whether ash may use the Keychain for your key: choose \"Always Allow\" (plain \"Allow\" asks again every time).{1}\n",
+            c.dim, c.reset
+        );
+    } else {
+        println!();
+    }
+}
+
+/// How the first-run identity offer ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRun {
+    /// An identity already existed (nothing was asked).
+    Present,
+    Created,
+    /// The user said no, or there was no one to ask (stdin closed).
+    Declined,
+    /// The identity store is unreadable, so nothing was offered: `ash init`
+    /// fails the same way until that is fixed.
+    Unavailable,
+}
+
+/// Offer inline identity creation on first run. Used by the interactive shell
+/// so newcomers don't need to know the `init` subcommand at all.
+fn offer_first_run_identity(data_dir: &Path) -> FirstRun {
+    let state = match try_load_identity(data_dir) {
+        Ok(Some(_)) => IdentityState::Ready,
+        Ok(None) => IdentityState::Missing,
+        Err(_) => IdentityState::Unavailable,
+    };
+    offer_first_run_identity_given(data_dir, state)
+}
+
+/// [`offer_first_run_identity`] for a caller that already asked the identity
+/// store (the welcome banner), so it is not asked twice.
+fn offer_first_run_identity_given(data_dir: &Path, state: IdentityState) -> FirstRun {
+    match state {
+        IdentityState::Ready => return FirstRun::Present,
+        // An unreadable identity store is not "no identity": never offer to
+        // create (and bind) a new key over it. `print_welcome` already said why.
+        IdentityState::Unavailable => return FirstRun::Unavailable,
+        IdentityState::Missing => {}
     }
     let c = c();
     let (green, reset, red, dim) = (c.green, c.reset, c.red, c.dim);
-    print!(
-        "{}?{} Create your Raven identity now? [{}Y/n{}] ",
-        c.yellow, reset, green, reset
-    );
-    let _ = io::stdout().flush();
-    let ans = read_line();
-    if !(ans.is_empty() || ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")) {
-        return false;
+    print_identity_explainer();
+    let mut asked_again = 0;
+    let ans = loop {
+        print!(
+            "{}?{} Create your Raven identity now? [{}Y/n{}] ",
+            c.yellow, reset, green, reset
+        );
+        let _ = io::stdout().flush();
+        let ans = read_line_opt();
+        if first_run_answer_is_unclear(ans.as_deref())
+            && stdin_is_tty()
+            && asked_again < FIRST_RUN_REASKS
+        {
+            asked_again += 1;
+            println!("{dim}Please answer y (yes) or n (no), using English letters.{reset}");
+            continue;
+        }
+        break ans;
+    };
+    if !first_run_answer_accepts(ans.as_deref(), stdin_is_tty()) {
+        if ans.is_none() {
+            println!("\n{dim}no answer (stdin closed) — identity not created.{reset}");
+        } else if first_run_answer_is_unclear(ans.as_deref()) {
+            println!("{dim}Not a yes or a no — identity not created.{reset}");
+        }
+        return FirstRun::Declined;
     }
     let id = ensure_identity(data_dir);
     if let Err(e) = raven_core::ensure_local_prekey(data_dir, &id) {
-        eprintln!("{red}prekey: {}{reset}", sanitize_terminal_text(&e));
+        eprintln!("{red}prekey: {}{reset}", sanitize_terminal_line(&e));
     }
     println!("{green}✔ identity created{reset}");
     print_public_identity(&id);
     println!(
-        "\n{dim}Private key stays on this machine. Share only the three public lines above.{reset}"
+        "\n{dim}Private key stays on this machine. Share only the public lines above (or just the invite line).{reset}"
     );
-    true
+    println!(
+        "{dim}Next: send your friend the invite line (`ash whoami` shows it again any time), then paste theirs under menu 5 Contacts.{reset}"
+    );
+    FirstRun::Created
 }
 
 fn section(label: &str) {
@@ -858,18 +1795,22 @@ fn item(num: &str, title: &str, hint: &str) {
 }
 
 fn print_menu() {
+    let menu_item = |idx: usize| {
+        let (num, title, hint) = MENU_ITEMS[idx];
+        item(num, title, hint);
+    };
     section("messages");
-    item("1", "Chat / Send", "message a contact — guided");
-    item("2", "Inbox", "committed endpoint inbox");
+    menu_item(0);
+    menu_item(1);
     section("network");
-    item("3", "Status", "identity · bridge · transports");
-    item("4", "Listen", "receive — one command, no flags");
+    menu_item(2);
+    menu_item(3);
     section("people");
-    item("5", "Contacts", "add by rvn1… paste · list · verify");
+    menu_item(4);
     section("tools");
-    item("6", "Mailbox", "opaque offline put/get");
-    item("7", "Nearby scan", "ephemeral BLE discovery");
-    item("8", "Tutorial", "guided walkthrough — start here");
+    menu_item(5);
+    menu_item(6);
+    menu_item(7);
     let c = c();
     println!();
     println!("    {c_dim}q  quit{reset}", c_dim = c.dim, reset = c.reset);
@@ -877,12 +1818,127 @@ fn print_menu() {
     let _ = io::stdout().flush();
 }
 
-fn read_line() -> String {
+/// One trimmed line from stdin. `None` = EOF or a read error, which is NOT the
+/// same as an empty answer: trust decisions must never treat it as one.
+fn read_line_opt() -> Option<String> {
     let mut s = String::new();
-    if io::stdin().read_line(&mut s).is_err() {
-        return String::new();
+    match io::stdin().read_line(&mut s) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(s.trim().to_string()),
     }
-    s.trim().to_string()
+}
+
+fn read_line() -> String {
+    read_line_opt().unwrap_or_default()
+}
+
+/// Throw away whatever is already queued on a terminal's stdin (lines of a
+/// multi-line paste that earlier prompts did not consume). Terminals only:
+/// piped input is the caller's explicit script and is left alone.
+///
+/// Best effort, NOT a barrier: a paste larger than the tty input queue (about
+/// 1 KiB) or delivered line by line keeps arriving after this drain, and on
+/// Windows there is no drain at all. What makes a trust decision unforgeable
+/// by pasted input is the random code of [`new_confirm_code`].
+fn discard_pending_tty_input() {
+    let _ = drain_tty_input("0");
+}
+
+/// [`discard_pending_tty_input`] that says how many bytes it threw away.
+/// `wait_tenths` is the VTIME wait ("0" = none, "1" = up to 100 ms for the tail
+/// of a paste that is still arriving). Terminals only; 0 elsewhere.
+fn drain_tty_input(wait_tenths: &str) -> usize {
+    if !cfg!(unix) || !stdin_is_tty() {
+        return 0;
+    }
+    // Non-canonical: read(2) returns 0 once the queue is empty (after the wait).
+    // The user's own tty settings come back via `restore_tty`.
+    let _ = saved_tty_state();
+    stty(&["-icanon", "min", "0", "time", wait_tenths]);
+    let mut buf = [0u8; 512];
+    let mut drained = 0usize;
+    for _ in 0..128 {
+        match io::stdin().read(&mut buf) {
+            Ok(n) if n > 0 => drained += n,
+            _ => break,
+        }
+    }
+    restore_tty();
+    drained
+}
+
+/// A line typed or pasted at a terminal prompt is read in cooked mode, so cursor
+/// keys arrive as escape bytes and other control bytes arrive as they are.
+/// The core refuses such text ("violates the bounded application policy") after
+/// the whole message was typed: say it here, before anything is sent.
+/// (Same rule as the core: tab / CR / LF are fine, every other control byte and
+/// DEL are not.)
+fn tty_message_problem(text: &str) -> Option<&'static str> {
+    if text.contains('\u{1b}') {
+        return Some("cursor keys are not supported in this prompt, retype the message");
+    }
+    if text
+        .chars()
+        .any(|ch| (ch < ' ' && !matches!(ch, '\t' | '\n' | '\r')) || ch == '\u{7f}')
+    {
+        return Some("control characters are not supported in this prompt, retype the message");
+    }
+    None
+}
+
+/// A cooked terminal line holds about 1023 bytes: the rest of a longer paste is
+/// dropped, silently. At or past this size the line is probably cut.
+const TTY_LINE_WARN_BYTES: usize = 1000;
+
+/// Read ONE message line at a terminal prompt (`"> "`), or `None` (nothing to
+/// send: a reason was printed). Piped input is taken as is, as before. On a
+/// terminal: cursor keys / control bytes are refused with a re-prompt, extra
+/// pasted lines refuse the send (they would otherwise run as menu commands and
+/// the message would go out cut), and a line near the terminal limit asks first.
+fn read_tty_message(prompt: &str) -> Option<String> {
+    let mut attempts = 0;
+    loop {
+        print!("{prompt}");
+        let _ = io::stdout().flush();
+        let text = read_line();
+        if text.is_empty() {
+            eprintln!("empty message");
+            return None;
+        }
+        if !stdin_is_tty() {
+            return Some(text);
+        }
+        let extra = drain_tty_input("1");
+        if extra > 0 {
+            eprintln!(
+                "{C_BOLD}NOT SENT:{C_RESET} you pasted more than one line (about {extra} more bytes). This prompt sends ONE line. For several lines: ash send --contact NAME < message.txt"
+            );
+            return None;
+        }
+        if let Some(problem) = tty_message_problem(&text) {
+            attempts += 1;
+            eprintln!("{problem}");
+            if attempts >= 3 {
+                return None;
+            }
+            continue;
+        }
+        if text.len() >= TTY_LINE_WARN_BYTES {
+            eprintln!(
+                "{C_BOLD}Careful:{C_RESET} this line is {} bytes; a terminal prompt may have cut it at about 1000 characters.",
+                text.len()
+            );
+            print!("Send it anyway? [y/N] ");
+            let _ = io::stdout().flush();
+            let yes = read_line_opt()
+                .is_some_and(|a| a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes"));
+            if !yes {
+                println!("{C_DIM}cancelled — nothing sent.{C_RESET}");
+                return None;
+            }
+        }
+        return Some(text);
+    }
 }
 
 /// Read one field, or drain a pasted multi-line `ash whoami` block from stdin.
@@ -913,17 +1969,382 @@ fn read_paste_blob() -> String {
     lines.join("\n")
 }
 
+/// True for a line of a pasted `ash whoami` block (address / fingerprint /
+/// pub_hex / invite). `read_paste_blob` stops once address + pub_hex are
+/// known, so the trailing `invite …` line must not be eaten by the next prompt.
+fn is_whoami_paste_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if parse_raven_invite(t).is_some() {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("fingerprint") {
+        let r = rest.trim_start_matches(['=', ':', ' ', '\t']);
+        return r.len() >= 12 && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    }
+    (lower.starts_with("address") && extract_address_field(t).is_some())
+        || (lower.starts_with("pub_hex") && extract_pub_hex_field(t).is_some())
+}
+
+/// What a prompt that may follow a pasted `ash whoami` block is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnswerKind {
+    /// Tag / petname / dial / verify choice: every whoami line is a leftover.
+    Free,
+    /// The explicit pub_hex prompt: a `pub_hex <hex>` line (or bare 64 hex,
+    /// or an `invite` line, reduced to its pub) IS the answer; other whoami
+    /// lines (address / fingerprint) are skipped.
+    PubHex,
+}
+
+/// First line from `lines` that answers a prompt of `kind`, skipping at most
+/// 8 leftover whoami lines (then an empty answer). `None` = `lines` ended
+/// (EOF) before any answer arrived. Pure so the prompt logic is unit-testable.
+fn pick_answer_line_checked<I: IntoIterator<Item = String>>(
+    lines: I,
+    kind: AnswerKind,
+) -> Option<String> {
+    let mut lines = lines.into_iter();
+    for _ in 0..8 {
+        let line = lines.next()?;
+        if kind == AnswerKind::PubHex {
+            match parse_raven_invite(&line) {
+                Some(Ok(invite)) => return Some(invite.pub_hex),
+                // Invalid invite typed at the pub_hex prompt: hand it back so
+                // the add fails loudly instead of the prompt silently hanging.
+                Some(Err(_)) => return Some(line),
+                None => {}
+            }
+            if !looks_like_shell_input(&line) {
+                if let Some(hex) = extract_pub_hex_field(&line) {
+                    return Some(hex);
+                }
+            }
+        }
+        if !is_whoami_paste_line(&line) {
+            return Some(line);
+        }
+    }
+    Some(String::new())
+}
+
+/// [`pick_answer_line_checked`] with EOF folded into an empty answer, for
+/// prompts whose empty answer is harmless (optional tag / petname / dial).
+fn pick_answer_line<I: IntoIterator<Item = String>>(lines: I, kind: AnswerKind) -> String {
+    pick_answer_line_checked(lines, kind).unwrap_or_default()
+}
+
+/// Answer to a prompt that follows a paste: skips leftover whoami lines.
+fn read_answer_line() -> String {
+    pick_answer_line(std::iter::from_fn(read_line_opt), AnswerKind::Free)
+}
+
+/// Answer to a trust decision: queued terminal input is dropped first and EOF
+/// is `None` (never an answer), so nothing is decided on the user's behalf.
+fn read_decision_line() -> Option<String> {
+    discard_pending_tty_input();
+    pick_answer_line_checked(std::iter::from_fn(read_line_opt), AnswerKind::Free)
+}
+
+/// Answer to the explicit pub_hex prompt: accepts the labelled whoami
+/// `pub_hex  <hex>` line (reduced to the hex), skips address/fingerprint lines.
+fn read_pub_hex_answer() -> String {
+    pick_answer_line(std::iter::from_fn(read_line_opt), AnswerKind::PubHex)
+}
+
+/// Parsed one-text invite (`raven:<rvn1 address>:<64 hex pub>`), as printed by
+/// `ash whoami` on its `invite` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedInvite {
+    address: String,
+    pub_hex: String,
+    fingerprint: String,
+}
+
+/// `None` when `text` is not an invite at all; `Some(Err)` when it is one but
+/// the address/key binding or hex is invalid. Accepts the whoami `invite` label.
+fn parse_raven_invite(text: &str) -> Option<Result<ParsedInvite, String>> {
+    let t = text.trim();
+    let t = if t.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("invite")) {
+        t[6..].trim_start_matches(['=', ':', ' ', '\t'])
+    } else {
+        t
+    };
+    let body = t.strip_prefix("raven:")?;
+    Some((|| {
+        let (addr_raw, pub_raw) = body
+            .rsplit_once(':')
+            .ok_or_else(|| "invite must be raven:<rvn1 address>:<64 hex pub>".to_string())?;
+        let ed = parse_pub_hex_strict(pub_raw)?;
+        let address = raven_core::address::from_display(addr_raw);
+        if decode_address(&address).is_none() {
+            return Err("invite address must be valid rvn1 bech32m".into());
+        }
+        if encode_address(&ed) != address {
+            return Err(
+                "invite address/pub mismatch — refusing (possible key substitution)".into(),
+            );
+        }
+        Ok(ParsedInvite {
+            address,
+            pub_hex: hex::encode(ed),
+            fingerprint: device_fingerprint_v1(&ed),
+        })
+    })())
+}
+
+/// What the fingerprint prompt decided. Only an explicit answer saves anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyChoice {
+    /// A / abort / q / Enter / anything unrecognised: nothing is saved.
+    Abort,
+    /// C / continue: save without a pin.
+    Unpinned,
+    /// V / verify / pin: pinning still needs the fingerprint typed back.
+    ConfirmFingerprint,
+    /// The fingerprint itself was entered: pin.
+    Pin,
+}
+
+/// Fingerprint characters without the display dashes and spaces.
+fn fingerprint_chars(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
+}
+
+/// Typed fingerprint vs the displayed one: separators ignored, case NOT. The
+/// fingerprint is base64, where `a` and `A` are different characters; folding
+/// case would also accept the fingerprints of other keys (~9 of its ~71 bits
+/// gone), which is what an attacker grinding keys for a look-alike wants.
+fn fingerprint_matches(typed: &str, fp: &str) -> bool {
+    let typed = fingerprint_chars(typed);
+    !typed.is_empty() && typed == fingerprint_chars(fp)
+}
+
+/// Right characters, wrong upper/lower case: still not a match, but worth
+/// saying so instead of a bare "did not match".
+fn fingerprint_case_only_mismatch(typed: &str, fp: &str) -> bool {
+    let (typed, fp) = (fingerprint_chars(typed), fingerprint_chars(fp));
+    !typed.is_empty() && typed != fp && typed.eq_ignore_ascii_case(&fp)
+}
+
+const FINGERPRINT_CASE_HINT: &str =
+    "upper/lower case differs: a fingerprint is case-sensitive (If4x is not if4x)";
+
+/// First answer at the `[V]erify & pin / [C]ontinue unpinned / [A]bort`
+/// prompt. An empty answer aborts: a stray Enter (or a pasted blank line)
+/// never adds a trusted contact, and `v` alone never pins.
+fn parse_verify_choice(choice: &str, fp: &str) -> VerifyChoice {
+    let c = choice.trim();
+    match c.to_ascii_lowercase().as_str() {
+        "v" | "verify" | "pin" => VerifyChoice::ConfirmFingerprint,
+        "c" | "continue" => VerifyChoice::Unpinned,
+        _ if fingerprint_matches(c, fp) => VerifyChoice::Pin,
+        _ => VerifyChoice::Abort,
+    }
+}
+
+/// Characters of a [`new_confirm_code`]: digits and capitals without the
+/// look-alikes 0/O and 1/I/L, so the code can be read off the screen and typed.
+const CONFIRM_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+const CONFIRM_CODE_LEN: usize = 5;
+
+/// A fresh random code for one save confirmation (~25 bits). It is drawn when
+/// the prompt appears and deliberately not derived from the contact: whoever
+/// composed a pasted contact card knows its keys and fingerprint, but cannot
+/// know a code that did not exist when the card was written.
+fn new_confirm_code<R: rand::Rng>(rng: &mut R) -> String {
+    (0..CONFIRM_CODE_LEN)
+        .map(|_| CONFIRM_CODE_ALPHABET[rng.gen_range(0..CONFIRM_CODE_ALPHABET.len())] as char)
+        .collect()
+}
+
+/// Typed code vs the displayed one (case, spaces and dashes ignored: the code
+/// alphabet has no lower-case letters, so folding loses nothing).
+fn confirm_code_matches(typed: &str, code: &str) -> bool {
+    let typed = fingerprint_chars(typed);
+    !typed.is_empty() && typed.eq_ignore_ascii_case(&fingerprint_chars(code))
+}
+
+/// The fingerprint decision as a pure state machine over `next` (one answer per
+/// call, `None` = EOF). `code` is `Some` at a terminal: whatever the choice, a
+/// save then also needs that code typed back. Pasted input can carry `c`, `v`
+/// and the (attacker's own) fingerprint, so those prove nothing; the code is
+/// what keeps a paste that outlives the one-shot tty flush from saving a key.
+/// `None` = piped stdin, the caller's explicit script (menu smoke, tests):
+/// nobody is there to read a code.
+fn verify_prompt_flow(
+    fp: &str,
+    code: Option<&str>,
+    next: &mut dyn FnMut() -> Option<String>,
+) -> Option<bool> {
+    print!("[V]erify & pin  /  [C]ontinue unpinned  /  [A]bort (Enter aborts): ");
+    let _ = io::stdout().flush();
+    let first = next()?;
+    let pin = match parse_verify_choice(&first, fp) {
+        VerifyChoice::Abort => {
+            if fingerprint_case_only_mismatch(&first, fp) {
+                println!("fingerprint did not match: {FINGERPRINT_CASE_HINT}");
+            }
+            return None;
+        }
+        VerifyChoice::Unpinned => false,
+        VerifyChoice::Pin => true,
+        VerifyChoice::ConfirmFingerprint => {
+            print!("Type the fingerprint shown above to pin it: ");
+            let _ = io::stdout().flush();
+            let typed = next()?;
+            if !fingerprint_matches(&typed, fp) {
+                if fingerprint_case_only_mismatch(&typed, fp) {
+                    println!("fingerprint did not match: {FINGERPRINT_CASE_HINT}");
+                } else {
+                    println!("fingerprint did not match");
+                }
+                return None;
+            }
+            true
+        }
+    };
+    if let Some(code) = code {
+        print!("Type {code} to confirm saving this contact (anything else cancels): ");
+        let _ = io::stdout().flush();
+        if !confirm_code_matches(&next()?, code) {
+            println!("confirmation code did not match");
+            return None;
+        }
+    }
+    Some(pin)
+}
+
+/// Interactive fingerprint decision for a new contact: `Some(pin)` = save
+/// (pinned or not), `None` = abort, nothing saved. EOF, Enter and unknown
+/// answers abort; pinning needs the fingerprint typed back; at a terminal every
+/// save also needs the random confirmation code (see [`verify_prompt_flow`]).
+fn prompt_verify_choice(fp: &str) -> Option<bool> {
+    let code = stdin_is_tty().then(|| new_confirm_code(&mut rand::thread_rng()));
+    verify_prompt_flow(fp, code.as_deref(), &mut read_decision_line)
+}
+
+/// Save an invite through [`add_contact`] (load + merge + binding / key-change /
+/// tag checks). `pin` is only true after the fingerprint was confirmed.
+fn commit_invite_contact(
+    data_dir: &Path,
+    invite: &ParsedInvite,
+    petname: &str,
+    pin: bool,
+) -> Result<(), String> {
+    add_contact(
+        data_dir,
+        &invite.address,
+        &invite.pub_hex,
+        petname,
+        "",
+        pin.then_some(invite.fingerprint.as_str()),
+        "",
+    )
+}
+
+/// Delivery marker for an outbound history row: ` [queued]` / ` [failed]` (or any
+/// other state the row carries) for a message that is not known to be delivered;
+/// nothing for inbound rows and delivered ones. Without it a queued or failed
+/// message looked exactly like a delivered one in the chat dump and `ash messages`,
+/// and the only notice of a failure was a one-off line at the next send. Shared by
+/// both views so they cannot diverge.
+pub(crate) fn delivery_suffix(e: &raven_core::ChatHistoryEntry) -> String {
+    if e.direction != "out" {
+        return String::new();
+    }
+    match e.delivery.as_str() {
+        "" | "delivered" => String::new(),
+        other => format!(" {C_DIM}[{}]{C_RESET}", sanitize_terminal_line(other)),
+    }
+}
+
+/// How long ago, in words: "just now", "5 min ago", "2 h ago", "3 d ago". An age
+/// needs no time zone (std has none), so it reads the same on every machine.
+/// `then_ms == 0` (unknown) gives "".
+fn short_age(now_ms: u64, then_ms: u64) -> String {
+    if then_ms == 0 {
+        return String::new();
+    }
+    let secs = now_ms.saturating_sub(then_ms) / 1000;
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3_599 => format!("{} min ago", secs / 60),
+        3_600..=86_399 => format!("{} h ago", secs / 3_600),
+        _ => format!("{} d ago", secs / 86_400),
+    }
+}
+
+/// On a terminal one huge message must not push everything else off the screen
+/// (piped output is never clipped).
+const TTY_BODY_MAX_CHARS: usize = 2000;
+/// Rows of the inbox shown on a terminal (the newest ones).
+const TTY_INBOX_ROWS: usize = 20;
+
+fn clip_body(text: String, max_chars: Option<usize>) -> String {
+    match max_chars {
+        Some(max) if text.chars().count() > max => {
+            let more = text.chars().count() - max;
+            let kept: String = text.chars().take(max).collect();
+            format!("{kept}\u{2026} (+{more} more characters)")
+        }
+        _ => text,
+    }
+}
+
+/// One stored message (`ash messages`) on ONE line: age, who to whom, the text,
+/// a ` [queued]` / ` [failed]` marker when it is not known to be delivered, and
+/// the short message id (the sender's `mid=`) last.
+fn format_history_row(
+    e: &raven_core::ChatHistoryEntry,
+    now_ms: u64,
+    max_chars: Option<usize>,
+) -> String {
+    let label = if !e.peer_petname.is_empty() {
+        sanitize_terminal_line(&e.peer_petname)
+    } else if !e.peer_tag.is_empty() {
+        format!("@{}", sanitize_terminal_line(&e.peer_tag))
+    } else {
+        sanitize_terminal_line(&e.peer_pub_hex.chars().take(12).collect::<String>())
+    };
+    let (from, to) = if e.direction == "out" {
+        ("you".to_string(), label)
+    } else {
+        (label, "you".to_string())
+    };
+    let age = short_age(now_ms, e.created_at_ms);
+    let when = if age.is_empty() {
+        String::new()
+    } else {
+        format!("{C_DIM}{age}{C_RESET}  ")
+    };
+    let text = if e.body.is_empty() {
+        &e.preview
+    } else {
+        &e.body
+    };
+    let mid: String = e.message_id_hex.chars().take(8).collect();
+    format!(
+        "  {when}{from} \u{2192} {to}: {}{}  {C_DIM}[{}]{C_RESET}",
+        clip_body(sanitize_terminal_line(text), max_chars),
+        delivery_suffix(e),
+        sanitize_terminal_line(&mid)
+    )
+}
+
 fn cmd_messages(data_dir: &Path) {
     let qpath = data_dir.join("queue.db");
     let qpath2 = data_dir.join("queue.sqlite");
     let path = if qpath.exists() { qpath } else { qpath2 };
+    // The old outgoing queue is only worth a line when something is waiting in it.
     if path.exists() {
         match OutgoingQueue::open(&path) {
             Ok(q) => match q.list_all() {
                 Ok(items) => {
-                    if items.is_empty() {
-                        println!("{C_DIM}Queue empty.{C_RESET}");
-                    } else {
+                    if !items.is_empty() {
                         println!("{C_DIM}{:<12} {:<12} peer{C_RESET}", "msg_id", "state");
                         for it in items {
                             let id = hex::encode(it.message_id);
@@ -941,29 +2362,23 @@ fn cmd_messages(data_dir: &Path) {
             },
             Err(e) => eprintln!("queue open error: {e}"),
         }
-    } else {
-        println!("{C_DIM}No outgoing queue yet.{C_RESET}");
     }
     match raven_core::ChatHistory::load(data_dir) {
         Ok(hist) if hist.entries.is_empty() => {
-            println!("{C_DIM}No local chat history.{C_RESET}");
+            println!("{C_DIM}No messages stored on this computer yet.{C_RESET}");
         }
         Ok(hist) => {
-            println!("{C_BOLD}Recent history{C_RESET} (protected at rest)");
+            println!("{C_BOLD}Recent messages{C_RESET} (stored encrypted on this computer)");
+            let now = now_ms();
+            let max_chars = io::stdout().is_terminal().then_some(TTY_BODY_MAX_CHARS);
+            let mut marked = false;
             for e in hist.entries.iter().rev().take(15).rev() {
-                let label = if !e.peer_petname.is_empty() {
-                    sanitize_terminal_text(&e.peer_petname)
-                } else if !e.peer_tag.is_empty() {
-                    format!("@{}", sanitize_terminal_text(&e.peer_tag))
-                } else {
-                    e.peer_pub_hex.chars().take(12).collect()
-                };
+                marked |= !delivery_suffix(e).is_empty();
+                println!("{}", format_history_row(e, now, max_chars));
+            }
+            if marked {
                 println!(
-                    "  {C_DIM}{}{C_RESET} {} → {}  {}",
-                    &e.message_id_hex[..8.min(e.message_id_hex.len())],
-                    e.direction,
-                    label,
-                    sanitize_terminal_text(&e.preview)
+                    "{C_DIM}[queued] = not delivered yet; [failed] = could not be delivered; [expired] = not delivered before it expired; [cancelled] = you stopped it.{C_RESET}"
                 );
             }
         }
@@ -971,6 +2386,37 @@ fn cmd_messages(data_dir: &Path) {
             eprintln!("local protected history unavailable: {error}");
         }
     }
+}
+
+/// `raven outbox ...`: the contact selector becomes its key first.
+fn cmd_outbox_cli(data_dir: &Path, cmd: Option<OutboxCommands>) -> Result<(), String> {
+    let cmd = match cmd.unwrap_or(OutboxCommands::List { contact: None }) {
+        OutboxCommands::List { contact } => {
+            let contact_pub_hex = match contact {
+                None => None,
+                Some(sel) => {
+                    let contacts = load_contacts(data_dir)?;
+                    let hits = resolve_contact_arg(&contacts, &sel);
+                    match hits.as_slice() {
+                        [one] => Some(one.pub_hex.clone()),
+                        [] => return Err(no_contact_message(&contacts, &sel)),
+                        many => {
+                            return Err(format!(
+                                "contact {} is ambiguous ({} matches): use the @tag",
+                                sanitize_terminal_line(&sel),
+                                many.len()
+                            ))
+                        }
+                    }
+                }
+            };
+            ext::OutboxCmd::List { contact_pub_hex }
+        }
+        OutboxCommands::Status { mid } => ext::OutboxCmd::Status { mid },
+        OutboxCommands::Retry { mid } => ext::OutboxCmd::Retry { mid },
+        OutboxCommands::Cancel { mid, yes } => ext::OutboxCmd::Cancel { mid, yes },
+    };
+    ext::cmd_outbox(data_dir, cmd)
 }
 
 fn now_ms() -> u64 {
@@ -1003,11 +2449,20 @@ fn shell_paste_rejection() -> &'static str {
     "That looks like a Terminal shell command. Exit ash (q), run those in zsh. Here paste only rvn1… or 64-char pub_hex from the other person's: ash whoami"
 }
 
+/// Lenient user-input parser: rejects pasted shell text and accepts a
+/// whoami `pub_hex  <hex>` line. Wire / IPC callers use [`parse_pub_hex_strict`].
 fn parse_pub_hex(s: &str) -> Result<[u8; 32], String> {
     if looks_like_shell_input(s) {
         return Err(shell_paste_rejection().into());
     }
     let h = extract_pub_hex_field(s).unwrap_or_else(|| s.trim().to_lowercase());
+    parse_pub_hex_strict(&h)
+}
+
+/// Exactly 64 hex chars (surrounding whitespace / case ignored) → 32 bytes.
+/// The single strict parser shared by cli, ext and pair_init_lab.
+fn parse_pub_hex_strict(s: &str) -> Result<[u8; 32], String> {
+    let h = s.trim().to_lowercase();
     if h.len() != 64 {
         return Err("pub_hex must be 64 hex chars (32 bytes)".into());
     }
@@ -1094,9 +2549,13 @@ const DEFAULT_LAN_PORT: u16 = 7420;
 /// Env overrides for peer LAN dial (checked in order). Matches RAVEN_* convention.
 const ENV_PEER_LAN_DIAL: &[&str] = &["RAVEN_PEER", "ASH_LAN_DIAL"];
 
+/// Longest `host:port` text accepted for a LAN or Internet route (the
+/// outbox's own bound, `raven_core::outbox::plausible_dial`).
+const MAX_DIAL_TEXT: usize = 300;
+
 fn looks_like_lan_dial(s: &str) -> bool {
     let t = s.trim();
-    if t.is_empty() || t.contains(' ') {
+    if t.is_empty() || t.contains(' ') || t.len() > MAX_DIAL_TEXT {
         return false;
     }
     // host:port — avoid treating rvn1… as dial
@@ -1104,12 +2563,133 @@ fn looks_like_lan_dial(s: &str) -> bool {
         return false;
     }
     if let Some((host, port)) = t.rsplit_once(':') {
-        if host.is_empty() {
+        // Hostname / IPv4 / bracketed IPv6 characters only — never control or
+        // escape bytes (the dial is stored, printed and handed to the daemon).
+        if host.is_empty()
+            || !host.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']' | ':' | '%')
+            })
+        {
             return false;
         }
         return port.parse::<u16>().ok().is_some_and(|p| p != 0);
     }
     false
+}
+
+/// Default Internet direct port (RIH1 over TCP; 7421 is mock BLE's).
+const DEFAULT_INTERNET_PORT: u16 = raven_core::paths::DEFAULT_INTERNET_PORT;
+
+/// A contact's Internet route, strictly: `host:port` where host is an IPv4
+/// address, a bracketed IPv6 address (`[2001:db8::1]:7422`) or a DNS name.
+/// Returns the normalised text (lowercase name, canonical IP) or a sentence
+/// that says what is wrong. Loopback is allowed (lab and tests); an
+/// unspecified, multicast or broadcast address, a zone id, an unbracketed IPv6
+/// address and a missing or zero port are not: none of them can be dialled.
+fn parse_internet_dial(raw: &str) -> Result<String, String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let s = raw.trim();
+    let example = format!(
+        "e.g. 203.0.113.7:{p}, [2001:db8::7]:{p} or node.example.com:{p}",
+        p = DEFAULT_INTERNET_PORT
+    );
+    if s.is_empty() {
+        return Err(format!("Internet address is empty ({example})"));
+    }
+    if s.len() > 261 || !s.chars().all(|c| c.is_ascii_graphic()) {
+        return Err(format!(
+            "Internet address must be one host:port without spaces or control characters ({example})"
+        ));
+    }
+    if s.starts_with("rvn1") {
+        return Err(format!(
+            "that is a Raven ID (who someone is), not a network address ({example})"
+        ));
+    }
+    let ip_ok = |ip: IpAddr| -> Result<(), String> {
+        let bad = match ip {
+            IpAddr::V4(v4) => v4.is_unspecified() || v4.is_multicast() || v4 == Ipv4Addr::BROADCAST,
+            IpAddr::V6(v6) => v6.is_unspecified() || v6.is_multicast(),
+        };
+        if bad {
+            Err(format!(
+                "{ip} cannot be dialled (unspecified, multicast or broadcast) ({example})"
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let parse_port = |p: &str| -> Result<u16, String> {
+        match p.parse::<u16>() {
+            Ok(0) | Err(_) => Err(format!(
+                "Internet address needs a port from 1 to 65535 after the last ':' ({example})"
+            )),
+            Ok(port) => Ok(port),
+        }
+    };
+    if let Some(rest) = s.strip_prefix('[') {
+        let (inside, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("IPv6 address is missing its closing ']' ({example})"))?;
+        if inside.contains('%') {
+            return Err(format!(
+                "a zone id (%…) only works on the local network: use --lan for that ({example})"
+            ));
+        }
+        let ip: Ipv6Addr = inside
+            .parse()
+            .map_err(|_| format!("[{inside}] is not an IPv6 address ({example})"))?;
+        let port = after
+            .strip_prefix(':')
+            .ok_or_else(|| format!("Internet address needs :port after ']' ({example})"))
+            .and_then(parse_port)?;
+        ip_ok(IpAddr::V6(ip))?;
+        return Ok(format!("[{ip}]:{port}"));
+    }
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return Err(format!(
+            "Internet address needs a port, e.g. {s}:{DEFAULT_INTERNET_PORT} ({example})"
+        ));
+    };
+    if host.contains(':') {
+        return Err(format!(
+            "write an IPv6 address in brackets, e.g. [2001:db8::7]:{DEFAULT_INTERNET_PORT}"
+        ));
+    }
+    let port = parse_port(port)?;
+    if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        ip_ok(IpAddr::V4(v4))?;
+        return Ok(format!("{v4}:{port}"));
+    }
+    let name = host.to_ascii_lowercase();
+    let labels: Vec<&str> = name.split('.').collect();
+    let label_ok = |l: &&str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    let last_numeric = labels
+        .last()
+        .is_some_and(|l| l.chars().all(|c| c.is_ascii_digit()));
+    if name.len() > 253 || !labels.iter().all(label_ok) || last_numeric {
+        return Err(format!(
+            "\"{}\" is not an IPv4 address or a DNS name ({example})",
+            sanitize_terminal_line(host)
+        ));
+    }
+    Ok(format!("{name}:{port}"))
+}
+
+/// A LAN route as saved: [`looks_like_lan_dial`], or a sentence saying why not.
+fn parse_lan_dial(raw: &str) -> Result<String, String> {
+    let d = raw.trim();
+    if looks_like_lan_dial(d) {
+        Ok(d.to_string())
+    } else {
+        Err("lan_dial must look like host:port (e.g. 192.168.1.20:7420)".into())
+    }
 }
 
 fn update_contact_lan_dial(data_dir: &Path, pub_hex: &str, dial: &str) -> Result<(), String> {
@@ -1152,23 +2732,30 @@ fn env_peer_lan_dial() -> Option<String> {
     None
 }
 
+/// Is a raven-node IPC server for this profile answering? A bounded probe: a
+/// wedged daemon must not stall `ash listen` for the full IPC I/O timeout.
 fn ipc_daemon_up(data_dir: &Path) -> bool {
-    ipc_client::ipc_daemon_up(data_dir)
+    ipc_client::ipc_daemon_up_within(data_dir, LISTEN_PREFLIGHT_PROBE)
 }
 
-fn ensure_mac_lan_service(data_dir: &Path) -> bool {
-    ext::ensure_mac_lan_daemon(data_dir)
+/// An address worth telling a friend: IPv4, and not loopback / link-local /
+/// unspecified (a Thunderbolt-bridge 169.254.x.x is no use to anyone else).
+#[cfg(any(target_os = "macos", test))]
+fn usable_lan_ipv4(s: &str) -> bool {
+    s.parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified())
 }
 
-/// Best-effort primary LAN IPv4 for tips (macOS `ipconfig getifaddr en0`, else none).
+/// Best-effort primary LAN IPv4 for tips (macOS `ipconfig getifaddr enN`, else none).
 fn local_lan_ipv4_tip() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        for iface in ["en0", "en1"] {
+        // Wi-Fi is usually en0/en1; USB / dock Ethernet adapters come later.
+        for iface in ["en0", "en1", "en2", "en3", "en4", "en5"] {
             if let Ok(out) = Command::new("ipconfig").args(["getifaddr", iface]).output() {
                 if out.status.success() {
                     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !s.is_empty() && s.parse::<std::net::Ipv4Addr>().is_ok() {
+                    if usable_lan_ipv4(&s) {
                         return Some(s);
                     }
                 }
@@ -1178,140 +2765,299 @@ fn local_lan_ipv4_tip() -> Option<String> {
     None
 }
 
+/// Exit code + message of a failed `ash listen`. `ash listen` exits with the
+/// code (a supervisor must see the failure); the menu prints the message and
+/// carries on.
+type ListenError = (i32, String);
+
+/// How long `ash listen` waits for the spawned service to prove its LAN
+/// listener is up before it says so: identity unlock (Keychain prompt) and the
+/// SQLCipher open can take a while. After this it warns and keeps waiting.
+const LISTEN_READY_DEADLINE: Duration = Duration::from_secs(20);
+const LISTEN_READY_POLL: Duration = Duration::from_millis(100);
+/// The service binds the LAN port in parallel with its IPC task, which can
+/// still fail on the instance lock: re-check the child after a short grace.
+const LISTEN_READY_GRACE: Duration = Duration::from_millis(300);
+/// Pre-flight IPC probe: a wedged daemon must not stall `ash listen` for the
+/// full IPC I/O timeout.
+const LISTEN_PREFLIGHT_PROBE: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+enum ListenWait {
+    Ready,
+    Exited(std::process::ExitStatus),
+    TimedOut,
+    WaitFailed(io::Error),
+}
+
+/// Poll until `ready()` says the listener is up, `child` exits, or `deadline`
+/// passes. Readiness is re-confirmed against the child after `grace`.
+fn wait_for_listener(
+    child: &mut std::process::Child,
+    deadline: Duration,
+    poll: Duration,
+    grace: Duration,
+    mut ready: impl FnMut() -> bool,
+) -> ListenWait {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return ListenWait::Exited(st),
+            Ok(None) => {}
+            Err(e) => return ListenWait::WaitFailed(e),
+        }
+        if ready() {
+            std::thread::sleep(grace);
+            return match child.try_wait() {
+                Ok(Some(st)) => ListenWait::Exited(st),
+                Ok(None) => ListenWait::Ready,
+                Err(e) => ListenWait::WaitFailed(e),
+            };
+        }
+        if start.elapsed() >= deadline {
+            return ListenWait::TimedOut;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// The daemon's own word that its LAN listener is bound: IPC `Status` lists
+/// `lan_direct` only once `lan_direct::listener_is_up()`. A bare IPC pong or a
+/// TCP connect would also be satisfied by a different process.
+fn status_reports_lan_listener(status: &Result<IpcResponse, String>) -> bool {
+    matches!(
+        status,
+        Ok(IpcResponse::Status { capabilities, .. }) if capabilities.iter().any(|c| c == "lan_direct")
+    )
+}
+
+/// Is the spawned service's LAN listener up right now?
+fn lan_listener_up(data_dir: &Path) -> bool {
+    if ipc_endpoint(data_dir).transport_available() {
+        status_reports_lan_listener(&ipc_client::ipc_request_timeout(
+            data_dir,
+            &IpcRequest::Status { v: IPC_VERSION },
+            Duration::from_millis(500),
+        ))
+    } else {
+        // No IPC transport on this OS: fall back to the port itself.
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], DEFAULT_LAN_PORT)),
+            Duration::from_millis(200),
+        )
+        .is_ok()
+    }
+}
+
+fn report_listen_error(msg: &str) {
+    let c = c();
+    eprintln!("{0}{msg}{1}", c.red, c.reset);
+}
+
 /// `ash listen` / menu 4 — receive messages with ONE command.
 ///
-/// Wraps `raven-node run` with everything pre-filled from the local profile:
-/// fixed LAN port, pinned-contact public keys (no flags to remember), and a
-/// share-banner showing exactly what the friend should dial.
-fn cmd_listen(data_dir: &Path) {
+/// Runs the same `raven-node service` receiver the secure send path dials
+/// (LAN-direct Noise XX + PairInit + indexed session), in the foreground on
+/// the fixed LAN port. Only peers in the contact book are trusted, so there is
+/// nothing to pick; received messages land in the endpoint inbox (menu 2).
+///
+/// `Ok` = clean stop (or the profile's service already receives); every
+/// startup failure and a non-zero listener exit is an `Err((exit code, why))`.
+fn cmd_listen(data_dir: &Path) -> Result<(), ListenError> {
     let c = c();
-    let id = require_identity(data_dir);
-    let contacts = load_contacts(data_dir).unwrap_or_default();
-
-    let contact = match contacts.len() {
-        0 => {
-            println!("{0}No pinned contacts yet.{1}", c.yellow, c.reset);
-            println!(
-                "{0}Add one first (menu 5), so I know whose keys to accept.{1}",
-                c.dim, c.reset
-            );
-            return;
+    let id = match try_load_identity(data_dir) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return Err((
+                1,
+                "identity missing — run: ash --data-dir <dir> init".into(),
+            ))
         }
-        1 => &contacts[0],
-        _ => {
-            println!("{}Listen for which contact?{}", c.bold, c.reset);
-            for (i, ct) in contacts.iter().enumerate() {
-                let fp = device_fingerprint_v1(&{
-                    let mut k = [0u8; 32];
-                    if let Ok(b) = hex::decode(&ct.pub_hex) {
-                        k.copy_from_slice(&b[..32.min(b.len())]);
-                    }
-                    k
-                });
-                println!("  {0} {1}  fp={2}", i + 1, ct.primary_label(), fp);
-            }
-            print!("number: ");
-            let _ = io::stdout().flush();
-            let pick: usize = read_line().parse().unwrap_or(0);
-            if pick == 0 || pick > contacts.len() {
-                println!("{0}cancelled.{1}", c.dim, c.reset);
-                return;
-            }
-            &contacts[pick - 1]
+        Err(e) => {
+            return Err((
+                1,
+                format!("secure identity store: {}", sanitize_terminal_line(&e)),
+            ))
         }
     };
+    let contacts = load_contacts(data_dir).map_err(|e| (1, sanitize_terminal_line(&e)))?;
+    if contacts.is_empty() {
+        return Err((
+            1,
+            "No pinned contacts yet.\nAdd one first (menu 5), so I know whose keys to accept."
+                .into(),
+        ));
+    }
 
     // Local IP(s) to share with the friend.
     let ip = local_lan_ipv4_tip().unwrap_or_else(|| "<your-LAN-IP>".into());
 
-    println!();
-    println!("{0}═══ LISTENING ═══{1}", c.purple, c.reset);
-    println!("{0}Tell your friend to send to:{1}", c.dim, c.reset);
-    println!("   {0}{ip}:{DEFAULT_LAN_PORT}{1}", c.cyan, c.reset);
-    println!("{0}…and use YOUR pub_hex when asked:{1}", c.dim, c.reset);
-    println!("   {}", hex::encode(id.public_key_bytes()));
-    println!(
-        "{0}Waiting for {1} …{2}",
-        c.dim,
-        contact.primary_label(),
-        c.reset
-    );
-    println!();
-
     let node = ext::raven_node_bin_public();
 
-    // Spawn first, then wait until the port actually accepts — otherwise the
-    // friend may dial before we're ready ("connection refused").
     // Pre-flight: make sure the port is actually free before spawning.
     {
         use std::net::TcpListener;
         match TcpListener::bind(("0.0.0.0", DEFAULT_LAN_PORT)) {
-            Ok(l) => drop(l),
-            Err(_) => {
+            Ok(l) => {
+                drop(l);
+                // Port free but this profile's service answers IPC: it is an
+                // outbound-only one (e.g. `RAVEN_SERVICE_LAN_LISTEN` was set).
+                // A second service would die on the IPC instance lock after
+                // already having bound the port, so refuse up front.
+                if ipc_daemon_up(data_dir) {
+                    return Err((
+                        1,
+                        format!(
+                            "a raven-node service for this profile is already running but is NOT \
+                             listening on port {DEFAULT_LAN_PORT} (outbound-only, started by an \
+                             earlier send).\n\
+                             Stop it:   pkill -f 'raven-node service'\n\
+                             then run `ash listen` again (or unset RAVEN_SERVICE_LAN_LISTEN)."
+                        ),
+                    ));
+                }
+            }
+            Err(_) if ipc_daemon_up(data_dir) => {
+                // The raven-node service for this profile (auto-started by a
+                // send) already listens on the LAN port and fills the inbox.
                 println!(
-                    "{0}port {DEFAULT_LAN_PORT} is already taken by another process.\n\
-                     Find it:   lsof -i :{DEFAULT_LAN_PORT}\n\
-                     Stop it:   pkill -f raven-node{1}",
-                    c.red, c.reset
+                    "{0}port {DEFAULT_LAN_PORT} is busy and a raven-node service for this profile is running{1}",
+                    c.yellow, c.reset
                 );
-                return;
+                println!(
+                    "{0}(started by an earlier send). It already receives — see menu 2 Inbox.{1}",
+                    c.dim, c.reset
+                );
+                println!(
+                    "   {0}Tell your friend: {ip}:{DEFAULT_LAN_PORT}{1}",
+                    c.cyan, c.reset
+                );
+                println!("   your pub_hex: {}", hex::encode(id.public_key_bytes()));
+                return Ok(());
+            }
+            Err(_) => {
+                return Err((
+                    1,
+                    format!(
+                        "port {DEFAULT_LAN_PORT} is already taken by another process.\n\
+                         Find it:   lsof -i :{DEFAULT_LAN_PORT}\n\
+                         Stop it:   pkill -f raven-node"
+                    ),
+                ));
             }
         }
     }
 
-    let mut child = match Command::new(node)
+    let mut child = Command::new(node)
         .stdin(std::process::Stdio::null())
-        .arg("run")
-        .args(["--data-dir", &data_dir.display().to_string()])
-        .args(["--listen", &format!("0.0.0.0:{DEFAULT_LAN_PORT}")])
-        // Keep receiving every message this session (Ctrl+C stops).
-        .args(["--timeout-secs", "21600"])
-        .args(["--peer-pub-hex", contact.pub_hex.trim()])
-        .args(["--origin-pub-hex", contact.pub_hex.trim()])
+        .arg("service")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(["--lan-listen", &format!("0.0.0.0:{DEFAULT_LAN_PORT}")])
+        .args(["--ble-listen", "127.0.0.1:0"])
         .spawn()
-    {
-        Ok(ch) => ch,
-        Err(e) => {
-            println!("{0}could not start raven-node: {1}{2}", c.red, e, c.reset);
-            return;
-        }
-    };
+        .map_err(|e| {
+            (
+                1,
+                format!(
+                    "could not start raven-node: {}",
+                    sanitize_terminal_line(&e.to_string())
+                ),
+            )
+        })?;
 
-    // Give the daemon a beat to bind; bail out if it died immediately.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    if let Some(st) = child.try_wait().ok().flatten() {
-        let _ = child.wait();
-        println!(
-            "{0}listener exited early ({1}) — see message above.{2}",
-            c.yellow, st, c.reset
+    // Announce nothing until the service itself reports its LAN listener up
+    // (or it died): a fixed sleep used to print LISTENING for a node that was
+    // still unlocking its identity, or about to fail on the IPC instance lock.
+    let probe = || lan_listener_up(data_dir);
+    let mut waited = wait_for_listener(
+        &mut child,
+        LISTEN_READY_DEADLINE,
+        LISTEN_READY_POLL,
+        LISTEN_READY_GRACE,
+        probe,
+    );
+    if matches!(waited, ListenWait::TimedOut) {
+        eprintln!(
+            "{0}still starting — the LAN listener is not up yet (identity unlock / Keychain prompt?). \
+             I will announce it once it is. (Ctrl+C to give up){1}",
+            c.yellow, c.reset
         );
-        return;
+        waited = wait_for_listener(
+            &mut child,
+            Duration::MAX,
+            LISTEN_READY_POLL,
+            LISTEN_READY_GRACE,
+            probe,
+        );
+    }
+    match waited {
+        ListenWait::Ready => {}
+        ListenWait::Exited(st) => {
+            let _ = child.wait();
+            return Err((
+                st.code().filter(|code| *code != 0).unwrap_or(1),
+                format!("listener exited during startup ({st}) — see raven-node's message above."),
+            ));
+        }
+        ListenWait::TimedOut => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err((1, "the LAN listener never came up".into()));
+        }
+        ListenWait::WaitFailed(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err((
+                1,
+                format!(
+                    "failed waiting for raven-node: {}",
+                    sanitize_terminal_line(&e.to_string())
+                ),
+            ));
+        }
     }
 
     println!();
     println!("{0}═══ LISTENING ═══{1}", c.purple, c.reset);
     println!("{0}Tell your friend to send to:{1}", c.dim, c.reset);
     println!("   {0}{ip}:{DEFAULT_LAN_PORT}{1}", c.cyan, c.reset);
-    println!("{0}…and use YOUR pub_hex when asked:{1}", c.dim, c.reset);
-    println!("   {}", hex::encode(id.public_key_bytes()));
+    println!("{0}{LISTEN_INVITE_HINT}{1}", c.dim, c.reset);
     println!(
-        "{0}Waiting for {1} … (Ctrl+C to stop){2}",
+        "   raven:{}:{}",
+        id.address(),
+        hex::encode(id.public_key_bytes())
+    );
+    println!(
+        "{0}Accepting your {1} contact(s) only. {LISTEN_STAYS_BUSY}{2}",
         c.dim,
-        contact.primary_label(),
+        contacts.len(),
         c.reset
     );
     println!();
 
-    let status = child.wait();
-
-    match status {
+    match child.wait() {
         Ok(s) if s.success() => {
-            println!("{0}✔ message received & ACKed.{1}", c.green, c.reset);
+            println!("{0}listener stopped.{1}", c.dim, c.reset);
+            Ok(())
         }
-        Ok(s) => println!("{0}listener exited ({1}).{2}", c.yellow, s, c.reset),
-        Err(e) => println!("{0}could not start raven-node: {1}{2}", c.red, e, c.reset),
+        Ok(s) => Err((s.code().unwrap_or(1), format!("listener exited ({s})."))),
+        Err(e) => Err((
+            1,
+            format!(
+                "failed waiting for raven-node: {}",
+                sanitize_terminal_line(&e.to_string())
+            ),
+        )),
     }
 }
+
+/// What a friend does with the address shown above: they have to add YOU too.
+const LISTEN_INVITE_HINT: &str =
+    "…and they add you under menu 5 Contacts, a, pasting this invite line (it is also in `ash whoami`):";
+
+/// This terminal is occupied by the receiver, so say where messages are read.
+const LISTEN_STAYS_BUSY: &str = "This terminal stays busy while listening: open a second terminal and run `ash inbox` (or `ash`, menu 2) to read messages. Ctrl+C stops receiving.";
 
 fn print_lan_unresolved_hint(contact_label: &str) {
     let s = style();
@@ -1320,13 +3066,16 @@ fn print_lan_unresolved_hint(contact_label: &str) {
     let reset = s.reset;
     println!(
         "{bold}LAN peer not resolved{reset} for {} — identity ≠ IP.",
-        sanitize_terminal_text(contact_label)
+        sanitize_terminal_line(contact_label)
     );
     println!(
         "{dim}EN:{reset} Peer must reach this Mac (iPhone Serverless LAN → Host=Mac IP, Port={DEFAULT_LAN_PORT}),"
     );
     println!(
         "{dim}   {reset} or set listen on the phone / export RAVEN_PEER=host:port. No host:port prompt."
+    );
+    println!(
+        "{dim}   {reset} Save it once: ash contact set-dial --petname <name> --lan-dial host:port"
     );
     println!(
         "{dim}FA:{reset} مخاطب باید به این مک برسد (آیفون Serverless LAN → Host=آی‌پی مک، Port={DEFAULT_LAN_PORT})؛"
@@ -1348,13 +3097,9 @@ fn print_lan_unresolved_hint(contact_label: &str) {
     );
 }
 
-/// Pure resolution used by tests: saved dial → env → Mac-listens local queue.
-/// `ipc_up` is informational for callers; empty dial always prefers local queue (daemon may auto-start).
-fn resolve_lan_peer_parts(
-    saved_lan_dial: &str,
-    env_dial: Option<&str>,
-    _ipc_up: bool,
-) -> Option<ResolvedLanPeer> {
+/// Pure resolution used by tests: saved dial → env. No dial → `None`
+/// (LocalListenQueue is disabled; the caller explains Mac-listens instead).
+fn resolve_lan_peer_parts(saved_lan_dial: &str, env_dial: Option<&str>) -> Option<ResolvedLanPeer> {
     let saved = saved_lan_dial.trim();
     if looks_like_lan_dial(saved) {
         return Some(ResolvedLanPeer::Dial(saved.to_string()));
@@ -1373,7 +3118,7 @@ fn contact_fingerprint(c: &Contact) -> String {
 }
 
 fn normalize_tag(tag: &str) -> String {
-    sanitize_terminal_text(tag.trim().trim_start_matches('@')).to_lowercase()
+    sanitize_terminal_line(tag.trim().trim_start_matches('@')).to_lowercase()
 }
 
 fn alias_store_path(data_dir: &Path) -> PathBuf {
@@ -1424,17 +3169,51 @@ fn load_alias_store(data_dir: &Path, now: u64) -> AliasClaimStore {
             signature,
             ed25519_pub,
         };
-        let _ = store.put(rec, now);
+        // Local file of the user's own publications: no network quota, so a
+        // reload never silently drops rows beyond the Sybil / rate limits.
+        let _ = store.put_trusted(rec, now);
     }
     store
 }
 
+/// Rows of `alias_claims.json`. Same policy as contacts.json: a corrupt store
+/// is an error, never an empty list that a rewrite would silently persist.
+fn read_alias_rows(data_dir: &Path) -> Result<Vec<AliasClaimJson>, String> {
+    match std::fs::read_to_string(alias_store_path(data_dir)) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|e| format!("alias_claims.json corrupt — refusing overwrite: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("alias_claims.json: {e}")),
+    }
+}
+
+/// Highest stored sequence for this (alias, identity), expired or not: peers
+/// keep that high-water mark after expiry too.
+fn stored_alias_sequence(
+    rows: &[AliasClaimJson],
+    alias: &str,
+    identity_address: &str,
+) -> Option<u64> {
+    rows.iter()
+        .filter(|r| r.alias == alias && r.identity_address == identity_address)
+        .map(|r| r.sequence)
+        .max()
+}
+
 fn save_alias_claim(data_dir: &Path, rec: &AliasRecord) -> Result<(), String> {
     let path = alias_store_path(data_dir);
-    let mut rows: Vec<AliasClaimJson> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|r| serde_json::from_str(&r).ok())
-        .unwrap_or_default();
+    let mut rows = read_alias_rows(data_dir)?;
+    // Mirror `AliasClaimStore::admit`: peers refuse a claim whose sequence is
+    // not above the one they already hold, so never regress local state.
+    if let Some(prev) = stored_alias_sequence(&rows, &rec.alias, &rec.identity_address) {
+        if rec.sequence <= prev {
+            return Err(format!(
+                "ALIAS_STALE_SEQUENCE: @{} is already stored at sequence {prev}; \
+                 publish with a higher --sequence (got {})",
+                rec.alias, rec.sequence
+            ));
+        }
+    }
     rows.retain(|r| !(r.alias == rec.alias && r.identity_address == rec.identity_address));
     rows.push(AliasClaimJson {
         alias: rec.alias.clone(),
@@ -1444,12 +3223,12 @@ fn save_alias_claim(data_dir: &Path, rec: &AliasRecord) -> Result<(), String> {
         signature_hex: hex::encode(rec.signature),
         ed25519_pub_hex: hex::encode(rec.ed25519_pub),
     });
-    std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
+    create_private_data_dir(data_dir).map_err(|e| e.to_string())?;
     let raw = serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?;
-    std::fs::write(path, raw).map_err(|e| e.to_string())
+    raven_core::atomic_write_private(&path, raw.as_bytes())
 }
 
-fn cmd_alias_publish(data_dir: &Path, alias: &str, sequence: u64, expires_at: Option<u64>) {
+fn cmd_alias_publish(data_dir: &Path, alias: &str, sequence: Option<u64>, expires_at: Option<u64>) {
     let id = require_identity(data_dir);
     let alias = match normalize_alias(alias) {
         Ok(a) => a,
@@ -1457,6 +3236,19 @@ fn cmd_alias_publish(data_dir: &Path, alias: &str, sequence: u64, expires_at: Op
             eprintln!("{e}");
             std::process::exit(1);
         }
+    };
+    // Default: one above what is stored, so a refresh (new expiry) is accepted
+    // by peers that already hold the earlier claim.
+    let sequence = match sequence {
+        Some(s) => s,
+        None => match read_alias_rows(data_dir) {
+            Ok(rows) => stored_alias_sequence(&rows, &alias, &id.address())
+                .map_or(1, |prev| prev.saturating_add(1)),
+            Err(e) => {
+                eprintln!("alias store: {e}");
+                std::process::exit(1);
+            }
+        },
     };
     let now = now_ms();
     let expires_at = expires_at.unwrap_or(now.saturating_add(30 * 24 * 60 * 60 * 1000));
@@ -1489,10 +3281,6 @@ fn cmd_alias_publish(data_dir: &Path, alias: &str, sequence: u64, expires_at: Op
     println!("{C_DIM}address{C_RESET}     {}", signed.identity_address);
 }
 
-fn load_profile_store(_data_dir: &Path, _now: u64) -> ProfileStore {
-    ProfileStore::default()
-}
-
 fn build_discovery_ctx(data_dir: &Path) -> DiscoveryContext {
     let now = now_ms();
     let contacts: Vec<LocalContactRow> = contacts_or_die(data_dir)
@@ -1514,8 +3302,12 @@ fn build_discovery_ctx(data_dir: &Path) -> DiscoveryContext {
     DiscoveryContext {
         contacts,
         aliases: load_alias_store(data_dir, now),
-        profiles: load_profile_store(data_dir, now),
-        blocked: BlockList::load(data_dir),
+        // No public profile index in V1 (serverless): nothing to load.
+        profiles: ProfileStore::default(),
+        blocked: BlockList::load_checked(data_dir).unwrap_or_else(|e| {
+            eprintln!("block list: {e}");
+            std::process::exit(1);
+        }),
         serverless: true,
         public_profile_index_enabled: false,
         now_ms: now,
@@ -1530,7 +3322,7 @@ fn print_discovery_hit(i: usize, h: &DiscoveryResult) {
         if h.display_name.is_empty() {
             "(no display name)".into()
         } else {
-            sanitize_terminal_text(&h.display_name)
+            sanitize_terminal_line(&h.display_name)
         },
         match h.verification_state {
             VerificationState::AliasConflict => format!("{C_PURPLE}ALIAS_CONFLICT{C_RESET}"),
@@ -1542,18 +3334,19 @@ fn print_discovery_hit(i: usize, h: &DiscoveryResult) {
             VerificationState::PublicSignedProfile => "PUBLIC_SIGNED_PROFILE".into(),
             VerificationState::ScopedVerified => "SCOPED_VERIFIED".into(),
             VerificationState::ExpiredOrStale => "EXPIRED_OR_STALE".into(),
+            VerificationState::Unverified => format!("{C_PURPLE}UNVERIFIED{C_RESET}"),
         }
     );
     println!(
         "      {C_DIM}raven_id{C_RESET}  {}",
-        sanitize_terminal_text(&h.raven_id)
+        sanitize_terminal_line(&h.raven_id)
     );
     if !h.aliases.is_empty() {
         println!(
             "      {C_DIM}aliases{C_RESET}   {}",
             h.aliases
                 .iter()
-                .map(|a| format!("@{a}"))
+                .map(|a| format!("@{}", sanitize_terminal_line(a)))
                 .collect::<Vec<_>>()
                 .join(" ")
         );
@@ -1588,7 +3381,7 @@ fn cmd_find(
     let hits = DiscoveryResolver::v1().search(query, scope, &ctx);
     println!(
         "{C_BOLD}Discovery{C_RESET} query={} scope={:?} hits={}",
-        sanitize_terminal_text(query),
+        sanitize_terminal_line(query),
         scope,
         hits.len()
     );
@@ -1615,57 +3408,107 @@ fn cmd_find(
                 let h = &hits[n - 1];
                 println!(
                     "{C_GREEN}selected{C_RESET} {} — use: ash contact request {}",
-                    sanitize_terminal_text(&h.raven_id),
-                    sanitize_terminal_text(&h.raven_id)
+                    sanitize_terminal_line(&h.raven_id),
+                    sanitize_terminal_line(&h.raven_id)
                 );
             }
         }
     }
 }
 
-fn cmd_nearby(data_dir: &Path) {
-    let path = nearby_store_path(data_dir);
-    let mut reg = NearbyRegistry::default();
-    if let Ok(raw) = std::fs::read_to_string(&path) {
-        if let Ok(tokens) = serde_json::from_str::<Vec<String>>(&raw) {
-            for t in tokens {
-                if let Ok(v) = hex::decode(&t) {
-                    if v.len() == 16 {
-                        let mut token = [0u8; 16];
-                        token.copy_from_slice(&v);
-                        let mut adv = NearbyAdvertisement::mint(now_ms(), 60_000, b"ash-nearby");
-                        adv.ephemeral_token = token;
-                        let _ = reg.publish_ephemeral(adv);
-                    }
-                }
-            }
+/// Persisted nearby advertisement (local mock). The full advertisement is
+/// stored so a reload shows the original token/commitment with its original
+/// expiry — tokens are never re-minted with a fresh TTL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NearbyTokenJson {
+    token_hex: String,
+    commitment_hex: String,
+    issued_at_ms: u64,
+    ttl_ms: u64,
+}
+
+impl NearbyTokenJson {
+    fn from_adv(a: &NearbyAdvertisement) -> Self {
+        Self {
+            token_hex: hex::encode(a.ephemeral_token),
+            commitment_hex: hex::encode(a.session_commitment),
+            issued_at_ms: a.issued_at_ms,
+            ttl_ms: a.ttl_ms,
         }
     }
-    let adv = NearbyAdvertisement::mint(now_ms(), 60_000, b"ash-nearby");
+
+    fn to_adv(&self) -> Option<NearbyAdvertisement> {
+        let token: [u8; 16] = hex::decode(&self.token_hex).ok()?.try_into().ok()?;
+        let commitment: [u8; 32] = hex::decode(&self.commitment_hex).ok()?.try_into().ok()?;
+        Some(NearbyAdvertisement {
+            ephemeral_token: token,
+            session_commitment: commitment,
+            issued_at_ms: self.issued_at_ms,
+            ttl_ms: self.ttl_ms,
+        })
+    }
+}
+
+/// Still-live stored advertisements. Expired rows, malformed rows and the
+/// legacy bare-token list (no mint time → cannot prove liveness) are dropped.
+fn load_live_nearby_ads(raw: &str, now: u64) -> Vec<NearbyAdvertisement> {
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .filter_map(|v| serde_json::from_value::<NearbyTokenJson>(v).ok())
+        .filter_map(|row| row.to_adv())
+        .filter(|a| a.is_live(now))
+        .collect()
+}
+
+fn cmd_nearby(data_dir: &Path) {
+    // The registry file is profile state: not before the first identity.
+    if let Err(e) = require_identity_before_state(data_dir, "nearby") {
+        eprintln!("{}", sanitize_terminal_line(&e));
+        std::process::exit(1);
+    }
+    let path = nearby_store_path(data_dir);
+    let now = now_ms();
+    let mut reg = NearbyRegistry::default();
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        for adv in load_live_nearby_ads(&raw, now) {
+            let _ = reg.publish_ephemeral(adv);
+        }
+    }
+    let adv = NearbyAdvertisement::mint(now, 60_000, b"ash-nearby");
     if adv.contains_permanent_raven_id() {
         eprintln!("refused: permanent Raven ID in nearby advertisement");
         std::process::exit(1);
     }
-    reg.publish_ephemeral(adv.clone()).unwrap();
-    let mut tokens: Vec<String> = reg
-        .live_ads
-        .iter()
-        .map(|a| hex::encode(a.ephemeral_token))
+    if let Err(e) = reg.publish_ephemeral(adv) {
+        eprintln!("nearby: {e}");
+        std::process::exit(1);
+    }
+    let rows: Vec<NearbyTokenJson> = reg
+        .scan_live(now)
+        .into_iter()
+        .map(NearbyTokenJson::from_adv)
         .collect();
-    tokens.sort();
-    tokens.dedup();
-    std::fs::create_dir_all(data_dir).ok();
-    let _ = std::fs::write(
-        path,
-        serde_json::to_string_pretty(&tokens).unwrap_or_default(),
+    if let Err(e) = create_private_data_dir(data_dir)
+        .map_err(|e| e.to_string())
+        .and_then(|_| {
+            let raw = serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?;
+            raven_core::atomic_write_private(&path, raw.as_bytes())
+        })
+    {
+        eprintln!("nearby store: {e}");
+    }
+    println!(
+        "{C_BOLD}Nearby{C_RESET} (local software mock — lists only THIS device's own ephemeral tokens; no BLE receive side)"
     );
-    println!("{C_BOLD}Nearby{C_RESET} (ephemeral — no permanent Raven ID in adv)");
-    for a in reg.scan_live(now_ms()) {
+    for a in reg.scan_live(now) {
         let phrase = raven_core::nearby_safety_phrase(&a.ephemeral_token, &a.session_commitment);
+        let left_ms = a.issued_at_ms.saturating_add(a.ttl_ms).saturating_sub(now);
         println!(
-            "  token={} ttl_ms={} commitment={}",
+            "  token={} ttl_left_ms={} commitment={}",
             hex::encode(a.ephemeral_token),
-            a.ttl_ms,
+            left_ms,
             hex::encode(a.session_commitment)
         );
         println!(
@@ -1707,6 +3550,12 @@ fn refuse_unready_contact_session() -> ! {
     std::process::exit(2)
 }
 
+/// 1-based user pick → 0-based index. 0 and anything past the end are out of
+/// range (a saturating `n - 1` used to turn `--pick 0` into candidate 1).
+fn pick_index(n: usize, len: usize) -> Option<usize> {
+    n.checked_sub(1).filter(|i| *i < len)
+}
+
 fn cmd_contact_request(data_dir: &Path, target: &str, message: &str, pick: Option<usize>) {
     if !contact_session_transport_ready() {
         refuse_unready_contact_session();
@@ -1730,10 +3579,13 @@ fn cmd_contact_request(data_dir: &Path, target: &str, message: &str, pick: Optio
     let chosen = if hits.len() == 1 {
         &hits[0]
     } else if let Some(n) = pick {
-        hits.get(n.saturating_sub(1)).unwrap_or_else(|| {
-            eprintln!("pick out of range");
-            std::process::exit(1);
-        })
+        // --pick is 1-based: 0 is out of range, never "the first candidate".
+        pick_index(n, hits.len())
+            .map(|i| &hits[i])
+            .unwrap_or_else(|| {
+                eprintln!("pick out of range (1-{})", hits.len());
+                std::process::exit(1);
+            })
     } else {
         println!("{C_PURPLE}multiple candidates{C_RESET} — pick one:");
         for (i, h) in hits.iter().enumerate() {
@@ -1762,13 +3614,13 @@ fn cmd_contact_request(data_dir: &Path, target: &str, message: &str, pick: Optio
         chosen.aliases.first().map(|s| s.as_str()).unwrap_or(q),
         now_ms(),
     ) {
+        // Only a claim for exactly the chosen identity may supply the key —
+        // never "the only claim", which could belong to someone else.
         if let Some(claim) = claims
             .iter()
             .find(|c| c.identity_address == chosen.raven_id)
         {
             claim.ed25519_pub
-        } else if claims.len() == 1 {
-            claims[0].ed25519_pub
         } else {
             eprintln!("need contact pub_hex or signed alias claim with matching raven_id");
             std::process::exit(1);
@@ -1801,7 +3653,10 @@ fn cmd_contact_request(data_dir: &Path, target: &str, message: &str, pick: Optio
         eprintln!("seal failed: {e}");
         std::process::exit(1);
     });
-    assert!(req.is_ciphertext_only());
+    if !req.is_ciphertext_only() {
+        eprintln!("refused: contact request is not ciphertext-only");
+        std::process::exit(1);
+    }
     let wire = req.encode_wire().unwrap_or_else(|e| {
         eprintln!("wire encode failed: {e}");
         std::process::exit(1);
@@ -1809,13 +3664,17 @@ fn cmd_contact_request(data_dir: &Path, target: &str, message: &str, pick: Optio
     // Ciphertext-only file (opaque to store/bridge) + full wire for endpoint delivery.
     let out_ct = data_dir.join(format!("contact_request_{}.bin", hex::encode(request_id)));
     let out_wire = data_dir.join(format!("contact_request_{}.wire", hex::encode(request_id)));
-    std::fs::write(&out_ct, &req.ciphertext).ok();
-    std::fs::write(&out_wire, &wire).ok();
+    for (path, bytes) in [(&out_ct, &req.ciphertext), (&out_wire, &wire)] {
+        if let Err(e) = raven_core::atomic_write_private(path, bytes) {
+            eprintln!("write {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
     println!("{C_GREEN}contact request sealed{C_RESET} (ciphertext-only for store/bridge)");
     println!("{C_DIM}request_id{C_RESET} {}", hex::encode(request_id));
     println!(
         "{C_DIM}recipient{C_RESET}  {}",
-        sanitize_terminal_text(&chosen.raven_id)
+        sanitize_terminal_line(&chosen.raven_id)
     );
     println!("{C_DIM}ciphertext{C_RESET} {}", out_ct.display());
     println!("{C_DIM}wire{C_RESET}       {}", out_wire.display());
@@ -1867,15 +3726,24 @@ fn load_contact_inbox(data_dir: &Path) -> ContactRequestInbox {
 
 fn persist_inbox_wire(data_dir: &Path, outer: &RavenContactRequestV1) -> Result<(), String> {
     let dir = contact_inbox_dir(data_dir);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    create_private_data_dir(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{}.wire", hex::encode(outer.request_id)));
     let wire = outer.encode_wire()?;
-    std::fs::write(path, wire).map_err(|e| e.to_string())
+    raven_core::atomic_write_private(&path, &wire)
 }
 
+/// Drop a handled request from the pending inbox. A failed delete is only a
+/// warning (the request would merely show up as pending again), but never silent.
 fn remove_inbox_wire(data_dir: &Path, request_id: &[u8; 16]) {
     let path = contact_inbox_dir(data_dir).join(format!("{}.wire", hex::encode(request_id)));
-    let _ = std::fs::remove_file(path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "warning: could not remove pending request {}: {e}",
+            path.display()
+        ),
+    }
 }
 
 fn cmd_contact_pending(data_dir: &Path) {
@@ -1898,9 +3766,9 @@ fn cmd_contact_pending(data_dir: &Path) {
             "  {C_CYAN}{}{C_RESET}  id={}  from={}  name=\"{}\"  msg=\"{}\"",
             i + 1,
             hex::encode(p.outer.request_id),
-            sanitize_terminal_text(&p.inner.sender_raven_id),
-            sanitize_terminal_text(&p.inner.sender_display_name),
-            sanitize_terminal_text(&p.inner.optional_message)
+            sanitize_terminal_line(&p.inner.sender_raven_id),
+            sanitize_terminal_line(&p.inner.sender_display_name),
+            sanitize_terminal_line(&p.inner.optional_message)
         );
     }
     println!("{C_DIM}ash contact accept <id> --petname \"…\" | decline <id> | block <id>{C_RESET}");
@@ -1920,7 +3788,11 @@ fn cmd_contact_ingest(data_dir: &Path, file: &Path) {
         std::process::exit(1);
     });
     // Bridge/store opacity: wire encodes outer metadata + opaque ciphertext.
-    assert!(outer.is_ciphertext_only());
+    // The wire comes from a user-supplied file: refuse, never panic.
+    if !outer.is_ciphertext_only() {
+        eprintln!("bad wire: not ciphertext-only");
+        std::process::exit(1);
+    }
     let mut inbox = ContactRequestInbox::default();
     let inner = inbox
         .ingest(outer.clone(), &id, now_ms())
@@ -1938,9 +3810,39 @@ fn cmd_contact_ingest(data_dir: &Path, file: &Path) {
     );
     println!(
         "{C_DIM}from{C_RESET} {} — {}",
-        sanitize_terminal_text(&inner.sender_raven_id),
-        sanitize_terminal_text(&inner.sender_display_name)
+        sanitize_terminal_line(&inner.sender_raven_id),
+        sanitize_terminal_line(&inner.sender_display_name)
     );
+}
+
+/// Make an accepted request durable: bind the contact, write the accept wire,
+/// and only then drop the pending request. A failure before the last step
+/// leaves the request pending, so accept can be re-run (`add_contact` replaces
+/// the same key's row, so a retry is idempotent). Returns the accept wire path.
+fn finish_contact_accept(
+    data_dir: &Path,
+    rid: &[u8; 16],
+    outcome: &ContactAcceptOutcome,
+) -> Result<PathBuf, String> {
+    // Bind local contact (raven_id + petname); verification = trusted contact.
+    add_contact(
+        data_dir,
+        &outcome.binding.raven_id,
+        &outcome.binding.pub_hex,
+        &outcome.binding.petname,
+        "",
+        None,
+        "",
+    )
+    .map_err(|e| format!("bind failed: {}", sanitize_terminal_line(&e)))?;
+    let wire = outcome
+        .accept
+        .encode_wire()
+        .map_err(|e| format!("accept wire: {e}"))?;
+    let out = data_dir.join(format!("contact_accept_{}.wire", hex::encode(rid)));
+    raven_core::atomic_write_private(&out, &wire).map_err(|e| format!("accept wire write: {e}"))?;
+    remove_inbox_wire(data_dir, rid);
+    Ok(out)
 }
 
 fn cmd_contact_accept(data_dir: &Path, request_id_hex: &str, petname: &str) {
@@ -1956,32 +3858,17 @@ fn cmd_contact_accept(data_dir: &Path, request_id_hex: &str, petname: &str) {
             eprintln!("accept failed: {e}");
             std::process::exit(1);
         });
-    remove_inbox_wire(data_dir, &rid);
-    // Bind local contact (raven_id + petname); verification = trusted contact.
-    if let Err(e) = add_contact(
-        data_dir,
-        &outcome.binding.raven_id,
-        &outcome.binding.pub_hex,
-        &outcome.binding.petname,
-        "",
-        None,
-        "",
-    ) {
-        eprintln!("bind note: {e}");
-    }
-    let wire = outcome.accept.encode_wire().unwrap_or_else(|e| {
-        eprintln!("accept wire: {e}");
+    let out = finish_contact_accept(data_dir, &rid, &outcome).unwrap_or_else(|e| {
+        eprintln!("{e}");
         std::process::exit(1);
     });
-    let out = data_dir.join(format!("contact_accept_{}.wire", hex::encode(rid)));
-    std::fs::write(&out, &wire).ok();
     println!(
         "{C_GREEN}accepted{C_RESET} + bound petname \"{}\"",
-        sanitize_terminal_text(&outcome.binding.petname)
+        sanitize_terminal_line(&outcome.binding.petname)
     );
     println!(
         "{C_DIM}raven_id{C_RESET} {}",
-        sanitize_terminal_text(&outcome.binding.raven_id)
+        sanitize_terminal_line(&outcome.binding.raven_id)
     );
     println!(
         "{C_DIM}verify{C_RESET}   {:?}",
@@ -2013,7 +3900,13 @@ fn cmd_contact_block(data_dir: &Path, request_id_hex: &str) {
     }
     let rid = parse_request_id_hex(request_id_hex);
     let mut inbox = load_contact_inbox(data_dir);
-    let mut blocks = BlockList::load(data_dir);
+    let mut blocks = match BlockList::load_checked(data_dir) {
+        Ok(blocks) => blocks,
+        Err(e) => {
+            eprintln!("block list: {e}");
+            std::process::exit(1);
+        }
+    };
     if let Err(e) = inbox.block(&rid, &mut blocks) {
         eprintln!("block failed: {e}");
         std::process::exit(1);
@@ -2029,6 +3922,11 @@ fn cmd_contact_block(data_dir: &Path, request_id_hex: &str) {
 /// Resolve @public_tag — never silent pick when multiple match.
 fn resolve_tag_contacts<'a>(contacts: &'a [Contact], tag: &str) -> Vec<&'a Contact> {
     let want = normalize_tag(tag);
+    // A lone "@" normalises to "", and so does every untagged contact: that is
+    // "no tag given", not a tag to match (it used to select petname-only contacts).
+    if want.is_empty() {
+        return Vec::new();
+    }
     contacts
         .iter()
         .filter(|c| normalize_tag(&c.public_tag) == want || normalize_tag(&c.alias) == want)
@@ -2040,6 +3938,60 @@ fn resolve_alias_contacts<'a>(contacts: &'a [Contact], alias: &str) -> Vec<&'a C
     resolve_tag_contacts(contacts, alias)
 }
 
+/// `--contact <value>` exactly like the guided picker: `@tag` is a tag (a lone
+/// `@` names nobody); anything else is a petname (case-insensitive), and a bare
+/// word that is no petname still works as a tag (`--contact b` for `@b`).
+fn resolve_contact_arg<'a>(contacts: &'a [Contact], arg: &str) -> Vec<&'a Contact> {
+    let t = arg.trim();
+    if t.starts_with('@') {
+        return resolve_alias_contacts(contacts, t);
+    }
+    let want = sanitize_terminal_line(t).to_lowercase();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let by_name: Vec<&Contact> = contacts
+        .iter()
+        .filter(|c| sanitize_terminal_line(&c.petname).to_lowercase() == want)
+        .collect();
+    if by_name.is_empty() {
+        resolve_alias_contacts(contacts, t)
+    } else {
+        by_name
+    }
+}
+
+/// "no contact for X" with the names that do exist, so a typo is one look away
+/// from the fix (keeps the `no contact for` prefix scripts and tests look for).
+fn no_contact_message(contacts: &[Contact], arg: &str) -> String {
+    let asked = sanitize_terminal_line(arg);
+    if contacts.is_empty() {
+        return format!(
+            "no contact for {asked} — you have no contacts yet. Add one: ash contact add --address rvn1… --pub-hex … --petname NAME (or run `ash`, menu 5)"
+        );
+    }
+    let names: Vec<String> = contacts
+        .iter()
+        .take(8)
+        .map(|c| match c.tag_subtitle() {
+            Some(tag) => format!("{} ({tag})", c.primary_label()),
+            None => c.primary_label(),
+        })
+        .collect();
+    let more = if contacts.len() > names.len() {
+        format!(
+            ", … (+{} more: `ash contact list`)",
+            contacts.len() - names.len()
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "no contact for {asked}. Your contacts: {}{more}. Use --contact NAME or --contact @tag.",
+        names.join(", ")
+    )
+}
+
 fn add_contact(
     data_dir: &Path,
     address: &str,
@@ -2049,6 +4001,31 @@ fn add_contact(
     verify_fp: Option<&str>,
     lan_dial: &str,
 ) -> Result<(), String> {
+    add_contact_with_routes(
+        data_dir, address, pub_hex, petname, public_tag, verify_fp, lan_dial, "", None,
+    )
+}
+
+/// [`add_contact`] plus an optional Internet route. Both routes are hints: an
+/// empty one keeps what the contact already had, a non-empty one is validated
+/// before anything else is looked at and replaces it.
+#[allow(clippy::too_many_arguments)]
+fn add_contact_with_routes(
+    data_dir: &Path,
+    address: &str,
+    pub_hex: &str,
+    petname: &str,
+    public_tag: &str,
+    verify_fp: Option<&str>,
+    lan_dial: &str,
+    internet_dial: &str,
+    p2p: Option<&P2pRoute>,
+) -> Result<(), String> {
+    let new_inet = if internet_dial.trim().is_empty() {
+        None
+    } else {
+        Some(parse_internet_dial(internet_dial)?)
+    };
     let ed = parse_pub_hex(pub_hex)?;
     let address_raw = extract_address_field(address).unwrap_or_else(|| address.trim().to_string());
     if address_raw.is_empty() {
@@ -2067,10 +4044,15 @@ fn add_contact(
     let fp = device_fingerprint_v1(&ed);
     let pin = if let Some(expected) = verify_fp {
         let exp = expected.trim();
-        if !exp.eq_ignore_ascii_case(&fp) {
+        if !fingerprint_matches(exp, &fp) {
+            let case = if fingerprint_case_only_mismatch(exp, &fp) {
+                format!(" ({FINGERPRINT_CASE_HINT})")
+            } else {
+                String::new()
+            };
             return Err(format!(
-                "fingerprint mismatch: got {fp}, expected {}",
-                sanitize_terminal_text(exp)
+                "fingerprint mismatch: got {fp}, expected {}{case}",
+                sanitize_terminal_line(exp)
             ));
         }
         true
@@ -2078,33 +4060,77 @@ fn add_contact(
         false
     };
 
-    let tag_clean = normalize_tag(public_tag);
-    let mut pet = sanitize_terminal_text(petname.trim());
-    if pet.is_empty() && !tag_clean.is_empty() {
-        pet = tag_clean.clone();
-    }
+    // Layer B tags follow the Alias V1 charset (a-z 0-9 _ -); never free text.
+    let tag_clean = if public_tag.trim().trim_start_matches('@').trim().is_empty() {
+        String::new()
+    } else {
+        normalize_alias(public_tag)
+            .map_err(|e| format!("public @tag rejected ({e}): use a-z 0-9 _ - (max 64)"))?
+    };
+    let mut pet = sanitize_terminal_line(petname.trim());
+    let ed_hex = hex::encode(ed);
 
     let mut contacts = load_contacts(data_dir)?;
 
-    // Key-change warning: pinned row with same public_tag but different pub/address.
-    if !tag_clean.is_empty() {
-        for c in contacts.iter() {
-            if normalize_tag(&c.public_tag) == tag_clean
-                && c.pinned
-                && (c.pub_hex != hex::encode(ed) || c.address != address)
-            {
-                eprintln!("{C_PURPLE}KEY-CHANGE WARNING{C_RESET}: pinned @{tag_clean} was");
-                eprintln!(
-                    "  old fp={}  {}",
-                    contact_fingerprint(c),
-                    sanitize_terminal_text(&c.address)
-                );
-                eprintln!("  new fp={fp}  {}", sanitize_terminal_text(&address));
-                eprintln!(
-                    "{C_DIM}DHT/gossip cannot overwrite pin. Refuse unless you intend to re-pin after verify.{C_RESET}"
-                );
-                return Err("KEY_CHANGE_REFUSED_WITHOUT_REPIN".into());
+    // Re-adding a known key (refreshing its `--lan-dial`, accepting a request
+    // from an existing contact, …) must not blank its labels: an omitted
+    // petname / tag keeps the stored one. An explicit value still overrides.
+    // The tag clash / key-change checks below look at the EXPLICIT tag only.
+    let prior = contacts
+        .iter()
+        .find(|c| c.pub_hex.eq_ignore_ascii_case(&ed_hex))
+        .cloned();
+    if pet.is_empty() {
+        pet = match prior.as_ref() {
+            Some(p) if !sanitize_terminal_line(&p.petname).is_empty() => {
+                sanitize_terminal_line(&p.petname)
             }
+            _ => tag_clean.clone(),
+        };
+    }
+    let tag_store = if tag_clean.is_empty() {
+        prior
+            .as_ref()
+            .map(|p| normalize_tag(&p.public_tag))
+            .unwrap_or_default()
+    } else {
+        tag_clean.clone()
+    };
+
+    // Key-change warning: pinned row for the same identity (address) or the
+    // same public_tag, but bound to a different key.
+    for c in contacts.iter() {
+        let same_identity = c.address == address;
+        let same_tag = !tag_clean.is_empty() && normalize_tag(&c.public_tag) == tag_clean;
+        if c.pinned
+            && (same_identity || same_tag)
+            && (!c.pub_hex.eq_ignore_ascii_case(&ed_hex) || c.address != address)
+        {
+            if same_tag {
+                eprintln!("{C_PURPLE}KEY-CHANGE WARNING{C_RESET}: pinned @{tag_clean} was");
+            } else {
+                eprintln!(
+                    "{C_PURPLE}KEY-CHANGE WARNING{C_RESET}: pinned {} was",
+                    c.primary_label()
+                );
+            }
+            eprintln!(
+                "  old fp={}  {}",
+                contact_fingerprint(c),
+                sanitize_terminal_line(&c.address)
+            );
+            eprintln!("  new fp={fp}  {}", sanitize_terminal_line(&address));
+            eprintln!(
+                "{C_DIM}DHT/gossip cannot overwrite a pin. To replace it deliberately: verify the new fingerprint out-of-band, run{C_RESET}"
+            );
+            eprintln!(
+                "  ash contact remove --address {}",
+                sanitize_terminal_line(&c.address)
+            );
+            eprintln!(
+                "{C_DIM}then add the new key again with --verify-fp <new fingerprint>.{C_RESET}"
+            );
+            return Err("KEY_CHANGE_REFUSED_WITHOUT_REPIN".into());
         }
     }
 
@@ -2112,7 +4138,10 @@ fn add_contact(
     if !tag_clean.is_empty() {
         let clashes: Vec<&Contact> = contacts
             .iter()
-            .filter(|c| normalize_tag(&c.public_tag) == tag_clean && c.pub_hex != hex::encode(ed))
+            .filter(|c| {
+                normalize_tag(&c.public_tag) == tag_clean
+                    && !c.pub_hex.eq_ignore_ascii_case(&ed_hex)
+            })
             .collect();
         if !clashes.is_empty() {
             eprintln!(
@@ -2141,11 +4170,22 @@ fn add_contact(
         }
     }
 
+    // Petnames are the primary local label and the Send picker key: unique
+    // on this device (case-insensitive), so a later add can never shadow one.
+    if !pet.is_empty() {
+        let want = pet.to_lowercase();
+        if let Some(other) = contacts
+            .iter()
+            .find(|c| !c.pub_hex.eq_ignore_ascii_case(&ed_hex) && c.petname.to_lowercase() == want)
+        {
+            return Err(format!(
+                "petname \"{pet}\" is already used by another contact (fp={}) — choose a distinct petname",
+                contact_fingerprint(other)
+            ));
+        }
+    }
+
     // Replace same pub_hex if present (preserve pin / dial if already set).
-    let prior = contacts
-        .iter()
-        .find(|c| c.pub_hex == hex::encode(ed))
-        .cloned();
     let prior_pinned = prior.as_ref().map(|c| c.pinned).unwrap_or(false);
     let prior_dial = prior
         .as_ref()
@@ -2160,29 +4200,81 @@ fn add_contact(
     } else {
         prior_dial
     };
-    contacts.retain(|c| c.pub_hex != hex::encode(ed));
+    let inet = new_inet.unwrap_or_else(|| {
+        prior
+            .as_ref()
+            .map(|c| c.internet_dial.clone())
+            .unwrap_or_default()
+    });
+    // Also drop unpinned rows claiming this address under another key: the
+    // address is derived from the key, so such a row is an invalid binding.
+    contacts.retain(|c| !c.pub_hex.eq_ignore_ascii_case(&ed_hex) && c.address != address);
     contacts.push(Contact {
         petname: pet,
-        public_tag: tag_clean.clone(),
-        alias: tag_clean,
+        public_tag: tag_store.clone(),
+        alias: tag_store,
         address,
-        pub_hex: hex::encode(ed),
+        pub_hex: ed_hex,
         pinned: pin || prior_pinned,
         lan_dial: dial,
+        internet_dial: inet,
+        // A card's p2p route replaces the old one; none keeps it.
+        p2p: p2p.map_or_else(
+            || prior.as_ref().map(|c| c.p2p.clone()).unwrap_or_default(),
+            |r| r.peer_id.clone(),
+        ),
+        p2p_via: p2p.map_or_else(
+            || {
+                prior
+                    .as_ref()
+                    .map(|c| c.p2p_via.clone())
+                    .unwrap_or_default()
+            },
+            |r| r.via.clone(),
+        ),
     });
     save_contacts(data_dir, &contacts)?;
-    println!("{C_GREEN}contact saved{C_RESET} (local only — no FastAPI / no registrar)");
+    if p2p.is_some() {
+        // New p2p hints: the outbox plans from the book again.
+        forget_outbox_routes(data_dir, &hex::encode(ed));
+    }
+    let saved = contacts.last().unwrap();
+    let label = saved.primary_label();
+    let named = !saved.petname.trim().is_empty();
+    if named || saved.tag_subtitle().is_some() {
+        println!("{C_GREEN}contact saved{C_RESET}: {label}");
+    } else {
+        println!(
+            "{C_GREEN}contact saved{C_RESET} (no name given: add --petname NAME next time so you can pick them easily)"
+        );
+    }
     println!(
         "{C_DIM}petname{C_RESET}     {}",
-        contacts.last().unwrap().primary_label()
+        if named { label.as_str() } else { "(none yet)" }
     );
-    if let Some(t) = contacts.last().unwrap().tag_subtitle() {
+    if let Some(t) = saved.tag_subtitle() {
         println!("{C_DIM}public_tag{C_RESET}  {t}");
     }
-    if !contacts.last().unwrap().lan_dial.is_empty() {
+    if !saved.lan_dial.is_empty() {
         println!(
             "{C_DIM}lan_dial{C_RESET}    {}",
-            sanitize_terminal_text(&contacts.last().unwrap().lan_dial)
+            sanitize_terminal_line(&saved.lan_dial)
+        );
+    }
+    if !saved.internet_dial.is_empty() {
+        println!(
+            "{C_DIM}internet{C_RESET}    {}",
+            sanitize_terminal_line(&saved.internet_dial)
+        );
+    }
+    if !saved.p2p.is_empty() {
+        println!(
+            "{C_DIM}p2p{C_RESET}         {}{}",
+            sanitize_terminal_line(&saved.p2p),
+            match saved.p2p_via.len() {
+                0 => String::new(),
+                n => format!(" (via {n} address{})", if n == 1 { "" } else { "es" }),
+            }
         );
     }
     println!("{C_DIM}fingerprint{C_RESET} {fp}");
@@ -2191,21 +4283,56 @@ fn add_contact(
         if pin || prior_pinned {
             "yes (Tag+key locked locally)"
         } else {
-            "no (pass --verify-fp to pin)"
+            "no — not verified yet (compare the fingerprint with them by phone or in person, then add them again with --verify-fp)"
         }
     );
+    let who = if named { label.as_str() } else { "them" };
+    println!(
+        "{C_BOLD}Next:{C_RESET} ask {who} to add YOU too: send them your invite (`ash whoami`). Messages only work once BOTH of you have added each other."
+    );
+    println!("{C_DIM}(stored on this computer only — no FastAPI / no registrar){C_RESET}");
+    Ok(())
+}
+
+/// Only the guided add shows this: the flag path is scripts and experts.
+fn print_iphone_note() {
     println!(
         "{C_DIM}iPhone:{C_RESET} this did NOT sync to the phone. On iPhone: Discover → Paste ash whoami → paste THIS Mac `ash whoami` (address + pub_hex)."
     );
     println!(
         "{C_DIM}آیفون:{C_RESET} مخاطب فقط روی مک ذخیره شد. روی گوشی: Discover → Paste ash whoami → whoami همین مک را بچسبانید."
     );
-    Ok(())
 }
 
-fn cmd_contact_list(data_dir: &Path) {
+/// Is this key the profile's own? (Pasting your own whoami instead of the
+/// friend's is a common slip.)
+fn is_own_pub_hex(data_dir: &Path, pub_hex: &str) -> bool {
+    matches!(
+        try_load_identity(data_dir),
+        Ok(Some(id)) if hex::encode(id.public_key_bytes()).eq_ignore_ascii_case(pub_hex.trim())
+    )
+}
+
+const OWN_INVITE_REFUSAL: &str =
+    "That is YOUR OWN invite. Paste your friend's `ash whoami` (or their invite line), not yours.";
+
+/// A name makes the contact easy to pick later. Terminal only: a piped script's
+/// next line is its answer to the NEXT prompt, so nothing is asked there.
+fn ask_petname_again(petname: String) -> String {
+    if !petname.trim().is_empty() || !stdin_is_tty() {
+        return petname;
+    }
+    println!(
+        "{C_DIM}A name helps you find them later, e.g. Alice. Press Enter again to skip.{C_RESET}"
+    );
+    print!("Petname: ");
+    let _ = io::stdout().flush();
+    read_answer_line()
+}
+
+fn cmd_contact_list(data_dir: &Path) -> Result<(), String> {
     let c = c();
-    let contacts = contacts_or_die(data_dir);
+    let contacts = load_contacts(data_dir)?;
     println!();
     println!("{}CONTACTS \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}", c.bold, c.reset);
     println!(
@@ -2234,7 +4361,7 @@ fn cmd_contact_list(data_dir: &Path) {
             "  {0}verify the fingerprint out-of-band before pinning{1}",
             c.dim, c.reset
         );
-        return;
+        return Ok(());
     }
 
     // Dynamic column widths from data (alignment is readability).
@@ -2261,16 +4388,24 @@ fn cmd_contact_list(data_dir: &Path) {
             format!("{0}○ unpinned{1}", c.dim, c.reset)
         };
         let fp = contact_fingerprint(ct);
-        let dial = if ct.lan_dial.is_empty() {
+        let mut dial = if ct.lan_dial.is_empty() {
             String::new()
         } else {
             format!(
                 "  {0}→ {1}{2}",
                 c.dim,
-                sanitize_terminal_text(&ct.lan_dial),
+                sanitize_terminal_line(&ct.lan_dial),
                 c.reset
             )
         };
+        if !ct.internet_dial.is_empty() {
+            dial.push_str(&format!(
+                "  {0}→ internet {1}{2}",
+                c.dim,
+                sanitize_terminal_line(&ct.internet_dial),
+                c.reset
+            ));
+        }
 
         println!(
             "  {i}. {name:<nw$}  {tag:<tw$}  {pin}{dial}",
@@ -2281,6 +4416,22 @@ fn cmd_contact_list(data_dir: &Path) {
             tw = w_tag
         );
         println!("     {d}fp {fp}{r}", d = c.dim, r = c.reset, fp = fp);
+    }
+    Ok(())
+}
+
+/// Menu callers: show why a command failed and stay in the menu.
+fn show_menu_error(result: Result<(), String>) {
+    if let Err(e) = result {
+        eprintln!("{}", sanitize_terminal_line(&e));
+    }
+}
+
+/// CLI callers: the reason goes to stderr and the process exits 1.
+fn exit_on_err(result: Result<(), String>) {
+    if let Err(e) = result {
+        eprintln!("{}", sanitize_terminal_line(&e));
+        std::process::exit(1);
     }
 }
 
@@ -2297,7 +4448,7 @@ fn cmd_contacts(data_dir: &Path) {
     let dim = s.dim;
     let reset = s.reset;
 
-    cmd_contact_list(data_dir);
+    show_menu_error(cmd_contact_list(data_dir));
     println!();
     screen_header("Contacts");
     println!(
@@ -2312,7 +4463,7 @@ fn cmd_contacts(data_dir: &Path) {
     let choice = read_line();
     match choice.to_ascii_lowercase().as_str() {
         "a" | "add" | "y" | "yes" => cmd_contact_add_interactive(data_dir),
-        "l" | "list" => cmd_contact_list(data_dir),
+        "l" | "list" => show_menu_error(cmd_contact_list(data_dir)),
         "2" | "s" | "send" => {
             println!("{dim}→ Send / Chat{reset}");
             cmd_send_interactive(data_dir);
@@ -2321,14 +4472,15 @@ fn cmd_contacts(data_dir: &Path) {
             println!("{dim}→ Messages (queue/history — to compose a new DM use 2){reset}");
             cmd_messages(data_dir);
         }
-        "4" | "status" => {
-            let _ = cmd_status(data_dir);
-        }
+        "4" | "status" => show_menu_error(cmd_status(data_dir)),
         "q" | "quit" | "exit" => {
             println!("{dim}Press Enter to leave Contacts, then type q at raven> to quit.{reset}");
         }
         "" => {}
-        other => println!("{dim}unknown:{reset} {other} — try a / l / 2 (Send) / Enter (back)"),
+        other => println!(
+            "{dim}unknown:{reset} {} — try a / l / 2 (Send) / Enter (back)",
+            sanitize_terminal_line(other)
+        ),
     }
 }
 
@@ -2337,6 +4489,13 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
     let bold = s.bold;
     let dim = s.dim;
     let reset = s.reset;
+
+    // `contacts.json` is exactly the state the first-install check treats as an
+    // established profile: no contact before the identity.
+    if let Err(e) = require_identity_before_state(data_dir, "adding a contact") {
+        eprintln!("{}", sanitize_terminal_line(&e));
+        return;
+    }
 
     println!();
     println!("{bold}Add contact{reset} {dim}(public bits only — never paste a seed){reset}");
@@ -2371,63 +4530,45 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
 
     let trimmed = who.trim();
 
-    // One-text invite: paste `raven:addr:pubhex` to skip manual entry
-    if trimmed.starts_with("raven:") {
-        let parts: Vec<&str> = trimmed.strip_prefix("raven:").unwrap().split(':').collect();
-        if parts.len() >= 2 && parts[0].starts_with("rvn1") && parts[1].len() == 64 {
-            let addr = parts[0].to_string();
-            let pub_hex = parts[1].to_string();
-            println!(
-                "{0}\u{2713} invite parsed \u{2014} {1}{2}",
-                C_GREEN, addr, C_RESET
-            );
-            print!("petname (e.g. \"Alice\"): ");
-            let _ = io::stdout().flush();
-            let petname = read_line();
-            let petname = if petname.is_empty() {
-                "friend".to_string()
-            } else {
-                petname
-            };
-            let mut key = [0u8; 32];
-            if let Ok(decoded) = hex::decode(&pub_hex) {
-                if decoded.len() == 32 {
-                    key.copy_from_slice(&decoded);
-                }
+    // One-text invite: paste `raven:addr:pubhex` to skip manual entry. Goes
+    // through add_contact (merge into the book, address/key binding, key-change
+    // and tag checks) — never a separate write path.
+    if let Some(parsed) = parse_raven_invite(trimmed) {
+        let invite = match parsed {
+            Ok(invite) => invite,
+            Err(e) => {
+                eprintln!("rejected: {}", sanitize_terminal_line(&e));
+                return;
             }
-            let fp = device_fingerprint_v1(&key);
-            println!(
-                "{dim}fingerprint{r} {fp}",
-                dim = C_DIM,
-                r = C_RESET,
-                fp = fp
-            );
-            print!("[V]erify & pin / [C]ontinue unpinned / [A]bort: ");
-            let _ = io::stdout().flush();
-            let choice = read_line();
-            let pinned = choice.trim().to_ascii_lowercase().starts_with('v');
-            let ct = Contact {
-                petname,
-                public_tag: String::new(),
-                alias: String::new(),
-                address: addr,
-                pub_hex,
-                pinned,
-                lan_dial: String::new(),
-            }
-            .migrate();
-            save_contacts(data_dir, std::slice::from_ref(&ct)).ok();
-            if pinned {
-                println!(
-                    "{green}\u{2713} contact saved & pinned{r}",
-                    green = C_GREEN,
-                    r = C_RESET
-                );
-            } else {
-                println!("{dim}contact saved (unpinned){r}", dim = C_DIM, r = C_RESET);
-            }
+        };
+        if is_own_pub_hex(data_dir, &invite.pub_hex) {
+            eprintln!("{OWN_INVITE_REFUSAL}");
             return;
         }
+        println!(
+            "{C_GREEN}\u{2713} invite parsed{C_RESET} \u{2014} {}",
+            sanitize_terminal_line(&invite.address)
+        );
+        print!("Optional petname (e.g. \"Alice\" — local label): ");
+        let _ = io::stdout().flush();
+        let petname = ask_petname_again(read_answer_line());
+        println!("{bold}Fingerprint{reset}  {}", invite.fingerprint);
+        println!(
+            "{dim}Compare this with your peer out-of-band (Signal call, in person, etc.).{reset}"
+        );
+        match prompt_verify_choice(&invite.fingerprint) {
+            None => println!("{dim}cancelled — nothing saved.{reset}"),
+            Some(pin) => match commit_invite_contact(data_dir, &invite, &petname, pin) {
+                Ok(()) => {
+                    println!(
+                        "{dim}Tip: menu 1 Send / Chat → pick this contact by # or @tag (not host:port).{reset}"
+                    );
+                    print_iphone_note();
+                }
+                Err(e) => eprintln!("rejected: {}", sanitize_terminal_line(&e)),
+            },
+        }
+        return;
     }
     // Full whoami paste: has both address + pub_hex lines.
     if let (Some(addr), Some(ph)) = (
@@ -2438,11 +4579,11 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
         pub_hex = ph;
         println!(
             "{dim}Parsed whoami → {}{reset}",
-            sanitize_terminal_text(&address)
+            sanitize_terminal_line(&address)
         );
         print!("optional public @tag (Soft Unique, e.g. poline): ");
         let _ = io::stdout().flush();
-        tag = read_line();
+        tag = read_answer_line();
     } else if let Some(ph) = looks_like_bare_pub_hex(trimmed) {
         // iPhone Serverless LAN "Copy pub hex" — derive rvn1; do NOT treat as @alias.
         let ed = match parse_pub_hex(&ph) {
@@ -2456,11 +4597,11 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
         pub_hex = ph;
         println!(
             "{dim}Detected pub_hex → derived {}{reset}",
-            sanitize_terminal_text(&address)
+            sanitize_terminal_line(&address)
         );
         print!("optional public @tag (Soft Unique, e.g. poline): ");
         let _ = io::stdout().flush();
-        tag = read_line();
+        tag = read_answer_line();
     } else if trimmed.starts_with('@') || (!trimmed.starts_with("rvn1") && !trimmed.contains(':')) {
         // Treat as @alias (Soft Unique) — look up local alias claims.
         let alias = trimmed.trim_start_matches('@');
@@ -2502,7 +4643,7 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
                 pub_hex = ph;
                 println!(
                     "{dim}Detected pub_hex → derived {}{reset}",
-                    sanitize_terminal_text(&address)
+                    sanitize_terminal_line(&address)
                 );
             } else {
                 address =
@@ -2512,7 +4653,7 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
                 } else {
                     print!("pub_hex (64 chars, public only): ");
                     let _ = io::stdout().flush();
-                    pub_hex = read_line();
+                    pub_hex = read_pub_hex_answer();
                 }
             }
         } else if claims.len() == 1 {
@@ -2521,7 +4662,7 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
             pub_hex = hex::encode(c.ed25519_pub);
             println!(
                 "{dim}Resolved @{tag} → {}{reset}",
-                sanitize_terminal_text(&address)
+                sanitize_terminal_line(&address)
             );
         } else {
             println!(
@@ -2533,7 +4674,7 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
                 println!(
                     "  {bold}{}{reset}  {}  fp={}",
                     i + 1,
-                    sanitize_terminal_text(&c.identity_address),
+                    sanitize_terminal_line(&c.identity_address),
                     fp
                 );
             }
@@ -2560,11 +4701,11 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
         } else {
             print!("pub_hex (64 chars from their `ash whoami` — public only): ");
             let _ = io::stdout().flush();
-            pub_hex = read_line();
+            pub_hex = read_pub_hex_answer();
         }
         print!("optional public @tag (Soft Unique, e.g. poline): ");
         let _ = io::stdout().flush();
-        tag = read_line();
+        tag = read_answer_line();
     }
 
     if looks_like_shell_input(&address) || looks_like_shell_input(&pub_hex) {
@@ -2574,11 +4715,11 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
 
     print!("Optional petname (e.g. \"Poline\" — local label): ");
     let _ = io::stdout().flush();
-    let petname = read_line();
+    let petname = ask_petname_again(read_answer_line());
 
     print!("Optional LAN dial host:port (Enter to skip — Send auto-resolves / Mac-listens): ");
     let _ = io::stdout().flush();
-    let lan_dial = read_line();
+    let lan_dial = read_answer_line();
 
     let ed = match parse_pub_hex(&pub_hex) {
         Ok(a) => a,
@@ -2587,25 +4728,17 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
             return;
         }
     };
+    if is_own_pub_hex(data_dir, &pub_hex) {
+        eprintln!("{OWN_INVITE_REFUSAL}");
+        return;
+    }
     let fp = device_fingerprint_v1(&ed);
     println!();
     println!("{bold}Fingerprint{reset}  {fp}");
     println!("{dim}Compare this with your peer out-of-band (Signal call, in person, etc.).{reset}");
-    print!("[V]erify & pin  /  [C]ontinue unpinned  /  [A]bort: ");
-    let _ = io::stdout().flush();
-    let choice = read_line();
-    let verify = match choice.trim().to_ascii_lowercase().as_str() {
-        "v" | "verify" | "pin" => Some(fp.clone()),
-        "c" | "continue" | "" => None,
-        "a" | "abort" | "q" => {
-            println!("{dim}cancelled.{reset}");
-            return;
-        }
-        other if other.eq_ignore_ascii_case(&fp) => Some(fp.clone()),
-        _ => {
-            println!("{dim}cancelled (expected V, C, or A).{reset}");
-            return;
-        }
+    let Some(pin) = prompt_verify_choice(&fp) else {
+        println!("{dim}cancelled — nothing saved.{reset}");
+        return;
     };
 
     if let Err(e) = add_contact(
@@ -2614,24 +4747,24 @@ fn cmd_contact_add_interactive(data_dir: &Path) {
         &pub_hex,
         &petname,
         &tag,
-        verify.as_deref(),
+        pin.then_some(fp.as_str()),
         &lan_dial,
     ) {
-        eprintln!("rejected: {e}");
+        eprintln!("rejected: {}", sanitize_terminal_line(&e));
     } else {
         println!(
-            "{dim}Tip: menu 2 Send / Chat → pick this contact by # or @tag (not host:port).{reset}"
+            "{dim}Tip: menu 1 Send / Chat → pick this contact by # or @tag (not host:port).{reset}"
         );
+        print_iphone_note();
     }
 }
 
-fn cmd_contact_resolve(data_dir: &Path, tag: &str) {
-    let contacts = contacts_or_die(data_dir);
+fn cmd_contact_resolve(data_dir: &Path, tag: &str) -> Result<(), String> {
+    let contacts = load_contacts(data_dir)?;
     let hits = resolve_tag_contacts(&contacts, tag);
     if hits.is_empty() {
-        eprintln!("no local contacts for @{}", normalize_tag(tag));
         eprintln!("{C_DIM}no \"is tag taken?\" API — add via QR/OOB only{C_RESET}");
-        return;
+        return Err(format!("no local contacts for @{}", normalize_tag(tag)));
     }
     if hits.len() == 1 {
         let c = hits[0];
@@ -2644,7 +4777,7 @@ fn cmd_contact_resolve(data_dir: &Path, tag: &str) {
             "{C_DIM}pinned{C_RESET}      {}",
             if c.pinned { "yes" } else { "no" }
         );
-        return;
+        return Ok(());
     }
     println!(
         "{C_PURPLE}ambiguity picker{C_RESET}: {} claims for @{} — never silent pick",
@@ -2662,6 +4795,35 @@ fn cmd_contact_resolve(data_dir: &Path, tag: &str) {
         );
     }
     println!("{C_DIM}Pick a # and use that petname in send — or re-add with a distinct petname.{C_RESET}");
+    Ok(())
+}
+
+/// Contacts picked by `--tag`, `--petname` or `--address` (first one given
+/// wins). `None` = no selector at all. An empty selector matches nothing.
+fn find_contacts<'a>(
+    contacts: &'a [Contact],
+    tag: Option<&str>,
+    petname: Option<&str>,
+    address: Option<&str>,
+) -> Option<Vec<&'a Contact>> {
+    if let Some(t) = tag {
+        Some(resolve_tag_contacts(contacts, t))
+    } else if let Some(p) = petname {
+        let want = sanitize_terminal_line(p.trim());
+        Some(if want.is_empty() {
+            Vec::new()
+        } else {
+            contacts
+                .iter()
+                .filter(|c| c.petname.eq_ignore_ascii_case(&want))
+                .collect()
+        })
+    } else {
+        address.map(|addr| {
+            let addr = raven_core::address::from_display(addr.trim());
+            contacts.iter().filter(|c| c.address == addr).collect()
+        })
+    }
 }
 
 fn cmd_contact_verify(
@@ -2670,27 +4832,12 @@ fn cmd_contact_verify(
     alias: Option<&str>,
     petname: Option<&str>,
     address: Option<&str>,
-) {
-    let contacts = contacts_or_die(data_dir);
-    let tag = tag.or(alias);
-    let matches: Vec<&Contact> = if let Some(t) = tag {
-        resolve_tag_contacts(&contacts, t)
-    } else if let Some(p) = petname {
-        let want = sanitize_terminal_text(p.trim());
-        contacts
-            .iter()
-            .filter(|c| c.petname.eq_ignore_ascii_case(&want))
-            .collect()
-    } else if let Some(addr) = address {
-        let addr = raven_core::address::from_display(addr.trim());
-        contacts.iter().filter(|c| c.address == addr).collect()
-    } else {
-        eprintln!("need --tag, --petname, or --address");
-        return;
-    };
+) -> Result<(), String> {
+    let contacts = load_contacts(data_dir)?;
+    let matches = find_contacts(&contacts, tag.or(alias), petname, address)
+        .ok_or("need --tag, --petname, or --address")?;
     if matches.is_empty() {
-        eprintln!("no contact matched");
-        return;
+        return Err("no contact matched".into());
     }
     if matches.len() > 1 {
         println!(
@@ -2705,7 +4852,7 @@ fn cmd_contact_verify(
         }
         println!(
             "{C_DIM}address{C_RESET}     {}",
-            sanitize_terminal_text(&c.address)
+            sanitize_terminal_line(&c.address)
         );
         println!("{C_DIM}fingerprint{C_RESET} {}", contact_fingerprint(c));
         println!(
@@ -2713,6 +4860,398 @@ fn cmd_contact_verify(
             if c.pinned { "yes" } else { "no" }
         );
     }
+    Ok(())
+}
+
+/// The one contact a `--tag/--petname/--address` selector names; several or
+/// none is an error (never a silent pick).
+fn select_one_contact(
+    contacts: &[Contact],
+    tag: Option<&str>,
+    petname: Option<&str>,
+    address: Option<&str>,
+) -> Result<Contact, String> {
+    let matches = find_contacts(contacts, tag, petname, address)
+        .ok_or("need --tag, --petname, or --address")?;
+    match matches.as_slice() {
+        [] => Err("no contact matched".into()),
+        [one] => Ok((*one).clone()),
+        many => Err(format!(
+            "{} contacts match — narrow it with --address (see `ash contact list`)",
+            many.len()
+        )),
+    }
+}
+
+/// Typed confirmation for a removal: Enter, EOF and anything else cancel, and
+/// a non-terminal stdin cannot confirm at all (scripts pass `--yes`).
+fn confirm_contact_removal() -> bool {
+    if !stdin_is_tty() {
+        eprintln!("stdin is not a terminal: pass --yes to remove without the prompt");
+        return false;
+    }
+    print!("Type \"remove\" to delete this contact and its pin (Enter cancels): ");
+    let _ = io::stdout().flush();
+    matches!(read_decision_line(), Some(t) if t.eq_ignore_ascii_case("remove"))
+}
+
+/// `ash contact remove`: the deliberate, local-only way to drop a contact or a
+/// pin (e.g. before re-pinning a peer's new key). Never reachable from the
+/// network, discovery or invite paths.
+fn cmd_contact_remove(
+    data_dir: &Path,
+    tag: Option<&str>,
+    petname: Option<&str>,
+    address: Option<&str>,
+    yes: bool,
+) -> Result<(), String> {
+    let mut contacts = load_contacts(data_dir)?;
+    let target = select_one_contact(&contacts, tag, petname, address)?;
+    println!("{C_DIM}contact{C_RESET}     {}", target.primary_label());
+    println!(
+        "{C_DIM}address{C_RESET}     {}",
+        sanitize_terminal_line(&target.address)
+    );
+    println!(
+        "{C_DIM}fingerprint{C_RESET} {}",
+        contact_fingerprint(&target)
+    );
+    println!(
+        "{C_DIM}pinned{C_RESET}      {}",
+        if target.pinned { "yes" } else { "no" }
+    );
+    if !yes && !confirm_contact_removal() {
+        return Err("cancelled — nothing removed".into());
+    }
+    contacts.retain(|c| !c.pub_hex.eq_ignore_ascii_case(&target.pub_hex));
+    save_contacts(data_dir, &contacts)?;
+    forget_outbox_routes(data_dir, &target.pub_hex);
+    println!("{C_GREEN}removed{C_RESET} {}", target.primary_label());
+    // Removing a contact is the explicit re-pin: also forget the prekey pinned
+    // for it, so a contact that reinstalled (and is refused as PEER_PREKEY_RESET
+    // until its old pinned prekey expires) is pinned afresh when added again. A
+    // failure here never undoes the removal.
+    if let Ok(ed) = parse_pub_hex(&target.pub_hex) {
+        match raven_core::lan_dispatch::forget_peer_prekey_pin(data_dir, &ed) {
+            Ok(true) => println!(
+                "{C_DIM}also forgot the prekey pinned for this contact; the next offer it makes is pinned afresh{C_RESET}"
+            ),
+            Ok(false) => {}
+            Err(e) => eprintln!(
+                "{C_DIM}note: could not clear the pinned prekey ({}){C_RESET}",
+                sanitize_terminal_line(&e)
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// `ash contact unblock`: undo a block (contact-request or chat `/block`).
+fn cmd_contact_unblock(data_dir: &Path, pub_hex: &str) -> Result<(), String> {
+    let ed = parse_pub_hex(pub_hex)?;
+    let ed_hex = hex::encode(ed);
+    let mut blocks = BlockList::load_checked(data_dir).map_err(|e| format!("block list: {e}"))?;
+    if !blocks.is_blocked(&ed_hex) {
+        return Err(format!(
+            "that key is not on the block list (fingerprint {})",
+            device_fingerprint_v1(&ed)
+        ));
+    }
+    blocks.unblock(&ed_hex);
+    blocks.save(data_dir)?;
+    println!(
+        "{C_GREEN}unblocked{C_RESET} fingerprint {}",
+        device_fingerprint_v1(&ed)
+    );
+    Ok(())
+}
+
+/// `ash contact set-dial`: refresh one contact's saved LAN dial in place
+/// (petname, tag and pin are untouched).
+fn cmd_contact_set_dial(
+    data_dir: &Path,
+    tag: Option<&str>,
+    petname: Option<&str>,
+    address: Option<&str>,
+    lan_dial: &str,
+) -> Result<(), String> {
+    let contacts = load_contacts(data_dir)?;
+    let target = select_one_contact(&contacts, tag, petname, address)?;
+    update_contact_lan_dial(data_dir, &target.pub_hex, lan_dial)?;
+    forget_outbox_routes(data_dir, &target.pub_hex);
+    println!(
+        "{C_GREEN}lan_dial updated{C_RESET} {} → {}",
+        target.primary_label(),
+        sanitize_terminal_line(lan_dial.trim())
+    );
+    Ok(())
+}
+
+/// What one `raven contact set-addr` changes, validated before the book is read.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RouteEdit {
+    /// `Some("")`: clear; `Some(v)`: set to the validated `v`; `None`: keep.
+    lan: Option<String>,
+    internet: Option<String>,
+    /// `None`: keep the p2p route.
+    p2p: Option<P2pEdit>,
+}
+
+/// A change to the p2p route (validated).
+#[derive(Debug, PartialEq, Eq)]
+enum P2pEdit {
+    Clear,
+    /// `peer_id: None`: keep the PeerId (`--via` alone); `via: None`: keep
+    /// the addresses unless the PeerId changes.
+    Set {
+        peer_id: Option<String>,
+        via: Option<Vec<String>>,
+    },
+}
+
+/// [`parse_route_edit_with`] without p2p flags.
+#[cfg(test)]
+fn parse_route_edit(
+    lan: Option<&str>,
+    internet: Option<&str>,
+    clear: &[String],
+) -> Result<RouteEdit, String> {
+    parse_route_edit_with(lan, internet, None, &[], clear)
+}
+
+fn parse_route_edit_with(
+    lan: Option<&str>,
+    internet: Option<&str>,
+    p2p: Option<&str>,
+    via: &[String],
+    clear: &[String],
+) -> Result<RouteEdit, String> {
+    let mut edit = RouteEdit::default();
+    let mut clear_lan = false;
+    let mut clear_inet = false;
+    let mut clear_p2p = false;
+    for kind in clear {
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "lan" => clear_lan = true,
+            "internet" | "inet" => clear_inet = true,
+            "p2p" => clear_p2p = true,
+            other => {
+                return Err(format!(
+                    "--clear takes lan, internet or p2p, not \"{}\"",
+                    sanitize_terminal_line(other)
+                ))
+            }
+        }
+    }
+    if clear_p2p && (p2p.is_some() || !via.is_empty()) {
+        return Err("--p2p / --via and --clear p2p contradict each other: give one".into());
+    }
+    if clear_p2p {
+        edit.p2p = Some(P2pEdit::Clear);
+    } else if p2p.is_some() || !via.is_empty() {
+        let peer_id = p2p
+            .map(|p| raven_core::p2p_route::normalize_peer_id(p).map_err(|e| format!("--p2p: {e}")))
+            .transpose()?;
+        let via = if via.is_empty() {
+            None
+        } else {
+            let refs: Vec<&str> = via.iter().map(String::as_str).collect();
+            // Validated against a placeholder PeerId: only the via part counts.
+            let probe = raven_core::p2p_route::local_peer_id(&Identity::from_seed(&[0; 32]));
+            Some(
+                P2pRoute::parse(peer_id.as_deref().unwrap_or(&probe), &refs)
+                    .map_err(|e| format!("--via: {e}"))?
+                    .via,
+            )
+        };
+        edit.p2p = Some(P2pEdit::Set { peer_id, via });
+    }
+    if clear_lan && lan.is_some() {
+        return Err("--lan and --clear lan contradict each other: give one".into());
+    }
+    if clear_inet && internet.is_some() {
+        return Err("--internet and --clear internet contradict each other: give one".into());
+    }
+    if let Some(v) = lan {
+        edit.lan = Some(parse_lan_dial(v)?);
+    } else if clear_lan {
+        edit.lan = Some(String::new());
+    }
+    if let Some(v) = internet {
+        edit.internet = Some(parse_internet_dial(v)?);
+    } else if clear_inet {
+        edit.internet = Some(String::new());
+    }
+    if edit == RouteEdit::default() {
+        return Err(
+            "nothing to change: pass --lan HOST:PORT, --internet HOST:PORT, --p2p PEER_ID \
+             [--via MULTIADDR] or --clear lan|internet|p2p"
+                .into(),
+        );
+    }
+    Ok(edit)
+}
+
+/// The one contact a `set-addr` selector names: a positional name / @tag /
+/// rvn1 address, or the `--tag` / `--petname` / `--address` flags of the older
+/// commands (never both).
+fn select_contact_for_edit(
+    contacts: &[Contact],
+    selector: Option<&str>,
+    tag: Option<&str>,
+    petname: Option<&str>,
+    address: Option<&str>,
+) -> Result<Contact, String> {
+    let Some(sel) = selector.map(str::trim).filter(|s| !s.is_empty()) else {
+        return select_one_contact(contacts, tag, petname, address);
+    };
+    if tag.is_some() || petname.is_some() || address.is_some() {
+        return Err(
+            "name the contact once: either as the argument or with --tag / --petname / \
+             --address"
+                .into(),
+        );
+    }
+    let hits: Vec<&Contact> = if sel.starts_with("rvn1") {
+        let want = raven_core::address::from_display(sel);
+        contacts.iter().filter(|c| c.address == want).collect()
+    } else {
+        resolve_contact_arg(contacts, sel)
+    };
+    match hits.as_slice() {
+        [] => Err(no_contact_message(contacts, sel)),
+        [one] => Ok((*one).clone()),
+        many => Err(format!(
+            "contact {} is ambiguous ({} matches): use the @tag or the rvn1 address",
+            sanitize_terminal_line(sel),
+            many.len()
+        )),
+    }
+}
+
+/// The contact's addresses changed or it was removed: raven-node's outbox
+/// forgets the routes recorded for its queued messages (it then plans from the
+/// contact book alone). Best effort: the records are hints only.
+fn forget_outbox_routes(data_dir: &Path, pub_hex: &str) {
+    if let Ok(key) = parse_pub_hex(pub_hex) {
+        let _ = raven_core::outbox::clear_peer_routes(data_dir, &key);
+    }
+}
+
+/// [`cmd_contact_set_routes`] without p2p flags.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn cmd_contact_set_addr(
+    data_dir: &Path,
+    selector: Option<&str>,
+    tag: Option<&str>,
+    petname: Option<&str>,
+    address: Option<&str>,
+    lan: Option<&str>,
+    internet: Option<&str>,
+    clear: &[String],
+) -> Result<(), String> {
+    cmd_contact_set_routes(
+        data_dir,
+        selector,
+        tag,
+        petname,
+        address,
+        lan,
+        internet,
+        None,
+        &[],
+        clear,
+    )
+}
+
+/// `raven contact set-addr`: set or clear one contact's LAN, Internet and p2p
+/// routes in place (petname, tag and pin are untouched). Every value is checked
+/// before the book is read, so a typo changes nothing.
+#[allow(clippy::too_many_arguments)]
+fn cmd_contact_set_routes(
+    data_dir: &Path,
+    selector: Option<&str>,
+    tag: Option<&str>,
+    petname: Option<&str>,
+    address: Option<&str>,
+    lan: Option<&str>,
+    internet: Option<&str>,
+    p2p: Option<&str>,
+    via: &[String],
+    clear: &[String],
+) -> Result<(), String> {
+    let edit = parse_route_edit_with(lan, internet, p2p, via, clear)?;
+    let mut contacts = load_contacts(data_dir)?;
+    let target = select_contact_for_edit(&contacts, selector, tag, petname, address)?;
+    let row = contacts
+        .iter_mut()
+        .find(|c| c.pub_hex.eq_ignore_ascii_case(&target.pub_hex))
+        .ok_or("contact not found for the address update")?;
+    if let Some(v) = &edit.lan {
+        row.lan_dial = v.clone();
+    }
+    if let Some(v) = &edit.internet {
+        row.internet_dial = v.clone();
+    }
+    match &edit.p2p {
+        None => {}
+        Some(P2pEdit::Clear) => {
+            row.p2p.clear();
+            row.p2p_via.clear();
+        }
+        Some(P2pEdit::Set { peer_id, via }) => {
+            match peer_id {
+                Some(p) if *p != row.p2p => {
+                    row.p2p = p.clone();
+                    row.p2p_via.clear();
+                }
+                Some(_) => {}
+                None if row.p2p.is_empty() => {
+                    return Err(format!(
+                        "{} has no p2p PeerId yet: give it with --p2p 12D3KooW… (the p2p= of \
+                         their card) along with --via",
+                        target.primary_label()
+                    ));
+                }
+                None => {}
+            }
+            if let Some(v) = via {
+                row.p2p_via = v.clone();
+            }
+        }
+    }
+    let (lan_now, inet_now) = (row.lan_dial.clone(), row.internet_dial.clone());
+    let (p2p_now, via_now) = (row.p2p.clone(), row.p2p_via.clone());
+    save_contacts(data_dir, &contacts)?;
+    forget_outbox_routes(data_dir, &target.pub_hex);
+    let show = |v: &str| {
+        if v.is_empty() {
+            "(none)".to_string()
+        } else {
+            sanitize_terminal_line(v)
+        }
+    };
+    println!(
+        "{C_GREEN}addresses updated{C_RESET} {}",
+        target.primary_label()
+    );
+    println!("{C_DIM}lan_dial{C_RESET}    {}", show(&lan_now));
+    println!("{C_DIM}internet{C_RESET}    {}", show(&inet_now));
+    if edit.p2p.is_some() || !p2p_now.is_empty() {
+        println!("{C_DIM}p2p{C_RESET}         {}", show(&p2p_now));
+        for v in &via_now {
+            println!("{C_DIM}  via{C_RESET}       {}", show(v));
+        }
+    }
+    if (!inet_now.is_empty() || !p2p_now.is_empty()) && !target.pinned {
+        println!(
+            "{C_DIM}note: an address is only a way to reach them; RAVEN still checks their key \
+             on every connection. Compare fingerprints and pin them (contact add --verify-fp) \
+             before you rely on it.{C_RESET}"
+        );
+    }
+    Ok(())
 }
 
 fn cmd_prekey_publish(data_dir: &Path, device_id: &str, out: Option<&Path>) {
@@ -2723,61 +5262,33 @@ fn cmd_prekey_publish(data_dir: &Path, device_id: &str, out: Option<&Path>) {
     }
 }
 
-fn cmd_prekey_fetch(data_dir: &Path, pub_hex: &str, file: Option<&Path>) {
-    let ed = match parse_pub_hex(pub_hex) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("{e}");
-            return;
-        }
-    };
+/// Every failure is an `Err` (the caller exits 1): `ash lab import-peer-prekey
+/// … && ash send …` must not carry on after an expired or mismatched bundle.
+fn cmd_prekey_fetch(data_dir: &Path, pub_hex: &str, file: Option<&Path>) -> Result<(), String> {
+    let ed = parse_pub_hex(pub_hex)?;
     let now = now_ms();
     let bundle = if let Some(path) = file {
-        match std::fs::read_to_string(path) {
-            Ok(raw) => match serde_json::from_str::<PrekeyBundleJson>(&raw) {
-                Ok(j) => match PrekeyBundle::from_json(&j) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("bundle parse: {e}");
-                        return;
-                    }
-                },
-                Err(e) => {
-                    eprintln!("json: {e}");
-                    return;
-                }
-            },
-            Err(e) => {
-                eprintln!("read: {e}");
-                return;
-            }
-        }
+        let raw = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+        let j = serde_json::from_str::<PrekeyBundleJson>(&raw).map_err(|e| format!("json: {e}"))?;
+        PrekeyBundle::from_json(&j).map_err(|e| format!("bundle parse: {e}"))?
     } else {
         match PrekeyStore::load_checked(data_dir).and_then(|s| s.fetch(&ed, now)) {
             Ok(Some(b)) => b,
             Ok(None) => {
-                eprintln!("no bundle in local store for that pub (try --file OOB json)");
-                return;
+                return Err("no bundle in local store for that pub (try --file OOB json)".into())
             }
-            Err(e) => {
-                eprintln!("fetch/verify failed: {e}");
-                return;
-            }
+            Err(e) => return Err(format!("fetch/verify failed: {e}")),
         }
     };
-    if let Err(e) = bundle.verify(now) {
-        eprintln!("verify failed: {e}");
-        return;
-    }
+    bundle
+        .verify(now)
+        .map_err(|e| format!("verify failed: {e}"))?;
     if bundle.identity_ed25519_pub != ed {
-        eprintln!("PREKEY_IDENTITY_MISMATCH");
-        return;
+        return Err("PREKEY_IDENTITY_MISMATCH".into());
     }
     // Persist into local untrusted store so PairInit / lab send can fetch.
-    if let Err(e) = raven_core::publish_prekey_bundle_checked(data_dir, &bundle, now) {
-        eprintln!("store publish: {e}");
-        return;
-    }
+    raven_core::publish_prekey_bundle_checked(data_dir, &bundle, now)
+        .map_err(|e| format!("store publish: {e}"))?;
     println!("{C_GREEN}prekey ok{C_RESET} (cached in prekey_store.json)");
     println!(
         "{C_DIM}fingerprint{C_RESET} {}",
@@ -2785,10 +5296,11 @@ fn cmd_prekey_fetch(data_dir: &Path, pub_hex: &str, file: Option<&Path>) {
     );
     println!(
         "{C_DIM}device_id{C_RESET}   {}",
-        sanitize_terminal_text(&bundle.device_id)
+        sanitize_terminal_line(&bundle.device_id)
     );
     println!("{C_DIM}prekey_id{C_RESET}   {}", bundle.signed_prekey_id);
     println!("{C_DIM}expires_ms{C_RESET}  {}", bundle.expires_at_ms);
+    Ok(())
 }
 
 fn print_messaging_path_diag() -> Result<(), String> {
@@ -2809,7 +5321,7 @@ fn print_messaging_path_diag() -> Result<(), String> {
             Ok(())
         }
         Err(e) => {
-            println!("  FAIL: messaging_path {}", sanitize_terminal_text(&e));
+            println!("  FAIL: messaging_path {}", sanitize_terminal_line(&e));
             Err(e)
         }
     }
@@ -2834,7 +5346,7 @@ fn cmd_lab_lan_dial_sealed(
         Ok(b) => b,
         Err(e) => {
             eprintln!("O6_M3_LAN_DIAL_SEALED=RED");
-            eprintln!("{}", sanitize_terminal_text(&e));
+            eprintln!("{}", sanitize_terminal_line(&e));
             eprintln!("HOLD=ACTIVE");
             std::process::exit(1);
         }
@@ -2849,7 +5361,7 @@ fn cmd_lab_lan_dial_sealed(
         }
         Err(e) => {
             eprintln!("O6_M3_LAN_DIAL_SEALED=RED");
-            eprintln!("{}", sanitize_terminal_text(&e));
+            eprintln!("{}", sanitize_terminal_line(&e));
             eprintln!("HOLD=ACTIVE");
             std::process::exit(1);
         }
@@ -2925,6 +5437,70 @@ fn print_production_gate_matrix() {
     );
 }
 
+/// Whether this computer can send and receive, as the local raven-node itself
+/// says it (its IPC `Status` lists `lan_direct` only while the LAN listener is
+/// really bound). Policy files say what the node WOULD do; this is what it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NodeReach {
+    /// Running, LAN listener up.
+    SendAndReceive,
+    /// Running, LAN listener down (busy port, or started outbound-only).
+    SendOnly,
+    /// No node for this profile.
+    NotRunning,
+    /// Something owns the endpoint but does not answer sensibly.
+    NotAnswering,
+}
+
+fn classify_node_reach(status: &Result<IpcResponse, String>) -> NodeReach {
+    match status {
+        Ok(IpcResponse::Status { capabilities, .. }) => {
+            if capabilities.iter().any(|c| c == "lan_direct") {
+                NodeReach::SendAndReceive
+            } else {
+                NodeReach::SendOnly
+            }
+        }
+        Err(e) if ipc_client::error_means_not_running(e) => NodeReach::NotRunning,
+        _ => NodeReach::NotAnswering,
+    }
+}
+
+/// Value of the `receiving` row of `ash status`.
+fn node_reach_row(reach: &NodeReach) -> String {
+    match reach {
+        NodeReach::SendAndReceive => {
+            "YES \u{2014} the LAN listener is up (friends on your network can send to you)".into()
+        }
+        NodeReach::SendOnly => "NO \u{2014} raven-node runs but its LAN listener is down (busy port, or started \
+             outbound-only); see raven-node-service.log in your Raven folder"
+            .into(),
+        NodeReach::NotRunning => {
+            "NO \u{2014} raven-node is not running (it starts when you send; to receive run `ash listen`)"
+                .into()
+        }
+        NodeReach::NotAnswering => {
+            "NO \u{2014} raven-node is running but does not answer; run `ash doctor`".into()
+        }
+    }
+}
+
+/// The one-line verdict `ash status` ends with.
+fn node_reach_verdict(reach: &NodeReach) -> String {
+    match reach {
+        NodeReach::SendAndReceive => "You can send and receive.".into(),
+        NodeReach::SendOnly => "You can send but NOT receive: this computer's LAN listener is \
+             down (busy port?). See raven-node-service.log in your Raven folder, or run `ash doctor`."
+            .into(),
+        NodeReach::NotRunning => "raven-node is not running: start it with `ash listen` (it also \
+             starts by itself when you send a message)."
+            .into(),
+        NodeReach::NotAnswering => {
+            "raven-node is running but does not answer: run `ash doctor` for details.".into()
+        }
+    }
+}
+
 fn cmd_status(data_dir: &Path) -> Result<(), String> {
     let c = c();
     println!();
@@ -2950,44 +5526,84 @@ fn cmd_status(data_dir: &Path) -> Result<(), String> {
         Err(e) => {
             return Err(format!(
                 "identity store unavailable: {}",
-                sanitize_terminal_text(&e)
+                sanitize_terminal_line(&e)
             ));
         }
     }
 
-    let contacts = contacts_or_die(data_dir);
-    println!();
-    println!("{}CONTACTS \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}", c.bold, c.reset);
-    kv("count", &contacts.len().to_string());
+    // A corrupt book must not abort the whole session (the menu calls this):
+    // report it in place, keep rendering, and fail the command at the end.
+    let contacts_err = match load_contacts(data_dir) {
+        Ok(contacts) => {
+            println!();
+            println!("{}CONTACTS \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}", c.bold, c.reset);
+            kv("count", &contacts.len().to_string());
+            None
+        }
+        Err(e) => {
+            println!();
+            println!("{}CONTACTS \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}", c.bold, c.reset);
+            kv("count", "unavailable (see error below)");
+            Some(sanitize_terminal_line(&e))
+        }
+    };
 
     let policy = load_policy(data_dir);
-    let fwd_path = data_dir.join("forward_queue.sqlite");
-    let (pending, total) = if fwd_path.exists() {
-        ForwardQueue::open(&fwd_path)
-            .ok()
-            .map(|q| (q.count_pending().unwrap_or(0), q.count_all().unwrap_or(0)))
-            .unwrap_or((0, 0))
-    } else {
-        (0, 0)
-    };
-    let snap = BridgeStatusSnapshot::from_policy(&policy, &["lan", "mock_ble"], pending, total);
+    let queue = forward_queue_view(&data_dir.join("forward_queue.sqlite"));
+    // What the node would do (node_policy.json) vs what is actually running:
+    // only the daemon's own IPC Status says the latter.
+    let daemon = ipc_client::ipc_request_timeout(
+        data_dir,
+        &IpcRequest::Status { v: IPC_VERSION },
+        Duration::from_secs(2),
+    );
 
     println!();
     println!("{}BRIDGE \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}", c.bold, c.reset);
-    kv("bridge", ok(snap.bridge));
-    kv("store", ok(snap.store));
-    kv("relay", ok(snap.relay));
-    kv("endpoint", ok(snap.endpoint));
-    kv("policy", if snap.auto_policy { "AUTO" } else { "manual" });
-    kv("transports", &snap.transports.join(", "));
-    kv("caps", &snap.capabilities.join(", "));
     kv(
-        "forward_q",
-        &format!(
-            "{} pending / {} total",
-            snap.forward_queue_pending, snap.forward_queue_total
+        "configured",
+        "node_policy.json (what raven-node will do when running)",
+    );
+    kv("bridge", ok(policy.bridge));
+    kv("store", ok(policy.store));
+    kv("relay", ok(policy.relay));
+    kv("endpoint", ok(policy.endpoint));
+    kv("policy", if policy.auto_policy { "AUTO" } else { "manual" });
+    match &daemon {
+        Ok(IpcResponse::Status {
+            capabilities,
+            forward_pending,
+            ..
+        }) => {
+            kv("daemon", "running (answers IPC)");
+            kv("caps", &capabilities.join(", "));
+            kv("fwd_pending", &forward_pending.to_string());
+        }
+        Ok(_) => kv("daemon", "unexpected IPC response"),
+        Err(e) if ipc_client::error_means_not_running(e) => kv(
+            "daemon",
+            "not running — policy only, nothing is relaying (it starts when you send; or run `ash listen`)",
+        ),
+        Err(e) => kv(
+            "daemon",
+            &format!(
+                "not running or not answering — policy only, nothing is relaying ({})",
+                sanitize_terminal_line(e)
+            ),
+        ),
+    }
+    let reach = classify_node_reach(&daemon);
+    kv("receiving", &node_reach_row(&reach));
+    kv(
+        "internet",
+        &internet_reach_row(
+            &daemon,
+            &policy.internet_listen,
+            raven_core::internet_direct_live_enabled(),
         ),
     );
+    p2p_cli::print_status_rows(&daemon, &policy);
+    kv("forward_q", &forward_queue_line(&queue));
 
     let qpath = data_dir.join("queue.db");
     let qpath2 = data_dir.join("queue.sqlite");
@@ -3002,11 +5618,60 @@ fn cmd_status(data_dir: &Path) -> Result<(), String> {
         println!("outbox file: {}", qp.display());
     }
 
-    Ok(())
+    println!();
+    println!("{}{}{}", c.bold, node_reach_verdict(&reach), c.reset);
+
+    contacts_err.map_or(Ok(()), Err)
+}
+
+/// What `ash status` can say about the store-and-forward queue file. A queue
+/// that exists but cannot be opened or counted is NOT "0 pending".
+#[derive(Debug, PartialEq, Eq)]
+enum ForwardQueueView {
+    Absent,
+    Counts { pending: usize, total: usize },
+    Unavailable(String),
+}
+
+fn forward_queue_view(path: &Path) -> ForwardQueueView {
+    match path.try_exists() {
+        Ok(false) => return ForwardQueueView::Absent,
+        Ok(true) => {}
+        Err(e) => return ForwardQueueView::Unavailable(format!("stat failed: {e}")),
+    }
+    let q = match ForwardQueue::open(path) {
+        Ok(q) => q,
+        Err(e) => return ForwardQueueView::Unavailable(format!("open failed: {e}")),
+    };
+    match (q.count_pending(), q.count_all()) {
+        (Ok(pending), Ok(total)) => ForwardQueueView::Counts { pending, total },
+        (Err(e), _) | (_, Err(e)) => ForwardQueueView::Unavailable(format!("count failed: {e}")),
+    }
+}
+
+fn forward_queue_line(view: &ForwardQueueView) -> String {
+    match view {
+        ForwardQueueView::Absent => "no queue file yet (0 pending / 0 total)".into(),
+        ForwardQueueView::Counts { pending, total } => {
+            format!("{pending} pending / {total} total")
+        }
+        ForwardQueueView::Unavailable(why) => {
+            format!(
+                "unavailable ({}) — pending items unknown",
+                sanitize_terminal_line(why)
+            )
+        }
+    }
 }
 
 fn set_node_flag(data_dir: &Path, which: &str, on: bool) {
-    let mut policy = load_policy(data_dir);
+    // An unreadable node_policy.json falls back to the fail-closed policy.
+    // Saving it would silently turn every flag the user did NOT name OFF, so
+    // that case is reported loudly (the save still repairs the file).
+    let (mut policy, unreadable) = match try_load_policy(data_dir) {
+        Ok(policy) => (policy, None),
+        Err(e) => (NodePolicy::fail_closed(), Some(e.to_string())),
+    };
     policy.auto_policy = false;
     match which {
         "bridge" => policy.bridge = on,
@@ -3021,22 +5686,167 @@ fn set_node_flag(data_dir: &Path, which: &str, on: bool) {
         eprintln!("save policy failed: {e}");
         std::process::exit(1);
     }
+    if let Some(why) = unreadable {
+        eprintln!(
+            "warning: node_policy.json was unreadable ({}); rewrote it from the fail-closed \
+             policy, so the flags you did not set are now OFF",
+            sanitize_terminal_line(&why)
+        );
+    }
     println!(
         "{C_GREEN}ok{C_RESET} {which}={} (raven-node reloads from {})",
         if on { "on" } else { "off" },
         data_dir.join("node_policy.json").display()
     );
-    // Never print keys.
-    let _ = NodePolicy::default();
+    println!(
+        "{C_DIM}policy{C_RESET}  bridge={} store={} relay={}",
+        ok(policy.bridge),
+        ok(policy.store),
+        ok(policy.relay)
+    );
 }
 
-/// Guided Send / Chat. Two lanes:
-///   * pinned contact with saved lan_dial → direct send, no extra prompts
-///   * advanced → ask host:port + pub_hex once (lab interim transport)
+/// How to restart the background service on this OS (the Internet listen
+/// setting is read when raven-node starts).
+fn service_restart_hint() -> &'static str {
+    if cfg!(windows) {
+        "Stop-ScheduledTask -TaskName RavenNodeBridge; Start-ScheduledTask -TaskName \
+         RavenNodeBridge (installed task), or stop raven-node and run `raven listen`"
+    } else if cfg!(target_os = "macos") {
+        "launchctl kickstart -k gui/$(id -u)/com.raven.raven-node (installed agent), or stop \
+         raven-node and run `raven listen`"
+    } else {
+        "systemctl --user restart raven-node (installed unit), or stop raven-node and run \
+         `raven listen`"
+    }
+}
+
+/// Inbound firewall rule for the Internet direct port, as text to run yourself
+/// (RAVEN never changes firewall settings).
+fn internet_firewall_hint(port: &str) -> String {
+    if cfg!(windows) {
+        format!(
+            "New-NetFirewallRule -DisplayName \"Raven node\" -Direction Inbound -Program \
+             <path to raven-node.exe> -Protocol TCP -LocalPort {port} -Profile Private \
+             (elevated PowerShell; never the Public profile)"
+        )
+    } else if cfg!(target_os = "macos") {
+        "if the macOS firewall is on: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add \
+         <path to raven-node> && sudo /usr/libexec/ApplicationFirewall/socketfilterfw \
+         --unblockapp <path to raven-node>"
+            .to_string()
+    } else {
+        format!("e.g. sudo ufw allow {port}/tcp (or your firewalld / nftables / cloud rule)")
+    }
+}
+
+/// `raven node internet on --listen IP:PORT | off`: saved in node_policy.json,
+/// applied by raven-node when it starts (it is never opened behind your back).
+fn cmd_node_internet(data_dir: &Path, listen: Option<&str>) -> Result<(), String> {
+    use raven_core::node_policy::normalize_internet_listen;
+    let addr = match listen {
+        Some(raw) => Some(normalize_internet_listen(raw)?.ok_or_else(|| {
+            format!(
+                "--listen needs an address, e.g. 0.0.0.0:{DEFAULT_INTERNET_PORT} (or use \
+                 `raven node internet off`)"
+            )
+        })?),
+        None => None,
+    };
+    // An unreadable policy would otherwise be saved over with the fail-closed
+    // one, silently turning the user's other flags off: refuse and say so.
+    let mut policy = try_load_policy(data_dir).map_err(|e| {
+        format!(
+            "node_policy.json is unreadable ({}); fix or move it aside first (nothing changed)",
+            sanitize_terminal_line(&e.to_string())
+        )
+    })?;
+    policy.internet_listen = addr.clone().unwrap_or_default();
+    save_policy(data_dir, &policy).map_err(|e| format!("save policy failed: {e}"))?;
+    match &addr {
+        Some(a) => {
+            let port = a.rsplit(':').next().unwrap_or("7422");
+            println!(
+                "{C_GREEN}ok{C_RESET} internet listen={a} saved in {}",
+                data_dir.join("node_policy.json").display()
+            );
+            println!(
+                "{C_DIM}raven-node opens it when it (re)starts: {}{C_RESET}",
+                service_restart_hint()
+            );
+            println!(
+                "{C_DIM}only your contacts get an answer, but anyone who scans that port can see \
+                 that a RAVEN node listens there. Allow inbound TCP {port}: {}{C_RESET}",
+                internet_firewall_hint(port)
+            );
+            if !raven_core::internet_direct_live_enabled() {
+                println!(
+                    "{C_PURPLE}note{C_RESET}: Internet direct is not enabled in this build \
+                     (INTERNET_DIRECT_PRODUCTION_ENABLED=false): raven-node keeps the port \
+                     closed until it is."
+                );
+            }
+        }
+        None => {
+            println!(
+                "{C_GREEN}ok{C_RESET} internet listen=off saved in {}",
+                data_dir.join("node_policy.json").display()
+            );
+            println!(
+                "{C_DIM}a running raven-node closes the port when it restarts: {}{C_RESET}",
+                service_restart_hint()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `internet` row of `raven status`: whether this computer receives over
+/// the Internet, from the running service's own Status (`internet_direct` is
+/// listed only while that listener is bound) and what node_policy.json asks.
+fn internet_reach_row(
+    status: &Result<IpcResponse, String>,
+    configured: &str,
+    internet_live: bool,
+) -> String {
+    let configured = sanitize_terminal_line(configured);
+    match status {
+        Ok(IpcResponse::Status { capabilities, .. })
+            if capabilities.iter().any(|c| c == "internet_direct") =>
+        {
+            "YES \u{2014} the Internet listener is up (contacts who have your Internet address \
+             can reach you)"
+                .into()
+        }
+        Ok(IpcResponse::Status { .. }) if configured.is_empty() => {
+            format!("off (opt-in: raven node internet on --listen 0.0.0.0:{DEFAULT_INTERNET_PORT})")
+        }
+        Ok(IpcResponse::Status { .. }) if !internet_live => format!(
+            "NO \u{2014} configured ({configured}) but Internet direct is not enabled in this \
+             build (INTERNET_DIRECT_PRODUCTION_ENABLED=false)"
+        ),
+        Ok(IpcResponse::Status { .. }) => format!(
+            "NO \u{2014} configured ({configured}) but the listener is down (busy port, or \
+             raven-node started before it was configured: restart it); see \
+             raven-node-service.log in your Raven folder"
+        ),
+        Err(e) if ipc_client::error_means_not_running(e) && configured.is_empty() => {
+            "off (raven-node is not running)".into()
+        }
+        Err(e) if ipc_client::error_means_not_running(e) => {
+            format!("off \u{2014} configured ({configured}), raven-node is not running")
+        }
+        _ => "unknown \u{2014} raven-node does not answer; run `ash doctor`".into(),
+    }
+}
+
+/// Guided Send / Chat. Every lane — picked contact or advanced host:port —
+/// goes through the same authenticated PairInit + indexed-session LAN-direct
+/// path as `ash send --contact/--peer` ([`menu_send_secure`]).
 fn cmd_send_interactive(data_dir: &Path) {
     let c = c();
-    match try_load_identity(data_dir) {
-        Ok(Some(_)) => {}
+    let id = match try_load_identity(data_dir) {
+        Ok(Some(id)) => id,
         Ok(None) => {
             println!("{0}No identity yet.{1}", c.bold, c.reset);
             println!(
@@ -3046,12 +5856,17 @@ fn cmd_send_interactive(data_dir: &Path) {
             return;
         }
         Err(e) => {
-            eprintln!("identity store unavailable: {}", sanitize_terminal_text(&e));
+            eprintln!("identity store unavailable: {}", sanitize_terminal_line(&e));
             return;
         }
-    }
-    let _id = require_identity(data_dir);
-    let contacts = load_contacts(data_dir).unwrap_or_default();
+    };
+    let contacts = match load_contacts(data_dir) {
+        Ok(contacts) => contacts,
+        Err(e) => {
+            eprintln!("{}", sanitize_terminal_line(&e));
+            return;
+        }
+    };
 
     if contacts.is_empty() {
         screen_header("Send");
@@ -3092,11 +5907,8 @@ fn cmd_send_interactive(data_dir: &Path) {
             );
             return;
         }
-        let (peer, pub_hex, text) = direct_peer_prompts();
-        if let Some((peer, pub_hex, text)) =
-            peer.zip(pub_hex).zip(text).map(|((p, k), t)| (p, k, t))
-        {
-            direct_interim_send(data_dir, &peer, &pub_hex, &text);
+        if let Some((peer, pub_hex, text)) = direct_peer_prompts() {
+            report_menu_send(menu_send_secure(data_dir, &id, &peer, &pub_hex, &text));
         }
         return;
     }
@@ -3104,7 +5916,11 @@ fn cmd_send_interactive(data_dir: &Path) {
     // ── Contact picker ──
     screen_header("Send");
     println!(
-        "{0}Pick a contact by number or @tag. Direct host:port is advanced only.{1}",
+        "{0}Pick a contact by number, @tag or petname. Direct host:port is advanced only.{1}",
+        c.dim, c.reset
+    );
+    println!(
+        "{0}This sends one message. For a live chat: ash send --contact NAME --chat{1}",
         c.dim, c.reset
     );
     for (i, ct) in contacts.iter().enumerate() {
@@ -3118,94 +5934,117 @@ fn cmd_send_interactive(data_dir: &Path) {
             format!(
                 "  {0}→ {1}{2}",
                 c.dim,
-                sanitize_terminal_text(&ct.lan_dial),
+                sanitize_terminal_line(&ct.lan_dial),
                 c.reset
             )
         };
         println!(
-            "  {n}  {label}{sub}{dial}{pinned}",
+            "  {n}  {label}{sub}  {d}fp={fp}{r}{dial}{pinned}",
             n = i + 1,
             label = ct.primary_label(),
+            d = c.dim,
+            fp = contact_fingerprint(ct),
+            r = c.reset,
             pinned = if ct.pinned { " [pinned]" } else { "" }
         );
     }
-    print!("contact # | @tag | advanced: ");
+    print!("contact # | @tag | petname | advanced: ");
     let _ = io::stdout().flush();
     let choice = read_line();
     let trimmed = choice.trim();
 
     if trimmed.eq_ignore_ascii_case("advanced") || looks_like_lan_dial(trimmed) {
-        let (peer, pub_hex, text) = direct_peer_prompts();
-        if let Some((peer, pub_hex, text)) =
-            peer.zip(pub_hex).zip(text).map(|((p, k), t)| (p, k, t))
-        {
-            direct_interim_send(data_dir, &peer, &pub_hex, &text);
+        if let Some((peer, pub_hex, text)) = direct_peer_prompts() {
+            report_menu_send(menu_send_secure(data_dir, &id, &peer, &pub_hex, &text));
         }
         return;
     }
 
-    // Resolve the picked contact.
-    let picked: Option<&Contact> = if let Ok(n) = trimmed.parse::<usize>() {
-        contacts.get(n.checked_sub(1).unwrap_or(usize::MAX))
-    } else if let Some(tag) = trimmed.strip_prefix('@') {
-        contacts
-            .iter()
-            .find(|x| x.public_tag.eq_ignore_ascii_case(tag) || x.alias.eq_ignore_ascii_case(tag))
-    } else {
-        contacts
-            .iter()
-            .find(|x| x.petname.eq_ignore_ascii_case(trimmed))
-    };
-    let Some(ct) = picked else {
-        println!(
-            "{0}unknown choice — pick a number, @tag, or type advanced.{1}",
-            c.dim, c.reset
-        );
-        return;
-    };
-
-    let peer = if ct.lan_dial.is_empty() {
-        print_lan_unresolved_hint(&ct.primary_label());
-        if !stdin_is_tty() {
+    // Resolve the picked contact — never a silent first match.
+    let ct = match pick_send_contact(&contacts, trimmed) {
+        SendPick::One(i) => &contacts[i],
+        SendPick::Ambiguous(hits) => {
             println!(
-                "{0}no LAN dial saved and stdin is not a terminal \u{2014} \
-                 re-add this contact with --lan-dial host:port{1}",
-                c.yellow, c.reset
+                "{0}ambiguity picker{1}: {2} contacts match — never silent pick",
+                c.bold,
+                c.reset,
+                hits.len()
+            );
+            for &i in &hits {
+                let ct = &contacts[i];
+                println!(
+                    "  {0}  {1}  {2}  fp={3}{4}",
+                    i + 1,
+                    ct.primary_label(),
+                    ct.tag_subtitle().unwrap_or_default(),
+                    contact_fingerprint(ct),
+                    if ct.pinned { " [pinned]" } else { "" }
+                );
+            }
+            print!("contact # (compare fingerprints; Enter cancels): ");
+            let _ = io::stdout().flush();
+            let n = read_line().trim().parse::<usize>().unwrap_or(0);
+            match n.checked_sub(1).filter(|i| hits.contains(i)) {
+                Some(i) => &contacts[i],
+                None => {
+                    println!("{0}cancelled.{1}", c.dim, c.reset);
+                    return;
+                }
+            }
+        }
+        SendPick::NoMatch => {
+            println!(
+                "{0}unknown choice — pick a number, @tag, petname, or type advanced.{1}",
+                c.dim, c.reset
             );
             return;
         }
-        let mut tries: u8 = 0;
-        let hp = loop {
-            tries += 1;
-            if tries > 3 {
+    };
+
+    let env = env_peer_lan_dial();
+    let (peer, prompted) = match resolve_lan_peer_parts(&ct.lan_dial, env.as_deref()) {
+        Some(ResolvedLanPeer::Dial(dial)) => (dial, false),
+        None => {
+            print_lan_unresolved_hint(&ct.primary_label());
+            if !stdin_is_tty() {
                 println!(
-                    "{0}too many invalid entries \u{2014} cancelled.{1}",
-                    c.dim, c.reset
+                    "{0}no LAN dial saved and stdin is not a terminal \u{2014} \
+                     re-add this contact with --lan-dial host:port{1}",
+                    c.yellow, c.reset
                 );
                 return;
             }
-            print!(
-                "{0}?{1} Type the IP:PORT shown on their Listen screen (e.g. 192.168.1.20:7420): ",
-                c.yellow, c.reset
-            );
-            let _ = io::stdout().flush();
-            let hp = read_line();
-            let t = hp.trim();
-            if t.is_empty() {
-                return;
-            }
-            if looks_like_lan_dial(t) {
-                break t.to_string();
-            }
-            println!(
-                "{0}not an IP:PORT — copy the line from their Listen screen (like 192.168.1.20:7420){1}",
-                c.red,
-                c.reset
-            );
-        };
-        hp
-    } else {
-        ct.lan_dial.clone()
+            let mut tries: u8 = 0;
+            let hp = loop {
+                tries += 1;
+                if tries > 3 {
+                    println!(
+                        "{0}too many invalid entries \u{2014} cancelled.{1}",
+                        c.dim, c.reset
+                    );
+                    return;
+                }
+                print!(
+                    "{0}?{1} Type the IP:PORT shown on their Listen screen (e.g. 192.168.1.20:7420): ",
+                    c.yellow, c.reset
+                );
+                let _ = io::stdout().flush();
+                let hp = read_line();
+                let t = hp.trim();
+                if t.is_empty() {
+                    return;
+                }
+                if looks_like_lan_dial(t) {
+                    break t.to_string();
+                }
+                println!(
+                    "{0}not an IP:PORT — copy the line from their Listen screen (like 192.168.1.20:7420){1}",
+                    c.red,
+                    c.reset
+                );
+            };
+            (hp, true)
+        }
     };
 
     println!(
@@ -3214,17 +6053,94 @@ fn cmd_send_interactive(data_dir: &Path) {
         ct.primary_label(),
         c.reset
     );
-    print!("> ");
-    let _ = io::stdout().flush();
-    let text = read_line();
-    if text.is_empty() {
-        eprintln!("empty message");
-        return;
+    if stdin_is_tty() {
+        println!(
+            "{0}One line, up to about 1000 characters; arrow keys do not edit here (use Backspace). Longer or multi-line text: ash send --contact NAME < message.txt{1}",
+            c.dim, c.reset
+        );
     }
-    direct_interim_send(data_dir, &peer, &ct.pub_hex.clone(), &text);
+    let Some(text) = read_tty_message("> ") else {
+        return;
+    };
+    let result = menu_send_secure(data_dir, &id, &peer, &ct.pub_hex, &text);
+    if result.is_err() && !prompted {
+        // A saved dial that no longer reaches the peer (new DHCP address) can
+        // only be replaced explicitly: it always wins over RAVEN_PEER.
+        println!(
+            "{0}If {1}'s address changed: ash contact set-dial --address {2} --lan-dial host:port{3}",
+            c.dim,
+            ct.primary_label(),
+            sanitize_terminal_line(&ct.address),
+            c.reset
+        );
+    }
+    if result.is_ok() && prompted {
+        // Beginners type host:port once; it is remembered after a real delivery.
+        match update_contact_lan_dial(data_dir, &ct.pub_hex, &peer) {
+            Ok(()) => println!(
+                "{0}Saved lan_dial on contact for next Send.{1}",
+                c.dim, c.reset
+            ),
+            Err(e) => eprintln!("could not save dial: {}", sanitize_terminal_line(&e)),
+        }
+    }
+    report_menu_send(result);
 }
 
-fn direct_peer_prompts() -> (Option<String>, Option<String>, Option<String>) {
+/// Send-picker resolution. Several matches are never resolved silently.
+#[derive(Debug, PartialEq, Eq)]
+enum SendPick {
+    One(usize),
+    Ambiguous(Vec<usize>),
+    NoMatch,
+}
+
+/// `#` (1-based), `@tag` (Soft Unique — may match several) or petname
+/// (case-insensitive; unique for new adds, legacy books may still repeat).
+fn pick_send_contact(contacts: &[Contact], input: &str) -> SendPick {
+    let t = input.trim();
+    if t.is_empty() {
+        return SendPick::NoMatch;
+    }
+    if let Ok(n) = t.parse::<usize>() {
+        return match n.checked_sub(1).filter(|i| *i < contacts.len()) {
+            Some(i) => SendPick::One(i),
+            None => SendPick::NoMatch,
+        };
+    }
+    let hits: Vec<usize> = if t.starts_with('@') {
+        let want = normalize_tag(t);
+        // A lone "@" normalises to "" — the tag of every untagged contact. It
+        // names nobody, so it must not select one.
+        if want.is_empty() {
+            return SendPick::NoMatch;
+        }
+        contacts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                normalize_tag(&c.public_tag) == want || normalize_tag(&c.alias) == want
+            })
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        let want = sanitize_terminal_line(t).to_lowercase();
+        contacts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| sanitize_terminal_line(&c.petname).to_lowercase() == want)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    match hits.as_slice() {
+        [] => SendPick::NoMatch,
+        [one] => SendPick::One(*one),
+        _ => SendPick::Ambiguous(hits),
+    }
+}
+
+/// Advanced lane: host:port + pub_hex + message, validated before any dial.
+fn direct_peer_prompts() -> Option<(String, String, String)> {
     let c = c();
     if !stdin_is_tty() {
         println!(
@@ -3232,7 +6148,7 @@ fn direct_peer_prompts() -> (Option<String>, Option<String>, Option<String>) {
              use a contact with --lan-dial, or run inside a terminal.{1}",
             c.yellow, c.reset
         );
-        return (None, None, None);
+        return None;
     }
     println!();
     println!("{0}Advanced — direct peer{1}", c.bold, c.reset);
@@ -3243,108 +6159,308 @@ fn direct_peer_prompts() -> (Option<String>, Option<String>, Option<String>) {
     print!("peer host:port: ");
     let _ = io::stdout().flush();
     let peer = read_line();
+    if !looks_like_lan_dial(&peer) {
+        println!("{0}not a host:port \u{2014} cancelled.{1}", c.dim, c.reset);
+        return None;
+    }
     print!("peer pub_hex (64 chars, public only): ");
     let _ = io::stdout().flush();
-    let pub_hex = read_line();
-    print!("message (stdin — never argv): ");
-    let _ = io::stdout().flush();
-    let text = read_line();
-    if peer.trim().is_empty() {
-        return (None, None, None);
-    }
-    (
-        Some(peer.trim().to_string()),
-        Some(pub_hex.trim().to_string()),
-        Some(text),
-    )
-}
-
-/// Proven lab transport lane: spawn raven-node with an interim-sealed envelope
-/// over direct TCP. Release builds without the lab feature make the daemon
-/// refuse here (ATSAM_SESSION_REQUIRED) \\u{2014} production stays fail-closed.
-fn direct_interim_send(data_dir: &Path, peer: &str, pub_hex: &str, text: &str) {
-    let c = c();
-    let node = ext::raven_node_bin_public();
-    let mut child = match Command::new(node)
-        .arg("run")
-        .args(["--data-dir", &data_dir.display().to_string()])
-        .args(["--listen", "127.0.0.1:0"])
-        .args(["--peer", peer.trim()])
-        .args(["--peer-pub-hex", pub_hex.trim()])
-        .args(["--send-stdin"])
-        .args(["--body-mode", "unsafe-interim"])
-        .args(["--exit-after-ack"])
-        .args(["--timeout-secs", "45"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(ch) => ch,
+    let pub_hex = match parse_pub_hex(&read_line()) {
+        Ok(k) => hex::encode(k),
         Err(e) => {
-            let (red, reset) = (c.red, c.reset);
-            eprintln!("{red}could not start raven-node: {e}{reset}");
-            return;
+            println!(
+                "{0}rejected: {1}{2}",
+                c.dim,
+                sanitize_terminal_line(&e),
+                c.reset
+            );
+            return None;
         }
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write as _;
-        let _ = stdin.write_all(text.as_bytes());
-        let _ = stdin.write_all(b"\\n");
-    }
-    match child.wait() {
-        Ok(s) if s.success() => {}
-        Ok(s) => {
-            let (yellow, reset) = (c.yellow, c.reset);
-            eprintln!("{yellow}send exited ({s}){reset}");
-        }
-        Err(e) => {
-            let (red, reset) = (c.red, c.reset);
-            eprintln!("{red}send failed: {e}{reset}");
-        }
+    let text = read_tty_message("message (stdin — never argv): ")?;
+    Some((peer.trim().to_string(), pub_hex, text))
+}
+
+/// Menu / bare-TTY send. Same authenticated default-build path as
+/// `ash send --contact/--peer`: PairInit (RLB1 over LanDial) + indexed session
+/// + sealed ACK via [`ext::run_send_secure`]. Never `--body-mode unsafe-interim`.
+fn menu_send_secure(
+    data_dir: &Path,
+    id: &Identity,
+    dial: &str,
+    pub_hex: &str,
+    text: &str,
+) -> Result<(), String> {
+    ext::run_send_secure(data_dir, id, dial, pub_hex, "127.0.0.1:0", text, "", "")
+}
+
+/// Menu sends report and return to the menu (never exit the process).
+fn report_menu_send(result: Result<(), String>) {
+    if let Err(e) = result {
+        let c = c();
+        eprintln!(
+            "{0}{1}{2}",
+            c.yellow,
+            sanitize_terminal_line(&pair_init_lab::send_failure_line(&e)),
+            c.reset
+        );
     }
 }
 
-fn resolve_or_reuse_lan_dial(data_dir: &Path, c: &Contact) -> Option<ResolvedLanPeer> {
+/// Dial for `c`, and whether it is NOT the saved one (it came from
+/// `RAVEN_PEER` / `ASH_LAN_DIAL`). An env dial is never written into the
+/// contact here: the variable is process-global, not per contact, so a stale or
+/// wrong value would be stamped onto whoever was picked and then beat the right
+/// one forever. Callers may save it after a delivery actually succeeded.
+fn resolve_or_reuse_lan_dial(c: &Contact) -> Option<(ResolvedLanPeer, bool)> {
+    resolve_or_reuse_lan_dial_with(c, env_peer_lan_dial())
+}
+
+/// [`resolve_or_reuse_lan_dial`] with the environment dial passed in (tests).
+fn resolve_or_reuse_lan_dial_with(
+    c: &Contact,
+    env: Option<String>,
+) -> Option<(ResolvedLanPeer, bool)> {
     let s = style();
     let bold = s.bold;
     let dim = s.dim;
     let reset = s.reset;
 
-    let env = env_peer_lan_dial();
-    let had_saved = looks_like_lan_dial(&c.lan_dial);
-    let ipc_up = ipc_daemon_up(data_dir);
-    let resolved = resolve_lan_peer_parts(&c.lan_dial, env.as_deref(), ipc_up);
-    if resolved.is_none() && !ipc_up {
-        println!("{dim}Starting raven-node service so IPC LanDial can run…{reset}");
-        let _ = ensure_mac_lan_service(data_dir);
-    }
+    // No service auto-start here: an unresolved dial fails below anyway, and
+    // the secure send path starts the service itself (with a notice) when it
+    // actually dials.
+    let resolved = resolve_lan_peer_parts(&c.lan_dial, env.as_deref());
 
-    match &resolved {
+    match resolved {
         Some(ResolvedLanPeer::Dial(dial)) => {
-            if had_saved && c.lan_dial.trim() == dial.as_str() {
+            let saved = looks_like_lan_dial(&c.lan_dial) && c.lan_dial.trim() == dial.as_str();
+            if saved {
                 println!(
                     "{dim}LAN dial{reset} {bold}{}{reset} {dim}(saved · {}){reset}",
-                    sanitize_terminal_text(dial),
+                    sanitize_terminal_line(&dial),
                     c.primary_label()
                 );
+                if let Some(e) = env.as_deref().filter(|e| *e != dial) {
+                    println!(
+                        "{dim}note: RAVEN_PEER={} is ignored — the saved dial wins. Replace it: \
+                         ash contact set-dial --address {} --lan-dial host:port{reset}",
+                        sanitize_terminal_line(e),
+                        sanitize_terminal_line(&c.address)
+                    );
+                }
             } else {
                 println!(
-                    "{dim}LAN dial{reset} {bold}{}{reset} {dim}(auto · {}){reset}",
-                    sanitize_terminal_text(dial),
+                    "{dim}LAN dial{reset} {bold}{}{reset} {dim}(env · {} · saved only after a delivery succeeds){reset}",
+                    sanitize_terminal_line(&dial),
                     c.primary_label()
                 );
-                if let Err(e) = update_contact_lan_dial(data_dir, &c.pub_hex, dial) {
-                    eprintln!("{dim}could not save dial: {e}{reset}");
-                } else {
-                    println!("{dim}Saved lan_dial on contact for next Send.{reset}");
-                }
             }
+            Some((ResolvedLanPeer::Dial(dial), !saved))
         }
         None => {
             print_lan_unresolved_hint(&c.primary_label());
-            return None;
+            None
         }
     }
-    resolved
+}
+
+/// Where `ash send` dials: the routes to try in order, the key every one of
+/// them must prove, and the LAN dial taken from `RAVEN_PEER` / `ASH_LAN_DIAL`
+/// (written to the contact only once a delivery over it worked).
+#[derive(Debug, PartialEq, Eq)]
+struct SendTarget {
+    routes: Vec<pair_init_lab::DialRoute>,
+    pub_hex: String,
+    listen: String,
+    env_lan_dial: Option<String>,
+}
+
+fn lan_route(dial: &str) -> pair_init_lab::DialRoute {
+    pair_init_lab::DialRoute {
+        carrier: pair_init_lab::DialCarrier::Lan,
+        dial: dial.to_string(),
+    }
+}
+
+fn internet_route(dial: &str) -> pair_init_lab::DialRoute {
+    pair_init_lab::DialRoute {
+        carrier: pair_init_lab::DialCarrier::Internet,
+        dial: dial.to_string(),
+    }
+}
+
+/// `raven contact set-addr <selector> --internet …` for hints.
+fn set_addr_hint(c: &Contact, flag: &str) -> String {
+    let sel = match c.tag_subtitle() {
+        Some(tag) => tag,
+        None => sanitize_terminal_line(&c.address),
+    };
+    format!("raven contact set-addr {sel} {flag} HOST:PORT")
+}
+
+/// The refusal for an Internet send to a contact that is not verified, with the
+/// two commands that fix it (show the fingerprint; pin it by adding again).
+fn unverified_contact_text(c: &Contact) -> String {
+    unverified_contact_text_for(c, "Internet")
+}
+
+/// [`unverified_contact_text`] for `carrier` (`Internet` or `p2p`).
+fn unverified_contact_text_for(c: &Contact, carrier: &str) -> String {
+    let (who, verify) = match c.tag_subtitle() {
+        Some(tag) => (
+            tag.clone(),
+            format!("raven contact verify --tag {}", tag.trim_start_matches('@')),
+        ),
+        None => (
+            c.primary_label(),
+            format!(
+                "raven contact verify --address {}",
+                sanitize_terminal_line(&c.address)
+            ),
+        ),
+    };
+    let pin = match parse_pub_hex(&c.pub_hex) {
+        Ok(key) => pair_init_lab::pin_command_hint(&key),
+        Err(_) => "raven contact add … --verify-fp <the fingerprint they read out>".into(),
+    };
+    pair_init_lab::unverified_carrier_text(&who, carrier, &verify, &pin)
+}
+
+fn p2p_route(peer_id: &str) -> pair_init_lab::DialRoute {
+    pair_init_lab::DialRoute {
+        carrier: pair_init_lab::DialCarrier::P2p,
+        dial: raven_core::p2p_route::peer_route(peer_id),
+    }
+}
+
+/// [`plan_contact_routes_with`] with the p2p gate closed.
+#[cfg(test)]
+fn plan_contact_routes(
+    c: &Contact,
+    choice: CarrierChoice,
+    env: Option<String>,
+    internet_live: bool,
+) -> Result<(Vec<pair_init_lab::DialRoute>, Option<String>), String> {
+    plan_contact_routes_with(c, choice, env, internet_live, false)
+}
+
+/// The routes `choice` allows for contact `c`, in plan order (transports
+/// design §2.3): LAN, Internet direct, p2p. `env` is the `RAVEN_PEER` /
+/// `ASH_LAN_DIAL` LAN dial; `internet_live` / `p2p_live` are the carrier gates.
+/// `auto` never plans a held carrier, and a LAN-only contact gets exactly the
+/// LAN send it always got. Internet and p2p only for a verified contact.
+fn plan_contact_routes_with(
+    c: &Contact,
+    choice: CarrierChoice,
+    env: Option<String>,
+    internet_live: bool,
+    p2p_live: bool,
+) -> Result<(Vec<pair_init_lab::DialRoute>, Option<String>), String> {
+    let inet = parse_internet_dial(&c.internet_dial).ok();
+    let p2p = raven_core::p2p_route::normalize_peer_id(&c.p2p).ok();
+    // p2p first decided, then planned last: an `auto` send whose only other
+    // address is held still has its p2p route.
+    let p2p_unverified = p2p_live
+        && !raven_core::carrier_allowed_for_contact(raven_core::OutboxCarrier::P2p, c.pinned);
+    let p2p_planned = match (&p2p, choice) {
+        (None, CarrierChoice::P2p) => {
+            return Err(format!(
+                "contact {} has no p2p route saved; save one with: {}",
+                c.primary_label(),
+                set_addr_hint(c, "--p2p PEER_ID --via MULTIADDR").replace(" HOST:PORT", "")
+            ));
+        }
+        (Some(_), CarrierChoice::P2p) if p2p_unverified => {
+            return Err(unverified_contact_text_for(c, "p2p"));
+        }
+        // `--carrier p2p` while held still plans it: the send path then
+        // refuses with P2P_HOLD before any daemon is started.
+        (Some(peer), CarrierChoice::P2p) => Some(p2p_route(peer)),
+        (Some(peer), CarrierChoice::Auto) if p2p_live && !p2p_unverified => Some(p2p_route(peer)),
+        _ => None,
+    };
+    // Another saved route (even one this send cannot use) means a missing
+    // LAN address is not the error to report.
+    let others = inet.is_some() || p2p.is_some();
+    let want_lan = matches!(choice, CarrierChoice::Auto | CarrierChoice::Lan);
+    let lan_possible = resolve_lan_peer_parts(&c.lan_dial, env.as_deref()).is_some();
+    let mut routes = Vec::new();
+    let mut env_lan = None;
+    // The LAN line ("LAN dial … (saved · Bob)") and the "no LAN address" hint are
+    // printed only when LAN is what this send relies on.
+    if want_lan && (lan_possible || !others || choice == CarrierChoice::Lan) {
+        match resolve_or_reuse_lan_dial_with(c, env) {
+            Some((ResolvedLanPeer::Dial(dial), from_env)) => {
+                if from_env {
+                    env_lan = Some(dial.clone());
+                }
+                routes.push(lan_route(&dial));
+            }
+            None if choice == CarrierChoice::Lan || !others => {
+                return Err(format!(
+                    "contact {} has no reachable lan_dial — set host:port (not LocalListenQueue)",
+                    c.primary_label()
+                ));
+            }
+            None => {}
+        }
+    }
+    if matches!(choice, CarrierChoice::Auto | CarrierChoice::Internet) {
+        // Internet delivery only for a verified (pinned) contact (owner
+        // decision 2026-10-08); LAN stays open to every contact. Decided where
+        // Internet would really be tried (the gate is open): `auto` then keeps
+        // the LAN route alone, and with no LAN route the send is refused.
+        let unverified = internet_live
+            && !raven_core::carrier_allowed_for_contact(
+                raven_core::OutboxCarrier::Internet,
+                c.pinned,
+            );
+        let nothing_else = routes.is_empty() && p2p_planned.is_none();
+        match inet {
+            Some(_) if unverified && (nothing_else || choice == CarrierChoice::Internet) => {
+                return Err(unverified_contact_text(c));
+            }
+            Some(_) if unverified => {}
+            Some(addr) if internet_live || choice == CarrierChoice::Internet => {
+                routes.push(internet_route(&addr));
+            }
+            Some(_) if nothing_else => {
+                return Err(format!(
+                    "{} — {} has only an Internet address saved; to reach them on your network \
+                     save a LAN one: {}",
+                    pair_init_lab::INTERNET_DIRECT_HOLD,
+                    c.primary_label(),
+                    set_addr_hint(c, "--lan")
+                ));
+            }
+            Some(_) => {}
+            None if choice == CarrierChoice::Internet => {
+                return Err(format!(
+                    "contact {} has no Internet address saved; save one with: {}",
+                    c.primary_label(),
+                    set_addr_hint(c, "--internet")
+                ));
+            }
+            None => {}
+        }
+    }
+    if let Some(route) = p2p_planned {
+        routes.push(route);
+    } else if routes.is_empty() && choice == CarrierChoice::Auto && p2p.is_some() {
+        // Only a p2p route, and it cannot be used: say why.
+        return Err(if p2p_unverified {
+            unverified_contact_text_for(c, "p2p")
+        } else {
+            format!(
+                "{} — {} has only a p2p route saved; to reach them on your network save a LAN \
+                 one: {}",
+                raven_core::P2P_HOLD,
+                c.primary_label(),
+                set_addr_hint(c, "--lan")
+            )
+        });
+    }
+    Ok((routes, env_lan))
 }
 
 fn resolve_send_target(
@@ -3353,107 +6469,276 @@ fn resolve_send_target(
     peer: &str,
     peer_pub_hex: &str,
     listen: &str,
-) -> Result<(String, String, String), String> {
+    choice: CarrierChoice,
+) -> Result<SendTarget, String> {
     if !contact.trim().is_empty() {
         let contacts = load_contacts(data_dir)?;
-        let hits = resolve_alias_contacts(&contacts, contact);
+        let hits = resolve_contact_arg(&contacts, contact);
         if hits.is_empty() {
-            return Err(format!(
-                "no contact for {} — ash contact add … --tag … --lan-dial host:port",
-                sanitize_terminal_text(contact)
-            ));
+            return Err(no_contact_message(&contacts, contact));
         }
         if hits.len() > 1 {
             return Err(format!(
-                "contact tag {} is ambiguous ({} matches)",
-                sanitize_terminal_text(contact),
+                "contact {} is ambiguous ({} matches): use the @tag, or see `ash contact list`",
+                sanitize_terminal_line(contact),
                 hits.len()
             ));
         }
         let c = hits[0];
-        return match resolve_or_reuse_lan_dial(data_dir, c) {
-            Some(ResolvedLanPeer::Dial(dial)) => Ok((dial, c.pub_hex.clone(), listen.to_string())),
-            None => Err(format!(
-                "contact {} has no reachable lan_dial — set host:port (not LocalListenQueue)",
-                c.primary_label()
-            )),
-        };
+        let (routes, env_lan_dial) = plan_contact_routes_with(
+            c,
+            choice,
+            env_peer_lan_dial(),
+            raven_core::internet_direct_live_enabled(),
+            raven_core::p2p_live_enabled(),
+        )?;
+        return Ok(SendTarget {
+            routes,
+            pub_hex: c.pub_hex.clone(),
+            listen: listen.to_string(),
+            env_lan_dial,
+        });
     }
     if peer_pub_hex.trim().is_empty() || !looks_like_lan_dial(peer) {
         return Err("send requires --contact @tag or --peer host:port plus --peer-pub-hex".into());
     }
-    Ok((
-        peer.to_string(),
-        peer_pub_hex.to_string(),
-        listen.to_string(),
-    ))
+    // An explicit --peer is a LAN dial unless `--carrier internet` says otherwise.
+    if choice == CarrierChoice::P2p {
+        return Err(
+            "send --carrier p2p needs --contact (the p2p route is saved with the contact: \
+             raven contact set-addr NAME --p2p PEER_ID --via MULTIADDR)"
+                .into(),
+        );
+    }
+    let route = if choice == CarrierChoice::Internet {
+        internet_route(peer)
+    } else {
+        lan_route(peer)
+    };
+    Ok(SendTarget {
+        routes: vec![route],
+        pub_hex: peer_pub_hex.to_string(),
+        listen: listen.to_string(),
+        env_lan_dial: None,
+    })
 }
 
-fn cmd_endpoint_inbox(data_dir: &Path) {
-    let mut store = match raven_core::IndexedSessionStore::open(data_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("inbox: {}", e.redacted_display());
-            return;
+/// Said when the inbox has nothing in it: the likely reasons and the profile
+/// (a wrong `--data-dir` looks exactly like "nobody wrote to me").
+fn inbox_empty_text(data_dir: &Path) -> String {
+    format!(
+        "No messages yet in {}.\n  Either nobody has written to you yet, or they have not added you as a contact, or this computer is not receiving (check: `ash status`).\n  To receive: add your friend as a contact (menu 5), then keep `ash listen` running.",
+        sanitize_terminal_line(&data_dir.display().to_string())
+    )
+}
+
+/// One line (stderr) when messages cannot arrive right now; `None` when they can.
+fn inbox_receiver_note(state: &ext::ReceiverState) -> Option<&'static str> {
+    match state {
+        ext::ReceiverState::Receiving => None,
+        ext::ReceiverState::NotRunning => Some(
+            "Note: raven-node is not running, so nothing can arrive right now. Start it with menu 4 Listen (`ash listen`); it also starts when you send.",
+        ),
+        ext::ReceiverState::NotReceiving => Some(
+            "Note: this computer is NOT receiving: raven-node runs but its LAN listener is down. Run `ash status`.",
+        ),
+        ext::ReceiverState::NotAnswering => {
+            Some("Note: raven-node is running but not answering. Run `ash doctor`.")
         }
-    };
-    match store.list_endpoint_inbox() {
-        Ok(rows) if rows.is_empty() => {
-            println!("{C_DIM}endpoint inbox empty{C_RESET}");
-        }
-        Ok(rows) => {
-            println!("{C_BOLD}inbox{C_RESET} ({})", rows.len());
-            for row in rows {
-                let preview = String::from_utf8_lossy(&row.plaintext);
-                println!(
-                    "  {C_DIM}{}{C_RESET} {}",
-                    hex::encode(&row.message_id[..4]),
-                    sanitize_terminal_text(&preview)
-                );
-            }
-        }
-        Err(e) => eprintln!("inbox: {}", e.redacted_display()),
     }
 }
 
-fn parse_send_carrier(s: &str) -> Result<pair_init_lab::DialCarrier, String> {
+fn print_inbox_receiver_note(data_dir: &Path) {
+    // Read-only and bounded: it never starts the service.
+    let state = ext::receiver_state(data_dir, Duration::from_millis(500));
+    if let Some(note) = inbox_receiver_note(&state) {
+        eprintln!("{C_DIM}{note}{C_RESET}");
+    }
+}
+
+/// An unreadable / locked / wrong-key store is an `Err` (exit 1), never
+/// confused with an empty inbox (`Ok`).
+fn cmd_endpoint_inbox(data_dir: &Path) -> Result<(), String> {
+    // Opening the session store creates it. Before the first identity the inbox
+    // is empty by definition, and creating the store would wedge `ash init`.
+    if !identity_exists_before_state(data_dir, "inbox")? {
+        println!("{C_DIM}no identity yet — the inbox is empty; run `ash init` first{C_RESET}");
+        return Ok(());
+    }
+    let mut store = raven_core::IndexedSessionStore::open(data_dir)
+        .map_err(|e| format!("inbox: {}", e.redacted_display()))?;
+    match store.list_endpoint_inbox() {
+        Ok(rows) if rows.is_empty() => {
+            println!("{C_DIM}{}{C_RESET}", inbox_empty_text(data_dir));
+            println!("{C_DIM}FA: \u{200f}هنوز پیامی دریافت نشده است.{C_RESET}");
+            print_inbox_receiver_note(data_dir);
+            Ok(())
+        }
+        Ok(rows) => {
+            // Attribution needs the book; a corrupt book still shows fingerprints.
+            let contacts = match load_contacts(data_dir) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}", sanitize_terminal_line(&e));
+                    Vec::new()
+                }
+            };
+            // On a terminal only the newest rows (and clipped bodies) are shown;
+            // piped output (`| grep`, `| less`) always gets everything.
+            let tty = io::stdout().is_terminal();
+            let hidden = if tty {
+                rows.len().saturating_sub(TTY_INBOX_ROWS)
+            } else {
+                0
+            };
+            let max_chars = tty.then_some(TTY_BODY_MAX_CHARS);
+            let now = now_ms();
+            println!("{C_BOLD}inbox{C_RESET} ({})", rows.len());
+            if hidden > 0 {
+                println!(
+                    "{C_DIM}  \u{2026} {hidden} older message(s) not shown (`ash inbox | less` shows them all){C_RESET}"
+                );
+            }
+            for row in rows.into_iter().skip(hidden) {
+                println!(
+                    "{}",
+                    format_inbox_row(
+                        &contacts,
+                        &row.sender_device,
+                        &row.message_id,
+                        &row.plaintext,
+                        &short_age(now, row.received_at_ms),
+                        max_chars,
+                    )
+                );
+            }
+            print_inbox_receiver_note(data_dir);
+            Ok(())
+        }
+        Err(e) => Err(format!("inbox: {}", e.redacted_display())),
+    }
+}
+
+/// One inbox row on ONE terminal line: how long ago, who from (petname, with
+/// "pinned" + fingerprint for a verified contact, or "unknown device" + its
+/// fingerprint), then the body with line breaks / controls neutralised, then the
+/// short message id (the sender's `mid=`) last.
+fn format_inbox_row(
+    contacts: &[Contact],
+    sender_device: &[u8; 32],
+    message_id: &[u8; 16],
+    plaintext: &[u8],
+    age: &str,
+    max_chars: Option<usize>,
+) -> String {
+    let sender_hex = hex::encode(sender_device);
+    let fp = device_fingerprint_v1(sender_device);
+    let who = match contacts
+        .iter()
+        .find(|c| c.pub_hex.trim().eq_ignore_ascii_case(&sender_hex))
+    {
+        Some(ct) if ct.pinned => format!(
+            "{C_BOLD}{}{C_RESET} {C_DIM}[pinned fp={fp}]{C_RESET}",
+            ct.primary_label()
+        ),
+        Some(ct) => format!(
+            "{C_BOLD}{}{C_RESET} {C_DIM}(not verified){C_RESET}",
+            ct.primary_label()
+        ),
+        None => format!("{C_PURPLE}unknown device{C_RESET} {C_DIM}[fp={fp}]{C_RESET}"),
+    };
+    let when = if age.is_empty() {
+        String::new()
+    } else {
+        format!("{C_DIM}{age}{C_RESET}  ")
+    };
+    format!(
+        "  {when}from {who}: {}  {C_DIM}[{}]{C_RESET}",
+        clip_body(
+            sanitize_terminal_line(&String::from_utf8_lossy(plaintext)),
+            max_chars
+        ),
+        hex::encode(&message_id[..4])
+    )
+}
+
+/// What `raven send --carrier` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarrierChoice {
+    /// The contact's saved LAN route first, then Internet, then p2p.
+    Auto,
+    Lan,
+    Internet,
+    /// The libp2p carrier only (direct, then via a relay; P3).
+    P2p,
+}
+
+fn parse_send_carrier(s: &str) -> Result<CarrierChoice, String> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "lan" | "" => Ok(pair_init_lab::DialCarrier::Lan),
-        "internet" => Ok(pair_init_lab::DialCarrier::Internet),
+        "auto" | "" => Ok(CarrierChoice::Auto),
+        "lan" => Ok(CarrierChoice::Lan),
+        "internet" => Ok(CarrierChoice::Internet),
+        "p2p" => Ok(CarrierChoice::P2p),
         other => Err(format!(
-            "unknown --carrier {other} (lan | internet). internet is localhost/indexed lab only — not WAN Proven"
+            "unknown --carrier {} (auto | lan | internet | p2p)",
+            sanitize_terminal_line(other)
         )),
     }
 }
 
 fn run_send(
     data_dir: &Path,
-    peer: &str,
-    peer_pub_hex: &str,
-    listen: &str,
+    target: &SendTarget,
     text: &str,
-    carrier: pair_init_lab::DialCarrier,
-) {
+    choice: CarrierChoice,
+) -> Result<pair_init_lab::DialRoute, String> {
     let id = require_identity(data_dir);
-    let result = match carrier {
-        pair_init_lab::DialCarrier::Lan => {
-            ext::run_send_secure(data_dir, &id, peer, peer_pub_hex, listen, text, "", "")
-        }
-        pair_init_lab::DialCarrier::Internet => ext::run_send_secure_on(
+    match target.routes.as_slice() {
+        // One LAN route (`--peer`, or a contact with only a LAN address): the
+        // path every LAN send has always taken, `--listen` fallback included.
+        [only] if only.carrier == pair_init_lab::DialCarrier::Lan => ext::run_send_secure(
             data_dir,
             &id,
-            peer,
-            peer_pub_hex,
-            listen,
+            &only.dial,
+            &target.pub_hex,
+            &target.listen,
             text,
             "",
             "",
-            carrier,
+        )
+        .map(|()| only.clone()),
+        // `--peer … --carrier internet`: the lab Internet path as before.
+        [only]
+            if choice == CarrierChoice::Internet
+                && only.carrier != pair_init_lab::DialCarrier::P2p =>
+        {
+            ext::run_send_secure_on(
+                data_dir,
+                &id,
+                &only.dial,
+                &target.pub_hex,
+                &target.listen,
+                text,
+                "",
+                "",
+                only.carrier,
+            )
+            .map(|()| only.clone())
+        }
+        routes => ext::run_send_secure_routes(
+            data_dir,
+            &id,
+            routes,
+            &target.pub_hex,
+            text,
+            matches!(choice, CarrierChoice::Internet | CarrierChoice::P2p),
+            match choice {
+                CarrierChoice::Auto => raven_core::outbox::CarrierChoice::Auto,
+                CarrierChoice::Lan => raven_core::outbox::CarrierChoice::Lan,
+                CarrierChoice::Internet => raven_core::outbox::CarrierChoice::Internet,
+                CarrierChoice::P2p => raven_core::outbox::CarrierChoice::P2p,
+            },
         ),
-    };
-    if let Err(error) = result {
-        eprintln!("send refused: {error}");
-        std::process::exit(1);
     }
 }
 
@@ -3471,16 +6756,17 @@ fn cmd_send_cli(
     let carrier = match parse_send_carrier(carrier) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{}", sanitize_terminal_text(&e));
+            eprintln!("{}", sanitize_terminal_line(&e));
             std::process::exit(1);
         }
     };
     let no_target = contact.trim().is_empty() && peer.trim().is_empty();
     if chat {
-        if carrier == pair_init_lab::DialCarrier::Internet {
+        if matches!(carrier, CarrierChoice::Internet | CarrierChoice::P2p) {
             eprintln!(
-                "ash send --chat --carrier internet is not in this slice \
-                 (localhost indexed send-only; not WAN Proven)"
+                "ash send --chat --carrier internet|p2p is not in this slice: live chat uses the \
+                 contact's LAN address (send single messages over the Internet with \
+                 `raven send --contact NAME`)"
             );
             std::process::exit(1);
         }
@@ -3499,24 +6785,22 @@ fn cmd_send_cli(
                     std::process::exit(1);
                 }
             };
-            let hits = resolve_alias_contacts(&contacts, contact);
+            let hits = resolve_contact_arg(&contacts, contact);
             if hits.is_empty() {
-                eprintln!(
-                    "no contact for {} — ash contact add … --tag … --lan-dial host:port",
-                    sanitize_terminal_text(contact)
-                );
+                eprintln!("{}", no_contact_message(&contacts, contact));
                 std::process::exit(1);
             }
             if hits.len() > 1 {
                 eprintln!(
-                    "contact tag {} is ambiguous ({} matches)",
-                    sanitize_terminal_text(contact),
+                    "contact {} is ambiguous ({} matches): use the @tag, or see `ash contact list`",
+                    sanitize_terminal_line(contact),
                     hits.len()
                 );
                 std::process::exit(1);
             }
             let c = hits[0];
-            let Some(ResolvedLanPeer::Dial(dial)) = resolve_or_reuse_lan_dial(data_dir, c) else {
+            // Chat never persists an env dial (no delivery signal to save after).
+            let Some((ResolvedLanPeer::Dial(dial), _)) = resolve_or_reuse_lan_dial(c) else {
                 eprintln!(
                     "contact {} has no reachable lan_dial — set host:port",
                     c.primary_label()
@@ -3543,60 +6827,149 @@ fn cmd_send_cli(
         return;
     }
     if no_target && stdin_is_tty() {
+        // The guided picker only speaks LAN: an explicit `--carrier internet`
+        // must not silently end up there (lab evidence on the wrong carrier).
+        if matches!(carrier, CarrierChoice::Internet | CarrierChoice::P2p) {
+            eprintln!(
+                "ash send --carrier internet|p2p requires --contact @tag (or, for internet, \
+                 --peer host:port plus --peer-pub-hex)"
+            );
+            std::process::exit(1);
+        }
         cmd_send_interactive(data_dir);
         return;
     }
     if !stdin_text {
         ext::refuse_argv_plaintext();
     }
-    let mut text = String::new();
-    if io::stdin().read_to_string(&mut text).is_err() {
-        eprintln!("failed to read message from stdin");
-        std::process::exit(1);
+    if stdin_is_tty() {
+        // A target was given, so no picker follows: say what is being waited for.
+        eprintln!("type your message, then press Ctrl-D on an empty line to send");
     }
-    let text = text.trim_end_matches(['\r', '\n']);
+    let text = match read_message_text(
+        io::stdin().lock(),
+        raven_core::lan_noise::MAX_LAN_ENDPOINT_TEXT,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
     if text.is_empty() {
         eprintln!("empty message");
         std::process::exit(1);
     }
-    match resolve_send_target(data_dir, contact, peer, peer_pub_hex, listen) {
-        Ok((peer, pub_hex, listen)) => run_send(data_dir, &peer, &pub_hex, &listen, text, carrier),
+    if stdin_is_tty() {
+        if let Some(problem) = tty_message_problem(&text) {
+            eprintln!("{problem}");
+            std::process::exit(1);
+        }
+    }
+    match resolve_send_target(data_dir, contact, peer, peer_pub_hex, listen, carrier) {
+        Ok(target) => {
+            let used = match run_send(data_dir, &target, &text, carrier) {
+                Ok(used) => used,
+                Err(error) => {
+                    eprintln!("{}", pair_init_lab::send_failure_line(&error));
+                    std::process::exit(1);
+                }
+            };
+            let env_dial_used = used.carrier == pair_init_lab::DialCarrier::Lan
+                && target.env_lan_dial.as_deref() == Some(used.dial.as_str());
+            if env_dial_used {
+                // The dial came from RAVEN_PEER and just reached (and
+                // authenticated) this contact: only now is it worth keeping.
+                match update_contact_lan_dial(data_dir, &target.pub_hex, &used.dial) {
+                    Ok(()) => println!("{C_DIM}Saved lan_dial on contact for next Send.{C_RESET}"),
+                    Err(e) => eprintln!("could not save dial: {}", sanitize_terminal_line(&e)),
+                }
+            }
+        }
         Err(e) => {
-            eprintln!("{}", sanitize_terminal_text(&e));
+            eprintln!("{}", sanitize_terminal_line(&e));
             std::process::exit(1);
         }
     }
 }
 
+/// Slack so trailing CR/LF past the limit are not mistaken for an oversized body.
+const STDIN_TRAILING_SLACK: usize = 4096;
+
+/// Read the message body for `ash send` from `input`, never buffering much
+/// more than `max_bytes`: a runaway pipe (`cat /dev/zero | ash send …`) must hit
+/// the size error, not exhaust memory first. Trailing CR/LF are dropped.
+fn read_message_text(input: impl Read, max_bytes: usize) -> Result<String, String> {
+    let too_large = || format!("message too large (max {max_bytes} bytes)");
+    let limit = (max_bytes + STDIN_TRAILING_SLACK + 1) as u64;
+    let mut buf = Vec::new();
+    input
+        .take(limit)
+        .read_to_end(&mut buf)
+        .map_err(|_| "failed to read message from stdin".to_string())?;
+    if buf.len() as u64 >= limit {
+        return Err(too_large());
+    }
+    let text =
+        String::from_utf8(buf).map_err(|_| "failed to read message from stdin".to_string())?;
+    let text = text.trim_end_matches(['\r', '\n']);
+    if text.len() > max_bytes {
+        return Err(too_large());
+    }
+    Ok(text.to_string())
+}
+
 /// Flat menu model shared by both navigation modes.
 const MENU_ITEMS: [(&str, &str, &str); 8] = [
-    ("1", "Chat / Send", "message a contact — guided"),
-    ("2", "Inbox", "committed endpoint inbox"),
-    ("3", "Status", "identity · bridge · transports"),
-    ("4", "Listen", "receive — one command, no flags"),
-    ("5", "Contacts", "add by rvn1… paste · list · verify"),
-    ("6", "Mailbox", "opaque offline put/get"),
-    ("7", "Nearby scan", "ephemeral BLE discovery"),
-    ("8", "Tutorial", "guided walkthrough — start here"),
+    ("1", "Chat / Send", "send one message to a contact"),
+    ("2", "Inbox", "messages you received"),
+    ("3", "Status", "your invite, contacts, is the node running"),
+    (
+        "4",
+        "Listen",
+        "stay online to receive (keep this window open)",
+    ),
+    (
+        "5",
+        "Contacts",
+        "add a friend (paste their invite) · list · verify",
+    ),
+    (
+        "6",
+        "Mailbox",
+        "advanced tool, this computer only (not your inbox)",
+    ),
+    (
+        "7",
+        "Nearby scan",
+        "demo, this computer only (no Bluetooth yet)",
+    ),
+    ("8", "Tutorial", "new here? start here"),
 ];
 
 /// Execute a menu choice; returns false when the user asked to quit.
 fn run_menu_choice(data_dir: &Path, choice: &str) -> bool {
     let c = c();
-    match choice {
+    match choice.to_ascii_lowercase().as_str() {
         "1" | "s" | "send" | "chat" => cmd_send_interactive(data_dir),
-        "2" | "i" | "inbox" => cmd_endpoint_inbox(data_dir),
-        "3" | "st" | "status" => {
-            let _ = cmd_status(data_dir);
+        "2" | "i" | "inbox" => show_menu_error(cmd_endpoint_inbox(data_dir)),
+        "3" | "st" | "status" => show_menu_error(cmd_status(data_dir)),
+        "4" | "l" | "listen" => {
+            if let Err((_, msg)) = cmd_listen(data_dir) {
+                report_listen_error(&msg);
+            }
         }
-        "4" | "l" | "listen" => cmd_listen(data_dir),
         "5" | "c" | "contacts" => cmd_contacts(data_dir),
         "6" | "mailbox" => println!(
-            "{0}mailbox is subcommand-driven — see `ash mailbox --help`.{1}",
+            "{0}Mailbox is an advanced tool for this computer only; it is not where your messages arrive (that is menu 2 Inbox). Details: `ash mailbox --help`.{1}",
             c.dim, c.reset
         ),
         "7" | "nearby" => println!(
-            "{0}nearby scan: run `ash nearby --help` in another shell              (menu stays responsive here).{1}",
+            "{0}Nearby scan is a demo on this computer only (no Bluetooth yet): it cannot find friends. To add a friend use menu 5 Contacts. Run the demo anyway: `ash nearby`.{1}",
+            c.dim, c.reset
+        ),
+        "h" | "?" | "help" => println!(
+            "{0}Pick a number from 1 to 8 (8 = Tutorial, a guided start), or q to quit.{1}",
             c.dim, c.reset
         ),
         "8" | "t" | "tutorial" => cmd_tutorial(data_dir),
@@ -3605,24 +6978,54 @@ fn run_menu_choice(data_dir: &Path, choice: &str) -> bool {
             return false;
         }
         "" => {}
-        other => println!(
-            "{0}unknown:{1} {2} {0}— pick 1-8 or q{1}",
-            c.dim, c.reset, other
+        _ => println!(
+            "{0}unknown:{1} {2} {0}— pick 1-8 or q (h = help){1}",
+            c.dim,
+            c.reset,
+            sanitize_terminal_line(choice)
         ),
     }
     true
 }
 
 fn interactive(data_dir: &Path) {
-    print_welcome(data_dir);
-    if !offer_first_run_identity(data_dir) {
-        println!("{C_DIM}tip: run `ash init` anytime to create an identity.{C_RESET}");
+    let state = print_welcome_state(data_dir);
+    let first = offer_first_run_identity_given(data_dir, state);
+    match first {
+        FirstRun::Present | FirstRun::Created => {}
+        FirstRun::Declined => {
+            println!("{C_DIM}tip: run `ash init` anytime to create an identity.{C_RESET}");
+        }
+        // `ash init` is exactly what the store is refusing: do not send the user
+        // there to create one; it prints the recovery steps instead.
+        FirstRun::Unavailable => {
+            println!(
+                "{C_DIM}no identity was offered: the identity store above must be fixed \
+                 first. `ash init` shows the same error and, for leftover profile state, \
+                 the recovery steps.{C_RESET}"
+            );
+        }
     }
     if io::stdin().is_terminal() && !cfg!(windows) {
+        // The arrow menu clears the screen: without a pause the identity and
+        // invite just printed (or the reason there is none) vanish at once.
+        if first != FirstRun::Present {
+            pause_before_menu();
+        }
         arrow_menu_loop(data_dir);
     } else {
         line_menu_loop(data_dir);
     }
+}
+
+/// Terminal only: wait for Enter so what the first-run offer printed can be read
+/// and copied before the menu redraws the screen. EOF just carries on.
+fn pause_before_menu() {
+    println!(
+        "\n{C_DIM}Press Enter to open the menu (`ash whoami` shows your invite again).{C_RESET}"
+    );
+    let _ = io::stdout().flush();
+    let _ = read_line_opt();
 }
 
 /// Classic numbered input — used when stdin is piped (tests) or on Windows.
@@ -3707,17 +7110,10 @@ fn wait_back() -> bool {
     // Returns false = quit app. True = go back to menu.
     println!("\n  {d}[Esc] back{r}", d = c().dim, r = c().reset);
     let _ = io::stdout().flush();
-    stty(&["raw", "-echo"]);
     loop {
         match read_key_raw() {
-            MenuKey::Escape | MenuKey::Enter => {
-                stty(&["sane"]);
-                return true;
-            }
-            MenuKey::Quit => {
-                stty(&["sane"]);
-                return false;
-            }
+            MenuKey::Escape | MenuKey::Enter => return true,
+            MenuKey::Quit => return false,
             _ => {}
         }
     }
@@ -3730,11 +7126,45 @@ fn stty(args: &[&str]) {
     let _ = args;
 }
 
+/// The user's own tty settings (`stty -g`), captured once before the first
+/// raw read so every restore puts back exactly what they had — not `sane`.
+fn saved_tty_state() -> Option<&'static str> {
+    static SAVED: OnceLock<Option<String>> = OnceLock::new();
+    SAVED
+        .get_or_init(|| {
+            #[cfg(unix)]
+            {
+                let out = Command::new("stty")
+                    .arg("-g")
+                    .stdin(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .ok()?;
+                let state = String::from_utf8(out.stdout).ok()?.trim().to_string();
+                (out.status.success() && !state.is_empty()).then_some(state)
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        })
+        .as_deref()
+}
+
+fn restore_tty() {
+    match saved_tty_state() {
+        Some(state) => stty(&[state]),
+        None => stty(&["sane"]),
+    }
+}
+
 fn read_key_raw() -> MenuKey {
+    // Capture the user's settings before the first switch into raw mode.
+    let _ = saved_tty_state();
     // Brief raw window: keystrokes arrive unbuffered (no Enter needed).
     stty(&["raw", "-echo"]);
     let key = read_key_raw_inner();
-    stty(&["sane"]);
+    restore_tty();
     key
 }
 
@@ -3747,29 +7177,73 @@ fn read_key_raw_inner() -> MenuKey {
     match b[0] {
         b'\r' | b'\n' => MenuKey::Enter,
         0x1b => {
-            let mut b2 = [0u8; 1];
-            // Poll briefly — if no follow-up byte, this is a bare ESC press.
-            if io::stdin().read(&mut b2).unwrap_or(0) == 0 {
-                return MenuKey::Escape;
-            }
-            if b2[0] != b'[' {
-                return MenuKey::Escape;
-            }
-            let mut b3 = [0u8; 1];
-            if io::stdin().read(&mut b3).unwrap_or(0) == 0 {
-                return MenuKey::Other;
-            }
-            match b3[0] {
-                b'A' => MenuKey::Up,
-                b'B' => MenuKey::Down,
-                _ => MenuKey::Other,
-            }
+            // `stty raw` is VMIN=1/VTIME=0, so a plain read would block until
+            // the NEXT key (and swallow it). Arrow keys send their bytes
+            // together; switch to a 100 ms timed read to tell them apart from
+            // a bare Esc press.
+            stty(&["min", "0", "time", "1"]);
+            let tail = read_escape_tail(|buf| io::stdin().read(buf).unwrap_or(0));
+            stty(&["min", "1", "time", "0"]);
+            classify_escape(&tail)
         }
         b'q' | b'Q' => MenuKey::Quit,
         b'\x03' => MenuKey::Quit, // Ctrl+C
         d @ b'1'..=b'8' => MenuKey::Digit((d - b'0') as usize),
         _ => MenuKey::Other,
     }
+}
+
+/// Drain the rest of one escape sequence after ESC: a whole CSI (`[`,
+/// parameter bytes 0x20..=0x3F, one final byte) or SS3 (`O` + one byte), so
+/// modifier keys such as Ctrl+Up (`ESC [ 1 ; 5 A`) leave no stray bytes for
+/// the next key read. `read1` returns 0 on timeout / EOF. Bounded at 16 bytes.
+fn read_escape_tail(mut read1: impl FnMut(&mut [u8]) -> usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut b = [0u8; 1];
+    if read1(&mut b) == 0 {
+        return out;
+    }
+    let first = b[0];
+    out.push(first);
+    match first {
+        b'[' => {
+            while out.len() < 16 {
+                if read1(&mut b) == 0 {
+                    break;
+                }
+                out.push(b[0]);
+                if !(0x20..=0x3f).contains(&b[0]) {
+                    break; // final byte (or anything that cannot continue a CSI)
+                }
+            }
+        }
+        b'O' if read1(&mut b) == 1 => out.push(b[0]),
+        _ => {}
+    }
+    out
+}
+
+/// Bytes read after ESC (within the timed window) → key. Accepts CSI and SS3
+/// (application cursor mode) arrows, with or without modifier parameters.
+fn classify_escape(after_esc: &[u8]) -> MenuKey {
+    match after_esc {
+        [] => MenuKey::Escape,
+        [b'[' | b'O', .., b'A'] => MenuKey::Up,
+        [b'[' | b'O', .., b'B'] => MenuKey::Down,
+        [b'[' | b'O', ..] => MenuKey::Other,
+        _ => MenuKey::Escape,
+    }
+}
+
+/// The `raven ❯` prompt row. Its style is closed again: an unreset bold here
+/// used to leak into the next command's first unstyled output.
+fn arrow_menu_prompt(cc: &Colors) -> String {
+    format!("raven {}❯ {}", cc.cyan, cc.reset)
+}
+
+/// The line under the arrow menu: ONE quit key, how to move, where to start.
+fn arrow_menu_footer(dim: &str, reset: &str) -> String {
+    format!("q  quit   {dim}(up/down + Enter, or press a number)  ·  new here? press 8{reset}")
 }
 
 fn render_arrow_menu(sel: usize, first: bool) {
@@ -3816,12 +7290,8 @@ fn render_arrow_menu(sel: usize, first: bool) {
     row(&mut lines, 6);
     row(&mut lines, 7);
     lines.push(String::new());
-    lines.push(format!(
-        "q  quit   {d}q  quit{r}   {d}(up/down + Enter · number = jump){r}",
-        d = dim,
-        r = reset
-    ));
-    lines.push(format!("raven {c}❯ ", c = cc.cyan));
+    lines.push(arrow_menu_footer(dim, reset));
+    lines.push(arrow_menu_prompt(&cc));
 
     let n = lines.len();
     // Clear-to-end-of-line on every row so highlights never leave residue,
@@ -3847,12 +7317,31 @@ pub fn run() {
         std::process::exit(1);
     }
     let cli = Cli::parse();
-    let data_dir = resolve_data_dir(&cli.data_dir);
-    let _ = std::fs::create_dir_all(&data_dir);
+    // Linux passphrase vault (no reachable Secret Service): the CLI may ask
+    // for the keystore passphrase on its terminal (no echo; twice on first
+    // creation). Non-TTY runs still need RAVEN_KEYSTORE_PASSPHRASE_FILE, and
+    // raven-node never prompts. No effect on macOS / Windows backends.
+    raven_core::keystore_vault::enable_terminal_prompt();
+    // Say up front when there is no profile to use (no --data-dir, no
+    // RAVEN_DATA_DIR / ASH_DATA_DIR and no usable HOME), instead of letting
+    // whichever store is touched first fail with "Not a directory".
+    let data_dir = match resolve_data_dir(&cli.data_dir) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let _ = create_private_data_dir(&data_dir);
     match cli.cmd {
         None => interactive(&data_dir),
         Some(Commands::Banner) => print_welcome(&data_dir),
-        Some(Commands::Listen) => cmd_listen(&data_dir),
+        Some(Commands::Listen) => {
+            if let Err((code, msg)) = cmd_listen(&data_dir) {
+                report_listen_error(&msg);
+                std::process::exit(code);
+            }
+        }
         Some(Commands::Init) => {
             let id = ensure_identity(&data_dir);
             println!("address={}", id.address());
@@ -3866,9 +7355,23 @@ pub fn run() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Whoami { json }) => match try_load_identity(&data_dir) {
+        Some(Commands::Whoami {
+            json,
+            card,
+            inet,
+            lan,
+            via,
+        }) => match try_load_identity(&data_dir) {
             Ok(Some(id)) => {
-                if json {
+                if card {
+                    exit_on_err(cmd_whoami_card(
+                        &data_dir,
+                        &id,
+                        inet.as_deref(),
+                        lan.as_deref(),
+                        &via,
+                    ));
+                } else if json {
                     println!("{}", public_whoami_card(&id));
                 } else {
                     print_public_identity(&id);
@@ -3879,13 +7382,16 @@ pub fn run() {
                     eprintln!("{{\"error\":\"no_identity\"}}");
                     std::process::exit(1);
                 }
+                if card {
+                    eprintln!("no identity — run `raven init` first");
+                    std::process::exit(1);
+                }
                 println!("no identity — run init");
             }
             Err(e) => {
-                eprintln!("identity store: {}", sanitize_terminal_text(&e));
-                if json {
-                    std::process::exit(1);
-                }
+                // A hard failure (not just "no identity yet"): never exit 0.
+                eprintln!("identity store: {}", sanitize_terminal_line(&e));
+                std::process::exit(1);
             }
         },
         Some(Commands::Status) => {
@@ -3896,7 +7402,8 @@ pub fn run() {
         }
         Some(Commands::Doctor { require_ready }) => cmd_doctor(&data_dir, require_ready),
         Some(Commands::IpcPing) => cmd_ipc_ping(&data_dir),
-        Some(Commands::Inbox) => cmd_endpoint_inbox(&data_dir),
+        Some(Commands::Inbox) => exit_on_err(cmd_endpoint_inbox(&data_dir)),
+        Some(Commands::Outbox { cmd }) => exit_on_err(cmd_outbox_cli(&data_dir, cmd)),
         Some(Commands::Send {
             peer,
             peer_pub_hex,
@@ -3933,6 +7440,30 @@ pub fn run() {
             NodeCommands::Relay { state } => {
                 set_node_flag(&data_dir, "relay", matches!(state, OnOff::On))
             }
+            NodeCommands::Internet { state } => exit_on_err(match state {
+                InternetState::On { listen } => cmd_node_internet(&data_dir, Some(&listen)),
+                InternetState::Off => cmd_node_internet(&data_dir, None),
+            }),
+            NodeCommands::P2p { state } => exit_on_err(match state {
+                P2pState::On {
+                    listen,
+                    relay,
+                    upnp,
+                    no_upnp,
+                } => p2p_cli::cmd_node_p2p(
+                    &data_dir,
+                    Some(p2p_cli::P2pOnArgs {
+                        listen,
+                        relay,
+                        upnp: (upnp || no_upnp).then_some(upnp),
+                    }),
+                ),
+                P2pState::Off => p2p_cli::cmd_node_p2p(&data_dir, None),
+            }),
+            NodeCommands::Upnp { state } => exit_on_err(p2p_cli::cmd_node_upnp(
+                &data_dir,
+                matches!(state, OnOff::On),
+            )),
             NodeCommands::AddBootstrap { multiaddr, manual } => {
                 ext::cmd_bootstrap_add(&data_dir, &multiaddr, manual)
             }
@@ -3942,6 +7473,16 @@ pub fn run() {
                 ext::cmd_bootstrap_init(&data_dir, no_raven_defaults)
             }
         },
+        Some(Commands::Relay { cmd }) => exit_on_err(match cmd {
+            RelayCommands::Allow { who, card, label } => {
+                p2p_cli::cmd_relay_allow(&data_dir, who.as_deref(), card.as_deref(), &label)
+            }
+            RelayCommands::Deny { who } => p2p_cli::cmd_relay_deny(&data_dir, &who),
+            RelayCommands::Status => p2p_cli::cmd_relay_status(&data_dir),
+            RelayCommands::Card { host, port, quic } => {
+                p2p_cli::cmd_relay_card(&data_dir, host.as_deref(), port, quic)
+            }
+        }),
         Some(Commands::Alias { cmd }) => match cmd {
             AliasCommands::Publish {
                 alias,
@@ -3954,7 +7495,7 @@ pub fn run() {
                 cmd_prekey_publish(&data_dir, &device_id, out.as_deref())
             }
             PrekeyCommands::Fetch { pub_hex, file } => {
-                cmd_prekey_fetch(&data_dir, &pub_hex, file.as_deref())
+                exit_on_err(cmd_prekey_fetch(&data_dir, &pub_hex, file.as_deref()))
             }
         },
         Some(Commands::Device { cmd }) => {
@@ -3974,15 +7515,23 @@ pub fn run() {
         Some(Commands::Mailbox { cmd }) => match cmd {
             MailboxCommands::Put {
                 k_route_hex,
+                k_route_stdin,
                 epoch,
                 slot,
                 envelope_hex,
-            } => ext::cmd_mailbox_put(&data_dir, &k_route_hex, epoch, slot, &envelope_hex),
+            } => {
+                let k_route = k_route_or_exit(k_route_hex.as_deref(), k_route_stdin);
+                ext::cmd_mailbox_put(&data_dir, &k_route, epoch, slot, &envelope_hex)
+            }
             MailboxCommands::Get {
                 k_route_hex,
+                k_route_stdin,
                 epoch,
                 slot,
-            } => ext::cmd_mailbox_get(&data_dir, &k_route_hex, epoch, slot),
+            } => {
+                let k_route = k_route_or_exit(k_route_hex.as_deref(), k_route_stdin);
+                ext::cmd_mailbox_get(&data_dir, &k_route, epoch, slot)
+            }
         },
         Some(Commands::Lab { cmd }) => match cmd {
             LabCommands::ExportCert => {
@@ -4001,7 +7550,7 @@ pub fn run() {
                 }
             }
             LabCommands::ImportPeerPrekey { peer_pub_hex, file } => {
-                cmd_prekey_fetch(&data_dir, &peer_pub_hex, Some(&file))
+                exit_on_err(cmd_prekey_fetch(&data_dir, &peer_pub_hex, Some(&file)))
             }
             LabCommands::Status => print_production_gate_matrix(),
             LabCommands::LanDialSealed {
@@ -4014,15 +7563,62 @@ pub fn run() {
             ContactCommands::Add {
                 address,
                 pub_hex,
+                card,
                 petname,
                 tag,
                 alias,
                 verify_fp,
                 prekey_file,
                 lan_dial,
+                internet_dial,
             } => {
                 let public_tag = if !tag.trim().is_empty() { tag } else { alias };
-                if let Err(e) = add_contact(
+                // A card is parsed (strictly) before anything else: a bad one
+                // changes nothing and creates no file.
+                let card = card.as_deref().map(read_card_arg).transpose();
+                let card = match card {
+                    Ok(card) => card,
+                    Err(e) => {
+                        eprintln!("{}", sanitize_terminal_line(&e));
+                        std::process::exit(1);
+                    }
+                };
+                let (address, pub_hex, lan_dial, internet_dial) = match &card {
+                    // Explicit route flags win over the card's hints.
+                    Some(c) => (
+                        c.address.clone(),
+                        c.pub_hex.clone(),
+                        if lan_dial.trim().is_empty() {
+                            c.lan.clone()
+                        } else {
+                            lan_dial
+                        },
+                        if internet_dial.trim().is_empty() {
+                            c.internet.clone()
+                        } else {
+                            internet_dial
+                        },
+                    ),
+                    None => (
+                        address.unwrap_or_default(),
+                        pub_hex.unwrap_or_default(),
+                        lan_dial,
+                        internet_dial,
+                    ),
+                };
+                exit_on_err(require_identity_before_state(&data_dir, "contact add"));
+                if is_own_pub_hex(&data_dir, &pub_hex) {
+                    eprintln!(
+                        "warning: this is YOUR OWN identity, not a friend's. Nobody else can be reached with it; ask your friend for THEIR invite (`ash whoami`)."
+                    );
+                }
+                if card.is_some() {
+                    println!(
+                        "{C_DIM}card read: key and address match; its addresses are only hints for reaching them{C_RESET}"
+                    );
+                }
+                let p2p = card.as_ref().and_then(|c| c.p2p.clone());
+                if let Err(e) = add_contact_with_routes(
                     &data_dir,
                     &address,
                     &pub_hex,
@@ -4030,32 +7626,34 @@ pub fn run() {
                     &public_tag,
                     verify_fp.as_deref(),
                     &lan_dial,
+                    &internet_dial,
+                    p2p.as_ref(),
                 ) {
-                    eprintln!("{}", sanitize_terminal_text(&e));
+                    eprintln!("{}", sanitize_terminal_line(&e));
                     std::process::exit(1);
                 }
                 if let Some(path) = prekey_file {
                     if let Err(e) = ext::contact_add_fetch_prekey(&data_dir, &pub_hex, Some(&path))
                     {
-                        eprintln!("{}", sanitize_terminal_text(&e));
+                        eprintln!("{}", sanitize_terminal_line(&e));
                         std::process::exit(1);
                     }
                 }
             }
-            ContactCommands::List => cmd_contact_list(&data_dir),
+            ContactCommands::List => exit_on_err(cmd_contact_list(&data_dir)),
             ContactCommands::Verify {
                 tag,
                 alias,
                 petname,
                 address,
-            } => cmd_contact_verify(
+            } => exit_on_err(cmd_contact_verify(
                 &data_dir,
                 tag.as_deref(),
                 alias.as_deref(),
                 petname.as_deref(),
                 address.as_deref(),
-            ),
-            ContactCommands::Resolve { tag } => cmd_contact_resolve(&data_dir, &tag),
+            )),
+            ContactCommands::Resolve { tag } => exit_on_err(cmd_contact_resolve(&data_dir, &tag)),
             ContactCommands::Request {
                 target,
                 message,
@@ -4069,6 +7667,55 @@ pub fn run() {
             } => cmd_contact_accept(&data_dir, &request_id, &petname),
             ContactCommands::Decline { request_id } => cmd_contact_decline(&data_dir, &request_id),
             ContactCommands::Block { request_id } => cmd_contact_block(&data_dir, &request_id),
+            ContactCommands::Unblock { pub_hex } => {
+                exit_on_err(cmd_contact_unblock(&data_dir, &pub_hex))
+            }
+            ContactCommands::Remove {
+                tag,
+                petname,
+                address,
+                yes,
+            } => exit_on_err(cmd_contact_remove(
+                &data_dir,
+                tag.as_deref(),
+                petname.as_deref(),
+                address.as_deref(),
+                yes,
+            )),
+            ContactCommands::SetAddr {
+                selector,
+                tag,
+                petname,
+                address,
+                lan,
+                internet,
+                p2p,
+                via,
+                clear,
+            } => exit_on_err(cmd_contact_set_routes(
+                &data_dir,
+                selector.as_deref(),
+                tag.as_deref(),
+                petname.as_deref(),
+                address.as_deref(),
+                lan.as_deref(),
+                internet.as_deref(),
+                p2p.as_deref(),
+                &via,
+                &clear,
+            )),
+            ContactCommands::SetDial {
+                tag,
+                petname,
+                address,
+                lan_dial,
+            } => exit_on_err(cmd_contact_set_dial(
+                &data_dir,
+                tag.as_deref(),
+                petname.as_deref(),
+                address.as_deref(),
+                &lan_dial,
+            )),
         },
     }
 }
@@ -4077,33 +7724,35 @@ pub fn run() {
 /// then runs the safe ones inline. No private material is ever displayed.
 fn cmd_tutorial(data_dir: &Path) {
     let c = c();
-    let _ = offer_first_run_identity(data_dir);
+    let first = offer_first_run_identity(data_dir);
 
     println!(
         "\n{0}\u{2550}\u{2550}\u{2550} RAVEN TUTORIAL \u{2550}\u{2550}\u{2550}{1}",
         c.purple, c.reset
     );
     println!(
-        "{0}Raven is serverless: you and your contacts ARE the network.{1}",
+        "{0}Raven has no central server: you and your friends ARE the network.{1}",
         c.dim, c.reset
     );
     println!(
-        "{0}No phone number, no central account, messages relayed by peers.{1}\n",
+        "{0}No phone number, no account. Messages go straight between people who added each other.{1}\n",
         c.dim, c.reset
     );
 
-    println!("{0}[1/4] Identity{1}", c.bold, c.reset);
+    println!("{0}[1/4] Your identity{1}", c.bold, c.reset);
     match try_load_identity(data_dir) {
         Ok(Some(id)) => {
+            let word = if first == FirstRun::Created {
+                "created"
+            } else {
+                "ready"
+            };
             println!(
-                "  {0}\u{2714}{1} created. Your public bits:",
+                "  {0}\u{2714}{1} {word}. These lines are public and safe to share. The one to send your friend is the `invite` line:",
                 c.green, c.reset
             );
             print_public_identity(&id);
-            println!(
-                "  {0}Share address+fingerprint with friends over any channel;\n  they pin it, you pin theirs \u{2014} that mutual pin IS the trust.{1}\n",
-                c.dim, c.reset
-            );
+            println!();
         }
         Ok(None) => {
             println!(
@@ -4113,14 +7762,14 @@ fn cmd_tutorial(data_dir: &Path) {
             return;
         }
         Err(e) => {
-            println!("  {0}\u{00d7} {1}\n", c.red, sanitize_terminal_text(&e));
+            println!("  {0}\u{00d7} {1}\n", c.red, sanitize_terminal_line(&e));
             return;
         }
     }
 
-    println!("{0}[2/4] Add your first contact{1}", c.bold, c.reset);
+    println!("{0}[2/4] Add your friend{1}", c.bold, c.reset);
     println!(
-        "  {0}Ask a friend to run {1}ash whoami{0} and paste their three lines here.\n  Paste detection accepts the whole block at once.{2}",
+        "  {0}Paste your friend's invite line (or their whole {1}ash whoami{0} block).\n  They must add YOU the same way: messages only flow between people who added each other.{2}",
         c.dim, c.bold, c.reset
     );
     print!("  {}Add now? [y/N] {}", c.yellow, c.reset);
@@ -4133,26 +7782,33 @@ fn cmd_tutorial(data_dir: &Path) {
     }
     println!();
 
-    println!("{0}[3/4] Health check{1}", c.bold, c.reset);
+    println!("{0}[3/4] Check this computer{1}", c.bold, c.reset);
     match cmd_status(data_dir) {
         Ok(_) => println!(
-            "  {0}\u{2714}{1} messaging_path must read {2}serverless_rvn1{1}\n",
-            c.green, c.reset, c.bold
+            "  {0}The last line above says whether this computer can send and receive.\n  Sending starts what it needs by itself; to RECEIVE keep menu 4 (Listen) open.{1}\n",
+            c.dim, c.reset
         ),
         Err(e) => println!("  {0}\u{00d7}{1} status: {2}\n", c.red, c.reset, e),
     }
 
-    println!("{0}[4/4] Send a message{1}", c.bold, c.reset);
+    println!("{0}[4/4] Send and receive{1}", c.bold, c.reset);
     println!(
-        "  {0}Menu 1 \u{2192} pick contact \u{2192} type message.\n  Direct LAN first; bridge relays when peers are apart;\n  mailbox stores opaque bytes while someone is offline.{1}\n",
+        "  {0}Send: menu 1, pick your friend, type the message.\n  Receive: your friend keeps menu 4 (Listen) open on their computer; you read replies in menu 2 (Inbox).\n  If a send fails, run `ash doctor`: it says what to do next.{1}\n",
         c.dim, c.reset
     );
 
     println!("{0}Done!{1}", c.purple, c.reset);
-    println!(
-        "  {0}Full diagnostics anytime: {1}ash doctor{0}{1}",
-        c.reset, c.dim
-    );
+    println!("{}", tutorial_footer(&c));
+}
+
+/// Tutorial last line: dim label, bold command, then one reset. (The arguments
+/// were swapped before, which dimmed the command and left everything printed
+/// afterwards dim.)
+fn tutorial_footer(c: &Colors) -> String {
+    format!(
+        "  {0}Full diagnostics anytime: {1}ash doctor{2}",
+        c.dim, c.bold, c.reset
+    )
 }
 
 fn arrow_menu_loop(data_dir: &Path) {
@@ -4217,6 +7873,7 @@ fn print_welcome_minimal(_data_dir: &Path) {
     let c = c();
     let (b, d, r) = (c.bold, c.dim, c.reset);
     println!("{b}R A V E N{r}  {d}\u{00b7}  serverless \u{00b7} P2P{r}");
+    println!("{d}your invite: `ash whoami`  \u{00b7}  new here? press 8{r}");
     println!();
 }
 
@@ -4316,7 +7973,7 @@ fn identity_usable(data_dir: &Path) -> bool {
 fn identity_not_usable_fail_line(issue: &str) -> String {
     format!(
         "  FAIL: identity not usable ({})",
-        sanitize_terminal_text(issue)
+        sanitize_terminal_line(issue)
     )
 }
 
@@ -4383,7 +8040,7 @@ fn probe_doctor_identity(data_dir: &Path) -> DoctorIdentityProbe {
                 _ => {
                     println!(
                         "  {C_PURPLE}secure_keystore{C_RESET}: unavailable ({})",
-                        sanitize_terminal_text(&raw)
+                        sanitize_terminal_line(&raw)
                     );
                     DoctorIdentityProbe {
                         usable: false,
@@ -4509,7 +8166,7 @@ fn print_presence(presence: &DaemonPresence) {
         DaemonPresence::Down { reason } => {
             println!(
                 "  daemon_presence: down ({})",
-                sanitize_terminal_text(reason)
+                sanitize_terminal_line(reason)
             );
         }
         DaemonPresence::Blocked { reason } => {
@@ -4536,17 +8193,92 @@ fn print_send_path(send: &SendPathLabel) {
     }
 }
 
+/// The one thing to do next, in plain words, from what `ash doctor` found. The
+/// first problem wins (no identity before no contacts before the node).
+fn doctor_next_step(identity: IdentityState, contacts: Option<usize>, reach: &NodeReach) -> String {
+    match (identity, contacts, reach) {
+        (IdentityState::Missing, _, _) => "run `ash init` to create your identity.".into(),
+        (IdentityState::Unavailable, _, _) => {
+            "fix the identity store problem shown in the details below; nothing can be sent until then."
+                .into()
+        }
+        (IdentityState::Ready, Some(0), _) => {
+            "add your first friend: run `ash`, open menu 5 Contacts and paste their invite line (they add yours the same way)."
+                .into()
+        }
+        (IdentityState::Ready, None, _) => {
+            "your contacts file cannot be read; see the message below.".into()
+        }
+        (IdentityState::Ready, Some(_), NodeReach::NotRunning) => {
+            "to receive messages run `ash listen` and keep it open (the node also starts by itself when you send).".into()
+        }
+        (IdentityState::Ready, Some(_), NodeReach::SendOnly) => {
+            "this computer is NOT receiving: the LAN listener is down. See raven-node-service.log in your Raven folder; sending still works.".into()
+        }
+        (IdentityState::Ready, Some(_), NodeReach::NotAnswering) => {
+            "raven-node is running but does not answer; see the details below.".into()
+        }
+        (IdentityState::Ready, Some(_), NodeReach::SendAndReceive) => {
+            "all set. Send a test message: echo \"hello\" | ash send --contact NAME".into()
+        }
+    }
+}
+
+/// Plain-language block at the top of `ash doctor` (the technical lines it keeps
+/// printing follow). Read-only: never starts the node. Returns the next step so
+/// the report can end with it too (`| tail` shows it).
+fn print_doctor_summary(data_dir: &Path) -> String {
+    let c = c();
+    let identity = match try_load_identity(data_dir) {
+        Ok(Some(_)) => IdentityState::Ready,
+        Ok(None) => IdentityState::Missing,
+        Err(_) => IdentityState::Unavailable,
+    };
+    let contacts = load_contacts(data_dir).ok().map(|v| v.len());
+    let reach = classify_node_reach(&ipc_client::ipc_request_timeout(
+        data_dir,
+        &IpcRequest::Status { v: IPC_VERSION },
+        Duration::from_secs(2),
+    ));
+    let identity_text = match identity {
+        IdentityState::Ready => "OK",
+        IdentityState::Missing => "MISSING (run: ash init)",
+        IdentityState::Unavailable => "UNAVAILABLE (see the details below)",
+    };
+    let node_text = match reach {
+        NodeReach::SendAndReceive => "running; you can send and receive",
+        NodeReach::SendOnly => "running, but NOT receiving (LAN listener is down)",
+        NodeReach::NotRunning => {
+            "NOT running (it starts when you send; to receive run: ash listen)"
+        }
+        NodeReach::NotAnswering => "running but not answering",
+    };
+    let contacts_text = match contacts {
+        Some(n) => n.to_string(),
+        None => "unreadable (see the message below)".into(),
+    };
+    let next = doctor_next_step(identity, contacts, &reach);
+    println!("{}SUMMARY{}", c.bold, c.reset);
+    kv("identity", identity_text);
+    kv("raven-node", node_text);
+    kv("contacts", &contacts_text);
+    kv("next step", &next);
+    println!("{}(technical details follow){}\n", c.dim, c.reset);
+    next
+}
+
 fn cmd_doctor(data_dir: &Path, require_ready: bool) {
     println!("{C_BOLD}raven doctor{C_RESET}");
+    let next_step = print_doctor_summary(data_dir);
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "?".into());
-    let exe_clean = sanitize_terminal_text(&exe);
+    let exe_clean = sanitize_terminal_line(&exe);
     println!("  this_binary={exe_clean}");
-    println!("  argv0_hint: prefer `raven` as primary command; `ash` is product alias");
+    println!("  argv0_hint: `raven` and `ash` are the same program (`ash` is the short name)");
     println!(
         "  data_dir={}",
-        sanitize_terminal_text(&data_dir.display().to_string())
+        sanitize_terminal_line(&data_dir.display().to_string())
     );
     let messaging_path_fail = print_messaging_path_diag().is_err();
     print_production_gate_matrix();
@@ -4569,12 +8301,12 @@ fn cmd_doctor(data_dir: &Path, require_ready: bool) {
             IpcEndpoint::Unsupported => "missing",
         }
     );
-    println!("  ipc_endpoint={}", sanitize_terminal_text(&ep.to_string()));
+    println!("  ipc_endpoint={}", sanitize_terminal_line(&ep.to_string()));
     match &ep {
         IpcEndpoint::UnixSocket(sock) => {
             println!(
                 "  file_present: ipc_endpoint={} {}",
-                sanitize_terminal_text(&sock.display().to_string()),
+                sanitize_terminal_line(&sock.display().to_string()),
                 if sock.exists() { "yes" } else { "no" }
             );
         }
@@ -4603,6 +8335,7 @@ fn cmd_doctor(data_dir: &Path, require_ready: bool) {
                 relay,
                 forward_pending,
                 capabilities,
+                ..
             }) => {
                 println!(
                     "  ipc_status: ok v={v} bridge={bridge} store={store} relay={relay} forward_pending={forward_pending} caps={}",
@@ -4611,7 +8344,7 @@ fn cmd_doctor(data_dir: &Path, require_ready: bool) {
             }
             Ok(_) => println!("  ipc_status: unexpected ipc response"),
             Err(e) => {
-                println!("  ipc_status: fail ({})", sanitize_terminal_text(e));
+                println!("  ipc_status: fail ({})", sanitize_terminal_line(e));
             }
         }
     }
@@ -4660,6 +8393,9 @@ fn cmd_doctor(data_dir: &Path, require_ready: bool) {
 
     let send = classify_send_path();
     print_send_path(&send);
+    println!(
+        "  send_path note: doctor never sends a test message; to try sending: echo \"hello\" | ash send --contact NAME"
+    );
 
     println!("  bluetooth: skipped (headless)");
     println!("  nat_class: unknown (BLOCKED_HARDWARE)");
@@ -4693,7 +8429,7 @@ fn cmd_doctor(data_dir: &Path, require_ready: bool) {
         {
             let s = String::from_utf8_lossy(&out.stdout);
             for line in s.lines() {
-                let clean = sanitize_terminal_text(line);
+                let clean = sanitize_terminal_line(line);
                 println!("  path_which: {clean}");
             }
         }
@@ -4703,12 +8439,12 @@ fn cmd_doctor(data_dir: &Path, require_ready: bool) {
             println!("  identity: present");
             print_public_identity(&id);
         }
-        Ok(None) => println!("  identity: missing (run raven init)"),
+        Ok(None) => println!("  identity: missing (run: ash init)"),
         Err(e) => {
             if identity_err.is_none() {
                 identity_err = Some(e.clone());
             }
-            println!("  identity: unavailable ({})", sanitize_terminal_text(&e));
+            println!("  identity: unavailable ({})", sanitize_terminal_line(&e));
         }
     }
     let pol = load_policy(data_dir);
@@ -4723,6 +8459,7 @@ fn cmd_doctor(data_dir: &Path, require_ready: bool) {
     println!(
         "{C_DIM}doctor report complete — send_path is not implied by daemon_presence or daemon_ready.{C_RESET}"
     );
+    println!("{C_BOLD}Next step:{C_RESET} {next_step}");
 
     let security = doctor_security_hold(messaging, identity_err.as_deref());
     let hard_failure = messaging_path_fail || identity.hard_fail;
@@ -4760,27 +8497,41 @@ mod tests {
 
     #[test]
     fn welcome_art_has_branding_not_secrets() {
-        // Capture-style: ensure motif strings exist; monochrome only (no brand RGB).
-        let art = format!("{}Welcome to Raven Node{}", "\x1b[1m", "\x1b[0m");
-        assert!(art.contains("Welcome to Raven Node"));
-        assert!(!art.contains("identity.seed"));
-        assert!(!art.contains("private"));
-        assert!(!art.contains("38;2;64;242;255")); // old cyan RGB gone
-        assert!(!art.contains("38;2;191;115;255")); // old purple RGB gone
+        // The real banner text printed by print_welcome (not a stand-in).
+        let art = welcome_banner_text();
+        assert!(art.contains("R A V E N"));
+        assert!(art.contains("Messaging Beyond Connectivity"));
+        assert!(art.contains("https://raven-messager.com"));
+        for secret in ["seed", "private_key", "secret", "rvn1", "pub_hex"] {
+            assert!(!art.contains(secret), "banner must not show {secret}");
+        }
+        // Monochrome: no 24-bit brand RGB, and only plain SGR (bold/dim/reset)
+        // when colour is on at all.
+        assert!(!art.contains("38;2;"));
+        if !color_enabled() {
+            assert!(!art.contains('\u{1b}'));
+        }
+        // Every framed line, borders included, has the same width (the old
+        // hand-padded box was ragged: 39..54 columns).
+        let widths: Vec<usize> = art
+            .lines()
+            .filter(|l| l.contains(['\u{2502}', '\u{256d}', '\u{2570}']))
+            .map(|l| l.chars().count())
+            .collect();
+        assert_eq!(widths.len(), 13, "{art}");
+        assert!(widths.iter().all(|w| *w == widths[0]), "{widths:?}");
     }
 
     #[test]
     fn no_color_style_is_empty() {
         // Palette consts are plain SGR codes (no 24-bit brand RGB).
-        assert!(!C_CYAN.contains("38;2"));
-        assert!(!C_PURPLE.contains("38;2"));
-        assert!(!C_GREEN.contains("38;2"));
+        assert!(!C_CYAN.0.contains("38;2"));
+        assert!(!C_PURPLE.0.contains("38;2"));
+        assert!(!C_GREEN.0.contains("38;2"));
         // color_enabled() is cached per-process (OnceLock), so we can only
         // assert consistency with the current environment, not both branches.
         let colors = c();
-        let colored_expected = std::env::var_os("NO_COLOR").is_none()
-            && std::env::var_os("TERM").as_deref() != Some(std::ffi::OsStr::new("dumb"));
-        if colored_expected {
+        if color_enabled() {
             // Black & white design: accent fields collapse to bold/dim.
             assert_eq!(colors.cyan, colors.bold);
             assert_eq!(colors.purple, colors.bold);
@@ -4788,7 +8539,18 @@ mod tests {
         } else {
             assert_eq!(colors.cyan, "");
             assert_eq!(colors.bold, "");
+            // The C_* palette used by ~100 format strings follows the same switch.
+            assert_eq!(format!("{C_BOLD}x{C_RESET}{C_DIM}{C_PURPLE}"), "x");
         }
+    }
+
+    #[test]
+    fn color_decision_honours_no_color_dumb_term_and_pipes() {
+        assert!(color_enabled_for(false, false, true));
+        assert!(!color_enabled_for(true, false, true));
+        assert!(!color_enabled_for(false, true, true));
+        // Output piped / redirected: no escapes.
+        assert!(!color_enabled_for(false, false, false));
     }
 
     #[test]
@@ -4909,38 +8671,35 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
     }
 
     #[test]
-    fn send_carrier_parses_lan_and_internet_refuses_wan() {
-        assert_eq!(
-            parse_send_carrier("lan").unwrap(),
-            pair_init_lab::DialCarrier::Lan
-        );
+    fn send_carrier_parses_auto_lan_and_internet_refuses_wan() {
+        assert_eq!(parse_send_carrier("auto").unwrap(), CarrierChoice::Auto);
+        assert_eq!(parse_send_carrier("").unwrap(), CarrierChoice::Auto);
+        assert_eq!(parse_send_carrier("lan").unwrap(), CarrierChoice::Lan);
+        assert_eq!(parse_send_carrier("LAN").unwrap(), CarrierChoice::Lan);
         assert_eq!(
             parse_send_carrier("internet").unwrap(),
-            pair_init_lab::DialCarrier::Internet
+            CarrierChoice::Internet
         );
         assert!(parse_send_carrier("wan").is_err());
+        assert!(parse_send_carrier("bluetooth").is_err());
     }
 
     #[test]
     fn resolve_reuses_saved_lan_dial_without_prompt() {
-        let got = resolve_lan_peer_parts("192.168.1.20:7420", None, false);
+        let got = resolve_lan_peer_parts("192.168.1.20:7420", None);
         assert_eq!(got, Some(ResolvedLanPeer::Dial("192.168.1.20:7420".into())));
         // Saved wins over env — no stdin involved.
-        let got = resolve_lan_peer_parts("10.0.0.2:7420", Some("10.0.0.9:7420"), true);
+        let got = resolve_lan_peer_parts("10.0.0.2:7420", Some("10.0.0.9:7420"));
         assert_eq!(got, Some(ResolvedLanPeer::Dial("10.0.0.2:7420".into())));
     }
 
     #[test]
     fn resolve_empty_dial_uses_env_then_errors_without_local_queue() {
-        let got = resolve_lan_peer_parts("", Some("192.168.1.50:7420"), false);
+        let got = resolve_lan_peer_parts("", Some("192.168.1.50:7420"));
         assert_eq!(got, Some(ResolvedLanPeer::Dial("192.168.1.50:7420".into())));
-        assert_eq!(resolve_lan_peer_parts("", None, true), None);
-        assert_eq!(resolve_lan_peer_parts("", None, false), None);
-        assert_eq!(resolve_lan_peer_parts("not-a-dial", None, false), None);
-        assert_eq!(
-            resolve_lan_peer_parts("", Some("rvn1notadial"), false),
-            None
-        );
+        assert_eq!(resolve_lan_peer_parts("", None), None);
+        assert_eq!(resolve_lan_peer_parts("not-a-dial", None), None);
+        assert_eq!(resolve_lan_peer_parts("", Some("rvn1notadial")), None);
     }
 
     #[test]
@@ -4975,6 +8734,7 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
             relay: false,
             forward_pending: 0,
             capabilities: vec!["ipc".into()],
+            p2p: None,
         })
     }
 
@@ -5019,8 +8779,11 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
         );
         let ep = ipc_endpoint(std::path::Path::new("/tmp/raven-data"));
         if cfg!(windows) {
-            assert_eq!(ep, IpcEndpoint::NamedPipe(raven_core::WINDOWS_NAMED_PIPE));
-            assert_eq!(ep.to_string(), raven_core::WINDOWS_NAMED_PIPE);
+            // Per-user pipe: `{WINDOWS_NAMED_PIPE}-{user SID}`.
+            assert!(matches!(ep, IpcEndpoint::NamedPipe(_)));
+            assert!(ep
+                .to_string()
+                .starts_with(&format!("{}-S-1-", raven_core::WINDOWS_NAMED_PIPE)));
             assert!(!ep.to_string().contains("raven-node.sock"));
             assert!(ep.transport_available());
         } else if cfg!(unix) {
@@ -5196,6 +8959,2558 @@ pub_hex     d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
         assert_eq!(
             doctor_exit_code(&ready, false, None, true),
             DOCTOR_EXIT_HARD
+        );
+    }
+
+    // ── g9 regression tests: invite / add_contact / send picker / display ──
+
+    fn ident(seed: u8) -> Identity {
+        Identity::from_seed(&[seed; 32])
+    }
+
+    fn invite_for(id: &Identity) -> String {
+        format!(
+            "raven:{}:{}",
+            id.address(),
+            hex::encode(id.public_key_bytes())
+        )
+    }
+
+    fn seed_book(dir: &Path) -> Vec<Contact> {
+        let a = ident(0x0a);
+        let b = ident(0x0b);
+        add_contact(
+            dir,
+            &a.address(),
+            &hex::encode(a.public_key_bytes()),
+            "Alice",
+            "alice",
+            Some(&device_fingerprint_v1(&a.public_key_bytes())),
+            "192.168.1.20:7420",
+        )
+        .unwrap();
+        add_contact(
+            dir,
+            &b.address(),
+            &hex::encode(b.public_key_bytes()),
+            "Bob",
+            "",
+            None,
+            "",
+        )
+        .unwrap();
+        load_contacts(dir).unwrap()
+    }
+
+    #[test]
+    fn invite_add_keeps_existing_contacts_pins_and_dials() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = seed_book(dir.path());
+        let carol = ident(0x0c);
+        let invite = parse_raven_invite(&invite_for(&carol)).unwrap().unwrap();
+        commit_invite_contact(dir.path(), &invite, "Carol", false).unwrap();
+        let after = load_contacts(dir.path()).unwrap();
+        assert_eq!(after.len(), 3, "invite must merge, not replace the book");
+        for old in &before {
+            let kept = after.iter().find(|c| c.pub_hex == old.pub_hex).unwrap();
+            assert_eq!(kept.pinned, old.pinned);
+            assert_eq!(kept.lan_dial, old.lan_dial);
+            assert_eq!(kept.petname, old.petname);
+        }
+        let c = after.iter().find(|c| c.petname == "Carol").unwrap();
+        assert_eq!(c.address, carol.address());
+        assert!(!c.pinned);
+    }
+
+    #[test]
+    fn invite_abort_or_unknown_answer_saves_nothing() {
+        // The interactive layer only calls `commit_invite_contact` for an
+        // explicit save decision: every other answer must classify as Abort
+        // (or the V → type-the-fingerprint step), never as a save.
+        let invite = parse_raven_invite(&invite_for(&ident(0x0c)))
+            .unwrap()
+            .unwrap();
+        for answer in ["a", "A", "abort", "q", "x", "yes please", "", "   "] {
+            assert_eq!(
+                parse_verify_choice(answer, &invite.fingerprint),
+                VerifyChoice::Abort,
+                "{answer:?}"
+            );
+        }
+        // Pinning: only with the confirmed fingerprint, exactly like the long add path.
+        let dir = tempfile::tempdir().unwrap();
+        commit_invite_contact(dir.path(), &invite, "Carol", true).unwrap();
+        assert!(load_contacts(dir.path()).unwrap()[0].pinned);
+    }
+
+    #[test]
+    fn invite_rejects_address_key_mismatch_and_bad_hex() {
+        let victim = ident(0x0a);
+        let attacker = ident(0x0e);
+        let forged = format!(
+            "raven:{}:{}",
+            victim.address(),
+            hex::encode(attacker.public_key_bytes())
+        );
+        let err = parse_raven_invite(&forged).unwrap().unwrap_err();
+        assert!(err.contains("mismatch"), "{err}");
+        let not_hex = format!("raven:{}:{}", victim.address(), "zz".repeat(32));
+        assert!(parse_raven_invite(&not_hex).unwrap().is_err());
+        let esc = format!(
+            "raven:rvn1\u{1b}]52;c;AAAA\u{7}:{}",
+            hex::encode(victim.public_key_bytes())
+        );
+        assert!(parse_raven_invite(&esc).unwrap().is_err());
+        assert!(parse_raven_invite("rvn1qabc").is_none());
+        // whoami `invite` label and upper-case hex are accepted and normalised.
+        let labelled = format!(
+            "invite        raven:{}:{}",
+            victim.address(),
+            hex::encode_upper(victim.public_key_bytes())
+        );
+        let ok = parse_raven_invite(&labelled).unwrap().unwrap();
+        assert_eq!(ok.pub_hex, hex::encode(victim.public_key_bytes()));
+        assert_eq!(
+            ok.fingerprint,
+            device_fingerprint_v1(&victim.public_key_bytes())
+        );
+    }
+
+    #[test]
+    fn invite_save_errors_propagate_and_keep_corrupt_book() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("contacts.json"), "{not-json").unwrap();
+        let invite = parse_raven_invite(&invite_for(&ident(0x0c)))
+            .unwrap()
+            .unwrap();
+        let err = commit_invite_contact(dir.path(), &invite, "Carol", false).unwrap_err();
+        assert!(err.contains("corrupt"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("contacts.json")).unwrap(),
+            "{not-json"
+        );
+    }
+
+    #[test]
+    fn invite_cannot_rebind_pinned_identity_to_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_book(dir.path());
+        // A pinned @alice stays authoritative: same tag, different key refused.
+        let mallory = ident(0x0e);
+        let err = add_contact(
+            dir.path(),
+            &mallory.address(),
+            &hex::encode(mallory.public_key_bytes()),
+            "Alice (new phone)",
+            "alice",
+            None,
+            "",
+        )
+        .unwrap_err();
+        assert_eq!(err, "KEY_CHANGE_REFUSED_WITHOUT_REPIN");
+        assert_eq!(load_contacts(dir.path()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn verify_choice_is_strict() {
+        let fp = "If4x-36FU-omFi";
+        // `v` alone never pins: the fingerprint has to be typed back.
+        assert_eq!(
+            parse_verify_choice("v", fp),
+            VerifyChoice::ConfirmFingerprint
+        );
+        assert_eq!(
+            parse_verify_choice(" Verify ", fp),
+            VerifyChoice::ConfirmFingerprint
+        );
+        assert_eq!(
+            parse_verify_choice("pin", fp),
+            VerifyChoice::ConfirmFingerprint
+        );
+        assert_eq!(parse_verify_choice(fp, fp), VerifyChoice::Pin);
+        assert_eq!(parse_verify_choice("If4x36FUomFi", fp), VerifyChoice::Pin);
+        // Base64 case is part of the fingerprint.
+        assert_eq!(parse_verify_choice("if4x36fuomfi", fp), VerifyChoice::Abort);
+        assert_eq!(parse_verify_choice("C", fp), VerifyChoice::Unpinned);
+        assert_eq!(parse_verify_choice("continue", fp), VerifyChoice::Unpinned);
+        // An empty answer (stray Enter / pasted blank line) is NOT a decision.
+        assert_eq!(parse_verify_choice("", fp), VerifyChoice::Abort);
+        assert_eq!(parse_verify_choice("a", fp), VerifyChoice::Abort);
+        assert_eq!(parse_verify_choice("vv", fp), VerifyChoice::Abort);
+        assert_eq!(parse_verify_choice("If4x-36FU", fp), VerifyChoice::Abort);
+    }
+
+    const VERIFY_FP: &str = "If4x-36FU-omFi";
+
+    /// `verify_prompt_flow` fed like `read_decision_line`: leftover whoami
+    /// lines are skipped, a stream that ends before an answer is `None`.
+    fn run_verify_flow(code: Option<&str>, answers: &[&str]) -> Option<bool> {
+        let mut it = lines(answers).into_iter();
+        verify_prompt_flow(VERIFY_FP, code, &mut || {
+            pick_answer_line_checked(&mut it, AnswerKind::Free)
+        })
+    }
+
+    #[test]
+    fn confirm_code_is_typeable_and_not_derived_from_the_contact() {
+        use rand::rngs::mock::StepRng;
+        let a = new_confirm_code(&mut StepRng::new(
+            0x1234_5678_9abc_def0,
+            0x9e37_79b9_7f4a_7c15,
+        ));
+        let b = new_confirm_code(&mut StepRng::new(
+            0x8765_4321_0fed_cba9,
+            0x9e37_79b9_7f4a_7c15,
+        ));
+        assert_ne!(a, b, "the code follows the rng, nothing else");
+        for code in [&a, &b] {
+            assert_eq!(code.len(), CONFIRM_CODE_LEN);
+            assert!(
+                code.bytes().all(|c| CONFIRM_CODE_ALPHABET.contains(&c)),
+                "{code}"
+            );
+        }
+        // Nothing to mistake for something else when reading it off a screen.
+        assert!(CONFIRM_CODE_ALPHABET
+            .iter()
+            .all(|c| !b"01OIL".contains(c) && !c.is_ascii_lowercase()));
+        assert_eq!(
+            CONFIRM_CODE_ALPHABET.len(),
+            CONFIRM_CODE_ALPHABET
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+    }
+
+    #[test]
+    fn confirm_code_match_forgives_form_not_content() {
+        assert!(confirm_code_matches("K7Q4M", "K7Q4M"));
+        assert!(confirm_code_matches("  k7q-4m ", "K7Q4M"));
+        assert!(!confirm_code_matches("", "K7Q4M"));
+        assert!(!confirm_code_matches("---", "K7Q4M"));
+        assert!(!confirm_code_matches("K7Q4", "K7Q4M"));
+        assert!(!confirm_code_matches("K7Q4MM", "K7Q4M"));
+        assert!(!confirm_code_matches("K7Q4N", "K7Q4M"));
+    }
+
+    #[test]
+    fn pasted_card_cannot_answer_the_confirmation_code() {
+        // Everything the author of a pasted contact card knows or can type.
+        let id = ident(0x66);
+        let pasted = [
+            "c".to_string(),
+            "v".to_string(),
+            "y".to_string(),
+            "yes".to_string(),
+            "continue".to_string(),
+            "confirm".to_string(),
+            String::new(),
+            VERIFY_FP.to_string(),
+            VERIFY_FP.to_ascii_lowercase(),
+            hex::encode(id.public_key_bytes()),
+            id.address(),
+        ];
+        let code = Some("K7Q4M");
+        for guess in &pasted {
+            for choice in [&["c"][..], &["v", VERIFY_FP], &[VERIFY_FP]] {
+                let mut answers = choice.to_vec();
+                answers.push(guess);
+                assert_eq!(run_verify_flow(code, &answers), None, "{answers:?}");
+            }
+        }
+        // Padding with whoami lines (they are skipped as leftovers) buys the
+        // paste nothing: the next real line still has to be the code.
+        let pad = "fingerprint AAAA-BBBB-CCCC-DDDD";
+        for n in 0..8 {
+            let mut answers = vec!["c"];
+            answers.extend(std::iter::repeat_n(pad, n));
+            answers.extend(["v", VERIFY_FP, "c"]);
+            assert_eq!(run_verify_flow(code, &answers), None, "pad {n}");
+        }
+        // The stream ending at the code prompt is not an answer either.
+        assert_eq!(run_verify_flow(code, &["c"]), None);
+        assert_eq!(run_verify_flow(code, &["v", VERIFY_FP]), None);
+        // A wrong fingerprint aborts before the code is even asked.
+        assert_eq!(
+            run_verify_flow(code, &["v", "AAAA-BBBB-CCCC", "K7Q4M"]),
+            None
+        );
+    }
+
+    #[test]
+    fn typed_confirmation_code_completes_every_save() {
+        let code = Some("K7Q4M");
+        assert_eq!(run_verify_flow(code, &["c", "k7q4m"]), Some(false));
+        assert_eq!(
+            run_verify_flow(code, &["v", VERIFY_FP, "K7Q-4M"]),
+            Some(true)
+        );
+        assert_eq!(run_verify_flow(code, &[VERIFY_FP, "K7Q4M"]), Some(true));
+        // Aborting at the choice never reaches the code.
+        assert_eq!(run_verify_flow(code, &["a", "K7Q4M"]), None);
+        assert_eq!(run_verify_flow(code, &["", "K7Q4M"]), None);
+    }
+
+    #[test]
+    fn piped_stdin_script_keeps_the_choice_only_flow() {
+        // No terminal, no code: scripts (menu smoke, tests) drive c / v + fp.
+        assert_eq!(run_verify_flow(None, &["c"]), Some(false));
+        assert_eq!(run_verify_flow(None, &["v", VERIFY_FP]), Some(true));
+        assert_eq!(run_verify_flow(None, &[""]), None);
+        assert_eq!(run_verify_flow(None, &[]), None);
+        assert_eq!(run_verify_flow(None, &["v"]), None);
+    }
+
+    #[test]
+    fn typed_fingerprint_must_match_the_whole_thing() {
+        let fp = "If4x-36FU-omFi";
+        assert!(fingerprint_matches("If4x-36FU-omFi", fp));
+        assert!(fingerprint_matches("  If4x 36FU omFi ", fp));
+        assert!(fingerprint_matches("If4x36FUomFi", fp));
+        // Base64: case is part of the fingerprint, never folded away.
+        assert!(!fingerprint_matches("if4x-36fu-omfi", fp));
+        assert!(!fingerprint_matches("IF4X-36FU-OMFI", fp));
+        assert!(fingerprint_case_only_mismatch("if4x 36fu omfi", fp));
+        assert!(!fingerprint_case_only_mismatch("If4x-36FU-omFi", fp));
+        assert!(!fingerprint_case_only_mismatch("If4x-36FU-omFj", fp));
+        assert!(!fingerprint_case_only_mismatch("", fp));
+        assert!(!fingerprint_matches("", fp));
+        assert!(!fingerprint_matches("---", fp));
+        assert!(!fingerprint_matches("If4x-36FU", fp));
+        assert!(!fingerprint_matches("If4x-36FU-omFj", fp));
+    }
+
+    #[test]
+    fn eof_is_not_an_answer_but_an_empty_line_is() {
+        // Trust decisions use the checked picker: a stream that ends before any
+        // answer arrives is None, never "" (which parse_verify_choice aborts
+        // and the optional prompts treat as "skip").
+        assert_eq!(
+            pick_answer_line_checked(Vec::<String>::new(), AnswerKind::Free),
+            None
+        );
+        assert_eq!(
+            pick_answer_line_checked(lines(&[""]), AnswerKind::Free),
+            Some(String::new())
+        );
+        let id = ident(0x0a);
+        // Only leftover whoami lines, then EOF: still no answer.
+        assert_eq!(
+            pick_answer_line_checked(lines(&[&invite_for(&id)]), AnswerKind::Free),
+            None
+        );
+        assert_eq!(
+            pick_answer_line_checked(lines(&[&invite_for(&id), "c"]), AnswerKind::Free),
+            Some("c".to_string())
+        );
+        // The lenient wrapper folds EOF into an empty answer (optional prompts).
+        assert_eq!(pick_answer_line(Vec::<String>::new(), AnswerKind::Free), "");
+    }
+
+    #[test]
+    fn first_run_identity_needs_a_real_yes() {
+        // EOF / closed stdin never creates an identity.
+        assert!(!first_run_answer_accepts(None, true));
+        assert!(!first_run_answer_accepts(None, false));
+        // On a terminal Enter takes the [Y] default; piped input must be explicit.
+        assert!(first_run_answer_accepts(Some(""), true));
+        assert!(!first_run_answer_accepts(Some(""), false));
+        for yes in ["y", "Y", "yes", "YES"] {
+            assert!(first_run_answer_accepts(Some(yes), false), "{yes}");
+            assert!(first_run_answer_accepts(Some(yes), true), "{yes}");
+        }
+        for no in ["n", "no", "yep", "sure", "1"] {
+            assert!(!first_run_answer_accepts(Some(no), true), "{no}");
+            assert!(!first_run_answer_accepts(Some(no), false), "{no}");
+        }
+    }
+
+    #[test]
+    fn leftover_whoami_lines_are_not_answers() {
+        let id = ident(0x0a);
+        assert!(is_whoami_paste_line(&format!(
+            "invite        {}",
+            invite_for(&id)
+        )));
+        assert!(is_whoami_paste_line(&invite_for(&id)));
+        assert!(is_whoami_paste_line("fingerprint If4x-36FU-omFi"));
+        assert!(is_whoami_paste_line(&format!(
+            "pub_hex     {}",
+            hex::encode(id.public_key_bytes())
+        )));
+        assert!(is_whoami_paste_line(&format!(
+            "address     {}",
+            id.address()
+        )));
+        for answer in [
+            "",
+            "poline",
+            "Address Book Guy",
+            "c",
+            "V",
+            "192.168.1.20:7420",
+        ] {
+            assert!(!is_whoami_paste_line(answer), "{answer}");
+        }
+    }
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pub_hex_prompt_accepts_labelled_whoami_line() {
+        // Regression: the pub_hex prompt must not swallow `pub_hex  <hex>`
+        // (that hung the TTY and shifted every later answer by one prompt).
+        let id = ident(0x0a);
+        let hex_pub = hex::encode(id.public_key_bytes());
+        let labelled = format!("pub_hex       {}", hex_pub.to_uppercase());
+        assert_eq!(
+            pick_answer_line(lines(&[&labelled, "poline"]), AnswerKind::PubHex),
+            hex_pub
+        );
+        // A whole whoami block pasted at the pub_hex prompt: address and
+        // fingerprint are skipped, the pub_hex line is the answer.
+        let addr = format!("address       {}", id.address());
+        let fp = format!(
+            "fingerprint   {}",
+            device_fingerprint_v1(&id.public_key_bytes())
+        );
+        assert_eq!(
+            pick_answer_line(lines(&[&addr, &fp, &labelled]), AnswerKind::PubHex),
+            hex_pub
+        );
+        // Bare hex and the invite line both reduce to the pub.
+        assert_eq!(
+            pick_answer_line(lines(&[&hex_pub]), AnswerKind::PubHex),
+            hex_pub
+        );
+        let inv = format!("invite        {}", invite_for(&id));
+        assert_eq!(
+            pick_answer_line(lines(&[&inv]), AnswerKind::PubHex),
+            hex_pub
+        );
+        // A broken invite is handed back (add then fails) instead of skipped.
+        let other = ident(0x0b);
+        let bad = format!(
+            "raven:{}:{}",
+            id.address(),
+            hex::encode(other.public_key_bytes())
+        );
+        let got = pick_answer_line(lines(&[&bad, "later"]), AnswerKind::PubHex);
+        assert_eq!(got, bad);
+        assert!(parse_pub_hex(&got).is_err());
+        // Garbage / shell text is returned verbatim so the caller rejects it.
+        assert_eq!(
+            pick_answer_line(lines(&["nope", &hex_pub]), AnswerKind::PubHex),
+            "nope"
+        );
+        let shell = format!("export X={hex_pub}");
+        assert_eq!(
+            pick_answer_line(lines(&[&shell]), AnswerKind::PubHex),
+            shell
+        );
+
+        // Free prompts (tag / petname / dial / choice) still skip every
+        // leftover whoami line, including the labelled pub_hex one.
+        assert_eq!(
+            pick_answer_line(lines(&[&labelled, &inv, "poline"]), AnswerKind::Free),
+            "poline"
+        );
+        assert_eq!(pick_answer_line(lines(&[""]), AnswerKind::Free), "");
+        // Bounded: never loops forever on a stream of leftovers.
+        let many: Vec<String> = std::iter::repeat_n(labelled.clone(), 20).collect();
+        assert_eq!(pick_answer_line(many, AnswerKind::Free), "");
+    }
+
+    #[test]
+    fn add_contact_validates_tag_charset_and_unique_petname() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_book(dir.path());
+        let carol = ident(0x0c);
+        let c_hex = hex::encode(carol.public_key_bytes());
+        let err = add_contact(
+            dir.path(),
+            &carol.address(),
+            &c_hex,
+            "Carol",
+            "invite raven:x",
+            None,
+            "",
+        )
+        .unwrap_err();
+        assert!(err.contains("@tag rejected"), "{err}");
+        let err =
+            add_contact(dir.path(), &carol.address(), &c_hex, "bob", "", None, "").unwrap_err();
+        assert!(err.contains("already used"), "{err}");
+        let err = add_contact(
+            dir.path(),
+            &carol.address(),
+            &c_hex,
+            "Carol",
+            "",
+            None,
+            "evil\u{1b}[2J:7420",
+        )
+        .unwrap_err();
+        assert!(err.contains("lan_dial"), "{err}");
+        assert_eq!(load_contacts(dir.path()).unwrap().len(), 2);
+        add_contact(
+            dir.path(),
+            &carol.address(),
+            &c_hex,
+            "Carol",
+            "@Carol",
+            None,
+            "",
+        )
+        .unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert_eq!(book.len(), 3);
+        assert_eq!(book[2].public_tag, "carol");
+        // Re-adding the same key under its own petname is an update, not a clash.
+        add_contact(dir.path(), &carol.address(), &c_hex, "carol", "", None, "").unwrap();
+        assert_eq!(load_contacts(dir.path()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn send_picker_never_silently_picks_among_duplicates() {
+        let a = ident(0x0a);
+        let b = ident(0x0b);
+        let row = |id: &Identity, pet: &str, tag: &str| Contact {
+            petname: pet.into(),
+            public_tag: tag.into(),
+            alias: tag.into(),
+            address: id.address(),
+            pub_hex: hex::encode(id.public_key_bytes()),
+            pinned: false,
+            lan_dial: String::new(),
+            internet_dial: String::new(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
+        };
+        let book = vec![
+            row(&a, "Ahmad (Berlin)", "ahmad"),
+            row(&b, "Ahmad (Tehran)", "ahmad"),
+        ];
+        assert_eq!(
+            pick_send_contact(&book, "@ahmad"),
+            SendPick::Ambiguous(vec![0, 1])
+        );
+        assert_eq!(
+            pick_send_contact(&book, "@AHMAD"),
+            SendPick::Ambiguous(vec![0, 1])
+        );
+        assert_eq!(pick_send_contact(&book, "2"), SendPick::One(1));
+        assert_eq!(pick_send_contact(&book, "ahmad (tehran)"), SendPick::One(1));
+        assert_eq!(pick_send_contact(&book, "3"), SendPick::NoMatch);
+        assert_eq!(pick_send_contact(&book, "0"), SendPick::NoMatch);
+        assert_eq!(pick_send_contact(&book, "@nobody"), SendPick::NoMatch);
+        let legacy_dupes = vec![row(&a, "Ahmad", ""), row(&b, "ahmad", "")];
+        assert_eq!(
+            pick_send_contact(&legacy_dupes, "Ahmad"),
+            SendPick::Ambiguous(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn menu_send_uses_secure_pair_init_path() {
+        // Menu send is ext::run_send_secure (PairInit / indexed session), never
+        // a raven-node `--body-mode unsafe-interim` child: its own validation
+        // answers before any process is spawned or dial attempted.
+        let dir = tempfile::tempdir().unwrap();
+        let me = ident(0x01);
+        let peer = ident(0x02);
+        let peer_hex = hex::encode(peer.public_key_bytes());
+        let err = menu_send_secure(dir.path(), &me, "not-a-dial", &peer_hex, "hi").unwrap_err();
+        assert!(err.contains("lan_dial host:port required"), "{err}");
+        let err = menu_send_secure(dir.path(), &me, "127.0.0.1:9", "zz", "hi").unwrap_err();
+        assert!(err.contains("pub_hex"), "{err}");
+        let mut blocks = BlockList::load_checked(dir.path()).unwrap();
+        blocks.block(&peer_hex);
+        blocks.save(dir.path()).unwrap();
+        let err = menu_send_secure(dir.path(), &me, "127.0.0.1:9", &peer_hex, "hi").unwrap_err();
+        assert!(err.contains("block list"), "{err}");
+    }
+
+    #[test]
+    fn inbox_rows_are_attributed_and_single_line() {
+        let a = ident(0x0a);
+        let stranger = ident(0x0f);
+        let book = vec![Contact {
+            petname: "Alice".into(),
+            public_tag: String::new(),
+            alias: String::new(),
+            address: a.address(),
+            pub_hex: hex::encode(a.public_key_bytes()),
+            pinned: true,
+            lan_dial: String::new(),
+            internet_dial: String::new(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
+        }];
+        let mid = [0xabu8; 16];
+        let forged =
+            b"ok\r  \xe2\x86\x92 1a2b3c4d I agree to pay\n  \xe2\x86\x90 99999999 Alice: hi";
+        let line = format_inbox_row(
+            &book,
+            &a.public_key_bytes(),
+            &mid,
+            forged,
+            "5 min ago",
+            None,
+        );
+        assert!(!line.contains('\r') && !line.contains('\n'), "{line:?}");
+        assert!(line.contains("Alice"));
+        assert!(line.contains("pinned"));
+        assert!(line.contains(&device_fingerprint_v1(&a.public_key_bytes())));
+        let line = format_inbox_row(
+            &book,
+            &stranger.public_key_bytes(),
+            &mid,
+            b"This is Alice: pay",
+            "",
+            None,
+        );
+        assert!(line.contains("unknown device"), "{line}");
+        assert!(line.contains(&device_fingerprint_v1(&stranger.public_key_bytes())));
+        assert!(!line.contains("Alice ["), "{line}");
+    }
+
+    fn history_row(direction: &str, delivery: &str) -> raven_core::ChatHistoryEntry {
+        raven_core::ChatHistoryEntry {
+            message_id_hex: "aa".repeat(16),
+            direction: direction.into(),
+            peer_petname: "Bob".into(),
+            peer_tag: String::new(),
+            peer_pub_hex: "bb".repeat(32),
+            created_at_ms: 1,
+            delivery: delivery.into(),
+            preview: "hi".into(),
+            body: "hi".into(),
+        }
+    }
+
+    /// A queued or failed message must not look like a delivered one in the chat
+    /// dump or `ash messages` (both render through `delivery_suffix`).
+    #[test]
+    fn outbound_rows_show_their_delivery_state_unless_delivered() {
+        assert_eq!(delivery_suffix(&history_row("out", "queued")), " [queued]");
+        assert_eq!(delivery_suffix(&history_row("out", "failed")), " [failed]");
+        assert_eq!(delivery_suffix(&history_row("out", "delivered")), "");
+        assert_eq!(delivery_suffix(&history_row("out", "")), "");
+        // Inbound rows carry "received": never annotated.
+        assert_eq!(delivery_suffix(&history_row("in", "received")), "");
+        // The state is sanitised like any other terminal text.
+        let hostile = delivery_suffix(&history_row("out", "failed\x1b[2J\nfake"));
+        assert!(
+            !hostile.contains('\x1b') && !hostile.contains('\n'),
+            "{hostile:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_ephemeral_data_dir_is_never_remapped() {
+        for p in [
+            "/var/folders/xy/abc/T/tmp.XXXX123",
+            "/tmp/raven-ash-menu-abc",
+            "/private/var/folders/q/T/tmp.1",
+        ] {
+            assert_eq!(resolve_data_dir(p), Ok(PathBuf::from(p)));
+        }
+        assert_eq!(resolve_data_dir("  "), default_ash_data_dir());
+    }
+
+    /// No `--data-dir`, no override and no usable HOME: an error that says what
+    /// to set, not a placeholder path whose first use fails with ENOTDIR.
+    #[test]
+    fn unresolvable_default_profile_is_an_up_front_error() {
+        let err = resolve_data_dir_with("", || {
+            raven_core::paths::try_resolve_raven_data_dir(None, None, None)
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("cannot determine the Raven data directory"),
+            "{err}"
+        );
+        assert!(
+            err.contains("RAVEN_DATA_DIR") && err.contains("--data-dir"),
+            "{err}"
+        );
+        assert!(err.contains("HOME"), "{err}");
+        // An explicit directory never consults the default.
+        assert_eq!(
+            resolve_data_dir_with("/some/profile", || -> Result<PathBuf, String> {
+                panic!("default must not be consulted")
+            }),
+            Ok(PathBuf::from("/some/profile"))
+        );
+    }
+
+    /// Defence in depth: even a caller that kept the infallible placeholder
+    /// can never make ash create a profile tree under it.
+    #[test]
+    fn the_unresolved_profile_placeholder_is_never_created() {
+        let placeholder = raven_core::resolve_raven_data_dir(None, None, None);
+        assert!(raven_core::paths::is_unresolved_data_dir(&placeholder));
+        let err = create_private_data_dir(&placeholder).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("cannot determine"), "{err}");
+    }
+
+    #[test]
+    fn private_data_dir_is_created_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/profile");
+        create_private_data_dir(&nested).unwrap();
+        assert!(nested.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn k_route_is_never_taken_from_argv() {
+        let err =
+            resolve_k_route_hex(Some("00ff"), false, Some("aa".into()), String::new).unwrap_err();
+        assert!(err.contains("REFUSE"), "{err}");
+        assert_eq!(
+            resolve_k_route_hex(None, false, Some(" 00ff \n".into()), String::new).unwrap(),
+            "00ff"
+        );
+        assert_eq!(
+            resolve_k_route_hex(None, true, None, || "abcd".to_string()).unwrap(),
+            "abcd"
+        );
+        assert!(resolve_k_route_hex(None, false, None, String::new).is_err());
+    }
+
+    #[test]
+    fn nearby_store_drops_expired_and_legacy_tokens() {
+        let now = 1_000_000u64;
+        let live = NearbyAdvertisement::mint(now - 10_000, 60_000, b"t");
+        let dead = NearbyAdvertisement::mint(now - 120_000, 60_000, b"t");
+        let raw = serde_json::to_string(&vec![
+            serde_json::to_value(NearbyTokenJson::from_adv(&live)).unwrap(),
+            serde_json::to_value(NearbyTokenJson::from_adv(&dead)).unwrap(),
+            serde_json::Value::String("00112233445566778899aabbccddeeff".into()),
+        ])
+        .unwrap();
+        let got = load_live_nearby_ads(&raw, now);
+        assert_eq!(got, vec![live.clone()]);
+        // Original expiry is kept (no fresh TTL on reload).
+        assert!(load_live_nearby_ads(&raw, now + 60_000).is_empty());
+        assert!(load_live_nearby_ads("[\"00112233445566778899aabbccddeeff\"]", now).is_empty());
+    }
+
+    #[test]
+    fn alias_claim_store_refuses_to_overwrite_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = alias_store_path(dir.path());
+        std::fs::write(&path, "[{broken").unwrap();
+        let id = ident(0x0a);
+        let rec = AliasRecord {
+            alias: "alice".into(),
+            identity_address: id.address(),
+            sequence: 1,
+            expires_at: now_ms() + 60_000,
+            signature: [0u8; 64],
+            ed25519_pub: id.public_key_bytes(),
+        }
+        .sign(&id)
+        .unwrap();
+        let err = save_alias_claim(dir.path(), &rec).unwrap_err();
+        assert!(err.contains("corrupt"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[{broken");
+    }
+
+    #[test]
+    fn escape_bytes_classify_without_blocking_on_next_key() {
+        assert!(classify_escape(&[]) == MenuKey::Escape);
+        assert!(classify_escape(b"[A") == MenuKey::Up);
+        assert!(classify_escape(b"[B") == MenuKey::Down);
+        assert!(classify_escape(b"OA") == MenuKey::Up);
+        assert!(classify_escape(b"[1;5A") == MenuKey::Up);
+        assert!(classify_escape(b"[1;2B") == MenuKey::Down);
+        assert!(classify_escape(b"[5~") == MenuKey::Other);
+        assert!(classify_escape(b"[") == MenuKey::Other);
+        assert!(classify_escape(b"q") == MenuKey::Escape);
+    }
+
+    /// Feed `bytes` one read at a time; 0 once exhausted (= timeout).
+    fn drain(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut rest = bytes.to_vec();
+        let tail = read_escape_tail(|buf| {
+            if rest.is_empty() {
+                0
+            } else {
+                buf[0] = rest.remove(0);
+                1
+            }
+        });
+        (tail, rest)
+    }
+
+    #[test]
+    fn escape_tail_consumes_whole_sequence_only() {
+        // Ctrl+Up: the whole CSI is consumed, the next key ('2') is not.
+        assert_eq!(drain(b"[1;5A2"), (b"[1;5A".to_vec(), b"2".to_vec()));
+        assert_eq!(drain(b"[B"), (b"[B".to_vec(), vec![]));
+        assert_eq!(drain(b"OAq"), (b"OA".to_vec(), b"q".to_vec()));
+        // Bare Esc (timeout) consumes nothing; Alt+x consumes just 'x'.
+        assert_eq!(drain(b""), (vec![], vec![]));
+        assert_eq!(drain(b"x1"), (b"x".to_vec(), b"1".to_vec()));
+        // Bounded even for a hostile never-ending parameter run.
+        let long = [b"[".as_slice(), &[b'1'; 40]].concat();
+        assert_eq!(drain(&long).0.len(), 16);
+    }
+
+    #[test]
+    fn lan_dial_rejects_control_bytes() {
+        assert!(looks_like_lan_dial("192.168.1.20:7420"));
+        assert!(looks_like_lan_dial("mac-mini.local:7420"));
+        assert!(looks_like_lan_dial("[fe80::1%en0]:7420"));
+        assert!(!looks_like_lan_dial("evil\u{1b}[2J:7420"));
+        assert!(!looks_like_lan_dial("host\u{202e}:7420"));
+        assert!(!looks_like_lan_dial("host:0"));
+    }
+
+    #[test]
+    fn strict_and_lenient_pub_hex_share_one_decoder() {
+        let hex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        let want = parse_pub_hex_strict(hex).unwrap();
+        assert_eq!(parse_pub_hex_strict(&hex.to_uppercase()).unwrap(), want);
+        assert_eq!(parse_pub_hex(&format!("pub_hex     {hex}")).unwrap(), want);
+        // Strict (wire / IPC) never accepts the whoami label form.
+        assert!(parse_pub_hex_strict(&format!("pub_hex {hex}")).is_err());
+    }
+
+    // ── fixer D regression tests: exit codes, trust prompts, contact book ──
+
+    fn book_row(id: &Identity, pet: &str, tag: &str) -> Contact {
+        Contact {
+            petname: pet.into(),
+            public_tag: tag.into(),
+            alias: tag.into(),
+            address: id.address(),
+            pub_hex: hex::encode(id.public_key_bytes()),
+            pinned: false,
+            lan_dial: String::new(),
+            internet_dial: String::new(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
+        }
+    }
+
+    fn status_with_caps(caps: &[&str]) -> Result<IpcResponse, String> {
+        Ok(IpcResponse::Status {
+            v: IPC_VERSION,
+            bridge: false,
+            store: false,
+            relay: false,
+            forward_pending: 0,
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            p2p: None,
+        })
+    }
+
+    #[test]
+    fn listener_ready_needs_lan_direct_in_ipc_status() {
+        // IPC answering is not enough: the IPC task can be up (or about to
+        // fail on the instance lock) before the LAN port is bound.
+        assert!(!status_reports_lan_listener(&status_with_caps(&["ipc"])));
+        assert!(status_reports_lan_listener(&status_with_caps(&[
+            "ipc",
+            "lan_direct",
+            "store"
+        ])));
+        assert!(!status_reports_lan_listener(&Ok(IpcResponse::Pong {
+            v: IPC_VERSION
+        })));
+        assert!(!status_reports_lan_listener(&Err("dial failed".into())));
+    }
+
+    #[cfg(unix)]
+    fn spawn_sh(script: &str) -> std::process::Child {
+        Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listen_wait_reports_an_early_exit_never_ready() {
+        // A service that dies on startup is an exit (with its status), not LISTENING.
+        let mut child = spawn_sh("exit 3");
+        let got = wait_for_listener(
+            &mut child,
+            Duration::from_secs(60),
+            Duration::from_millis(2),
+            Duration::ZERO,
+            || false,
+        );
+        match got {
+            ListenWait::Exited(st) => assert_eq!(st.code(), Some(3)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listen_wait_is_ready_while_the_child_lives_and_times_out_otherwise() {
+        let mut child = spawn_sh("sleep 60");
+        let got = wait_for_listener(
+            &mut child,
+            Duration::from_secs(60),
+            Duration::from_millis(2),
+            Duration::ZERO,
+            || true,
+        );
+        assert!(matches!(got, ListenWait::Ready), "{got:?}");
+        // The listener never reports up: a bounded wait ends in TimedOut
+        // (the caller warns instead of announcing LISTENING).
+        let got = wait_for_listener(
+            &mut child,
+            Duration::from_millis(30),
+            Duration::from_millis(2),
+            Duration::ZERO,
+            || false,
+        );
+        assert!(matches!(got, ListenWait::TimedOut), "{got:?}");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    fn signed_claim(id: &Identity, alias: &str, sequence: u64) -> AliasRecord {
+        AliasRecord {
+            alias: alias.into(),
+            identity_address: id.address(),
+            sequence,
+            expires_at: now_ms() + 60_000,
+            signature: [0u8; 64],
+            ed25519_pub: id.public_key_bytes(),
+        }
+        .sign(id)
+        .unwrap()
+    }
+
+    #[test]
+    fn alias_publish_never_regresses_the_stored_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = ident(0x0a);
+        let addr = id.address();
+        save_alias_claim(dir.path(), &signed_claim(&id, "alice", 5)).unwrap();
+        // A refresh published with the old default (1), or a replay (5), is
+        // refused: peers holding seq 5 would reject it as ALIAS_STALE_SEQUENCE.
+        for seq in [1, 4, 5] {
+            let err = save_alias_claim(dir.path(), &signed_claim(&id, "alice", seq)).unwrap_err();
+            assert!(err.contains("ALIAS_STALE_SEQUENCE"), "{err}");
+        }
+        let rows = read_alias_rows(dir.path()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(stored_alias_sequence(&rows, "alice", &addr), Some(5));
+        // Higher sequences replace the row; other aliases / identities are independent.
+        save_alias_claim(dir.path(), &signed_claim(&id, "alice", 6)).unwrap();
+        save_alias_claim(dir.path(), &signed_claim(&id, "bob", 1)).unwrap();
+        save_alias_claim(dir.path(), &signed_claim(&ident(0x0b), "alice", 1)).unwrap();
+        let rows = read_alias_rows(dir.path()).unwrap();
+        assert_eq!(stored_alias_sequence(&rows, "alice", &addr), Some(6));
+        assert_eq!(stored_alias_sequence(&rows, "bob", &addr), Some(1));
+        assert_eq!(stored_alias_sequence(&rows, "carol", &addr), None);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn lan_tip_skips_unusable_addresses() {
+        assert!(usable_lan_ipv4("192.168.1.20"));
+        assert!(usable_lan_ipv4("10.0.0.5"));
+        for bad in [
+            "",
+            "127.0.0.1",
+            "169.254.3.4",
+            "0.0.0.0",
+            "fe80::1",
+            "not-an-ip",
+        ] {
+            assert!(!usable_lan_ipv4(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pick_is_one_based_and_never_clamps_to_the_first_candidate() {
+        assert_eq!(pick_index(1, 3), Some(0));
+        assert_eq!(pick_index(3, 3), Some(2));
+        assert_eq!(pick_index(0, 3), None);
+        assert_eq!(pick_index(4, 3), None);
+        assert_eq!(pick_index(1, 0), None);
+    }
+
+    #[test]
+    fn re_adding_a_contact_keeps_its_labels_and_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_book(dir.path());
+        let a = ident(0x0a);
+        let a_hex = hex::encode(a.public_key_bytes());
+        let find = |dir: &Path| {
+            load_contacts(dir)
+                .unwrap()
+                .into_iter()
+                .find(|c| c.pub_hex == a_hex)
+                .unwrap()
+        };
+        // The documented dial-refresh workflow: only address + key + dial given.
+        add_contact(
+            dir.path(),
+            &a.address(),
+            &a_hex,
+            "",
+            "",
+            None,
+            "192.168.1.31:7420",
+        )
+        .unwrap();
+        let alice = find(dir.path());
+        assert_eq!(alice.petname, "Alice");
+        assert_eq!(alice.public_tag, "alice");
+        assert_eq!(alice.alias, "alice");
+        assert!(alice.pinned);
+        assert_eq!(alice.lan_dial, "192.168.1.31:7420");
+        assert_eq!(load_contacts(dir.path()).unwrap().len(), 2);
+        // An explicit petname still overrides; the omitted tag is kept.
+        add_contact(dir.path(), &a.address(), &a_hex, "Alice B", "", None, "").unwrap();
+        let alice = find(dir.path());
+        assert_eq!(alice.petname, "Alice B");
+        assert_eq!(alice.public_tag, "alice");
+        assert_eq!(alice.lan_dial, "192.168.1.31:7420");
+        // A petname-only contact stays petname-only.
+        let b = ident(0x0b);
+        add_contact(
+            dir.path(),
+            &b.address(),
+            &hex::encode(b.public_key_bytes()),
+            "",
+            "",
+            None,
+            "",
+        )
+        .unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        let bob = book.iter().find(|c| c.petname == "Bob").unwrap();
+        assert_eq!(bob.public_tag, "");
+        assert!(!bob.pinned);
+    }
+
+    #[test]
+    fn lone_at_sign_selects_nobody() {
+        let a = ident(0x0a);
+        let b = ident(0x0b);
+        let book = vec![book_row(&a, "Alice", "alice"), book_row(&b, "Bob", "")];
+        for q in ["@", "@@", " @ "] {
+            assert!(resolve_tag_contacts(&book, q).is_empty(), "{q:?}");
+            assert!(resolve_alias_contacts(&book, q).is_empty(), "{q:?}");
+            assert_eq!(pick_send_contact(&book, q), SendPick::NoMatch, "{q:?}");
+        }
+        // Real tags still resolve.
+        assert_eq!(resolve_tag_contacts(&book, "@alice").len(), 1);
+        assert_eq!(pick_send_contact(&book, "@Alice"), SendPick::One(0));
+        // `ash send --contact @` must not reach the petname-only contact.
+        let dir = tempfile::tempdir().unwrap();
+        save_contacts(dir.path(), &book).unwrap();
+        let err = resolve_send_target(dir.path(), "@", "", "", "127.0.0.1:0", CarrierChoice::Auto)
+            .unwrap_err();
+        assert!(err.contains("no contact for"), "{err}");
+    }
+
+    #[test]
+    fn env_dial_is_resolved_but_never_written_to_the_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_book(dir.path());
+        let book = load_contacts(dir.path()).unwrap();
+        let alice = book.iter().find(|c| c.petname == "Alice").unwrap();
+        let bob = book.iter().find(|c| c.petname == "Bob").unwrap();
+        let before = std::fs::read(dir.path().join("contacts.json")).unwrap();
+        // No saved dial: the env dial is used, flagged "not saved", and the
+        // book is untouched (it used to be stamped onto whoever was picked).
+        assert_eq!(
+            resolve_or_reuse_lan_dial_with(bob, Some("10.9.9.9:7420".into())),
+            Some((ResolvedLanPeer::Dial("10.9.9.9:7420".into()), true))
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("contacts.json")).unwrap(),
+            before
+        );
+        // A saved dial wins (documented) and is not flagged for saving.
+        assert_eq!(
+            resolve_or_reuse_lan_dial_with(alice, Some("10.9.9.9:7420".into())),
+            Some((ResolvedLanPeer::Dial("192.168.1.20:7420".into()), false))
+        );
+        assert_eq!(resolve_or_reuse_lan_dial_with(bob, None), None);
+    }
+
+    #[test]
+    fn forward_queue_status_does_not_hide_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forward_queue.sqlite");
+        assert_eq!(forward_queue_view(&path), ForwardQueueView::Absent);
+        assert!(forward_queue_line(&ForwardQueueView::Absent).contains("no queue file"));
+        ForwardQueue::open(&path).unwrap();
+        assert_eq!(
+            forward_queue_view(&path),
+            ForwardQueueView::Counts {
+                pending: 0,
+                total: 0
+            }
+        );
+        assert_eq!(
+            forward_queue_line(&ForwardQueueView::Counts {
+                pending: 2,
+                total: 5
+            }),
+            "2 pending / 5 total"
+        );
+        // A queue that exists but cannot be opened is NOT "0 pending / 0 total".
+        std::fs::write(&path, b"this is not a sqlite database, just text padding").unwrap();
+        let view = forward_queue_view(&path);
+        assert!(matches!(view, ForwardQueueView::Unavailable(_)), "{view:?}");
+        let line = forward_queue_line(&view);
+        assert!(line.contains("unavailable"), "{line}");
+        assert!(!line.contains("0 pending"), "{line}");
+    }
+
+    #[test]
+    fn stdin_message_is_bounded_and_trimmed() {
+        assert_eq!(
+            read_message_text(&b"hello\r\n\n"[..], 100).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            read_message_text(&b"hi\nthere\n"[..], 100).unwrap(),
+            "hi\nthere"
+        );
+        assert_eq!(read_message_text(&b""[..], 100).unwrap(), "");
+        // Exactly the limit (plus the trailing newline) fits; one byte more does not.
+        let exact = format!("{}\n", "a".repeat(100));
+        assert_eq!(read_message_text(exact.as_bytes(), 100).unwrap().len(), 100);
+        let over = "a".repeat(101);
+        let err = read_message_text(over.as_bytes(), 100).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        // An endless pipe stops at the cap instead of being buffered forever.
+        let err = read_message_text(std::io::repeat(b'a'), 100).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        assert_eq!(
+            read_message_text(&[0xff, 0xfe][..], 100).unwrap_err(),
+            "failed to read message from stdin"
+        );
+    }
+
+    #[test]
+    fn node_flag_keeps_unnamed_flags_and_repairs_an_unreadable_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        // A readable policy: only the named flag changes.
+        let p = NodePolicy {
+            bridge: false,
+            store: true,
+            relay: true,
+            endpoint: true,
+            auto_policy: true,
+            internet_listen: String::new(),
+            ..NodePolicy::default()
+        };
+        save_policy(dir.path(), &p).unwrap();
+        set_node_flag(dir.path(), "bridge", true);
+        let got = try_load_policy(dir.path()).unwrap();
+        assert!(got.bridge && got.store && got.relay);
+        assert!(!got.auto_policy);
+        // Unreadable policy: the command still repairs the file (fail-closed
+        // base, only the named flag on) — and warns about the reset flags.
+        std::fs::write(raven_core::node_policy::policy_path(dir.path()), "{broken").unwrap();
+        set_node_flag(dir.path(), "bridge", true);
+        let got = try_load_policy(dir.path()).unwrap();
+        assert!(got.bridge && !got.store && !got.relay && !got.auto_policy);
+    }
+
+    #[test]
+    fn styled_terminal_rows_close_their_styles() {
+        let cc = Colors {
+            bold: "\x1b[1m",
+            dim: "\x1b[2m",
+            reset: "\x1b[0m",
+            cyan: "\x1b[1m",
+            purple: "\x1b[1m",
+            green: "\x1b[1m",
+            yellow: "\x1b[2m",
+            red: "\x1b[1m",
+        };
+        // Tutorial footer: dim label, bold command, one trailing reset (the
+        // arguments were swapped, leaving everything after it dim).
+        assert_eq!(
+            tutorial_footer(&cc),
+            "  \x1b[2mFull diagnostics anytime: \x1b[1mash doctor\x1b[0m"
+        );
+        // Menu prompt row: its bold is closed again.
+        assert_eq!(arrow_menu_prompt(&cc), "raven \x1b[1m❯ \x1b[0m");
+    }
+
+    #[test]
+    fn accept_keeps_the_request_until_bind_and_wire_are_durable() {
+        use raven_core::contact_request::{ContactAcceptV1, ContactBinding};
+        let dir = tempfile::tempdir().unwrap();
+        let me = ident(0x0b);
+        let sender = ident(0x0a);
+        let other = ident(0x0c);
+        // "Alice" is already a different contact: the bind must fail.
+        add_contact(
+            dir.path(),
+            &other.address(),
+            &hex::encode(other.public_key_bytes()),
+            "Alice",
+            "",
+            None,
+            "",
+        )
+        .unwrap();
+        let rid = [0x42u8; 16];
+        let pending = contact_inbox_dir(dir.path()).join(format!("{}.wire", hex::encode(rid)));
+        std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        std::fs::write(&pending, b"pending request").unwrap();
+        let accept = ContactAcceptV1 {
+            request_id: rid,
+            accepter_raven_id: String::new(),
+            requester_raven_id: sender.address(),
+            accepted_at: 1,
+            signature: [0u8; 64],
+            accepter_pub: [0u8; 32],
+        }
+        .sign(&me)
+        .unwrap();
+        let mut outcome = ContactAcceptOutcome {
+            accept,
+            binding: ContactBinding {
+                raven_id: sender.address(),
+                pub_hex: hex::encode(sender.public_key_bytes()),
+                petname: "Alice".into(),
+                verification_state: VerificationState::TrustedContact,
+            },
+        };
+        let accept_wire = dir
+            .path()
+            .join(format!("contact_accept_{}.wire", hex::encode(rid)));
+        let err = finish_contact_accept(dir.path(), &rid, &outcome).unwrap_err();
+        assert!(
+            err.contains("bind failed") && err.contains("already used"),
+            "{err}"
+        );
+        assert!(
+            pending.exists(),
+            "request must stay pending after a failed bind"
+        );
+        assert!(!accept_wire.exists());
+        assert_eq!(load_contacts(dir.path()).unwrap().len(), 1);
+        // Retry with a free petname: bound, accept wire written, request gone.
+        outcome.binding.petname = "Alice 2".into();
+        let out = finish_contact_accept(dir.path(), &rid, &outcome).unwrap();
+        assert_eq!(out, accept_wire);
+        assert!(accept_wire.exists());
+        assert!(!pending.exists());
+        assert_eq!(load_contacts(dir.path()).unwrap().len(), 2);
+        // Re-running after the request is gone is harmless (same key row replaced).
+        finish_contact_accept(dir.path(), &rid, &outcome).unwrap();
+        assert_eq!(load_contacts(dir.path()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn contact_remove_is_the_explicit_path_to_re_pin_a_changed_key() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_book(dir.path());
+        let mallory = ident(0x0e);
+        let m_hex = hex::encode(mallory.public_key_bytes());
+        let m_fp = device_fingerprint_v1(&mallory.public_key_bytes());
+        let add_new = |fp: Option<&str>| {
+            add_contact(
+                dir.path(),
+                &mallory.address(),
+                &m_hex,
+                "Alice (new phone)",
+                "alice",
+                fp,
+                "",
+            )
+        };
+        assert_eq!(
+            add_new(Some(&m_fp)).unwrap_err(),
+            "KEY_CHANGE_REFUSED_WITHOUT_REPIN"
+        );
+        // Selectors that name nobody (or everybody) remove nothing.
+        assert!(cmd_contact_remove(dir.path(), None, None, None, true).is_err());
+        assert!(cmd_contact_remove(dir.path(), None, Some("nobody"), None, true).is_err());
+        assert!(cmd_contact_remove(dir.path(), Some("@"), None, None, true).is_err());
+        assert!(cmd_contact_remove(dir.path(), None, Some(""), None, true).is_err());
+        assert_eq!(load_contacts(dir.path()).unwrap().len(), 2);
+        // Remove the old pinned row by petname, then re-pin the new key.
+        cmd_contact_remove(dir.path(), None, Some("alice"), None, true).unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert_eq!(book.len(), 1);
+        assert_eq!(book[0].petname, "Bob");
+        add_new(Some(&m_fp)).unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert!(book
+            .iter()
+            .any(|c| c.pinned && c.public_tag == "alice" && c.pub_hex == m_hex));
+    }
+
+    #[test]
+    fn contact_remove_never_guesses_among_several_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ident(0x0a);
+        let b = ident(0x0b);
+        save_contacts(
+            dir.path(),
+            &[
+                book_row(&a, "Ahmad (Berlin)", "ahmad"),
+                book_row(&b, "Ahmad (Tehran)", "ahmad"),
+            ],
+        )
+        .unwrap();
+        let err = cmd_contact_remove(dir.path(), Some("ahmad"), None, None, true).unwrap_err();
+        assert!(err.contains("2 contacts match"), "{err}");
+        assert_eq!(load_contacts(dir.path()).unwrap().len(), 2);
+        // A unique selector works (address form).
+        cmd_contact_remove(dir.path(), None, None, Some(&a.address()), true).unwrap();
+        assert_eq!(load_contacts(dir.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn contact_unblock_reverses_a_block_and_refuses_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = ident(0x0d);
+        let peer_hex = hex::encode(peer.public_key_bytes());
+        let mut blocks = BlockList::load_checked(dir.path()).unwrap();
+        blocks.block(&peer_hex);
+        blocks.save(dir.path()).unwrap();
+        cmd_contact_unblock(dir.path(), &peer_hex).unwrap();
+        assert!(!BlockList::load_checked(dir.path())
+            .unwrap()
+            .is_blocked(&peer_hex));
+        let err = cmd_contact_unblock(dir.path(), &peer_hex).unwrap_err();
+        assert!(err.contains("not on the block list"), "{err}");
+        assert!(cmd_contact_unblock(dir.path(), "zz").is_err());
+        // A corrupt list is never overwritten.
+        let path = raven_core::chat_history::blocked_path(dir.path());
+        std::fs::write(&path, "{broken").unwrap();
+        let err = cmd_contact_unblock(dir.path(), &peer_hex).unwrap_err();
+        assert!(err.contains("block list"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn set_dial_refreshes_only_the_dial() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_book(dir.path());
+        let a = ident(0x0a);
+        cmd_contact_set_dial(
+            dir.path(),
+            None,
+            None,
+            Some(&a.address()),
+            "192.168.1.31:7420",
+        )
+        .unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        let alice = book.iter().find(|c| c.petname == "Alice").unwrap();
+        assert_eq!(alice.lan_dial, "192.168.1.31:7420");
+        assert_eq!(alice.public_tag, "alice");
+        assert!(alice.pinned);
+        // Bad dials and unknown contacts change nothing.
+        let before = std::fs::read(dir.path().join("contacts.json")).unwrap();
+        assert!(
+            cmd_contact_set_dial(dir.path(), Some("@alice"), None, None, "evil\u{1b}[2J:7420")
+                .is_err()
+        );
+        assert!(
+            cmd_contact_set_dial(dir.path(), None, Some("Zed"), None, "10.0.0.1:7420").is_err()
+        );
+        assert!(cmd_contact_set_dial(dir.path(), Some("@"), None, None, "10.0.0.1:7420").is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join("contacts.json")).unwrap(),
+            before
+        );
+    }
+
+    /// O: when a contact's addresses change (set-dial, set-addr, set-addr
+    /// --clear) or the contact is removed, raven-node's outbox forgets the
+    /// routes it recorded for that contact's queued messages; another
+    /// contact's records stay.
+    #[test]
+    fn contact_edits_and_removal_forget_the_outbox_routes_recorded_for_it() {
+        use raven_core::outbox::{
+            object_route_records, record_object_routes, CarrierChoice, OutboxCarrier, OutboxRoute,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        seed_book(dir.path());
+        let alice = ident(0x0a).public_key_bytes();
+        let bob = ident(0x0b).public_key_bytes();
+        let now = super::now_ms();
+        let record = |mid: u8, peer: &[u8; 32]| {
+            let route = OutboxRoute {
+                carrier: OutboxCarrier::Lan,
+                dial: "192.168.1.20:7420".into(),
+            };
+            record_object_routes(
+                dir.path(),
+                &[mid; 16],
+                peer,
+                CarrierChoice::Lan,
+                &[route],
+                now + 3_600_000,
+                now,
+            )
+            .unwrap();
+        };
+        let held = |mid: u8| {
+            object_route_records(dir.path(), now)
+                .unwrap()
+                .contains_key(&[mid; 16])
+        };
+        let edits: [&dyn Fn() -> Result<(), String>; 4] = [
+            &|| cmd_contact_set_dial(dir.path(), Some("@alice"), None, None, "192.168.1.31:7420"),
+            &|| {
+                cmd_contact_set_addr(
+                    dir.path(),
+                    Some("@alice"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("[2001:db8::7]:7422"),
+                    &[],
+                )
+            },
+            &|| {
+                cmd_contact_set_addr(
+                    dir.path(),
+                    Some("@alice"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &["internet".into()],
+                )
+            },
+            &|| cmd_contact_remove(dir.path(), Some("alice"), None, None, true),
+        ];
+        for (i, edit) in edits.iter().enumerate() {
+            record(1, &alice);
+            record(2, &bob);
+            assert!(held(1) && held(2));
+            edit().unwrap();
+            assert!(!held(1), "edit {i} kept Alice's recorded routes");
+            assert!(held(2), "edit {i} dropped Bob's recorded routes");
+        }
+    }
+    // ── plain-language screens ──────────────────────────────────────────────
+
+    #[test]
+    fn a_first_run_answer_that_is_neither_yes_nor_no_is_asked_again() {
+        for unclear in ["ok", "yea", "da", "بله", "غ", "yes please", " "] {
+            assert!(first_run_answer_is_unclear(Some(unclear)), "{unclear:?}");
+            assert!(
+                !first_run_answer_accepts(Some(unclear), true),
+                "{unclear:?}"
+            );
+            assert!(
+                !first_run_answer_accepts(Some(unclear), false),
+                "{unclear:?}"
+            );
+        }
+        for clear in ["y", "Y", "yes", "YES", "n", "N", "no", "No"] {
+            assert!(!first_run_answer_is_unclear(Some(clear)), "{clear:?}");
+        }
+        // EOF is no answer and Enter is the default: neither is "unclear".
+        assert!(!first_run_answer_is_unclear(None));
+        assert!(!first_run_answer_is_unclear(Some("")));
+        // Whatever it is, an empty answer on a pipe and EOF never create one.
+        assert!(!first_run_answer_accepts(None, true));
+        assert!(!first_run_answer_accepts(Some(""), false));
+    }
+
+    #[test]
+    fn short_age_reads_in_plain_words() {
+        let now = 10_000_000_000u64;
+        assert_eq!(short_age(now, now), "just now");
+        assert_eq!(short_age(now, now - 59_999), "just now");
+        assert_eq!(short_age(now, now - 60_000), "1 min ago");
+        assert_eq!(short_age(now, now - 5 * 60_000), "5 min ago");
+        assert_eq!(short_age(now, now - 3_600_000), "1 h ago");
+        assert_eq!(short_age(now, now - 23 * 3_600_000), "23 h ago");
+        assert_eq!(short_age(now, now - 3 * 86_400_000), "3 d ago");
+        // A clock that ran backwards is not a time in the future.
+        assert_eq!(short_age(now, now + 5_000_000), "just now");
+        // No timestamp, no age.
+        assert_eq!(short_age(now, 0), "");
+    }
+
+    #[test]
+    fn inbox_rows_lead_with_age_and_name_not_with_ids_and_pin_jargon() {
+        let a = ident(0x0a);
+        let b = ident(0x0b);
+        let mk = |petname: &str, who: &Identity, pinned: bool| Contact {
+            petname: petname.into(),
+            public_tag: String::new(),
+            alias: String::new(),
+            address: who.address(),
+            pub_hex: hex::encode(who.public_key_bytes()),
+            pinned,
+            lan_dial: String::new(),
+            internet_dial: String::new(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
+        };
+        let book = vec![mk("Alice", &a, false), mk("Bobby", &b, true)];
+        let mid = [0xabu8; 16];
+        let line = format_inbox_row(
+            &book,
+            &a.public_key_bytes(),
+            &mid,
+            "سلام، می\u{200c}خواهم بیایم".as_bytes(),
+            "5 min ago",
+            None,
+        );
+        // Who and when come first; the id is last; no "unpinned fp=" on the row.
+        assert!(line.starts_with("  5 min ago  from Alice"), "{line}");
+        assert!(line.ends_with("[abababab]"), "{line}");
+        assert!(
+            !line.contains("unpinned") && !line.contains("fp="),
+            "{line}"
+        );
+        assert!(line.contains("(not verified)"), "{line}");
+        // Persian text and the ZWNJ come through byte-exact.
+        assert!(line.contains("سلام، می\u{200c}خواهم بیایم"), "{line}");
+        // A verified contact still reads `Name [pinned ...` (scripts grep it).
+        let pinned = format_inbox_row(&book, &b.public_key_bytes(), &mid, b"hi", "", None);
+        assert!(pinned.contains("Bobby [pinned fp="), "{pinned}");
+        assert!(pinned.starts_with("  from Bobby"), "{pinned}");
+        // Never wrapped or split across lines.
+        assert!(!line.contains('\n') && !pinned.contains('\n'));
+    }
+
+    #[test]
+    fn long_bodies_are_clipped_only_on_request() {
+        let long = "x".repeat(50);
+        assert_eq!(clip_body(long.clone(), None), long);
+        assert_eq!(clip_body(long.clone(), Some(50)), long);
+        let clipped = clip_body(long.clone(), Some(10));
+        assert!(clipped.starts_with(&"x".repeat(10)), "{clipped}");
+        assert!(clipped.ends_with("(+40 more characters)"), "{clipped}");
+        // Clipping counts characters, never splits one.
+        let persian = "س".repeat(30);
+        let clipped = clip_body(persian, Some(5));
+        assert!(clipped.starts_with(&"س".repeat(5)) && clipped.contains("(+25 more"));
+    }
+
+    #[test]
+    fn history_rows_say_who_to_whom_and_whether_it_arrived() {
+        let now = 5_000_000_000u64;
+        let mut e = history_row("out", "queued");
+        e.created_at_ms = now - 120_000;
+        e.body = "see you at five".into();
+        let row = format_history_row(&e, now, None);
+        assert!(
+            row.starts_with("  2 min ago  you \u{2192} Bob: see you at five"),
+            "{row}"
+        );
+        assert!(row.contains(" [queued]"), "{row}");
+        assert!(row.ends_with("[aaaaaaaa]"), "{row}");
+        let delivered = format_history_row(&history_row("out", "delivered"), now, None);
+        assert!(!delivered.contains("[queued]") && !delivered.contains("[failed]"));
+        let incoming = format_history_row(&history_row("in", "received"), now, None);
+        assert!(incoming.contains("Bob \u{2192} you"), "{incoming}");
+        let failed = format_history_row(&history_row("out", "failed"), now, None);
+        assert!(failed.contains(" [failed]"), "{failed}");
+        // The body is shown when there is one; the 120-char preview only for old rows.
+        assert!(format_history_row(&history_row("out", "queued"), now, None).contains(": hi"));
+    }
+
+    fn book_with(names: &[(&str, &str)]) -> Vec<Contact> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, (petname, tag))| {
+                let id = ident(0x20 + i as u8);
+                Contact {
+                    petname: (*petname).into(),
+                    public_tag: (*tag).into(),
+                    alias: (*tag).into(),
+                    address: id.address(),
+                    pub_hex: hex::encode(id.public_key_bytes()),
+                    pinned: false,
+                    lan_dial: String::new(),
+                    internet_dial: String::new(),
+                    p2p: String::new(),
+                    p2p_via: Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contact_argument_resolves_a_petname_like_the_picker() {
+        let book = book_with(&[("Alice", "alice"), ("Bob", ""), ("Carol", "cc")]);
+        let name_of = |arg: &str| -> Vec<String> {
+            resolve_contact_arg(&book, arg)
+                .iter()
+                .map(|c| c.petname.clone())
+                .collect()
+        };
+        // Petname, any case, with or without the picker's whitespace.
+        assert_eq!(name_of("Bob"), ["Bob"]);
+        assert_eq!(name_of("bob"), ["Bob"]);
+        assert_eq!(name_of(" BOB "), ["Bob"]);
+        // @tag keeps tag semantics (and a petname after @ is not a tag).
+        assert_eq!(name_of("@alice"), ["Alice"]);
+        assert_eq!(name_of("@ALICE"), ["Alice"]);
+        assert!(name_of("@bob").is_empty());
+        // A bare word that is no petname still works as a tag.
+        assert_eq!(name_of("cc"), ["Carol"]);
+        // Nobody: nothing, a lone @ and empty never select an untagged contact.
+        for none in ["", " ", "@", "@@", "Zed", "@zed"] {
+            assert!(name_of(none).is_empty(), "{none:?}");
+        }
+        // The petname wins over a tag with the same word.
+        let tricky = book_with(&[("alice", "zed"), ("Zed", "alice")]);
+        let pet: Vec<_> = resolve_contact_arg(&tricky, "alice")
+            .iter()
+            .map(|c| c.petname.clone())
+            .collect();
+        assert_eq!(pet, ["alice"]);
+    }
+
+    #[test]
+    fn no_contact_message_names_who_exists_and_keeps_its_prefix() {
+        let book = book_with(&[("Alice", "alice"), ("Bob", "")]);
+        let msg = no_contact_message(&book, "Zed");
+        assert!(msg.starts_with("no contact for Zed"), "{msg}");
+        assert!(
+            msg.contains("Alice (@alice)") && msg.contains("Bob"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("--contact NAME") && msg.contains("--contact @tag"),
+            "{msg}"
+        );
+        let none = no_contact_message(&[], "Zed");
+        assert!(none.starts_with("no contact for Zed"), "{none}");
+        assert!(
+            none.contains("no contacts yet") && none.contains("ash contact add"),
+            "{none}"
+        );
+        // A hostile name cannot smuggle escapes into the line.
+        assert!(!no_contact_message(&book, "x\u{1b}[2J").contains('\u{1b}'));
+        // Many contacts are capped, with a way to see the rest.
+        let many: Vec<(String, String)> =
+            (0..12).map(|i| (format!("P{i}"), String::new())).collect();
+        let refs: Vec<(&str, &str)> = many.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let msg = no_contact_message(&book_with(&refs), "nobody");
+        assert!(
+            msg.contains("+4 more") && msg.contains("ash contact list"),
+            "{msg}"
+        );
+    }
+
+    fn status_with(caps: &[&str]) -> Result<IpcResponse, String> {
+        Ok(IpcResponse::Status {
+            v: IPC_VERSION,
+            bridge: true,
+            store: true,
+            relay: false,
+            forward_pending: 0,
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            p2p: None,
+        })
+    }
+
+    #[test]
+    fn status_says_in_plain_words_whether_this_computer_can_receive() {
+        let up = classify_node_reach(&status_with(&["ipc", "lan_direct", "bridge"]));
+        assert_eq!(up, NodeReach::SendAndReceive);
+        assert!(node_reach_row(&up).starts_with("YES"));
+        assert_eq!(node_reach_verdict(&up), "You can send and receive.");
+
+        let deaf = classify_node_reach(&status_with(&["ipc", "bridge"]));
+        assert_eq!(deaf, NodeReach::SendOnly);
+        assert!(node_reach_row(&deaf).starts_with("NO"));
+        assert!(node_reach_verdict(&deaf).starts_with("You can send but NOT receive"));
+
+        let down = classify_node_reach(&Err(
+            "raven-node is not running; start it with `ash listen`".into(),
+        ));
+        assert_eq!(down, NodeReach::NotRunning);
+        assert!(node_reach_row(&down).starts_with("NO"));
+        let verdict = node_reach_verdict(&down);
+        assert!(verdict.starts_with("raven-node is not running: start it with `ash listen`"));
+
+        // A node that answers badly, or not at all, is not "not running".
+        for other in [
+            Err("raven-node did not answer in time: it is busy or stuck".to_string()),
+            Ok(IpcResponse::Pong { v: IPC_VERSION }),
+        ] {
+            let reach = classify_node_reach(&other);
+            assert_eq!(reach, NodeReach::NotAnswering, "{other:?}");
+            assert!(node_reach_verdict(&reach).contains("ash doctor"));
+        }
+        // No row or verdict may use the words `ash status` must not show without
+        // a daemon (bridge_abc_demo / cli_failure_paths) or any secret word.
+        for reach in [up, deaf, down] {
+            for line in [node_reach_row(&reach), node_reach_verdict(&reach)] {
+                let low = line.to_lowercase();
+                for banned in ["mock_ble", "transports", "seed", "private key", "plaintext"] {
+                    assert!(!low.contains(banned), "{line}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_names_one_next_step_and_the_first_problem_wins() {
+        use IdentityState::*;
+        let all_up = NodeReach::SendAndReceive;
+        assert!(doctor_next_step(Missing, Some(0), &all_up).contains("ash init"));
+        assert!(doctor_next_step(Missing, None, &NodeReach::NotRunning).contains("ash init"));
+        assert!(doctor_next_step(Unavailable, Some(2), &all_up).contains("identity store"));
+        assert!(
+            doctor_next_step(Ready, Some(0), &NodeReach::NotRunning).contains("menu 5 Contacts")
+        );
+        assert!(doctor_next_step(Ready, None, &all_up).contains("contacts file"));
+        assert!(doctor_next_step(Ready, Some(2), &NodeReach::NotRunning).contains("ash listen"));
+        assert!(doctor_next_step(Ready, Some(2), &NodeReach::SendOnly).contains("NOT receiving"));
+        assert!(doctor_next_step(Ready, Some(2), &NodeReach::NotAnswering).contains("not answer"));
+        assert!(doctor_next_step(Ready, Some(2), &all_up).contains("ash send --contact NAME"));
+    }
+
+    #[test]
+    fn a_message_typed_at_a_prompt_is_checked_before_anything_is_sent() {
+        // Cursor keys arrive as escape sequences in a cooked terminal line.
+        for arrow in [
+            "see you at 5 \u{1b}[D\u{1b}[D pm",
+            "\u{1b}[H",
+            "\u{1b}OA hi",
+        ] {
+            let problem = tty_message_problem(arrow).expect(arrow);
+            assert_eq!(
+                problem,
+                "cursor keys are not supported in this prompt, retype the message"
+            );
+        }
+        // Other control bytes (NUL, BEL, DEL, backspace) are refused too.
+        for ctrl in ["a\u{0}b", "a\u{7}b", "a\u{7f}b", "a\u{8}b"] {
+            assert!(tty_message_problem(ctrl).is_some(), "{ctrl:?}");
+        }
+        // Everything the core accepts passes: Persian, ZWNJ, RLM/LRM, emoji, tab.
+        for fine in [
+            "hello",
+            "سلام، حالت چطوره؟",
+            "می\u{200c}خواهم",
+            "a\u{200f}b\u{200e}c",
+            "👨\u{200d}👩\u{200d}👧 ok",
+            "tab\there",
+        ] {
+            assert_eq!(tty_message_problem(fine), None, "{fine:?}");
+        }
+    }
+
+    #[test]
+    fn menu_hints_are_plain_and_say_when_a_tool_is_local_only() {
+        let hints: Vec<&str> = MENU_ITEMS.iter().map(|(_, _, h)| *h).collect();
+        for jargon in [
+            "committed endpoint",
+            "transports",
+            "opaque",
+            "ephemeral BLE",
+            "one command, no flags",
+        ] {
+            assert!(
+                !hints.iter().any(|h| h.contains(jargon)),
+                "{jargon:?} in {hints:?}"
+            );
+        }
+        assert!(
+            MENU_ITEMS[5].2.contains("this computer only"),
+            "{:?}",
+            MENU_ITEMS[5]
+        );
+        assert!(
+            MENU_ITEMS[6].2.contains("this computer only"),
+            "{:?}",
+            MENU_ITEMS[6]
+        );
+        assert!(
+            MENU_ITEMS[6].2.contains("no Bluetooth"),
+            "{:?}",
+            MENU_ITEMS[6]
+        );
+        // The numbers scripts and muscle memory use do not move.
+        let titles: Vec<&str> = MENU_ITEMS.iter().map(|(_, t, _)| *t).collect();
+        assert_eq!(
+            titles,
+            [
+                "Chat / Send",
+                "Inbox",
+                "Status",
+                "Listen",
+                "Contacts",
+                "Mailbox",
+                "Nearby scan",
+                "Tutorial"
+            ]
+        );
+    }
+    #[test]
+    fn the_arrow_menu_footer_lists_quit_once_and_points_new_users_to_the_tutorial() {
+        let footer = arrow_menu_footer("", "");
+        assert_eq!(footer.matches("quit").count(), 1, "{footer}");
+        assert!(footer.starts_with("q  quit"), "{footer}");
+        assert!(
+            footer.contains("press a number") && footer.contains("press 8"),
+            "{footer}"
+        );
+        // Styles are opened and closed around the hint only.
+        assert_eq!(arrow_menu_footer("<d>", "</d>").matches("<d>").count(), 1);
+    }
+    #[test]
+    fn the_listen_screen_says_this_terminal_is_busy_and_how_a_friend_adds_you() {
+        // It used to promise "Messages land in menu 2 Inbox" in the one terminal
+        // that cannot reach any menu while it listens.
+        assert!(
+            LISTEN_STAYS_BUSY.contains("second terminal"),
+            "{LISTEN_STAYS_BUSY}"
+        );
+        assert!(
+            LISTEN_STAYS_BUSY.contains("`ash inbox`"),
+            "{LISTEN_STAYS_BUSY}"
+        );
+        assert!(
+            !LISTEN_STAYS_BUSY.contains("land in menu 2"),
+            "{LISTEN_STAYS_BUSY}"
+        );
+        assert!(LISTEN_INVITE_HINT.contains("add you") && LISTEN_INVITE_HINT.contains("menu 5"));
+        assert!(
+            LISTEN_INVITE_HINT.contains("`ash whoami`"),
+            "{LISTEN_INVITE_HINT}"
+        );
+    }
+
+    // ── Contact routes, set-addr, cards, carrier plan (transports P1) ────────
+
+    #[test]
+    fn internet_dial_accepts_ipv4_ipv6_and_names_and_says_what_is_wrong() {
+        let ok = |s: &str| parse_internet_dial(s).unwrap();
+        assert_eq!(ok("203.0.113.7:7422"), "203.0.113.7:7422");
+        assert_eq!(ok(" 127.0.0.1:9 "), "127.0.0.1:9");
+        assert_eq!(ok("[2001:DB8::7]:7422"), "[2001:db8::7]:7422");
+        assert_eq!(ok("[::1]:7422"), "[::1]:7422");
+        assert_eq!(ok("Node.Example.COM:7422"), "node.example.com:7422");
+        assert_eq!(ok("mac-mini.local:7422"), "mac-mini.local:7422");
+        let err = |s: &str| parse_internet_dial(s).unwrap_err();
+        assert!(err("").contains("empty"));
+        assert!(err("203.0.113.7").contains("needs a port"));
+        assert!(err("203.0.113.7:0").contains("port"));
+        assert!(err("203.0.113.7:70000").contains("port"));
+        assert!(err("2001:db8::7:7422").contains("brackets"));
+        assert!(err("[2001:db8::7]").contains(":port"));
+        assert!(err("[fe80::1%en0]:7422").contains("zone"));
+        assert!(err("[2001:db8::7:7422").contains("']'"));
+        assert!(err("0.0.0.0:7422").contains("cannot be dialled"));
+        assert!(err("[::]:7422").contains("cannot be dialled"));
+        assert!(err("224.0.0.1:7422").contains("cannot be dialled"));
+        assert!(err("255.255.255.255:7422").contains("cannot be dialled"));
+        assert!(err("rvn1qqqq:7422").contains("Raven ID"));
+        assert!(err("300.1.1.1:7422").contains("not an IPv4 address or a DNS name"));
+        assert!(err("bad_host:7422").contains("not an IPv4 address or a DNS name"));
+        assert!(err("-x.example:7422").contains("DNS name"));
+        assert!(err("a b:7422").contains("without spaces"));
+        assert!(err("evil\u{1b}[2J:7422").contains("control"));
+    }
+
+    #[test]
+    fn route_edits_are_validated_before_the_book_is_read() {
+        let e = parse_route_edit(Some("192.168.1.31:7420"), Some("203.0.113.7:7422"), &[]).unwrap();
+        assert_eq!(e.lan.as_deref(), Some("192.168.1.31:7420"));
+        assert_eq!(e.internet.as_deref(), Some("203.0.113.7:7422"));
+        let e = parse_route_edit(None, None, &["internet".into()]).unwrap();
+        assert_eq!(e.internet.as_deref(), Some(""));
+        assert_eq!(e.lan, None);
+        assert!(parse_route_edit(None, None, &[])
+            .unwrap_err()
+            .contains("nothing to change"));
+        assert!(parse_route_edit(None, None, &["wifi".into()])
+            .unwrap_err()
+            .contains("lan, internet or p2p"));
+        assert!(
+            parse_route_edit(Some("10.0.0.1:7420"), None, &["lan".into()])
+                .unwrap_err()
+                .contains("contradict")
+        );
+        assert!(parse_route_edit(None, Some("example.com"), &[])
+            .unwrap_err()
+            .contains("port"));
+        assert!(parse_route_edit(Some("not a dial"), None, &[])
+            .unwrap_err()
+            .contains("lan_dial"));
+    }
+
+    #[test]
+    fn set_addr_sets_and_clears_routes_and_keeps_labels_and_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_book(dir.path());
+        let before = std::fs::read(dir.path().join("contacts.json")).unwrap();
+        // An old book (no Internet routes) is written without the new key.
+        assert!(!String::from_utf8_lossy(&before).contains("internet_dial"));
+        cmd_contact_set_addr(
+            dir.path(),
+            Some("@alice"),
+            None,
+            None,
+            None,
+            None,
+            Some("[2001:db8::7]:7422"),
+            &[],
+        )
+        .unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        let alice = book.iter().find(|c| c.petname == "Alice").unwrap();
+        assert_eq!(alice.internet_dial, "[2001:db8::7]:7422");
+        assert_eq!(alice.lan_dial, "192.168.1.20:7420");
+        assert_eq!(alice.public_tag, "alice");
+        assert!(alice.pinned);
+        let raw = std::fs::read_to_string(dir.path().join("contacts.json")).unwrap();
+        assert_eq!(raw.matches("\"pub_hex\"").count(), 2, "{raw}");
+        // The flag selectors of set-dial work too; clearing removes the key again.
+        cmd_contact_set_addr(
+            dir.path(),
+            None,
+            None,
+            Some("Alice"),
+            None,
+            None,
+            None,
+            &["internet".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("contacts.json")).unwrap(),
+            before
+        );
+        // Bad values, unknown or ambiguous selectors change nothing.
+        for (sel, inet) in [
+            (Some("@alice"), Some("0.0.0.0:7422")),
+            (Some("Zed"), Some("203.0.113.7:7422")),
+            (Some("@"), Some("203.0.113.7:7422")),
+        ] {
+            assert!(
+                cmd_contact_set_addr(dir.path(), sel, None, None, None, None, inet, &[]).is_err()
+            );
+        }
+        assert!(cmd_contact_set_addr(
+            dir.path(),
+            Some("Alice"),
+            Some("alice"),
+            None,
+            None,
+            None,
+            Some("203.0.113.7:7422"),
+            &[],
+        )
+        .unwrap_err()
+        .contains("name the contact once"));
+        assert_eq!(
+            std::fs::read(dir.path().join("contacts.json")).unwrap(),
+            before
+        );
+        // By rvn1 address.
+        let a = ident(0x0a);
+        cmd_contact_set_addr(
+            dir.path(),
+            Some(&a.address()),
+            None,
+            None,
+            None,
+            Some("192.168.1.40:7420"),
+            None,
+            &[],
+        )
+        .unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert_eq!(
+            book.iter().find(|c| c.petname == "Alice").unwrap().lan_dial,
+            "192.168.1.40:7420"
+        );
+    }
+
+    #[test]
+    fn contacts_json_without_internet_routes_still_loads_and_keeps_unknown_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ident(0x0a);
+        // A book written before routes existed (no internet_dial key at all).
+        let old = format!(
+            "[\n  {{\n    \"petname\": \"Alice\",\n    \"public_tag\": \"alice\",\n    \"alias\": \"alice\",\n    \"address\": \"{}\",\n    \"pub_hex\": \"{}\",\n    \"pinned\": true,\n    \"lan_dial\": \"192.168.1.20:7420\"\n  }}\n]",
+            a.address(),
+            hex::encode(a.public_key_bytes())
+        );
+        std::fs::write(dir.path().join("contacts.json"), &old).unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert_eq!(book[0].lan_dial, "192.168.1.20:7420");
+        assert!(book[0].internet_dial.is_empty());
+        // Saving it unchanged reproduces the old bytes.
+        save_contacts(dir.path(), &book).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("contacts.json")).unwrap(),
+            old
+        );
+    }
+
+    #[test]
+    fn cards_round_trip_and_parse_strictly() {
+        let a = ident(0x0a);
+        let card = format_card(&a, "203.0.113.7:7422", "192.168.1.20:7420");
+        assert!(card.starts_with("raven-card/1 address=rvn1"), "{card}");
+        assert!(!card.contains('\n'));
+        for forbidden in ["seed", "private", "secret"] {
+            assert!(!card.to_lowercase().contains(forbidden), "{card}");
+        }
+        let parsed = parse_card(&card).unwrap();
+        assert_eq!(parsed.address, a.address());
+        assert_eq!(parsed.pub_hex, hex::encode(a.public_key_bytes()));
+        assert_eq!(
+            parsed.fingerprint,
+            device_fingerprint_v1(&a.public_key_bytes())
+        );
+        assert_eq!(parsed.internet, "203.0.113.7:7422");
+        assert_eq!(parsed.lan, "192.168.1.20:7420");
+        let bare = parse_card(&format_card(&a, "", "")).unwrap();
+        assert!(bare.internet.is_empty() && bare.lan.is_empty());
+
+        let b = ident(0x0b);
+        let pub_a = hex::encode(a.public_key_bytes());
+        let swap_addr = card.replace(&a.address(), &b.address());
+        let cases: Vec<(String, &str)> = vec![
+            ("hello".into(), "must start with raven-card/1"),
+            (
+                card.replace("raven-card/1", "raven-card/3"),
+                "not supported",
+            ),
+            // A v2 card must carry its p2p route.
+            (
+                card.replace("raven-card/1", "raven-card/2"),
+                "needs a p2p= PeerId",
+            ),
+            (swap_addr, "does not belong"),
+            (
+                card.replace(
+                    &device_fingerprint_v1(&a.public_key_bytes()),
+                    "AAAA-BBBB-CCCC",
+                ),
+                "fingerprint does not match",
+            ),
+            (format!("{card} via=/ip4/1.2.3.4"), "unknown"),
+            (format!("{card} inet=198.51.100.1:7422"), "twice"),
+            (
+                card.replace("inet=203.0.113.7:7422", "inet=0.0.0.0:7422"),
+                "card inet",
+            ),
+            (
+                card.replace("lan=192.168.1.20:7420", "lan=nope"),
+                "card lan",
+            ),
+            (
+                card.replace(&format!("pub_hex={pub_a}"), "pub_hex="),
+                "key=value",
+            ),
+            (card.replace(&format!(" pub_hex={pub_a}"), ""), "no pub_hex"),
+            (format!("{card} \u{1b}[2J"), "plain characters"),
+            (
+                card.replace(
+                    &device_fingerprint_v1(&a.public_key_bytes()),
+                    &device_fingerprint_v1(&a.public_key_bytes()).to_ascii_lowercase(),
+                ),
+                "fingerprint does not match",
+            ),
+            ("x".repeat(2000), "plain characters"),
+        ];
+        for (text, want) in cases {
+            let err = parse_card(&text).unwrap_err();
+            assert!(err.contains(want), "{text:?}: {err}");
+        }
+    }
+
+    /// P3 cards: `raven-card/2` adds `p2p=` and at most two `via=`; a card
+    /// without them stays `raven-card/1`; the grammar is strict, and a v1 card
+    /// cannot smuggle p2p fields in.
+    #[test]
+    fn p2p_cards_round_trip_and_parse_strictly() {
+        let a = ident(0x0c);
+        let peer = raven_core::p2p_route::local_peer_id(&a);
+        let relay = raven_core::p2p_route::local_peer_id(&ident(0x0d));
+        let via1 = format!("/ip4/198.51.100.7/tcp/7423/p2p/{relay}");
+        let via2 = format!("/ip4/203.0.113.9/udp/7423/quic-v1/p2p/{peer}");
+        let route = P2pRoute::parse(&peer, &[&via1, &via2]).unwrap();
+        let card = format_card_with(&a, "", "", Some(&route));
+        assert!(card.starts_with("raven-card/2 address=rvn1"), "{card}");
+        assert!(
+            card.contains(&format!(" p2p={peer} via={via1} via={via2}")),
+            "{card}"
+        );
+        let parsed = parse_card(&card).unwrap();
+        assert_eq!(parsed.p2p, Some(route.clone()));
+        assert_eq!(parse_card(&format_card(&a, "", "")).unwrap().p2p, None);
+        // The policy decides when no --via is given; without p2p the card is v1.
+        let mut policy = NodePolicy::default();
+        assert_eq!(own_card_p2p(&a, &[], &policy).unwrap(), None);
+        policy.p2p_listen = "7423".into();
+        policy.p2p_relays = vec![via1.clone()];
+        let own = own_card_p2p(&a, &[], &policy).unwrap().unwrap();
+        assert_eq!(own.peer_id, peer);
+        assert_eq!(own.via, vec![via1.clone()]);
+        assert!(own_card_p2p(&a, &["/ip4/1.2.3.4/tcp/1".into()], &NodePolicy::default()).is_err());
+        let v1 = format_card(&a, "", "");
+        let one = format_card_with(&a, "", "", Some(&P2pRoute::parse(&peer, &[&via1]).unwrap()));
+        let cases: Vec<(String, &str)> = vec![
+            (format!("{v1} p2p={peer}"), "unknown"),
+            (format!("{one} via={via1}"), "appears twice"),
+            (
+                format!("{card} via=/ip4/1.1.1.1/tcp/1/p2p/{relay}"),
+                "at most 2",
+            ),
+            (
+                card.replace(&format!(" p2p={peer}"), ""),
+                "needs a p2p= PeerId",
+            ),
+            (card.replace(&peer, "12D3KooWnotapeer"), "card p2p"),
+            (
+                card.replace(&via1, &format!("{via1}/p2p-circuit/p2p/{peer}")),
+                "circuit",
+            ),
+            (
+                card.replace(&via1, "/ip4/198.51.100.7/tcp/7423"),
+                "card p2p",
+            ),
+            (format!("{card} p2p={relay}"), "twice"),
+        ];
+        for (text, want) in cases {
+            let err = parse_card(&text).unwrap_err();
+            assert!(err.contains(want), "{text:?}: {err}");
+        }
+    }
+
+    /// Review item 12: the longest card valid fields give is accepted by
+    /// `contact add --card` (its limit is computed from the field maxima).
+    #[test]
+    fn the_longest_valid_card_round_trips() {
+        let a = ident(0x0e);
+        let peer = raven_core::p2p_route::local_peer_id(&a);
+        let relay = raven_core::p2p_route::local_peer_id(&ident(0x0f));
+        let name = |len: usize| -> String {
+            // Labels of at most 63 characters, joined by dots, `len` in all.
+            let mut out = String::new();
+            while out.len() < len {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                let take = (len - out.len()).min(63);
+                out.push_str(&"a".repeat(take));
+            }
+            out
+        };
+        // A DNS name has at most 253 characters.
+        let inet = format!("{}:65535", name(253));
+        assert_eq!(parse_internet_dial(&inet).unwrap(), inet);
+        assert!(parse_internet_dial(&format!("{}:65535", name(254))).is_err());
+        let lan = format!("{}:65535", name(MAX_DIAL_TEXT - 6));
+        assert_eq!(parse_lan_dial(&lan).unwrap(), lan);
+        assert!(parse_lan_dial(&format!("{}:65535", name(MAX_DIAL_TEXT - 5))).is_err());
+        let via = |who: &str| {
+            let fixed = "/dns4/".len() + "/tcp/65535/p2p/".len() + who.len();
+            format!(
+                "/dns4/{}/tcp/65535/p2p/{who}",
+                name(raven_core::p2p_route::MAX_MULTIADDR_CHARS - fixed)
+            )
+        };
+        let (v1, v2) = (via(&relay), via(&peer));
+        assert_eq!(v1.len(), raven_core::p2p_route::MAX_MULTIADDR_CHARS);
+        let route = P2pRoute::parse(&peer, &[&v1, &v2]).unwrap();
+        let card = format_card_with(&a, &inet, &lan, Some(&route));
+        assert!(
+            card.len() > 1024,
+            "longer than the old limit: {}",
+            card.len()
+        );
+        assert!(
+            card.len() <= CARD_MAX_LEN,
+            "{} > {CARD_MAX_LEN}",
+            card.len()
+        );
+        let parsed = parse_card(&card).unwrap();
+        assert_eq!(parsed.p2p, Some(route));
+        assert_eq!(parsed.lan, lan);
+        assert_eq!(parsed.internet, inet);
+        assert!(a.address().len() <= CARD_ADDRESS_MAX);
+        assert!(device_fingerprint_v1(&a.public_key_bytes()).len() <= CARD_FINGERPRINT_MAX);
+    }
+
+    #[test]
+    fn set_addr_sets_and_clears_the_p2p_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let bob = ident(0x3b);
+        save_contacts(
+            dir.path(),
+            &[Contact {
+                petname: "Bob".into(),
+                public_tag: "bob".into(),
+                alias: "bob".into(),
+                address: bob.address(),
+                pub_hex: hex::encode(bob.public_key_bytes()),
+                pinned: true,
+                lan_dial: String::new(),
+                internet_dial: String::new(),
+                p2p: String::new(),
+                p2p_via: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let peer = raven_core::p2p_route::local_peer_id(&bob);
+        let relay = raven_core::p2p_route::local_peer_id(&ident(0x3c));
+        let via = format!("/ip4/198.51.100.7/tcp/7423/p2p/{relay}");
+        let set = |p2p: Option<&str>, via: &[String], clear: &[String]| {
+            cmd_contact_set_routes(
+                dir.path(),
+                Some("@bob"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                p2p,
+                via,
+                clear,
+            )
+        };
+        // --via alone needs a PeerId first.
+        assert!(set(None, std::slice::from_ref(&via), &[])
+            .unwrap_err()
+            .contains("has no p2p PeerId"));
+        set(Some(&peer), std::slice::from_ref(&via), &[]).unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert_eq!(book[0].p2p, peer);
+        assert_eq!(book[0].p2p_via, vec![via.clone()]);
+        // A new PeerId drops the old addresses; --via alone replaces them.
+        let other = raven_core::p2p_route::local_peer_id(&ident(0x3d));
+        set(Some(&other), &[], &[]).unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert!(book[0].p2p == other && book[0].p2p_via.is_empty());
+        set(None, std::slice::from_ref(&via), &[]).unwrap();
+        assert_eq!(
+            load_contacts(dir.path()).unwrap()[0].p2p_via,
+            vec![via.clone()]
+        );
+        // --clear p2p clears both; contradictions and junk change nothing.
+        assert!(set(Some(&peer), &[], &["p2p".into()]).is_err());
+        assert!(set(Some("12D3KooWnope"), &[], &[]).is_err());
+        assert!(set(None, &["/ip4/1.2.3.4/tcp/1".into()], &[]).is_err());
+        set(None, &[], &["p2p".into()]).unwrap();
+        let book = load_contacts(dir.path()).unwrap();
+        assert!(book[0].p2p.is_empty() && book[0].p2p_via.is_empty());
+        assert!(book[0].pinned, "the pin is kept");
+        // The file keeps no empty p2p keys (older readers see the same rows).
+        let raw = std::fs::read_to_string(dir.path().join("contacts.json")).unwrap();
+        assert!(!raw.contains("p2p"), "{raw}");
+    }
+
+    #[test]
+    fn auto_plans_p2p_last_for_verified_contacts_and_p2p_alone_on_request() {
+        let peer = raven_core::p2p_route::local_peer_id(&ident(0x4a));
+        let mut c = contact_with("192.168.1.20:7420", "203.0.113.7:7422");
+        c.p2p = peer.clone();
+        let names = |routes: Vec<pair_init_lab::DialRoute>| -> Vec<String> {
+            routes
+                .into_iter()
+                .map(|r| format!("{}={}", r.carrier.label(), r.dial))
+                .collect()
+        };
+        let plan = |c: &Contact, choice, inet: bool, p2p: bool| {
+            plan_contact_routes_with(c, choice, None, inet, p2p).map(|(r, _)| names(r))
+        };
+        assert_eq!(
+            plan(&c, CarrierChoice::Auto, true, true).unwrap(),
+            vec![
+                "lan_dial=192.168.1.20:7420".to_string(),
+                "internet_dial=203.0.113.7:7422".into(),
+                format!("p2p_dial=/p2p/{peer}")
+            ]
+        );
+        // The p2p gate closed: auto leaves it out; --carrier p2p still plans
+        // it (the send path then refuses with P2P_HOLD).
+        assert_eq!(plan(&c, CarrierChoice::Auto, true, false).unwrap().len(), 2);
+        assert_eq!(
+            plan(&c, CarrierChoice::P2p, true, false).unwrap(),
+            vec![format!("p2p_dial=/p2p/{peer}")]
+        );
+        // A p2p-only contact: auto is p2p.
+        let mut only = contact_with("", "");
+        only.p2p = peer.clone();
+        assert_eq!(
+            plan(&only, CarrierChoice::Auto, false, true).unwrap(),
+            vec![format!("p2p_dial=/p2p/{peer}")]
+        );
+        assert!(plan(&only, CarrierChoice::Auto, false, false)
+            .unwrap_err()
+            .starts_with("P2P_HOLD"));
+        // Unverified: refused for p2p, LAN kept for auto.
+        only.pinned = false;
+        assert!(plan(&only, CarrierChoice::P2p, false, true)
+            .unwrap_err()
+            .contains("p2p delivery needs the fingerprint checked"));
+        assert!(plan(&only, CarrierChoice::Auto, false, true)
+            .unwrap_err()
+            .contains("CONTACT_NOT_VERIFIED"));
+        c.pinned = false;
+        assert_eq!(
+            plan(&c, CarrierChoice::Auto, false, true).unwrap(),
+            vec!["lan_dial=192.168.1.20:7420".to_string()]
+        );
+        // No p2p route saved.
+        assert!(plan(
+            &contact_with("192.168.1.20:7420", ""),
+            CarrierChoice::P2p,
+            false,
+            true
+        )
+        .unwrap_err()
+        .contains("no p2p route saved"));
+        assert_eq!(parse_send_carrier("P2P").unwrap(), CarrierChoice::P2p);
+    }
+
+    #[test]
+    fn card_arg_reads_text_or_one_line_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ident(0x0a);
+        let card = format_card(&a, "203.0.113.7:7422", "");
+        assert_eq!(read_card_arg(&card).unwrap().internet, "203.0.113.7:7422");
+        let file = dir.path().join("bob.card");
+        std::fs::write(&file, format!("\n{card}\n\n")).unwrap();
+        assert_eq!(
+            read_card_arg(file.to_str().unwrap()).unwrap().address,
+            a.address()
+        );
+        std::fs::write(&file, format!("{card}\n{card}\n")).unwrap();
+        assert!(read_card_arg(file.to_str().unwrap())
+            .unwrap_err()
+            .contains("exactly one"));
+        std::fs::write(&file, "").unwrap();
+        assert!(read_card_arg(file.to_str().unwrap())
+            .unwrap_err()
+            .contains("empty"));
+        assert!(read_card_arg(dir.path().join("missing").to_str().unwrap())
+            .unwrap_err()
+            .contains("neither a card"));
+    }
+
+    fn contact_with(lan: &str, inet: &str) -> Contact {
+        let a = ident(0x0a);
+        Contact {
+            petname: "Alice".into(),
+            public_tag: "alice".into(),
+            alias: "alice".into(),
+            address: a.address(),
+            pub_hex: hex::encode(a.public_key_bytes()),
+            pinned: true,
+            lan_dial: lan.into(),
+            internet_dial: inet.into(),
+            p2p: String::new(),
+            p2p_via: Vec::new(),
+        }
+    }
+
+    fn plan(
+        c: &Contact,
+        choice: CarrierChoice,
+        env: Option<&str>,
+        live: bool,
+    ) -> Result<Vec<String>, String> {
+        plan_contact_routes(c, choice, env.map(str::to_string), live).map(|(routes, _)| {
+            routes
+                .iter()
+                .map(|r| format!("{}={}", r.carrier.label(), r.dial))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn auto_plans_lan_first_then_internet_and_never_a_held_carrier() {
+        let both = contact_with("192.168.1.20:7420", "203.0.113.7:7422");
+        let lan_only = contact_with("192.168.1.20:7420", "");
+        let inet_only = contact_with("", "203.0.113.7:7422");
+        let none = contact_with("", "");
+        let auto = CarrierChoice::Auto;
+        assert_eq!(
+            plan(&both, auto, None, true).unwrap(),
+            [
+                "lan_dial=192.168.1.20:7420",
+                "internet_dial=203.0.113.7:7422"
+            ]
+        );
+        // Internet direct held: auto silently keeps LAN only.
+        assert_eq!(
+            plan(&both, auto, None, false).unwrap(),
+            ["lan_dial=192.168.1.20:7420"]
+        );
+        assert_eq!(
+            plan(&lan_only, auto, None, true).unwrap(),
+            ["lan_dial=192.168.1.20:7420"]
+        );
+        assert_eq!(
+            plan(&inet_only, auto, None, true).unwrap(),
+            ["internet_dial=203.0.113.7:7422"]
+        );
+        assert!(plan(&inet_only, auto, None, false)
+            .unwrap_err()
+            .starts_with("INTERNET_DIRECT_HOLD"));
+        assert!(plan(&none, auto, None, true)
+            .unwrap_err()
+            .contains("no reachable lan_dial"));
+        // An env LAN dial counts as a LAN route (and is reported for saving).
+        let (routes, env) =
+            plan_contact_routes(&inet_only, auto, Some("10.0.0.5:7420".into()), true).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(env.as_deref(), Some("10.0.0.5:7420"));
+        // Explicit carriers use exactly that route.
+        assert_eq!(
+            plan(&both, CarrierChoice::Lan, None, true).unwrap(),
+            ["lan_dial=192.168.1.20:7420"]
+        );
+        assert!(plan(&inet_only, CarrierChoice::Lan, None, true)
+            .unwrap_err()
+            .contains("no reachable lan_dial"));
+        assert_eq!(
+            plan(&both, CarrierChoice::Internet, None, true).unwrap(),
+            ["internet_dial=203.0.113.7:7422"]
+        );
+        // `--carrier internet` while held still plans it: the send path then
+        // refuses with INTERNET_DIRECT_HOLD before any daemon is started.
+        assert_eq!(
+            plan(&both, CarrierChoice::Internet, None, false).unwrap(),
+            ["internet_dial=203.0.113.7:7422"]
+        );
+        let err = plan(&lan_only, CarrierChoice::Internet, None, true).unwrap_err();
+        assert!(
+            err.contains("no Internet address")
+                && err.contains("raven contact set-addr @alice --internet"),
+            "{err}"
+        );
+    }
+
+    /// Owner decision 2026-10-08: Internet delivery only for verified (pinned)
+    /// contacts. An unpinned contact keeps LAN exactly as before.
+    #[test]
+    fn an_unverified_contact_never_gets_an_internet_route() {
+        let unpinned = |lan: &str, inet: &str| Contact {
+            pinned: false,
+            ..contact_with(lan, inet)
+        };
+        let both = unpinned("192.168.1.20:7420", "203.0.113.7:7422");
+        let inet_only = unpinned("", "203.0.113.7:7422");
+        let auto = CarrierChoice::Auto;
+        // auto: the Internet route is skipped, LAN stays.
+        assert_eq!(
+            plan(&both, auto, None, true).unwrap(),
+            ["lan_dial=192.168.1.20:7420"]
+        );
+        // Internet the only route, or asked for: refused, nothing planned.
+        for (c, choice) in [
+            (&inet_only, auto),
+            (&inet_only, CarrierChoice::Internet),
+            (&both, CarrierChoice::Internet),
+        ] {
+            let err = plan(c, choice, None, true).unwrap_err();
+            assert!(
+                err.starts_with("NOT SENT: @alice is not verified: Internet delivery needs the fingerprint checked first"),
+                "{err}"
+            );
+            assert!(err.contains("raven contact verify --tag alice"), "{err}");
+            assert!(
+                err.contains("raven contact add --address rvn1") && err.contains("--verify-fp"),
+                "{err}"
+            );
+            assert!(err.contains("Nothing was dialled"), "{err}");
+            assert!(err.contains(raven_core::CONTACT_NOT_VERIFIED), "{err}");
+        }
+        // LAN is untouched for an unpinned contact.
+        assert_eq!(
+            plan(&both, CarrierChoice::Lan, None, true).unwrap(),
+            ["lan_dial=192.168.1.20:7420"]
+        );
+        // With the gate held the gate refusal still comes first.
+        assert!(plan(&inet_only, auto, None, false)
+            .unwrap_err()
+            .starts_with("INTERNET_DIRECT_HOLD"));
+    }
+
+    #[test]
+    fn status_internet_row_says_what_the_running_node_does() {
+        let status = |caps: &[&str]| -> Result<IpcResponse, String> {
+            Ok(IpcResponse::Status {
+                v: IPC_VERSION,
+                bridge: false,
+                store: false,
+                relay: false,
+                forward_pending: 0,
+                capabilities: caps.iter().map(|c| c.to_string()).collect(),
+                p2p: None,
+            })
+        };
+        let up = internet_reach_row(&status(&["ipc", "internet_direct"]), "", true);
+        assert!(up.starts_with("YES"), "{up}");
+        let off = internet_reach_row(&status(&["ipc"]), "", true);
+        assert!(
+            off.starts_with("off") && off.contains("raven node internet on"),
+            "{off}"
+        );
+        let held = internet_reach_row(&status(&["ipc"]), "0.0.0.0:7422", false);
+        assert!(held.starts_with("NO") && held.contains("INTERNET_DIRECT_PRODUCTION_ENABLED"));
+        let down = internet_reach_row(&status(&["ipc"]), "0.0.0.0:7422", true);
+        assert!(down.starts_with("NO") && down.contains("restart"), "{down}");
+        for row in [&up, &off, &held, &down] {
+            let l = row.to_lowercase();
+            assert!(
+                !l.contains("seed") && !l.contains("private") && !l.contains("transports"),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_internet_on_off_round_trips_through_the_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        cmd_node_internet(dir.path(), Some("0.0.0.0")).unwrap();
+        assert_eq!(load_policy(dir.path()).internet_listen, "0.0.0.0:7422");
+        // The other flags are untouched.
+        assert_eq!(load_policy(dir.path()).bridge, NodePolicy::default().bridge);
+        cmd_node_internet(dir.path(), None).unwrap();
+        assert!(load_policy(dir.path()).internet_listen.is_empty());
+        assert!(cmd_node_internet(dir.path(), Some("example.com:7422")).is_err());
+        assert!(cmd_node_internet(dir.path(), Some("")).is_err());
+        // An unreadable policy is never overwritten.
+        std::fs::write(dir.path().join("node_policy.json"), "{broken").unwrap();
+        assert!(cmd_node_internet(dir.path(), Some("0.0.0.0:7422"))
+            .unwrap_err()
+            .contains("unreadable"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("node_policy.json")).unwrap(),
+            "{broken"
         );
     }
 }

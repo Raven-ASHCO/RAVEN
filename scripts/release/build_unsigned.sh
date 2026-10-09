@@ -13,7 +13,8 @@ OUT="${RAVEN_RELEASE_OUT:-$REPO/dist/raven-serverless-${VER}-${HOST}-${ARCH}-${S
 mkdir -p "$OUT/bin" "$OUT/scripts" "$OUT/docs"
 
 echo "Building release binaries…"
-(cd "$NODE" && cargo build -p raven-node -p ash -p raven-swarm --release -q)
+# --locked: ship exactly the audited Cargo.lock.
+(cd "$NODE" && cargo build --locked -p raven-node -p ash -p raven-swarm --release -q)
 
 install -m 755 "$NODE/target/release/ash" "$OUT/bin/ash"
 install -m 755 "$NODE/target/release/raven-node" "$OUT/bin/raven-node"
@@ -43,7 +44,11 @@ See docs/SIGNING_NOTARIZATION_CHECKLIST.md for operator signing steps.
 Quick start:
   ./bin/ash --data-dir ./raven-data init
   ./bin/ash --data-dir ./raven-data doctor
-  ./bin/raven-node service --data-dir ./raven-data
+  ./bin/raven-node service --data-dir ./raven-data --lan-listen 127.0.0.1:7420
+
+LAN exposure is opt-in: the bare service default is 0.0.0.0:7420 (every
+interface), so always pass an explicit address; use
+--lan-listen <this-host-LAN-IP>:7420 to accept LAN peers. See docs/INSTALL_*.md.
 EOF
 
 (

@@ -17,6 +17,7 @@ pub mod ble_adapter;
 pub mod bootstrap;
 pub mod bridge;
 pub mod canon;
+pub mod carrier_admission;
 pub mod chat_history;
 pub mod contact_request;
 pub mod device_cert;
@@ -45,17 +46,23 @@ pub mod internet;
 pub mod internet_gate;
 pub mod introduction;
 pub mod ipc;
+pub mod keystore_select;
+pub mod keystore_vault;
 pub mod lan_dispatch;
 pub mod lan_gate;
 pub mod lan_noise;
 pub mod lan_rlb1;
 pub mod lan_vectors;
+pub mod macos_keychain;
 pub mod message_router;
 pub mod messaging_path;
 #[cfg(feature = "mlkem768-incremental-lab")]
 pub mod mlkem768_incremental;
 pub mod nearby;
 pub mod node_policy;
+pub mod outbox;
+pub mod p2p_gate;
+pub mod p2p_route;
 pub mod pair_init;
 pub mod pair_init_lan_oob;
 pub mod paths;
@@ -64,21 +71,24 @@ pub mod prekey_lifecycle;
 pub mod profile_record;
 pub mod queue;
 pub mod records;
+pub mod relay_allow;
 pub mod routing_tag;
 pub mod sanitize;
 pub mod seal;
 pub mod store_object;
 pub mod transport;
 pub mod vectors;
+/// Owner-only DACLs behind the private file helpers in [`paths`] (Windows).
+#[cfg(windows)]
+mod win_acl;
 
 pub use address::{decode_address, encode_address, from_display, to_display};
 pub use alias_record::{normalize_alias, AliasClaimStore, AliasPublishQuota, AliasRecord};
 pub use atsam_aead::{build_aad_v1, build_aad_v2, seal_rvna1_v2, unseal_rvna1_v2};
 pub use atsam_mlkem::{
-    begin_hybrid_initiation, initiate_hybrid_root, respond_hybrid_root, HybridKeypair,
-    PendingHybridInitiation,
+    begin_hybrid_initiation, respond_hybrid_root, HybridKeypair, PendingHybridInitiation,
 };
-pub use atsam_root::{derive_root, transcript_hash, x25519_shared, x25519_shared_checked};
+pub use atsam_root::{derive_root, transcript_hash, x25519_shared_checked};
 pub use ble_adapter::{
     ble_frame_decode, ble_frame_encode, select_ble_adapter, select_ble_adapter_from_env,
     validate_opaque_rvn1, BleAdapterKind,
@@ -169,6 +179,11 @@ pub use messaging_path::{
 };
 pub use nearby::{nearby_safety_phrase, NearbyAdvertisement, NearbyRegistry};
 pub use node_policy::{load_policy, policy_path, save_policy, BridgeStatusSnapshot, NodePolicy};
+pub use outbox::{
+    carrier_allowed_for_contact, contact_is_pinned, envelope_expires_at, OutboxCarrier,
+    OutboxRoute, PeerSendLock, CONTACT_NOT_VERIFIED, ENVELOPE_VALIDITY_MS,
+};
+pub use p2p_gate::{p2p_live_enabled, P2P_HOLD, P2P_PRODUCTION_ENABLED};
 pub use pair_init::{
     confirmation_tag, decode_init, decode_response as decode_pair_response,
     derive_provisional_root, device_certificate_hash, encode_init,

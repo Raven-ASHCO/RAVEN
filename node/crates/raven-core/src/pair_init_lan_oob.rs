@@ -8,6 +8,12 @@
 //!
 //! Classifiers sniff the inner magic. Live networking remains gated by
 //! `lab_test_a_enabled()` / production tripwires at the callsite.
+//!
+//! The wrapped body is the *plaintext* PairInit/PairResponse (both addresses,
+//! device keys, cert and prekey digests). §7 forbids placing it in an
+//! observable relay body, so the wrapper is direct-only: `hop_limit` and
+//! `replication_budget` are 0 (a cooperative relay drops it in
+//! `bridge::prepare_forward`) and the outer TTL is short.
 
 use rand::{CryptoRng, RngCore};
 
@@ -19,6 +25,12 @@ use crate::pair_init::{INIT_MAGIC, INIT_WIRE_LEN, RESPONSE_MAGIC, RESPONSE_WIRE_
 /// Do not set on the wire until the envelope flag registry is extended;
 /// classifiers sniff RVPI1/RVPR1 magic in message_ciphertext instead.
 pub const FLAG_PAIR_INIT_OOB: u16 = 1 << 8;
+
+/// Outer RVN1 lifetime of an OOB pairing envelope. The carrier is a live,
+/// direct exchange and consumers enforce the inner record's own validity
+/// window, so this only bounds how long any store/bridge that sees the frame
+/// may retain it.
+pub const PAIR_INIT_OOB_TTL_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairInitOobKind {
@@ -86,9 +98,10 @@ pub fn wrap_oob_wire<R: RngCore + CryptoRng>(
         routing_tag,
         dest_device_hint: 0,
         created_at: now_ms,
-        expires_at: now_ms.saturating_add(7 * 24 * 3600 * 1000),
-        hop_limit: 8,
-        replication_budget: 2,
+        expires_at: now_ms.saturating_add(PAIR_INIT_OOB_TTL_MS),
+        // Direct-only (§7): never relay-, spray- or store-forward eligible.
+        hop_limit: 0,
+        replication_budget: 0,
         anti_replay_nonce: nonce,
         ratchet_header_ciphertext: vec![],
         message_ciphertext: wire.to_vec(),
@@ -139,5 +152,39 @@ mod tests {
             }
             other => panic!("expected PairInit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oob_wrapper_is_direct_only() {
+        use crate::bridge::{decide, BridgeAction, BridgeRole, DropReason};
+
+        let wire = pair_init_wire();
+        let id = Identity::from_seed(&[0x42; 32]);
+        let mut rng = StdRng::seed_from_u64(10);
+        let now = 1_700_000_000_000;
+        let packed = wrap_oob_wire(
+            &wire,
+            PairInitOobKind::PairInit,
+            &id,
+            [0x11; 16],
+            now,
+            &mut rng,
+        )
+        .unwrap();
+        let env = Envelope::unpack(&packed).expect("unpack");
+        assert_eq!(env.hop_limit, 0);
+        assert_eq!(env.replication_budget, 0);
+        assert_eq!(env.expires_at, now + PAIR_INIT_OOB_TTL_MS);
+        assert!(env.verify(&id.public_key_bytes()));
+        assert_eq!(
+            decide(&packed, BridgeRole::Relay, now, false),
+            BridgeAction::Drop {
+                reason: DropReason::HopExhausted
+            }
+        );
+        assert_eq!(
+            decide(&packed, BridgeRole::Endpoint, now, false),
+            BridgeAction::DeliverLocal
+        );
     }
 }

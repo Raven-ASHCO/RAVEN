@@ -11,7 +11,7 @@
 #   Never require daemon_ready: ready (do not greenwash ready from presence / Ping).
 #   Named-pipe client is on this tree — do NOT require ipc_transport_missing.
 #   Try-phase (Windows): start raven-node ipc --data-dir, assert daemon_presence: present
-#     (Ping→Pong over \\.\pipe\raven-node), then kill and assert presence down
+#     (Ping→Pong over the per-user pipe \\.\pipe\raven-node-<user SID>), then kill and assert presence down
 #     (fail-closed connect — not a soft skip / blocked transport).
 #
 # Operator (from node/, Windows / pwsh host):
@@ -57,7 +57,8 @@ function Require-Match([string]$Haystack, [string]$Pattern, [string]$What) {
     }
 }
 
-# cmd_doctor may paint presence with C_GREEN/C_DIM even when NO_COLOR=1.
+# ash emits no colour escapes with NO_COLOR=1 / redirected stdout; stripping any
+# stray SGR codes stays as a belt-and-braces guard for older binaries.
 function Get-PlainText([string]$Text) {
     return [regex]::Replace($Text, '\x1b\[[0-9;]*m', '')
 }
@@ -152,6 +153,12 @@ function Invoke-AshCapture {
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
     [void]$p.Start()
+    # Drain stdout AND stderr concurrently from the start: a child that writes more than
+    # the pipe buffer blocks in write(), WaitForExit then times out and the smoke fails
+    # with a misleading "hang" diagnostic. Separate tasks, because draining only one
+    # stream can still deadlock on the other.
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
     if ($null -ne $StdinText) {
         $p.StandardInput.Write($StdinText)
         $p.StandardInput.Close()
@@ -162,8 +169,10 @@ function Invoke-AshCapture {
         try { $p.Kill() } catch { }
         Fail "ash $($AshArgs -join ' ') exceeded ${TimeoutSec}s — refusing hang-as-pass"
     }
-    $stdout = $p.StandardOutput.ReadToEnd()
-    $stderr = $p.StandardError.ReadToEnd()
+    # Parameterless WaitForExit() also waits for the redirected streams to reach EOF.
+    $p.WaitForExit()
+    $stdout = $outTask.GetAwaiter().GetResult()
+    $stderr = $errTask.GetAwaiter().GetResult()
     return @{ ExitCode = $p.ExitCode; Text = ($stdout + "`n" + $stderr) }
 }
 

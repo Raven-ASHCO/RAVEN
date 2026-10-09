@@ -4,7 +4,7 @@
 **Establishment:** **PairInit V2** / **PairResponse V2** (new wire; not PairInit V1)  
 **Ratchet construction (normative):** Signal **Triple Ratchet** = EC **Double Ratchet** + **Sparse Post-Quantum Ratchet (SPQR)** over **ML-KEM Braid (SCKA)**; hybrid message key via `KDF_HYBRID(ec_mk, pq_mk)`  
 **Suite (draft):** `0x01` = X25519 + ML-KEM-768 (FIPS 203) + HKDF-SHA256 / HMAC-SHA256 (as in Signal KDF recommendations) + ChaCha20-Poly1305 + Ed25519 (classical auth)  
-**Document revision:** **9** (payload rules both directions + empty-type index=0; EK_VECTOR_SIZE naming)  
+**Document revision:** **11** (2026-10-07 clarifications: V2 signature domains + PairResponse V2 table §0.4, OTP/DK retention per prekey lifecycle §3.3, known vector/spec discrepancies §13.1; no wire change)  
 **Status:** **REQUIRED / NOT YET APPROVED** — draft companion under [`RAVEN_UNIFIED_SERVERLESS_ARCHITECTURE_V2.md`](RAVEN_UNIFIED_SERVERLESS_ARCHITECTURE_V2.md)  
 **Approval prerequisites:** Umbrella **Approved** (met) + [`RAVEN_DEVICE_REVOCATION_V1.md`](RAVEN_DEVICE_REVOCATION_V1.md) **APPROVED** (met)  
 **Production:** disabled
@@ -71,6 +71,43 @@ Alice MAY seal application message 0 under Triple Ratchet state after local init
 `Z_X` MAY use Bob’s OTP X25519 when present (else SPK) for PairInit agreement only. Initial EC ratchet key remains **SPK** (§3.3).
 
 Order: encapsulate → build/sign PairInit V2 → hash → expand. No substitute-transcript API.
+
+### 0.4 Signature domains, PairResponse V2 wire and trust-record digests
+
+Exactly what `protocol/reference/raven_protocol/pair_init_v2.py` computes. `pair_init_v2_001` pins both signing inputs (`pair_init_signing_bytes_hex`, `pair_response_signing_bytes_hex`); the `pair_init_v2_001` and `pair_init_v2_002` wires verify under them. All integers are unsigned big-endian.
+
+```text
+PairInit V2 signature input     = "rvn1/pair-init-v2"     || PairInitV2[0 .. 2723]
+    # 2787-byte wire; 64-byte signature at 2723 by the initiator device key (offset 171)
+PairResponse V2 signature input = "rvn1/pair-response-v2" || PairResponseV2[0 .. 163]
+    # 227-byte wire; 64-byte signature at 163 by the responder device key (offset 83)
+```
+
+**PairResponse V2 wire (exactly 227 bytes):**
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 8 | magic `RVPR2\0\0\0` |
+| 8 | 1 | version = `0x02` |
+| 9 | 1 | suite = `0x01` |
+| 10 | 1 | role = responder = `0x01` |
+| 11 | 1 | profile length = `23` |
+| 12 | 23 | ASCII `ATSAM/hybrid-ratchet/v2` |
+| 35 | 16 | exact accepted `init_id` |
+| 51 | 32 | exact accepted `init_hash_v2` |
+| 83 | 32 | responder device Ed25519 public key |
+| 115 | 8 | response `created_at_ms` |
+| 123 | 8 | response `expires_at_ms` |
+| 131 | 32 | `confirmation_tag` (§3.3, under `K_confirm`) |
+| 163 | 64 | responder-device Ed25519 signature |
+
+**Trust-record digests:** V2 reuses the V1 labels unchanged, exactly as in [`RAVEN_PAIR_INIT_V1.md`](RAVEN_PAIR_INIT_V1.md) §2 (`pair_init_v2.py` imports `device_certificate_hash` / `prekey_bundle_hash` from `pair_init.py`; pinned by `pair_init_v2_002` `initiator_device_cert_hash_hex` / `responder_device_cert_hash_hex` / `responder_prekey_bundle_hash_hex`). There are no V2-specific digest labels.
+
+```text
+device_cert_hash   = SHA-256("rvn1/pair-devcert" || identity_ed25519_pub(32)
+                             || RavenDeviceCertificateV1.signing_bytes || certificate_signature(64))
+prekey_bundle_hash = SHA-256("rvn1/pair-prekey" || RavenPrekeyBundleV1.signing_bytes || prekey_signature(64))
+```
 
 ---
 
@@ -178,12 +215,14 @@ Contact delete/block/revoke → fail-closed for send/receive/PairInit/ACK on tha
 
 **EC initial ratchet key (Signal-aligned):** Bob’s **signed X25519 prekey (SPK)** is always the initial EC Double Ratchet public/keypair (`bob_dh_public_key` / `bob_dh_key_pair`). This matches Signal PQXDH→Double Ratchet integration (`SPKB` → initial ratchet key).
 
-**OTP role:** If a one-time X25519 prekey is present, it MAY contribute to PairInit `Z_X` / `IKM_pair` only. It MUST NOT be the initial EC ratchet key. OTP private material is consumed under prekey lifecycle after authenticated claim (§3.2.1); it is not retained as `DHs`.
+**OTP role:** If a one-time X25519 prekey is present, it MAY contribute to PairInit `Z_X` / `IKM_pair` only. It MUST NOT be the initial EC ratchet key and is never retained as `DHs`. OTP private material is **not** consumed or destroyed at first claim: per [`RAVEN_PREKEY_LIFECYCLE_V1.md`](RAVEN_PREKEY_LIFECYCLE_V1.md) §4/§6 it is retained exactly as long as its generation's signed-prekey material (bundle expiry + 7-day grace, extended only by a pending handoff), and a distinct valid PairInit reusing the same OTP is accepted as a distinct claim, root and session (§3.5 item 5). OTPs therefore add no forward secrecy beyond the signed prekey; immediate OTP destruction requires a versioned change (lifecycle §6).
+
+**ML-KEM decapsulation key:** the generation's ML-KEM-768 decapsulation seed is likewise retained under the same lifecycle bound and decapsulates `ct_PQ` for every PairInit accepted against that generation (each accepted PairInit yields its own `Z_PQ`; §3.5 forbids re-decapsulating an exact duplicate for a new root). It is not a single-use key.
 
 | Role | EC init | Private material retained |
 |------|---------|---------------------------|
 | **Alice** | `RatchetInitAliceTR(..., bob_dh_public_key = SPK_B)` | Alice’s EC ratchet private `DHs`; SPQR Alice state; not Bob’s OTP |
-| **Bob** | `RatchetInitBobTR(..., bob_dh_key_pair = SPK_B keypair)` | SPK private until later DH ratchet replaces `DHs`; PairInit ML-KEM DK used once for `Z_PQ`; SPQR Bob state |
+| **Bob** | `RatchetInitBobTR(..., bob_dh_key_pair = SPK_B keypair)` | SPK private until later DH ratchet replaces `DHs`; generation ML-KEM DK seed (prekey lifecycle, not ratchet state) yields `Z_PQ` for every PairInit accepted against that generation, destroyed only per lifecycle §6; SPQR Bob state |
 
 Normative Triple Ratchet init (**role-specific SCKA**, Signal §5.4 — not a role-neutral `RatchetInitSCKA`):
 
@@ -206,7 +245,7 @@ Implementations that call a single role-neutral SCKA init are **non-conformant**
 
 **Message 0 (Alice):** encrypted with `RatchetEncryptTR` on `PROVISIONAL_TR` after Alice-init. Header carries Alice’s EC ratchet public and SPQR/SCKA send chunks per ML-KEM Braid. Plaintext is application (or padding); it is **not** PairResponse.
 
-**PairResponse V2:** key confirmation only (not Delivered). Uses `K_confirm`:
+**PairResponse V2:** key confirmation only (not Delivered). Exact 227-byte wire and signature input: §0.4. Uses `K_confirm`:
 
 ```text
 confirmation_tag = HMAC-SHA256(
@@ -350,6 +389,32 @@ Exact length: `wire.len == 23 + plen + 32`. Trailing bytes rejected. Binding dig
 
 Full Braid MUST still implement incremental `KeyGen → Encaps1 → Encaps2 → Decaps`, real erasure recovery from any sufficient chunk set, the Signal state machine, and dense negatives (duplicate/loss/reorder/tamper/epoch-wrap/caps).
 
+**Epoch width in pre–Full Braid stubs:** the frozen KAT stubs (composite TR header / AAD in `tr_hybrid_aead_001`, the SCKA `AcceptKey` packing in `tr_replay_duplicate_001`) keep their frozen 4-byte epoch fields. They are superseded by the u64be epochs of RVBC1/RVCH1/RVFB1 and MUST reject (never truncate or wrap) any epoch ≥ 2^32. In-memory SCKA epochs are u64 everywhere and every increment is checked.
+
+### 5.2 Full Braid lab engine (lab-only; `full-braid-lab`)
+
+These rules are normative for the lab engine (`hybrid_ratchet_v2_full_braid`, Python `full_braid_*`) and pinned by `full_braid_*` vectors. Lab wire may still change; production stays disabled.
+
+**RVFI1 init (§3.3).** `SK_ec` is only the EC root key. Alice's `role_material` is her ephemeral EC ratchet private key: `RatchetInitAlice(SK_ec, role_material, SPK_B)`. Bob's `role_material` is the SPK private key (checked against `bob_spk_pub`): `RatchetInitBob(SK_ec, SPK_B keypair)`. A root key MUST NOT double as a DH private key. Bob has no EC sending chain until he receives Alice's first EC message, so an encapsulator Bob cannot run the nested confirm before that; such a Send is rejected without commit and the host sends without the confirm.
+
+**Nested TR confirm (single seal).** The encapsulator seals at most one confirm per SCKA epoch, on the HeaderReceived Send that emits the first CT1 frame, and places `RVCH1 || sealed_ct` in RVBO1 next to that frame:
+
+```text
+AD = u32be_len(RVBA1) || RVBA1 || u32be_len(RVCH1) || RVCH1 || u32be_len(RVBC1) || RVBC1
+RVBC1 = the encapsulator's first CT1 frame of the epoch (type CT1, index 0)
+(key, nonce) = KDF_HYBRID(ec_mk, scka_mk)      # scka_mk = KDF_OK epoch secret
+```
+
+The keygen side opens **exactly those `sealed_ct` bytes** on the Receive whose CT2 chunk completes Decaps. It rebuilds the AD's RVBC1 from the decapsulated CT1 (systematic chunk 0, binding over the peer's direction), not from the CT2 frame it is processing. Each `(ec_mk, scka_mk)` therefore produces exactly one ciphertext; resealing under the same key with a different AD is forbidden (it reuses the ChaCha20-Poly1305 nonce, §6.4).
+
+**Failure semantics (§4.2 step 7).** Everything that can be caused by unauthenticated input is a no-commit **Reject** (`ERR_PARSE`, zero durable mutation): a chunk whose index is already stored with a different payload, RVCH1/EC header validation (DH, `MAX_SKIP`, skipped-key budget), confirm seal mismatch, and AEAD open failure. Terminal states are reserved for authenticator MAC failure on a reassembled HDR/CT2 source, ML-KEM failures, and explicit repair/expiry. EC skipped keys are bounded by the RVFT1 cap (1000) **before** any AEAD, so an accepted message is always encodable.
+
+**Chunk emission.** Chunk indices live in `[0, 64)`. A sender's cursor cycles through that space instead of stalling after 64 Sends in one state; re-sent indices carry identical deterministic payloads and are decoder no-ops at the receiver. `EkSentCt1Received` emits `Ct1Ack` (pinned SPQR behaviour).
+
+**Durable pipeline.** Replay records are a FIFO window in commit order (oldest first, unique transition ids). On each commit the oldest records are evicted so that at most `min(64, cap_replay_entries, floor(cap_replay_bytes / 102))` remain, the new record included; a window of 0 is `ERR_NEED_CAPACITY`. The `input_digest` persisted in RVBJ1/RVOR1 is `SHA-256("ATSAM/v2/full-braid/input" || RVBI1')`, where RVBI1' is the input with any mode-0 (seal_compare) plaintext body replaced by the same number of zero bytes; `expected_ct` still binds the plaintext, but retained evidence no longer allows offline plaintext confirmation. `terminalize_conflict` repairs only when the live state contradicts the journaled intent (same or older generation, or the next generation reached through a different transition); a stale journal for a session that has advanced further returns `ERR_CAS`.
+
+**Lab C ABI.** Output buffers and out-parameters MUST NOT overlap inputs or each other; an overlapping call returns `ERR_PARSE` and writes nothing. Inputs longer than `RAVEN_FB_MAX_RVBJ1` are `ERR_PARSE` before any slice is formed. Secret-bearing lab state (RVFB1 auth keys, TLVs, RVFT1, RVBE1 seeds, RVFI1, RVBM1 bodies) is wiped on drop and redacted from debug output.
+
 ---
 
 ## 6. KDFs — published interfaces, Raven domain strings
@@ -383,7 +448,25 @@ KDF_CK(ck) -> (ck', mk):
 
 ### 6.3 SPQR / SCKA KDFs (Signal §5 / §7.2)
 
-Use Signal’s `KDF_SCKA_INIT`, `KDF_SCKA_RK`, `KDF_SCKA_CK` with `SPQR_PROTOCOL_INFO` and recommended salts/lengths from Double Ratchet Rev 4 §7.2. Vector suite MUST pin every byte; ports match vectors, not prose memory.
+Use Signal’s `KDF_SCKA_INIT`, `KDF_SCKA_RK`, `KDF_SCKA_CK` with `SPQR_PROTOCOL_INFO` and recommended salts/lengths from Double Ratchet Rev 4 §7.2. Vector suite MUST pin every byte; ports match vectors, not prose memory. The exact instantiation (pinned by `tr_scka_init_001`, `tr_braid_epoch_001`, `full_braid_*`; frozen pre–Full Braid stub deviations: §13.1):
+
+```text
+KDF_SCKA_INIT(SK_scka) -> (RK, CK_A2B, CK_B2A):
+    # HKDF-SHA256: salt = 32×0x00, IKM = SK_scka, info = SCKA_INIT_INFO, L = 96
+    # RK = okm[0:32], CK_A2B = okm[32:64], CK_B2A = okm[64:96]
+    # Alice: send = CK_A2B, recv = CK_B2A;  Bob: send = CK_B2A, recv = CK_A2B
+
+KDF_SCKA_RK(rk, epoch_secret) -> (rk', ck):
+    # HKDF-SHA256: salt = rk, IKM = epoch_secret, info = SPQR_PROTOCOL_INFO, L = 64
+    # rk' = okm[0:32], ck = okm[32:64]; all-zero epoch_secret is a hard fail
+
+KDF_SCKA_CK(ck) = KDF_CK(ck)          # §6.2: HMAC(ck, 0x01) → mk, HMAC(ck, 0x02) → ck'
+
+epoch_secret (Full Braid) = KDF_OK(ML-KEM shared secret, epoch)
+    # pinned SPQR: HKDF info "Signal_PQCKA_V1_MLKEM768:SCKA Key" || u64be(epoch)
+```
+
+SCKA epochs are `EPOCH_TYPE = u64` (§5.1); chain counters are u32. Every increment is checked and overflow is a hard fail.
 
 ### 6.4 Hybrid message key
 
@@ -423,6 +506,20 @@ New sealed proto/version for this profile (not silent reuse of indexed `0x03`) �
 
 AEAD AD MUST bind: profile, `session_id`, suite/proto, transcript direction addresses, EC `(dh_pub,N)` and SCKA epoch/ctr used for `mk`, sender device cert digest class, and header bytes as required by TR.
 
+Frozen stub byte layout (pinned by `tr_hybrid_aead_001`; the Full Braid lab uses the RVBA1‖RVCH1‖RVBC1 AD of §5.2 instead):
+
+```text
+header = "ATSAM/v2/tr-header" || u8(SEALED_PROTO) || dh_pub(32) || u32be(PN) || u32be(N)
+      || u32be(sending_epoch) || u32be(receiving_epoch) || u32be(send_ctr)
+      || u8(chunk_flags) || kem_ct_digest(32)
+AD     = "ATSAM/v2/aad" || "ATSAM/hybrid-ratchet/v2" || u8(0x01 suite) || u8(SEALED_PROTO)
+      || u8(direction) || session_id(32) || ASCII(initiator_address) || 0x00
+      || ASCII(responder_address) || sender_device_cert_hash(32) || dh_pub(32)
+      || u32be(N) || u32be(sending_epoch) || u32be(send_ctr) || header
+```
+
+The u32 epoch fields are the frozen stub width (§5.1): values ≥ 2^32 are rejected.
+
 ### 7.4 AckV2 plaintext (logical; exact layout in vectors)
 
 ```text
@@ -437,6 +534,8 @@ acked_message_id(16)
 ```
 
 Inner signature covers all prior AckV2 fields under domain `"ATSAM/v2/ack"`.
+
+Exact frozen layout (197 bytes; `tr_ackv2_001`): `acked_message_id(16) || acked_object_digest(32) || status(u8) || ack_nonce(12) || u64be(created_at_ms) || recipient_device_cert_hash(32) || session_id(32) || ed25519_signature(64)`; the signature is over `"ATSAM/v2/ack"` followed by the first 133 bytes.
 
 **Multi-path cancel** keys on `acked_object_digest` (and matching outbound row), not `message_id` alone.
 
@@ -493,7 +592,7 @@ routing_tag = HMAC-SHA256(
 )[:16]
 ```
 
-`app_type` distinguishes message vs AckV2 vs reserved. Exact packing freezes with vectors.
+`app_type` is 7 bits (`app_type & 0x7f`): `0x01` application message, `0x02` AckV2, others reserved. `d` is 1 bit. Pinned by `tr_route_mailbox_001`.
 
 ### 10.4 Out-of-order candidate lookup
 
@@ -716,7 +815,10 @@ Generation decrease on load is a hard security failure.
 
 | Class | Path / status |
 |-------|----------------|
-| `pair_init_v2_001` | Wire + expand + confirm — **frozen** |
+| `pair_init_v2_001` | Wire + expand + confirm — **frozen**; codec + expand KAT only: its `Z_X` is injected from the hybrid KAT and its prekey digest is not a RavenPrekeyBundleV1 digest, so it is **non-conformant for trust binding** |
+| `pair_init_v2_002` | Trust-binding KAT: `Z_X = X25519(eph, OTP)` over the wire keys, identity-signed RavenPrekeyBundleV1 digest, dedicated device X keys; supersedes `_001` for trust binding |
+| `full_braid_full_exchange_2pq_2dh_001` | Full Braid lab: 2 PQ epochs, 4 nested confirms (each receive opens the peer's exact `sealed_ct`), 2 DH ratchets — lab-only |
+| `full_braid_rvfi1_init_001` | Full Braid lab: RVFI1 → initial RVFB1 for both roles (Python-computed; §3.3 EC keys) — lab-only |
 | `negative/pair_init_v1_as_v2_001` | V1≠V2 — **frozen** |
 | `tr_domain_labels_001` | Domain/info catalog — **frozen** |
 | `tr_ec_kdf_001` | `KDF_RK` / `KDF_CK` — **frozen** |
@@ -742,6 +844,26 @@ Frozen constants: `SEALED_PROTO=0x04`, `MAX_SKIP=1000`, `ROUTE_LOOKAHEAD=32`, `M
 Reference: `protocol/reference/raven_protocol/{pair_init_v2,hybrid_ratchet_v2,hybrid_ratchet_v2_state}.py`, `generate_hybrid_ratchet_v2.py`.
 
 Negatives: PairInit V1 as V2; mutate-on-bad-header; role-neutral SCKA init; OTP claim before auth; ACK-of-ACK intent; CAS-before-seal Materialized-without-bytes; dual ACK materialize; route from evolving RK; poll-only yesterday; advance day cursor mid-page; drop ACK on transport success; AckV2 layout-only “verify”; delivery downgrade.
+
+### 13.1 Known vector/spec discrepancies (informative)
+
+The vectors below are frozen and are **not** changed. Ports MUST match them byte-for-byte for interop; the prose of this document states the intended construction. Each item is resolved only by a versioned vector revision.
+
+- **(a) `tr_hybrid_aead_001` skips `KDF_SCKA_CK`.** Its `inputs.scka_mk_hex` is Alice's raw SCKA send chain key (`tr_scka_init_001` `expected.alice.ck_send_hex` = `CK_A2B`), fed directly to `KDF_HYBRID`; §6.3 requires `scka_mk` = `KDF_SCKA_CK(CK).mk` = HMAC-SHA256(CK, 0x01). `tr_candidate_fail_001` / `tr_tamper_candidate_001` take that derived key/nonce as input. `tr_combo_multi_001` applies `KDF_SCKA_CK` as §6.3 requires (but see (b)).
+- **(b) Raw ML-KEM shared secret as epoch secret.** `tr_braid_epoch_001` (injected `ss_epoch1_hex` / `ss_epoch2_hex`), `tr_braid_kem_chunk_001` (KAT `z_pq_hex` of `mlkem768_hybrid_kat_001`) and the SCKA epochs of `tr_combo_multi_001` (`ss_scka1_hex` / `ss_scka2_hex`) use `ss` directly as the `KDF_SCKA_RK` IKM; §6.3 specifies `epoch_secret = KDF_OK(ss, epoch)`, which only the Full Braid lab (`full_braid_*`) applies. The `KDF_SCKA_RK` construction itself (salt = rk, info = `SPQR_PROTOCOL_INFO`, L = 64) matches §6.3.
+- **(c) CT1/CT2 split.** `tr_braid_kem_chunk_001` cuts the whole 1088-byte ML-KEM-768 ciphertext into 42-byte chunks (`chunk_size` = 42, `chunk_count` = 26): indices 0–24 are typed `Ct1` (bytes 0–1049) and index 25 is typed `Ct2` (the last 38 bytes). §5.1 has `Ct1` = chunks of the 960-byte CT1 and `Ct2` = chunks of the 128-byte CT2, so index 22 straddles the CT1/CT2 boundary and CT2 bytes 960–1049 travel as `Ct1`.
+- **(d) RVBC1 `binding_digest_sha256` is defined only in the Python reference, not in §5.1.** Neither form covers magic or `plen`; `session_id` comes from session context, not the wire. The two forms differ by the direction byte and are not interchangeable:
+
+  ```text
+  # pre–Full Braid codec: hybrid_ratchet_v2_tr.py:braid_binding (tr_braid_kem_chunk_001, tr_braid_codec_negatives_001)
+  binding_digest_sha256 = SHA-256("ATSAM/v2/braid-chunk" || u64be(epoch) || u8(type) || u32be(index)
+                                  || payload || session_id(32))
+  # Full Braid lab: full_braid_digest.py:binding_digest (full_braid_digests_001, full_braid_*)
+  binding_digest_sha256 = SHA-256("ATSAM/v2/braid-chunk" || u8(direction) || u64be(epoch) || u8(type)
+                                  || u32be(index) || payload || session_id(32))
+  ```
+
+- **(e) `tr_ackv2_001` binds the wrong device.** The AckV2 is signed by Bob's responder device (`inputs.signer_device_ed_pub_hex`) and acknowledges Alice's message 0 (`inputs.acked_endpoint_object_hex` = `tr_hybrid_aead_001` header ‖ ciphertext, direction 0), so Bob signs it as the recipient of the acked message. Its `recipient_device_cert_hash` (plaintext offset 69, 32 bytes) carries Alice's **initiator** device-cert hash (`pair_init_v2_001` PairInit offset 331). Per §7.4 with §11.2 step 5 / §11.3 step 4, the recipient device binding is the acked message's intended recipient, i.e. the ACK-signing device: Bob's responder device-cert hash (PairInit offset 363).
 
 ---
 
@@ -785,7 +907,7 @@ Companion APPROVED + umbrella §9–§10 for carriers; lab indexed/A2 not rebran
 | Field | Value |
 |-------|-------|
 | Created | 2026-08-16 |
-| Revision | **9** (bidirectional payload rules; empty-type `chunk_index=0`; `EK_VECTOR_SIZE=1152` vs FIPS EK 1184) |
+| Revision | **11** (2026-10-07 owner-approved clarifications, no wire change: §0.4 V2 signature domains, PairResponse V2 table, reused V1 digest labels; §3.3 OTP / ML-KEM DK retention per prekey lifecycle §4/§6; §13.1 known vector/spec discrepancies). Rev 10: Full Braid lab rules §5.2; SCKA KDF byte tables §6.3; exact stub AAD/AckV2 layouts; `pair_init_v2_002`. Rev 9: bidirectional payload rules; empty-type `chunk_index=0`; `EK_VECTOR_SIZE=1152` vs FIPS EK 1184 |
 | Status | **REQUIRED / NOT YET APPROVED** |
 | Next | Full Signal Braid incremental Encaps1/Encaps2 + erasure coding; durable restart evidence; independent review; then human APPROVED |
 | Explicitly not next | Production flags; PairInit V1 reinterpret; marking APPROVED before Remaining §13 items close |

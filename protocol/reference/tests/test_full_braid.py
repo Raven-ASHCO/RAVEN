@@ -383,3 +383,71 @@ def test_full_exchange_aead_checkpoints_replay_in_python():
         output_epochs.append(result.meta.output_key_epoch)
 
     assert sorted(set(output_epochs)) == [1, 2]
+
+
+def test_replay_window_is_fifo_and_never_wedges():
+    v = _load("full_braid_sm_round_001.json")
+    inputs = v["inputs"]
+    material = sm.KeygenMaterial(
+        dk=bytes.fromhex(inputs["keygen_dk_hex"]),
+        header=bytes.fromhex(inputs["keygen_header_hex"]),
+        ek_vector=bytes.fromhex(inputs["keygen_ek_vector_hex"]),
+    )
+    alice = state.decode_rvfb1(bytes.fromhex(inputs["alice_before_hex"]))
+    # A full window in commit order (newest last), deliberately unsorted.
+    alice.replays = [
+        state.ReplayRecord(
+            transition_id=bytes([255 - i]) * 32,
+            execution_digest=bytes([i]) * 32,
+            output_digest=bytes(32),
+            output_len=14,
+            flags=0,
+        )
+        for i in range(sm.MAX_REPLAYS)
+    ]
+    full = state.encode_rvfb1(alice)
+    assert state.decode_rvfb1(full).replays == alice.replays
+
+    prepared = sm.transition_prepare(
+        full,
+        bytes.fromhex(inputs["send_input_hex"]),
+        bytes.fromhex(inputs["send_env_hex"]),
+        keygen_material=material,
+    )
+    replays = state.decode_rvfb1(prepared.candidate_bytes).replays
+    assert len(replays) == sm.MAX_REPLAYS
+    assert replays[:-1] == alice.replays[1:]  # oldest evicted
+    assert replays[-1].transition_id == prepared.meta.transition_id
+
+    alice.replays = alice.replays[:2] + [alice.replays[0]]
+    with pytest.raises(ValueError, match="duplicate transition_id"):
+        state.encode_rvfb1(alice)
+
+
+def test_journal_input_digest_redacts_seal_plaintext():
+    vector = _load("full_braid_full_exchange_2pq_2dh_001.json")
+    send = next(cp for cp in vector["aead_checkpoints"] if cp["op"] == wire.OP_SEND)
+    inp = wire.decode_rvbi1(bytes.fromhex(send["input_hex"]))
+    assert inp.mutation.mode == wire.MODE_SEAL_COMPARE and inp.mutation.body
+    persisted = sm.journal_input_digest(inp)
+    assert persisted != dig.input_digest(bytes.fromhex(send["input_hex"]))
+    guess = sm.dataclasses.replace(
+        inp, mutation=sm.dataclasses.replace(inp.mutation, body=b"\x00" * len(inp.mutation.body))
+    )
+    assert sm.journal_input_digest(guess) == persisted
+    rvbj1 = bytes.fromhex(send["expected"]["rvbj1_hex"])
+    # RVBJ1 header: magic(8) schema(2) sid(32) role dir kind rsv(4) gen(8) tid exec input...
+    input_off = 8 + 2 + 32 + 4 + 8 + 32 + 32
+    assert rvbj1[input_off : input_off + 32] == persisted
+
+
+def test_rvfi1_init_vector_is_computed_by_python():
+    v = _load("full_braid_rvfi1_init_001.json")
+    for role in ("alice", "bob"):
+        init = bytes.fromhex(v["inputs"][f"{role}_rvfi1_hex"])
+        assert sm.init_write(init).hex() == v["expected"][f"{role}_rvfb1_hex"], role
+    bob = state.decode_rvfb1(bytes.fromhex(v["expected"]["bob_rvfb1_hex"]))
+    bob_tr = state.decode_rvft1(bob.tr_bytes)
+    # Bob ratchets with his SPK; SK_ec (0x11…) is the root, never a DH key.
+    assert bob_tr.ec_rk == bytes([0x11]) * 32
+    assert bob_tr.ec_dhs_priv != bob_tr.ec_rk

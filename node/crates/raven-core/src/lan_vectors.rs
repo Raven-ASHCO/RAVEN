@@ -3,6 +3,11 @@
 //! CI: `.github/workflows/raven-serverless.yml` runs `cargo test -p raven-core --lib lan_`.
 //! iOS KAT: `node/scripts/ios_lan_kat.sh` (Swift `RavenSecureLanNoiseTests` / `RavenSecureLanRlb1Tests`).
 //! Manual lab order: `node/scripts/ios_lan_lab_checklist.md` (design §11).
+//!
+//! Test fixtures only: the public seeds and the fixed-ephemeral handshake KAT
+//! must not ship in a default/release build, so the module compiles under
+//! `cfg(test)` or the `test-helpers` feature.
+#![cfg(any(test, feature = "test-helpers"))]
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -167,7 +172,7 @@ pub fn assert_noise_static_vector() {
     );
     assert_eq!(HKDF_SALT, b"rvn1/lan-noise/v1");
     assert_eq!(HKDF_INFO, b"static-x25519");
-    assert_ne!(priv_key, seed);
+    assert_ne!(*priv_key, seed);
 }
 
 pub fn assert_noise_bind_vector() {

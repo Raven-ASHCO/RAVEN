@@ -6,6 +6,14 @@
 **Repo:** [Raven-ASHCO/RAVEN](https://github.com/Raven-ASHCO/RAVEN)  
 **Workflow cited:** [`.github/workflows/raven-serverless.yml`](../../../.github/workflows/raven-serverless.yml) (`name: Raven Serverless Node`)
 
+> **Status-wording note (2026-10-05):** this document is a dated 2026-09-04
+> snapshot. Its "in flight" / "pending" labels for PR #16, #17 and #26 predate
+> their landing: `.github/workflows/raven-serverless.yml` on `main` already runs
+> `ash_menu_smoke.sh` in the Linux, macOS and Windows jobs and named `bridge_v1`
+> on macOS and Windows. Treat those labels as historical and re-check the
+> workflow before relying on any "in-flight" row; this note does not upgrade any
+> row to Proven.
+
 This file defines **Proven** vs **PASS_SOFTWARE_SUBSTITUTE** vs **Blocked** for terminal Win / macOS / Linux reliability. It does **not** invent run counts, soak rates, or `reliability_matrix_20` pass totals.
 
 **FOUNDER RULE — Try phase = execute.** Harvest numbers only from runs we actually trigger, **or** cite exact GitHub Actions run IDs. Soft budgets only after real snapshots land. **Never invent or estimate metrics.** Precedent: [PR #14](https://github.com/Raven-ASHCO/RAVEN/pull/14) / [`perf-baseline-2026-09-04.md`](perf-baseline-2026-09-04.md) (triggered `cargo test` harvest on a recorded host). Soft latency budgets stay **draft**.
@@ -399,15 +407,17 @@ Doctor prints these as skips / unknown. They are **never** a checkmark and **nev
 
 **CLI / terminal ready** still requires **install → doctor → send** on that OS, **or** green [`ash_menu_smoke.sh`](../../../node/scripts/ash_menu_smoke.sh) (Unix; [PR #16](https://github.com/Raven-ASHCO/RAVEN/pull/16)), **or** green [`ash_doctor_send_smoke.ps1`](../../../node/scripts/ash_doctor_send_smoke.ps1) (Windows; this PR). Doctor output is an *input* to that chain; a single green exit is not enough.
 
-### Windows presence (no UDS probe)
+### Windows presence (named-pipe Ping)
 
-Canonical pipe: `raven_core::ipc::WINDOWS_NAMED_PIPE` = `\\.\pipe\raven-node`.
+Canonical pipe: `raven_core::ipc::WINDOWS_NAMED_PIPE` = `\\.\pipe\raven-node` is the prefix; the daemon binds the per-user pipe `\\.\pipe\raven-node-<user SID>` (`raven_core::ipc::windows_user_pipe_name`).
 
-Until Platform lands a named-pipe **client**, Windows doctor does **not** probe `raven-node.sock`. Presence is **missing / blocked**:
+The `ash` named-pipe **client** has landed (PR #43; `node/crates/ash/src/ipc_client.rs`: `connect_named_pipe` / `open_named_pipe`, which refuses a pipe served by another user). On Windows `ash doctor` never looks for `raven-node.sock`: it prints `file_present: raven-node.sock not_probed` and pings the pipe, so presence is the same Ping classification as on Unix:
 
-- `daemon_presence: blocked (reason=ipc_transport_missing)` — never a checkmark
-- `daemon_ready: not_ready (reason=ipc_transport_blocked)`
-- `send_path: not_ready (reason=not_probed)` (or `unchecked`)
+- `daemon_presence: present` — a Ping answered on the pipe (still **not** CLI ready, **not** send Proven)
+- `daemon_presence: down` — the pipe could not be opened or did not answer
+- `daemon_presence: blocked (reason=ipc_transport_missing)` — only when there is no IPC transport at all: an unsupported OS, or a Windows process whose user SID cannot be read (`ipc_endpoint` is then `Unsupported`). Never a checkmark; it also makes `daemon_ready: not_ready (reason=ipc_transport_blocked)` and `send_path: not_ready (reason=not_probed)`.
+
+The pipe is per user, not per profile: `ipc_endpoint` ignores the data dir on Windows (see `node/scripts/install/WINDOWS_SERVICE.md`).
 
 Do not treat a loopback listen on `127.0.0.1:7420` as presence or path Proven (**B12**).
 

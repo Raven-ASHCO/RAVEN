@@ -1,0 +1,97 @@
+# cargo-fuzz targets for Raven's attacker-facing decoders.
+#
+# Deliberately NOT a member of the node/ workspace (the empty [workspace] below
+# makes this directory its own root), so libfuzzer-sys never enters normal
+# builds. Target bodies live in src/lib.rs, which raven-core's
+# tests/fuzz_smoke.rs also compiles and runs on stable in CI.
+#
+#   cargo +nightly install cargo-fuzz --locked
+#   cd node/fuzz && cargo +nightly fuzz run envelope -- -max_total_time=60
+[package]
+name = "raven-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+raven-core = { path = "../crates/raven-core" }
+serde_json = "1"
+
+[profile.release]
+debug = 1
+
+# Same SQLite/SQLCipher build as the node workspace (see node/Cargo.toml).
+[patch.crates-io]
+libsqlite3-sys = { path = "../third_party/libsqlite3-sys-raven" }
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_object"
+path = "fuzz_targets/store_object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rlb1_offer"
+path = "fuzz_targets/rlb1_offer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "carrier_frames"
+path = "fuzz_targets/carrier_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pair_init"
+path = "fuzz_targets/pair_init.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "device_cert"
+path = "fuzz_targets/device_cert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "device_revocation"
+path = "fuzz_targets/device_revocation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_frame"
+path = "fuzz_targets/ipc_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_and_records"
+path = "fuzz_targets/session_and_records.rs"
+test = false
+doc = false
+bench = false

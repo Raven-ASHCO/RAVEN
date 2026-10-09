@@ -205,25 +205,29 @@ pub fn terminal_scope_id(canonical_root_bytes: &[u8]) -> Result<[u8; 32], Protec
     scope_id(TERMINAL_APP_ID, canonical_root_bytes)
 }
 
-fn hkdf32(ikm: &[u8], info: &[u8]) -> [u8; 32] {
+/// Derive straight into the (wipe-on-drop) destination: no loose stack copy.
+fn hkdf32_into(out: &mut [u8; 32], ikm: &[u8], info: &[u8]) {
     let okm = hkdf_sha256(ikm, &ZERO_SALT, info, 32);
-    let mut out = [0u8; 32];
     out.copy_from_slice(&okm);
-    out
 }
 
 pub fn derive_store_keys(seed32: &[u8; SEED_LEN]) -> DerivedKeys {
+    let mut keys = DerivedKeys {
+        k_state: [0u8; 32],
+        k_index: [0u8; 32],
+        k_sql: [0u8; 32],
+        k_local: [0u8; 32],
+        k_anchor: [0u8; 32],
+        k_sql_salt: [0u8; 16],
+    };
+    hkdf32_into(&mut keys.k_state, seed32, INFO_STATE);
+    hkdf32_into(&mut keys.k_index, seed32, INFO_INDEX);
+    hkdf32_into(&mut keys.k_sql, seed32, INFO_SQL);
+    hkdf32_into(&mut keys.k_local, seed32, INFO_LOCAL);
+    hkdf32_into(&mut keys.k_anchor, seed32, INFO_ANCHOR);
     let salt16 = hkdf_sha256(seed32, &ZERO_SALT, INFO_SQL_SALT, 16);
-    let mut k_sql_salt = [0u8; 16];
-    k_sql_salt.copy_from_slice(&salt16);
-    DerivedKeys {
-        k_state: hkdf32(seed32, INFO_STATE),
-        k_index: hkdf32(seed32, INFO_INDEX),
-        k_sql: hkdf32(seed32, INFO_SQL),
-        k_local: hkdf32(seed32, INFO_LOCAL),
-        k_anchor: hkdf32(seed32, INFO_ANCHOR),
-        k_sql_salt,
-    }
+    keys.k_sql_salt.copy_from_slice(&salt16);
+    keys
 }
 
 pub fn record_key(k_index: &[u8; 32], session_id: &[u8; 32]) -> [u8; 32] {
@@ -233,16 +237,18 @@ pub fn record_key(k_index: &[u8; 32], session_id: &[u8; 32]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-pub fn k_state_record(k_state: &[u8; 32], record_key32: &[u8; 32]) -> [u8; 32] {
+/// Per-record state key; wiped when the returned value is dropped.
+pub fn k_state_record(k_state: &[u8; 32], record_key32: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let okm = hkdf_sha256(k_state, record_key32, INFO_STATE_RECORD, 32);
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&okm);
     out
 }
 
-pub fn k_stage_transition(k_local: &[u8; 32], transition_id: &[u8; 32]) -> [u8; 32] {
+/// Per-transition stage key; wiped when the returned value is dropped.
+pub fn k_stage_transition(k_local: &[u8; 32], transition_id: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let okm = hkdf_sha256(k_local, transition_id, INFO_STAGE, 32);
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&okm);
     out
 }

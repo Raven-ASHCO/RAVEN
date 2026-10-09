@@ -16,6 +16,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/lib/o6_ipc_guard.sh
+source "$ROOT/scripts/lib/o6_ipc_guard.sh"
 LABEL="NON-RELEASE"
 BOARD="docs/engineering/baseline-freeze/o6-raven-rdap-try-phase-gap-board.md"
 ADR="docs/adr/0004-raven-rdap-atsam-transport.md"
@@ -47,9 +49,15 @@ grep -q 'Daemon never seals here' "$IPC" \
   || fail_reg "$IPC missing EnqueueSealed sealed-frame-only invariant"
 grep -q 'EnqueueSealed' "$IPC" && grep -q 'LanDial' "$IPC" \
   || fail_reg "$IPC missing EnqueueSealed / LanDial"
-if grep -Eq 'enum IpcRequest' -A 40 "$IPC" | grep -Eqi 'SealPlaintext|SealPayload|EnqueuePlain'; then
-  fail_reg "$IPC grew a plaintext-seal op; do not treat as O6 green — Crypto must own M2"
-fi
+ipc_guard_rc=0
+o6_ipc_guard "$IPC" || ipc_guard_rc=$?
+case "$ipc_guard_rc" in
+  0) ;;
+  2) fail_reg "$IPC: 'pub enum IpcRequest' not found; the IPC-surface guard would be a silent no-op" ;;
+  3) fail_reg "$IPC grew a plaintext-seal op (other than the reviewed SealUnderSession); do not treat as O6 green — Crypto review required" ;;
+  4) fail_reg "$IPC grew a Whoami op; the O6 checks use ash whoami, not a new IPC surface" ;;
+  *) fail_reg "$IPC: IPC-surface guard failed unexpectedly (status $ipc_guard_rc)" ;;
+esac
 if grep -qi 'python MUST NOT construct' "$ADR"; then
   :
 elif grep -q 'Python / RDAP MUST NOT' "$ADR"; then

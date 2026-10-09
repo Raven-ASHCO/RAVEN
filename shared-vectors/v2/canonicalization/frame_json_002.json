@@ -1,0 +1,52 @@
+{
+  "name": "Feature-frame v2 signing input — JCS edge cases",
+  "description": "Floats (ECMAScript shortest form: 1.0→1, -0→0, 1e21→1e+21, 1e-7→1e-7, 0.000001 stays decimal), `/` not escaped, non-ASCII literal, control char as \\u001f, keys sorted by UTF-16 code units (U+1F600 before U+E000). These are the cases where \"sorted keys\" JSON diverges across languages (MESH_PROTOCOL.md §I.14).",
+  "protocol_version": "v2-draft",
+  "spec_reference": "MESH_PROTOCOL_v2.md §3 + RFC 8785",
+  "created_at": "2026-05-15T00:00:00Z",
+  "deterministic": true,
+  "inputs": {
+    "raw_frame": {
+      "mk": "raven.example.v1",
+      "p": {
+        "url": "https://cdn.raven.app/u/alice.png",
+        "caption": "café ☕ \"q\" \\ \u001f",
+        "nums": [
+          0,
+          -0.0,
+          1.0,
+          1.5,
+          -2.25,
+          1e+21,
+          1e-07,
+          1e-06,
+          333333333.3333333,
+          5e-324
+        ],
+        "": "private-use key sorts after the astral one",
+        "😀": "astral key (UTF-16 D83D DE00)",
+        "ok": true,
+        "none": null
+      },
+      "sid": "alice-device-1",
+      "mid": "frame-002",
+      "hc": 0,
+      "hl": 10,
+      "sc": 5,
+      "ts": 1700000000000,
+      "rp": [],
+      "ttl": 86400,
+      "s": "PLACEHOLDER_SIG_b64",
+      "spk": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+    },
+    "signer": "alice"
+  },
+  "expected": {
+    "canonical_utf8": "{\"hc\":0,\"hl\":10,\"mid\":\"frame-002\",\"mk\":\"raven.example.v1\",\"p\":{\"caption\":\"café ☕ \\\"q\\\" \\\\ \\u001f\",\"none\":null,\"nums\":[0,0,1,1.5,-2.25,1e+21,1e-7,0.000001,333333333.3333333,5e-324],\"ok\":true,\"url\":\"https://cdn.raven.app/u/alice.png\",\"😀\":\"astral key (UTF-16 D83D DE00)\",\"\":\"private-use key sorts after the astral one\"},\"rp\":[],\"sc\":5,\"sid\":\"alice-device-1\",\"ts\":1700000000000,\"ttl\":86400}",
+    "canonical_hex": "7b226863223a302c22686c223a31302c226d6964223a226672616d652d303032222c226d6b223a22726176656e2e6578616d706c652e7631222c2270223a7b2263617074696f6e223a22636166c3a920e29895205c22715c22205c5c205c7530303166222c226e6f6e65223a6e756c6c2c226e756d73223a5b302c302c312c312e352c2d322e32352c31652b32312c31652d372c302e3030303030312c3333333333333333332e333333333333332c35652d3332345d2c226f6b223a747275652c2275726c223a2268747470733a2f2f63646e2e726176656e2e6170702f752f616c6963652e706e67222c22f09f9880223a2261737472616c206b657920285554462d31362044383344204445303029222c22ee8080223a22707269766174652d757365206b657920736f727473206166746572207468652061737472616c206f6e65227d2c227270223a5b5d2c227363223a352c22736964223a22616c6963652d6465766963652d31222c227473223a313730303030303030303030302c2274746c223a38363430307d",
+    "signing_bytes_hex": "ff52564d45534832037b226863223a302c22686c223a31302c226d6964223a226672616d652d303032222c226d6b223a22726176656e2e6578616d706c652e7631222c2270223a7b2263617074696f6e223a22636166c3a920e29895205c22715c22205c5c205c7530303166222c226e6f6e65223a6e756c6c2c226e756d73223a5b302c302c312c312e352c2d322e32352c31652b32312c31652d372c302e3030303030312c3333333333333333332e333333333333332c35652d3332345d2c226f6b223a747275652c2275726c223a2268747470733a2f2f63646e2e726176656e2e6170702f752f616c6963652e706e67222c22f09f9880223a2261737472616c206b657920285554462d31362044383344204445303029222c22ee8080223a22707269766174652d757365206b657920736f727473206166746572207468652061737472616c206f6e65227d2c227270223a5b5d2c227363223a352c22736964223a22616c6963652d6465766963652d31222c227473223a313730303030303030303030302c2274746c223a38363430307d",
+    "signature_hex": "9aa5e2a74719e50d586767b1556801cf28695fc0aa9dbd741ba2b2cfa78e7abb930d17094a44c35f60dabe0980440ca326852a335c4c0b5753579f9ce1588e07",
+    "signature_b64": "mqXip0cZ5Q1YZ2exVWgBzyhpX8Cqnb10G6Kyz6eOeruTDRcJSkTDX2DavgmARAyjJoUqM1xMC1dTV5+c4ViOBw=="
+  },
+  "notes": "DRAFT (docs/MESH_PROTOCOL_v2.md): no port ships v2 yet; frozen once v2 is adopted."
+}

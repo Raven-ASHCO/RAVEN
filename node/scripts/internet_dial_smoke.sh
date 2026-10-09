@@ -4,12 +4,16 @@
 # endpoint actor and sealed ACK lifecycle are wired to this carrier.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/target/debug"
+# shellcheck source=../../scripts/lib/harness_util.sh
+source "$ROOT/../scripts/lib/harness_util.sh"
+BIN="${RAVEN_BIN_DIR:-$ROOT/target/debug}"   # optional prebuilt debug bin dir (skips the build)
 NODE="$BIN/raven-node"
 # Same debug/lab identity override as lan_direct / ash menu (refused in Release).
 export RAVEN_IDENTITY_BACKEND=locked-file
 export RAVEN_CHAT_HISTORY_BACKEND=locked-file
-WORKDIR="${TMPDIR:-/tmp}/raven-inet-$$"
+# mktemp: 0700 and never pre-existing (a predictable name can be pre-created or
+# symlinked by another user).
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/raven-inet-XXXXXX")"
 mkdir -p "$WORKDIR/a" "$WORKDIR/b"
 cleanup() {
   if [[ -n "${BPID:-}" ]]; then
@@ -20,7 +24,13 @@ cleanup() {
 }
 trap cleanup EXIT
 source "${HOME}/.cargo/env" 2>/dev/null || true
-[[ -x "$NODE" ]] || (cd "$ROOT" && cargo build -p raven-node -q)
+# Always builds (a no-op when fresh) unless RAVEN_BIN_DIR is given: an existing
+# binary used to be reused however stale, so this gate could pass against old code.
+raven_build_bins "$ROOT" raven-node
+if [[ ! -x "$NODE" ]]; then
+  echo "FAIL: $NODE is missing" >&2
+  exit 1
+fi
 
 "$NODE" init --data-dir "$WORKDIR/a" | tee "$WORKDIR/a.out"
 "$NODE" init --data-dir "$WORKDIR/b" | tee "$WORKDIR/b.out"
@@ -37,10 +47,8 @@ B_PUB=$(grep '^pub_hex=' "$WORKDIR/b.out" | cut -d= -f2)
   --peer-pub-hex "$A_PUB" \
   >"$WORKDIR/b.log" 2>&1 &
 BPID=$!
-for _ in $(seq 1 80); do
-  [[ -f "$WORKDIR/b.addr" ]] && break
-  sleep 0.05
-done
+# Non-empty file (written create+truncate then write), daemon alive, 15 s budget.
+raven_wait_file "$WORKDIR/b.addr" "$BPID" 15 "$WORKDIR/b.log"
 B_ADDR=$(cat "$WORKDIR/b.addr")
 
 set +e
@@ -60,7 +68,18 @@ if [[ "$A_STATUS" -eq 0 ]]; then
   echo "INTERNET_TRANSPORT_FALSE_DELIVERY: raw path unexpectedly exited zero" >&2
   exit 1
 fi
-grep -q 'ATSAM_SESSION_REQUIRED: no authenticated persisted ATSAM session is available' "$WORKDIR/a.log"
-! grep -q 'ACK delivered' "$WORKDIR/a.log"
-! grep -q 'DELIVERED' "$WORKDIR/b.log"
+if ! grep -q 'ATSAM_SESSION_REQUIRED: no authenticated persisted ATSAM session is available' "$WORKDIR/a.log"; then
+  echo "INTERNET_TRANSPORT_WRONG_REFUSAL: rc=$A_STATUS without ATSAM_SESSION_REQUIRED" >&2
+  cat "$WORKDIR/a.log" >&2 || true
+  exit 1
+fi
+# Explicit if/exit: errexit never fires on a `!`-negated command.
+if grep -q 'ACK delivered' "$WORKDIR/a.log"; then
+  echo "INTERNET_TRANSPORT_FALSE_DELIVERY: sender logged an ACK" >&2
+  exit 1
+fi
+if grep -q 'DELIVERED' "$WORKDIR/b.log"; then
+  echo "INTERNET_TRANSPORT_FALSE_DELIVERY: receiver logged a delivery" >&2
+  exit 1
+fi
 echo "PASS: legacy InternetTransport remains fail-closed pending indexed endpoint wiring"

@@ -97,39 +97,27 @@ impl DeviceRevocationV1 {
             return Err("bad version/suite".into());
         }
         let mut off = 10;
-        let addr = std::str::from_utf8(&wire[off..off + ADDRESS_LEN])
+        let addr = std::str::from_utf8(take(wire, &mut off, ADDRESS_LEN)?)
             .map_err(|_| "identity_address not utf8")?;
         let identity_address = addr.to_string();
         require_address(&identity_address)?;
-        off += ADDRESS_LEN;
         let (device_id, noff) = read_lp(wire, off)?;
         off = noff;
-        let mut device_ed_pub = [0u8; 32];
-        device_ed_pub.copy_from_slice(&wire[off..off + 32]);
-        off += 32;
-        let mut device_x_pub = [0u8; 32];
-        device_x_pub.copy_from_slice(&wire[off..off + 32]);
-        off += 32;
-        let mut device_cert_hash = [0u8; 32];
-        device_cert_hash.copy_from_slice(&wire[off..off + 32]);
-        off += 32;
+        // Every fixed-size field is bounds-checked: the length floor above
+        // assumes 1-byte ids, so a long id with a short tail must be an error.
+        let device_ed_pub = take_array::<32>(wire, &mut off)?;
+        let device_x_pub = take_array::<32>(wire, &mut off)?;
+        let device_cert_hash = take_array::<32>(wire, &mut off)?;
         let (issuer_device_id, noff) = read_lp(wire, off)?;
         off = noff;
-        let issuer_seq = u64::from_be_bytes(wire[off..off + 8].try_into().unwrap());
-        off += 8;
-        let mut revocation_id = [0u8; 16];
-        revocation_id.copy_from_slice(&wire[off..off + 16]);
-        off += 16;
+        let issuer_seq = u64::from_be_bytes(take_array::<8>(wire, &mut off)?);
+        let revocation_id = take_array::<16>(wire, &mut off)?;
         if revocation_id == [0u8; 16] {
             return Err("revocation_id all-zero".into());
         }
-        let reason_code = wire[off];
-        off += 1;
-        let created_at_ms = u64::from_be_bytes(wire[off..off + 8].try_into().unwrap());
-        off += 8;
-        let mut signature = [0u8; 64];
-        signature.copy_from_slice(&wire[off..off + 64]);
-        off += 64;
+        let reason_code = take_array::<1>(wire, &mut off)?[0];
+        let created_at_ms = u64::from_be_bytes(take_array::<8>(wire, &mut off)?);
+        let signature = take_array::<64>(wire, &mut off)?;
         if off != wire.len() {
             return Err("trailing bytes".into());
         }
@@ -165,6 +153,22 @@ impl DeviceRevocationV1 {
         }
         Ok(())
     }
+}
+
+fn take<'a>(buf: &'a [u8], off: &mut usize, n: usize) -> Result<&'a [u8], String> {
+    let end = off
+        .checked_add(n)
+        .filter(|end| *end <= buf.len())
+        .ok_or_else(|| "truncated field".to_string())?;
+    let out = &buf[*off..end];
+    *off = end;
+    Ok(out)
+}
+
+fn take_array<const N: usize>(buf: &[u8], off: &mut usize) -> Result<[u8; N], String> {
+    let mut out = [0u8; N];
+    out.copy_from_slice(take(buf, off, N)?);
+    Ok(out)
 }
 
 fn read_lp(buf: &[u8], off: usize) -> Result<(Vec<u8>, usize), String> {
@@ -311,6 +315,33 @@ mod tests {
             .as_str()
             .unwrap()));
         assert!(rec.verify(&pubk).is_err());
+    }
+
+    #[test]
+    fn long_id_short_tail_is_error_not_panic() {
+        let v = load("negative/device_revocation_long_id_short_tail.json");
+        let wire = hex(v["inputs"]["wire_hex"].as_str().unwrap());
+        assert_eq!(
+            wire.len() as u64,
+            v["expected"]["wire_len"].as_u64().unwrap()
+        );
+        assert!(DeviceRevocationV1::decode(&wire).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_every_truncation_and_id_length_without_panic() {
+        let v = load("device_revocation/valid_001.json");
+        let wire = hex(v["expected"]["wire_hex"].as_str().unwrap());
+        for n in 0..wire.len() {
+            assert!(DeviceRevocationV1::decode(&wire[..n]).is_err());
+        }
+        for n in 0u16..70 {
+            let mut w = wire.clone();
+            w[54..56].copy_from_slice(&n.to_be_bytes());
+            let full = DeviceRevocationV1::decode(&w);
+            assert_eq!(full.is_ok(), w == wire);
+            assert!(DeviceRevocationV1::decode(&w[..253]).is_err());
+        }
     }
 
     #[test]

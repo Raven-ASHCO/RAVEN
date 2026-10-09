@@ -12,6 +12,10 @@ fn main() {
     }
     println!("cargo:rustc-env=RAVEN_BUILD_PROFILE={profile}");
 
+    // Primary release hold. Defence in depth: full_braid_durable_lab/mod.rs
+    // refuses to compile without debug assertions, libsqlite3-sys-raven holds
+    // any release `bundled-sqlcipher*` build, and
+    // scripts/sqlcipher_release_feature_audit.sh checks shipped feature graphs.
     if durable_lab && profile == "release" {
         // Exact diagnostic required by Task 0A.2 stop-line / CI.
         panic!("FULL_BRAID_SQLCIPHER_NOT_APPROVED");

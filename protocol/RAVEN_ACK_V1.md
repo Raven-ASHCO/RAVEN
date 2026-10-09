@@ -51,11 +51,25 @@ device-identity key ([`RAVEN_IDENTITY_V1.md`](RAVEN_IDENTITY_V1.md)) — the sam
 key type that authenticates envelopes. The ack record itself carries no
 embedded public-key field; a verifier resolves which key to check against via
 the established session or the counterpart's known `RavenDeviceCertificateV1`,
-not from anything inside the ack payload. Because the signature is over the
-ack's own domain-separated bytes (not the envelope's), a verifier holding only
-the counterpart's identity/device key material can confirm "the message was
-received/read" independent of which transport or intermediary session carried
-the envelope.
+not from anything inside the ack payload.
+
+**What the inner signature does *not* bind.** The signed bytes name only the
+`acked_message_id`, which the *sender* chose and which is visible in the clear
+outer envelope. They bind no conversation/session, no acknowledging-recipient
+identity beyond the signing key, and no digest of the acknowledged object. A
+V1 ack record is therefore **not** a transferable, context-free proof that
+"message X was received/read": the same signed record is equally valid for
+any object that carries (or is made to carry) that `message_id`. It is
+meaningful only inside the checks of
+[`SECURITY_ERRATA_RVN1_2026-08-13.md`](SECURITY_ERRATA_RVN1_2026-08-13.md)
+rule 4: the ack must arrive sealed under the authenticated session AEAD
+(whose AAD supplies the session/direction binding), from the expected
+non-revoked device, and match an outstanding outbound row bound to that same
+recipient device. Verifiers MUST NOT accept or relay a V1 ack record outside
+that session context. `AckV2`
+([`ATSAM_HYBRID_RATCHET_V2.md`](ATSAM_HYBRID_RATCHET_V2.md) §7.4) adds
+`acked_object_digest`, a recipient-device binding and `session_id` to the
+signed bytes and supersedes V1 for these bindings.
 
 **Vector:** `shared-vectors/rvn1/ack/delivered_bob_to_alice.json` — bob
 acknowledging alice's message (`status=1`, delivered).
@@ -113,9 +127,17 @@ NOT trigger this transition. They may only establish or hold `FORWARDED`.
 
 ## 4. ACK replay and dedup
 
-Because an ACK travels as an ordinary `env_type=2` envelope, envelope-level
-dedup (keyed on the outer `message_id`) already prevents delivering the exact
-same ack-envelope twice. That is not sufficient on its own: a recipient may
+An ACK travels as an ordinary `env_type=2` envelope, so it gets the same
+envelope-level replay handling as any message — which, per errata rule 6, is
+**not** keyed on the unverified outer `message_id`. An endpoint records its
+authenticated dedup receipt only in the successful commit after outer
+authentication, AEAD open and inner-signature verification; an opaque relay
+keys its bounded replay cache on
+`SHA-256(domain || envelope_signing_bytes || outer_signature)`. Nothing may
+durably suppress an ack solely because an unverified outer `message_id` was
+seen before (an attacker could pre-burn a legitimate ack's ID).
+
+Envelope-level dedup is also not sufficient on its own: a recipient may
 legitimately resend a semantically-identical ack (same `acked_message_id` +
 `status`) inside a *fresh* envelope — with a new `message_id`, a new
 `ack_nonce`, and a slightly different `created_at` — after, say, a
@@ -123,9 +145,11 @@ route-failure retry. Envelope dedup will not catch this, because it's a
 different envelope.
 
 Implementations MUST therefore also dedup at the application layer on
-`(acked_message_id, status)`: a repeat `status=1` ack for a message already at
-`DELIVERED_TO_DEVICE` is a no-op (idempotent), and a repeat `status=2` for a
-message already at `READ` must not re-fire a "message read" notification.
+`(acked_message_id, status)` — applied only to acks that already passed the
+errata rule 4 checks for the outstanding row they match: a repeat `status=1`
+ack for a message already at `DELIVERED_TO_DEVICE` is a no-op (idempotent),
+and a repeat `status=2` for a message already at `READ` must not re-fire a
+"message read" notification.
 `ack_nonce` uniqueness is not a substitute for this check — it exists for
 signature domain separation (§2), not for idempotency tracking.
 

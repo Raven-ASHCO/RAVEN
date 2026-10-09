@@ -10,7 +10,7 @@ use snow::{Builder, HandshakeState, TransportState};
 
 pub use snow::TransportState as NoiseTransport;
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::identity::Identity;
 
@@ -19,7 +19,9 @@ pub const BIND_DOMAIN: &[u8] = b"rvn1/lan-noise/v1";
 pub const BIND_LEN: usize = 32 + 64;
 pub const HKDF_SALT: &[u8] = b"rvn1/lan-noise/v1";
 pub const HKDF_INFO: &[u8] = b"static-x25519";
-const MAX_NOISE_MSG: usize = 65535;
+/// Largest Noise message snow will read or write (handshake or transport).
+/// LAN/Internet framers reject longer `u32_be` lengths before allocating.
+pub const MAX_NOISE_MSG: usize = 65535;
 /// ChaChaPoly tag is 16 bytes; snow rejects larger transport plaintexts.
 pub const MAX_TRANSPORT_PLAINTEXT: usize = MAX_NOISE_MSG - 16;
 /// Conservative application text cap so the packed RVN1 envelope still fits.
@@ -44,12 +46,15 @@ pub enum LanNoiseError {
 }
 
 /// HKDF-SHA256 static X25519 private key from the identity seed.
-pub fn derive_noise_static(identity: &Identity) -> Result<[u8; 32], LanNoiseError> {
+///
+/// Knowing this key is equivalent to impersonating the identity on LAN, so it
+/// is returned in a wrapper that wipes it on drop.
+pub fn derive_noise_static(identity: &Identity) -> Result<Zeroizing<[u8; 32]>, LanNoiseError> {
     let mut seed = identity.seed_bytes();
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), &seed);
     seed.zeroize();
-    let mut okm = [0u8; 32];
-    hk.expand(HKDF_INFO, &mut okm)
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(HKDF_INFO, okm.as_mut_slice())
         .map_err(|_| LanNoiseError::KeyDerive)?;
     Ok(okm)
 }
@@ -97,42 +102,87 @@ pub fn verify_bind(
     Ok(ed)
 }
 
-fn builder_with_ephemeral<'a>(
+fn builder<'a>(
     static_priv: &'a [u8; 32],
-    fixed_ephemeral: Option<&'a [u8; 32]>,
+    prologue: Option<&'a [u8]>,
 ) -> Result<Builder<'a>, LanNoiseError> {
     let params = NOISE_PATTERN
         .parse()
         .map_err(|_| LanNoiseError::Handshake)?;
     let mut b = Builder::new(params).local_private_key(static_priv);
+    // LAN never sets a prologue (wire-frozen); other carriers use one for
+    // domain separation so a LAN transcript can never complete against them.
+    if let Some(p) = prologue {
+        b = b.prologue(p);
+    }
+    Ok(b)
+}
+
+pub fn build_initiator(static_priv: &[u8; 32]) -> Result<HandshakeState, LanNoiseError> {
+    builder(static_priv, None)?
+        .build_initiator()
+        .map_err(|_| LanNoiseError::Handshake)
+}
+
+pub fn build_responder(static_priv: &[u8; 32]) -> Result<HandshakeState, LanNoiseError> {
+    builder(static_priv, None)?
+        .build_responder()
+        .map_err(|_| LanNoiseError::Handshake)
+}
+
+/// Known-answer-test builder. A caller-chosen ephemeral key voids forward
+/// secrecy and makes the handshake keys predictable, so this exists only for
+/// tests and the `test-helpers` feature and never in a default/release build.
+#[cfg(any(test, feature = "test-helpers"))]
+fn builder_with_fixed_ephemeral<'a>(
+    static_priv: &'a [u8; 32],
+    fixed_ephemeral: Option<&'a [u8; 32]>,
+) -> Result<Builder<'a>, LanNoiseError> {
+    let mut b = builder(static_priv, None)?;
     if let Some(eph) = fixed_ephemeral {
         b = b.fixed_ephemeral_key_for_testing_only(eph);
     }
     Ok(b)
 }
 
-pub fn build_initiator(static_priv: &[u8; 32]) -> Result<HandshakeState, LanNoiseError> {
-    build_initiator_with_ephemeral(static_priv, None)
-}
-
-pub fn build_responder(static_priv: &[u8; 32]) -> Result<HandshakeState, LanNoiseError> {
-    build_responder_with_ephemeral(static_priv, None)
-}
-
+/// Test/KAT-only (see [`builder_with_fixed_ephemeral`]).
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn build_initiator_with_ephemeral(
     static_priv: &[u8; 32],
     fixed_ephemeral: Option<&[u8; 32]>,
 ) -> Result<HandshakeState, LanNoiseError> {
-    builder_with_ephemeral(static_priv, fixed_ephemeral)?
+    builder_with_fixed_ephemeral(static_priv, fixed_ephemeral)?
         .build_initiator()
         .map_err(|_| LanNoiseError::Handshake)
 }
 
+/// Test/KAT-only (see [`builder_with_fixed_ephemeral`]).
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn build_responder_with_ephemeral(
     static_priv: &[u8; 32],
     fixed_ephemeral: Option<&[u8; 32]>,
 ) -> Result<HandshakeState, LanNoiseError> {
-    builder_with_ephemeral(static_priv, fixed_ephemeral)?
+    builder_with_fixed_ephemeral(static_priv, fixed_ephemeral)?
+        .build_responder()
+        .map_err(|_| LanNoiseError::Handshake)
+}
+
+/// Same XX pattern and static key, with a carrier-specific Noise prologue.
+/// Not used by LAN (its transcript has no prologue).
+pub fn build_initiator_with_prologue(
+    static_priv: &[u8; 32],
+    prologue: &[u8],
+) -> Result<HandshakeState, LanNoiseError> {
+    builder(static_priv, Some(prologue))?
+        .build_initiator()
+        .map_err(|_| LanNoiseError::Handshake)
+}
+
+pub fn build_responder_with_prologue(
+    static_priv: &[u8; 32],
+    prologue: &[u8],
+) -> Result<HandshakeState, LanNoiseError> {
+    builder(static_priv, Some(prologue))?
         .build_responder()
         .map_err(|_| LanNoiseError::Handshake)
 }
@@ -330,7 +380,46 @@ mod tests {
     fn noise_static_is_not_identity_seed() {
         let id = alice();
         let noise = derive_noise_static(&id).unwrap();
-        assert_ne!(noise, id.seed_bytes());
-        assert_ne!(noise, [0u8; 32]);
+        assert_ne!(*noise, id.seed_bytes());
+        assert_ne!(*noise, [0u8; 32]);
+    }
+
+    #[test]
+    fn noise_static_is_wiped_on_drop() {
+        // The derived key is identity-equivalent; it must not be a bare array
+        // that callers leave on the stack.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        let noise = derive_noise_static(&alice()).unwrap();
+        assert_zeroize_on_drop(&noise);
+    }
+
+    #[test]
+    fn max_noise_msg_matches_snow_limit() {
+        // Framers cap `u32_be` lengths at this value before allocating; it must
+        // equal snow's own limit so no valid Noise message is ever rejected.
+        let (mut a, mut b, _, _) = handshake_pair(&alice(), &bob()).unwrap();
+        let ct = transport_encrypt(&mut a, &vec![0u8; MAX_TRANSPORT_PLAINTEXT]).unwrap();
+        assert_eq!(ct.len(), MAX_NOISE_MSG);
+        let too_long = vec![0u8; MAX_NOISE_MSG + 1];
+        assert!(b
+            .read_message(&too_long, &mut vec![0u8; MAX_NOISE_MSG + 1])
+            .is_err());
+    }
+
+    #[test]
+    fn prologue_mismatch_fails_handshake() {
+        // A LAN (no prologue) initiator must not complete XX against a
+        // responder that uses a carrier prologue.
+        let a = derive_noise_static(&alice()).unwrap();
+        let b = derive_noise_static(&bob()).unwrap();
+        let mut initiator = build_initiator(&a).unwrap();
+        let mut responder = build_responder_with_prologue(&b, b"raven/internet/v1").unwrap();
+        let m1 = handshake_write(&mut initiator, &[]).unwrap();
+        handshake_read(&mut responder, &m1).unwrap();
+        let m2 = handshake_write(&mut responder, &[]).unwrap();
+        assert_eq!(
+            handshake_read(&mut initiator, &m2),
+            Err(LanNoiseError::Handshake)
+        );
     }
 }

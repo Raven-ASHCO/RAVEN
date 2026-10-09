@@ -27,7 +27,19 @@ decision, and `now_ms`. Processing order is mandatory:
 3. Parse only the fixed, bounded RVNA1 `0x03` header to obtain its message-lane
    index. Reject every other protocol/suite for this profile.
 4. Resolve exactly one session whose expected inbound direction, device hint,
-   and derived route tag match. Tag matching is only candidate selection.
+   and derived route tag match. A `dest_device_hint` of `0` matches any
+   session; a non-zero hint must equal the legacy hint of the local device
+   (§4.1 step 2). Tag matching is only candidate selection.
+   Session-specific lifetime checks run only after this selection, against the
+   selected session, with the start-bound skew tolerance of
+   [`RAVEN_PAIR_INIT_V1.md`](RAVEN_PAIR_INIT_V1.md) §1: neither `now_ms` nor
+   the envelope `created_at` may precede the session start (its signed PairInit
+   `created_at_ms`) by more than `MAX_PEER_CLOCK_SKEW_MS` (300000 ms), while
+   `now_ms < session expires_at_ms` and envelope
+   `expires_at <= session expires_at_ms` stay exact. A lifetime check placed
+   before selection would refuse a valid envelope sealed under another live
+   session with the same peer (for example the older of two crossed sessions).
+   Outbound sealing applies the same session-window rule.
 5. Require a currently accepted, non-revoked sender device certificate and
    verify the outer Ed25519 signature with that exact device key.
 6. Compute the immutable object digest over the canonical signing bytes and
@@ -126,8 +138,19 @@ ordering to ordinary outbound text:
    before mutation and again before every queue handoff.
 2. Generate non-zero `message_id`, sealing nonce, and anti-replay nonce from a
    caller-supplied cryptographic RNG. Require fixed `flags=0`,
-   `hop_limit=8`, `replication_budget=2`, an empty ratchet-header field, the
-   exact remote device hint, and the derived message-lane route.
+   `hop_limit=8`, `replication_budget=2`, an empty ratchet-header field,
+   `dest_device_hint=0`, and the derived message-lane route.
+
+   *Erratum 2026-10-08.* Earlier revisions required the exact remote device
+   hint `SHA-256("rvn1/device-hint/v1" || remote_device_pub)[:8]`. Anyone who
+   holds the recipient's public key (its address) can compute that value, so a
+   relay, store or bridge holding the object would recognise the recipient.
+   New messages and ACKs (§4.2) therefore carry `0`. The field is outside the
+   signing bytes and the object digest (`RAVEN_ENVELOPE_V1.md` §2), and `0` was
+   always a valid value, so no wire format, signature input or vector changes.
+   Revalidation of a stored object (retry below) accepts `0` or that legacy
+   value, so objects queued before the change are retried with their exact
+   bytes; receivers accept both (§1 step 4).
 3. Reserve and advance the protected message-send ratchet, seal proto `0x03`,
    sign the outer envelope, and immediately verify that signature.
 4. Protected-write the advanced ratchet plus one pending outbound journal

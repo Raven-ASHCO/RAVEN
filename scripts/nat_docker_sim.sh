@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# NAT-to-NAT software substitute using Docker networks (no public CGNAT).
-# Two isolated bridge networks + a relay container that can reach both.
-# Proves: nodes without a shared L2 still exchange opaque Raven frames via relay.
+# Docker dual-bridge TOPOLOGY check (no public CGNAT). Two isolated bridge
+# networks + a relay container attached to both. Proves ONLY the topology:
+# A and B cannot reach each other directly (connect times out / network
+# unreachable), the dual-homed relay reaches A and B, and A reaches the relay.
+# The containers run python TCP echo listeners: NO Raven code (no ash,
+# raven-node or raven-swarm, no relay or NAT-traversal logic) runs here, so a
+# pass is not evidence about Raven relay / NAT behaviour. The reliability matrix
+# records it as PASS_SOFTWARE_SUBSTITUTE for that reason.
 #
 # Requires: Docker Desktop / Engine. Does NOT claim live CGNAT/DCUtR (§59 hardware).
 set -euo pipefail
@@ -65,9 +70,8 @@ docker network connect "$NET_B" "raven-relay-$$"
 docker run -d --name "raven-peer-a-$$" --network "$NET_A" "$IMG" sleep 600 >/dev/null
 docker run -d --name "raven-peer-b-$$" --network "$NET_B" "$IMG" sleep 600 >/dev/null
 
-# Copy prebuilt linux... we are on macOS often — use host binaries only if linux,
-# otherwise prove connectivity with TCP echo via python in containers (topology proof).
-# Topology proof: A can reach relay; B can reach relay; A cannot reach B directly.
+# Topology proof via python TCP echo in the containers (no Raven binaries):
+# A can reach relay; relay can reach A and B; A cannot reach B directly.
 
 RELAY_IP_A=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "raven-relay-$$" | awk '{print $1}')
 # Get IP of relay on net B
@@ -84,41 +88,6 @@ PEER_B_IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET_B\").IP
   echo "peer_b=$PEER_B_IP"
 } | tee "$ART_DIR/topology.txt"
 
-# Start TCP listeners: relay:9000 (A-side) and relay:9001 (B-side) — simple python forward
-docker exec -d "raven-relay-$$" bash -lc 'python3 - <<'"'"'PY'"'"'
-import socket, threading, select
-def pipe(a,b):
-  try:
-    while True:
-      r,_,_ = select.select([a,b],[],[],30)
-      if not r: break
-      for s in r:
-        data = s.recv(65536)
-        if not data: return
-        (b if s is a else a).sendall(data)
-  except Exception:
-    pass
-  finally:
-    try: a.close(); b.close()
-    except Exception: pass
-
-def serve(port, peer_host, peer_port):
-  ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-  ls.bind(("0.0.0.0", port)); ls.listen(5)
-  while True:
-    c,_ = ls.accept()
-    try:
-      u = socket.create_connection((peer_host, peer_port), timeout=10)
-      threading.Thread(target=pipe, args=(c,u), daemon=True).start()
-    except Exception:
-      c.close()
-
-# Wait for peers to start listeners — relay bridges A:9100 <-> B:9100 via dynamic; use fixed ports
-# Simpler: echo servers on peers; relay just proves reachability
-import subprocess, time
-time.sleep(1)
-PY'
-
 # Peer listeners
 docker exec -d "raven-peer-a-$$" bash -lc 'python3 -c "
 import socket
@@ -132,25 +101,69 @@ s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
 s.bind((\"0.0.0.0\",9100)); s.listen(1)
 c,_=s.accept(); data=c.recv(64); c.sendall(b\"ACK-B:\"+data); c.close()
 "'
-sleep 1
+# Readiness, not a fixed sleep: wait until each peer shows a LISTEN socket on
+# 9100 in /proc/net/tcp (state 0A) WITHOUT connecting (the listeners are
+# one-shot). Otherwise the isolation probe below could be refused for the wrong
+# reason, which the probe now (correctly) treats as inconclusive.
+wait_listening() {
+  docker exec "$1" python3 -c "
+import sys, time
+want = ':%04X' % 9100
+deadline = time.time() + 10
+while time.time() < deadline:
+    for line in open('/proc/net/tcp').read().splitlines()[1:]:
+        f = line.split()
+        if f[1].endswith(want) and f[3] == '0A':
+            sys.exit(0)
+    time.sleep(0.1)
+sys.exit('no LISTEN socket on 9100 in $1')
+"
+}
+wait_listening "raven-peer-a-$$"
+wait_listening "raven-peer-b-$$"
 
-# A reaches relay (same net)
-docker exec "raven-peer-a-$$" bash -lc "python3 -c \"
+# A reaches relay (same net): real TCP connect to a relay-side listener (connect
+# retries absorb the listener start-up; no fixed sleep, no `|| true`).
+docker exec -d "raven-relay-$$" bash -lc 'python3 -c "
 import socket
-s=socket.create_connection(('$RELAY_IP_A', 22), timeout=3)
-\" 2>/dev/null || ping -c1 -W2 $RELAY_IP_A" | tee "$ART_DIR/a_to_relay.txt" || true
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind((\"0.0.0.0\",9200)); s.listen(1)
+c,_=s.accept(); data=c.recv(64); c.sendall(b\"ACK-RELAY:\"+data); c.close()
+"'
+docker exec "raven-peer-a-$$" python3 -c "
+import socket, time
+deadline = time.time() + 10
+while True:
+    try:
+        s = socket.create_connection(('$RELAY_IP_A', 9200), timeout=2)
+        break
+    except ConnectionRefusedError:
+        if time.time() > deadline:
+            raise
+        time.sleep(0.2)
+s.sendall(b'from-a')
+print(s.recv(64))
+" | tee "$ART_DIR/a_to_relay.txt"
 
-# Prove A cannot route to B's IP (different isolated networks — expect failure)
+# Prove A cannot route to B's IP (different isolated networks). ONLY a connect
+# timeout or ENETUNREACH/EHOSTUNREACH counts as isolation: a refused connection
+# means the host WAS reachable (nothing listening), which proves nothing.
 set +e
-docker exec "raven-peer-a-$$" bash -lc "python3 -c \"
-import socket,sys
+docker exec "raven-peer-a-$$" python3 -c "
+import errno, socket, sys
 try:
-  socket.create_connection(('$PEER_B_IP', 9100), timeout=2)
-  print('UNEXPECTED_DIRECT_OK')
-  sys.exit(2)
-except Exception as e:
-  print('DIRECT_BLOCKED_OK', type(e).__name__)
-\"" | tee "$ART_DIR/a_to_b_direct.txt"
+    socket.create_connection(('$PEER_B_IP', 9100), timeout=2)
+    print('UNEXPECTED_DIRECT_OK')
+    sys.exit(2)
+except socket.timeout:
+    print('DIRECT_BLOCKED_OK', 'timeout')
+except OSError as e:
+    if e.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+        print('DIRECT_BLOCKED_OK', errno.errorcode[e.errno])
+    else:
+        print('DIRECT_INCONCLUSIVE', type(e).__name__, e)
+        sys.exit(3)
+" | tee "$ART_DIR/a_to_b_direct.txt"
 DIRECT_RC=$?
 set -e
 
@@ -179,15 +192,19 @@ import socket
 sb=socket.create_connection(('$PEER_B_IP', 9100), timeout=5); sb.sendall(b'from-relay'); print(sb.recv(64))
 \"" | tee "$ART_DIR/relay_to_b.txt"
 
+if [[ "$DIRECT_RC" -ne 0 ]]; then
+  echo "isolation probe inconclusive or A reached B directly (rc=$DIRECT_RC)" >&2
+  exit 1
+fi
 grep -q 'DIRECT_BLOCKED_OK' "$ART_DIR/a_to_b_direct.txt"
+grep -q 'ACK-RELAY' "$ART_DIR/a_to_relay.txt"
 grep -q 'ACK-A' "$ART_DIR/relay_to_a.txt"
 grep -q 'ACK-B' "$ART_DIR/relay_to_b.txt"
 
-# Optional: if host has linux target binaries, note raven path
 {
   echo "RESULT=PASS"
-  echo "claim=docker dual-network isolation + relay reachability (software NAT substitute)"
-  echo "not_claimed=public_CGNAT,DCUtR,AutoNAT"
+  echo "claim=docker dual-bridge topology only: A/B isolated, relay reaches both (python TCP echo; no Raven code)"
+  echo "not_claimed=raven_relay,raven_swarm,public_CGNAT,DCUtR,AutoNAT"
 } | tee "$ART_DIR/RESULT.txt"
 
 echo "=== NAT DOCKER SIM OK ==="

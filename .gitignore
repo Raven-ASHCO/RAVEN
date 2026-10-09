@@ -1,3 +1,33 @@
 node/target/
 proof_artifacts/
 *.log
+
+# Secret / node-state material. Docs promise these stay out of git (see
+# docs/SECRET_HISTORY_SCAN_REPORT.md): a demo run with `--data-dir .`, or a
+# local .env, must not become one `git add -A` away from history. Mirrors the
+# filename classes of scripts/secret_history_scan.sh (is_raven_secret_filename).
+.env
+.env.*
+!.env.example
+identity.seed
+identity.backend
+*.seed
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+prekey_store.json
+contacts.json
+mailbox_store.json
+*.pem
+*.p12
+*.pfx
+raven-data/
+# RDAP / M1 same-RVN1 working dir at the repo root only: the public pin artifacts
+# under docs/engineering/baseline-freeze/artifacts/**/.team/keys are tracked on purpose.
+/.team/
+
+# Local build / OS output
+/dist/
+.DS_Store

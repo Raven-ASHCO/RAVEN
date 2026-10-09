@@ -4,6 +4,7 @@
 //! persistence, mutation leases, RVQI checks, and the atomic clear barrier.
 
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::hybrid_ratchet_v2_full_braid::agent::AGENT_TERMINAL;
 use crate::hybrid_ratchet_v2_full_braid::constants::{
@@ -16,10 +17,12 @@ use crate::hybrid_ratchet_v2_full_braid::digest::{
 };
 use crate::hybrid_ratchet_v2_full_braid::spqr_pin_audit::CW;
 use crate::hybrid_ratchet_v2_full_braid::state_codec::{
-    decode_rvfb1, encode_rvfb1, ReplayRecord, Rvfb1Prefix, Rvfb1State, RVFB1_SCHEMA,
+    decode_rvfb1, encode_rvfb1, rvfb1_encodes_to, ReplayRecord, Rvfb1Prefix, Rvfb1State,
+    MAX_REPLAYS, REPLAY_RECORD_LEN, RVFB1_SCHEMA,
 };
 use crate::hybrid_ratchet_v2_full_braid::transition::{
-    transition, BraidCrypto, Disposition, TERMINAL_REASON_EXPIRED, TERMINAL_REASON_REPAIR,
+    cursor_index, terminalize, transition, BraidCrypto, Disposition, TERMINAL_REASON_EXPIRED,
+    TERMINAL_REASON_REPAIR,
 };
 pub use crate::hybrid_ratchet_v2_full_braid::transition::{
     META_FLAG_IGNORED, META_FLAG_REPLAY_HIT, META_FLAG_TERMINAL,
@@ -33,6 +36,7 @@ use crate::hybrid_ratchet_v2_full_braid::wire_rvbj1::{
     decode_rvbj1, encode_rvbj1, Rvbj1, Rvbj1Header, INTENT_NORMAL, INTENT_REPAIR_CONFLICT,
     INTENT_REPAIR_EXPIRED,
 };
+use crate::hybrid_ratchet_v2_full_braid::wire_rvbm1::MODE_SEAL_COMPARE;
 use crate::hybrid_ratchet_v2_full_braid::wire_rvbo1::{
     decode_rvbo1, encode_empty_rvbo1, encode_rvbo1, validate_receive_success,
     validate_repair_or_terminal_empty, validate_send_success, Rvbo1,
@@ -88,6 +92,15 @@ struct ValidatedIntent {
     cleared_bytes: Vec<u8>,
 }
 
+impl Drop for ValidatedIntent {
+    fn drop(&mut self) {
+        // Encoded states carry every ratchet secret; callers get their own copies.
+        // (`intent.candidate_bytes` is wiped by `Rvbj1`'s own Drop.)
+        self.promoted_bytes.zeroize();
+        self.cleared_bytes.zeroize();
+    }
+}
+
 fn is_zero_pending(prefix: &Rvfb1Prefix) -> bool {
     prefix.pending_transition_id == [0; 32]
         && prefix.pending_before_digest == [0; 32]
@@ -122,7 +135,7 @@ fn decode_canonical_state(bytes: &[u8]) -> Result<Rvfb1State, i32> {
     }
     let state = decode_rvfb1(bytes).map_err(|_| ERR_PARSE)?;
     validate_state_semantics(&state)?;
-    if encode_rvfb1(&state).map_err(|_| ERR_PARSE)? != bytes {
+    if !rvfb1_encodes_to(&state, bytes).map_err(|_| ERR_PARSE)? {
         return Err(ERR_PARSE);
     }
     Ok(state)
@@ -207,7 +220,7 @@ fn enforce_env_caps(
     if state.replays.len() as u32 > env.cap_replay_entries {
         return Err(ERR_NEED_CAPACITY);
     }
-    if state.replays.len().saturating_mul(102) > env.cap_replay_bytes as usize {
+    if state.replays.len().saturating_mul(REPLAY_RECORD_LEN) > env.cap_replay_bytes as usize {
         return Err(ERR_NEED_CAPACITY);
     }
     if outputs.len() > MAX_RVBO1 {
@@ -245,8 +258,10 @@ fn preflight_env_caps(state: &Rvfb1State, input: &Rvbi1, env: &Rvbe1) -> Result<
             let next_index = state
                 .active_send
                 .as_ref()
-                .map(|active| active.next_spqr_index)
+                .map(|active| cursor_index(active.next_spqr_index, env.cap_chunks))
                 .unwrap_or(0);
+            // `emit_active` wraps the cursor inside `cap_chunks`, so only a zero
+            // cap leaves no legal index for this Send.
             if next_index >= env.cap_chunks {
                 return Err(ERR_NEED_CAPACITY);
             }
@@ -267,6 +282,27 @@ fn preflight_env_caps(state: &Rvfb1State, input: &Rvbi1, env: &Rvbe1) -> Result<
     Ok(())
 }
 
+/// Input digest persisted in RVBJ1/RVOR1.
+///
+/// A mode-0 (seal_compare) Send carries the application plaintext, and every
+/// other RVBI1 field is public or derivable, so an unsalted digest over it
+/// would let anyone who dumps retained RVOR1 evidence confirm guessed
+/// plaintexts after the message keys are gone. The plaintext bytes are zeroed
+/// before hashing; the input stays uniquely bound because `expected_ct` (the
+/// ChaCha20-Poly1305 ciphertext of that plaintext) is still covered.
+fn journal_input_digest(input: &Rvbi1) -> Result<[u8; 32], i32> {
+    if input.mutation.needs_aead != 1 || input.mutation.mode != MODE_SEAL_COMPARE {
+        return Ok(input_digest(&encode_rvbi1(input).map_err(|_| ERR_PARSE)?));
+    }
+    let mut redacted = input.clone();
+    redacted.mutation.body.zeroize();
+    redacted.mutation.body.resize(input.mutation.body.len(), 0);
+    let mut bytes = encode_rvbi1(&redacted).map_err(|_| ERR_PARSE)?;
+    let digest = input_digest(&bytes);
+    bytes.zeroize();
+    Ok(digest)
+}
+
 fn bind_live_session_role(live: &Rvfb1State, header: &Rvbj1Header) -> Result<(), i32> {
     if live.prefix.session_id != header.session_id || live.prefix.role != header.role {
         return Err(ERR_CAS);
@@ -274,6 +310,18 @@ fn bind_live_session_role(live: &Rvfb1State, header: &Rvbj1Header) -> Result<(),
     Ok(())
 }
 
+/// Replay-window size for a transition: the codec cap narrowed by the host's
+/// replay entry/byte capacities from RVBE1.
+fn replay_window(env: &Rvbe1) -> usize {
+    MAX_REPLAYS
+        .min(env.cap_replay_entries as usize)
+        .min(env.cap_replay_bytes as usize / REPLAY_RECORD_LEN)
+}
+
+/// Append the new transition's replay record, evicting the oldest records so
+/// the window never exceeds `window`. Only the pending transition's record must
+/// survive (RVBJ1 validation); older transitions are already cleared, so a
+/// session never wedges on a full replay table.
 fn insert_replay(
     candidate: &mut Rvfb1State,
     transition_id: [u8; 32],
@@ -281,15 +329,20 @@ fn insert_replay(
     output: [u8; 32],
     output_len: usize,
     flags: u32,
+    window: usize,
 ) -> Result<(), i32> {
+    if window == 0 {
+        return Err(ERR_NEED_CAPACITY);
+    }
     if candidate
         .replays
         .iter()
         .any(|record| record.transition_id == transition_id)
-        || candidate.replays.len() >= 64
     {
         return Err(ERR_PARSE);
     }
+    let excess = (candidate.replays.len() + 1).saturating_sub(window.min(MAX_REPLAYS));
+    candidate.replays.drain(..excess);
     candidate.replays.push(ReplayRecord {
         transition_id,
         execution_digest: execution,
@@ -297,7 +350,6 @@ fn insert_replay(
         output_len: output_len.try_into().map_err(|_| ERR_PARSE)?,
         flags: flags.try_into().map_err(|_| ERR_PARSE)?,
     });
-    candidate.replays.sort_by_key(|record| record.transition_id);
     Ok(())
 }
 
@@ -314,13 +366,14 @@ fn promoted_and_cleared(prepared: &Rvfb1State) -> Result<(Vec<u8>, Vec<u8>), i32
     let mut promoted = prepared.clone();
     promoted.prefix.pending_phase = 2;
     promoted.prefix.flags |= FLAG_AWAITING_COMPLETE;
-    let promoted_bytes = encode_rvfb1(&promoted).map_err(|_| ERR_PARSE)?;
+    // Wiped if the cleared encoding below fails.
+    let mut promoted_bytes = Zeroizing::new(encode_rvfb1(&promoted).map_err(|_| ERR_PARSE)?);
 
     let mut cleared = promoted;
     clear_pending_fields(&mut cleared.prefix);
     cleared.prefix.generation = cleared.prefix.generation.checked_add(1).ok_or(ERR_EPOCH)?;
     let cleared_bytes = encode_rvfb1(&cleared).map_err(|_| ERR_PARSE)?;
-    Ok((promoted_bytes, cleared_bytes))
+    Ok((std::mem::take(&mut *promoted_bytes), cleared_bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -337,6 +390,7 @@ fn prepare_candidate(
     retention_origin_ms: u64,
     meta_flags: u32,
     output_key_epoch: Option<u64>,
+    replay_window: usize,
 ) -> Result<PipelineResult, i32> {
     if direction > 1
         || !matches!(
@@ -380,6 +434,7 @@ fn prepare_candidate(
         output,
         outputs.len(),
         meta_flags,
+        replay_window,
     )?;
     candidate.prefix.flags &= !FLAG_AWAITING_COMPLETE;
     candidate.prefix.pending_phase = 1;
@@ -388,11 +443,17 @@ fn prepare_candidate(
     candidate.prefix.pending_output_digest = output;
     candidate.prefix.pending_execution_digest = execution;
 
-    let candidate_bytes = encode_rvfb1(&candidate).map_err(|_| ERR_PARSE)?;
+    // Full serialized session state: wiped on every early return below, and
+    // handed to the caller (by `mem::take`, no extra copy) only on success.
+    let mut candidate_bytes = Zeroizing::new(encode_rvfb1(&candidate).map_err(|_| ERR_PARSE)?);
     if candidate_bytes.len() > BRAID_MAX_CANONICAL_STATE_BYTES {
         return Err(ERR_PARSE);
     }
-    let (promoted_bytes, cleared_bytes) = promoted_and_cleared(&candidate)?;
+    let (mut promoted_bytes, mut cleared_bytes) = promoted_and_cleared(&candidate)?;
+    let promoted_state_digest = state_digest(RVFB1_SCHEMA, &promoted_bytes);
+    let cleared_state_digest = state_digest(RVFB1_SCHEMA, &cleared_bytes);
+    promoted_bytes.zeroize();
+    cleared_bytes.zeroize();
     let retention_expiry_ms = retention_origin_ms
         .checked_add(BRAID_RVOR_TTL_MS)
         .ok_or(ERR_PARSE)?;
@@ -407,8 +468,8 @@ fn prepare_candidate(
         input_digest: input,
         before_state_digest: before_digest,
         prepared_state_digest: state_digest(RVFB1_SCHEMA, &candidate_bytes),
-        promoted_state_digest: state_digest(RVFB1_SCHEMA, &promoted_bytes),
-        cleared_state_digest: state_digest(RVFB1_SCHEMA, &cleared_bytes),
+        promoted_state_digest,
+        cleared_state_digest,
         output_digest: output,
         object_digest: object,
         retention_origin_ms,
@@ -416,20 +477,21 @@ fn prepare_candidate(
         candidate_len: candidate_bytes.len().try_into().map_err(|_| ERR_PARSE)?,
         outputs_len: outputs.len().try_into().map_err(|_| ERR_PARSE)?,
     };
-    let intent_bytes = encode_rvbj1(&Rvbj1 {
+    // `Rvbj1` wipes its copy of the candidate state when it drops.
+    let journal = Rvbj1 {
         header,
-        candidate_bytes: candidate_bytes.clone(),
+        candidate_bytes: candidate_bytes.to_vec(),
         outputs_bytes: outputs.clone(),
-    })
-    .map_err(|_| ERR_PARSE)?;
+    };
+    let mut intent_bytes = Zeroizing::new(encode_rvbj1(&journal).map_err(|_| ERR_PARSE)?);
     if intent_bytes.len() > MAX_RVBJ1 {
         return Err(ERR_PARSE);
     }
     let meta = state_meta(&candidate, meta_flags, output_key_epoch, transition_id);
     Ok(PipelineResult {
-        candidate_bytes,
+        candidate_bytes: std::mem::take(&mut *candidate_bytes),
         outputs_bytes: outputs,
-        intent_bytes,
+        intent_bytes: std::mem::take(&mut *intent_bytes),
         meta,
     })
 }
@@ -447,9 +509,9 @@ pub fn transition_prepare<C: BraidCrypto>(
     }
     let input = decode_rvbi1(input_bytes).map_err(|_| ERR_PARSE)?;
     let env = decode_rvbe1(env_bytes).map_err(|_| ERR_PARSE)?;
-    if encode_rvbi1(&input).map_err(|_| ERR_PARSE)? != input_bytes
-        || encode_rvbe1(&env).map_err(|_| ERR_PARSE)? != env_bytes
-    {
+    let reencoded_input = Zeroizing::new(encode_rvbi1(&input).map_err(|_| ERR_PARSE)?);
+    let reencoded_env = Zeroizing::new(encode_rvbe1(&env).map_err(|_| ERR_PARSE)?);
+    if reencoded_input.as_slice() != input_bytes || reencoded_env.as_slice() != env_bytes {
         return Err(ERR_PARSE);
     }
     preflight_env_caps(&state, &input, &env)?;
@@ -507,27 +569,37 @@ pub fn transition_prepare<C: BraidCrypto>(
                 Disposition::Terminal { .. } => META_FLAG_TERMINAL,
                 _ => transitioned.meta.flags,
             };
-            let result = prepare_candidate(
+            let mut result = prepare_candidate(
                 &state,
                 state_bytes,
                 transitioned.candidate,
                 input.direction,
                 INTENT_NORMAL,
                 execution_digest(input_bytes, env_bytes),
-                input_digest(input_bytes),
+                journal_input_digest(&input)?,
                 input.object_digest.unwrap_or([0; 32]),
                 outputs,
                 env.clock,
                 flags,
                 transitioned.meta.output_key_epoch,
+                replay_window(&env),
             )?;
-            let candidate = decode_canonical_state(&result.candidate_bytes)?;
-            enforce_env_caps(
-                &candidate,
-                result.candidate_bytes.len(),
-                &result.outputs_bytes,
-                &env,
-            )?;
+            // `ERR_NEED_CAPACITY` is an ordinary outcome when the host tightens
+            // caps: the rejected candidate/journal carry the whole session
+            // state, so wipe them instead of freeing them as plain `Vec`s.
+            let checked = decode_canonical_state(&result.candidate_bytes).and_then(|candidate| {
+                enforce_env_caps(
+                    &candidate,
+                    result.candidate_bytes.len(),
+                    &result.outputs_bytes,
+                    &env,
+                )
+            });
+            if let Err(code) = checked {
+                result.candidate_bytes.zeroize();
+                result.intent_bytes.zeroize();
+                return Err(code);
+            }
             Ok(result)
         }
     }
@@ -618,17 +690,20 @@ fn validate_intent(intent_bytes: &[u8]) -> Result<ValidatedIntent, i32> {
     }
 
     let (promoted_bytes, cleared_bytes) = promoted_and_cleared(&prepared_state)?;
-    if state_digest(RVFB1_SCHEMA, &promoted_bytes) != header.promoted_state_digest
-        || state_digest(RVFB1_SCHEMA, &cleared_bytes) != header.cleared_state_digest
-    {
-        return Err(ERR_PARSE);
-    }
-    Ok(ValidatedIntent {
+    // Own the encoded states before comparing so a mismatch wipes them (Drop).
+    let validated = ValidatedIntent {
         intent,
         prepared_state,
         promoted_bytes,
         cleared_bytes,
-    })
+    };
+    let header = &validated.intent.header;
+    if state_digest(RVFB1_SCHEMA, &validated.promoted_bytes) != header.promoted_state_digest
+        || state_digest(RVFB1_SCHEMA, &validated.cleared_bytes) != header.cleared_state_digest
+    {
+        return Err(ERR_PARSE);
+    }
+    Ok(validated)
 }
 
 /// Promote a clean/before or prepared state to phase 2.
@@ -853,34 +928,8 @@ fn repair_execution_digest(
 }
 
 fn terminalize_state(state: &mut Rvfb1State, reason: u16) {
-    state.prefix.agent = AGENT_TERMINAL;
-    state.prefix.terminal_reason = reason;
-    state.prefix.flags = FLAG_TERMINAL;
-    state.prefix.auth_root = [0; 32];
-    state.prefix.auth_mac_key = [0; 32];
+    terminalize(state, reason);
     clear_pending_fields(&mut state.prefix);
-    state.active_send = None;
-    state.tlvs.clear();
-    state.tr.scka_rk = [0; 32];
-    state.tr.scka_sending_epoch = 0;
-    state.tr.scka_receiving_epoch = 0;
-    state.tr.scka_send_chain.clear();
-    state.tr.scka_recv_chain.clear();
-    state.tr.scka_send_pn = 0;
-    state.tr.scka_skipped.clear();
-    state.tr.ec_rk = [0; 32];
-    state.tr.ec_dhs_priv = [0; 32];
-    state.tr.ec_dhs_pub = [0; 32];
-    state.tr.ec_dhr_present = 0;
-    state.tr.ec_dhr_pub = [0; 32];
-    state.tr.ec_ck_send_present = 0;
-    state.tr.ec_ck_recv_present = 0;
-    state.tr.ec_ck_send = [0; 32];
-    state.tr.ec_ck_recv = [0; 32];
-    state.tr.ec_ns = 0;
-    state.tr.ec_nr = 0;
-    state.tr.ec_pn = 0;
-    state.tr.ec_skipped.clear();
 }
 
 fn build_repair(
@@ -916,6 +965,7 @@ fn build_repair(
         now_ms,
         META_FLAG_TERMINAL,
         None,
+        MAX_REPLAYS,
     )?;
     // The repair RVBO1 is embedded in RVBJ1; terminalize FFI has no RVBO output.
     result.outputs_bytes.clear();
@@ -946,6 +996,9 @@ pub fn terminalize_conflict(
     {
         return Err(ERR_CAS);
     }
+    if !live_contradicts_intent(&live, header) {
+        return Err(ERR_CAS);
+    }
     build_repair(
         live,
         live_bytes,
@@ -954,6 +1007,32 @@ pub fn terminalize_conflict(
         INTENT_REPAIR_CONFLICT,
         TERMINAL_REASON_REPAIR,
     )
+}
+
+/// Whether a live state that matches none of an intent's four digests proves a
+/// conflict with that intent, rather than the intent merely being stale.
+///
+/// Generation only increments when a transition clears, so the live state
+/// contradicts intent `T` (prepared from generation `g`) iff:
+/// - it sits at or below `g` (a different state occupies `T`'s slot, or the
+///   session was rolled back behind a journaled transition), or
+/// - it sits at `g + 1` and the transition cleared from `g` was not `T`
+///   (phase 0 with a different digest, or a pending transition whose before
+///   state is not `T`'s cleared state).
+///
+/// Beyond `g + 1` the session has advanced past `T`; an old journal left behind
+/// (for example by a crash between clear and journal deletion) must not
+/// terminalize a healthy session.
+fn live_contradicts_intent(live: &Rvfb1State, header: &Rvbj1Header) -> bool {
+    let generation = live.prefix.generation;
+    if generation <= header.generation {
+        return true;
+    }
+    if generation != header.generation.saturating_add(1) {
+        return false;
+    }
+    live.prefix.pending_phase == 0
+        || live.prefix.pending_before_digest != header.cleared_state_digest
 }
 
 /// Terminalize an expired original transition after validating its RVOR1.
@@ -1185,6 +1264,54 @@ mod tests {
     }
 
     #[test]
+    fn journal_input_digest_never_depends_on_seal_plaintext() {
+        use crate::hybrid_ratchet_v2_full_braid::digest::input_digest;
+        use crate::hybrid_ratchet_v2_full_braid::wire_rvbm1::{MODE_SEAL_COMPARE, RVBA1_LEN};
+
+        let seal_input = |body: &[u8]| Rvbi1 {
+            op: OP_SEND,
+            direction: 0,
+            ch: None,
+            expected_ch: None,
+            object_digest: None,
+            frame: None,
+            mutation: Rvbm1 {
+                needs_aead: 1,
+                ec_mk_oracle_len: 0,
+                ec_mk_oracle: [0; 32],
+                aad: vec![0xAA; RVBA1_LEN],
+                mode: MODE_SEAL_COMPARE,
+                body: body.to_vec(),
+                expected_ct: Some(vec![0xC7; body.len() + 16]),
+            },
+        };
+        let yes = seal_input(b"yes");
+        let no = seal_input(b"no!");
+        // A guessed plaintext cannot be confirmed against the persisted digest.
+        assert_ne!(
+            journal_input_digest(&yes).unwrap(),
+            input_digest(&encode_rvbi1(&yes).unwrap())
+        );
+        assert_eq!(
+            journal_input_digest(&yes).unwrap(),
+            journal_input_digest(&no).unwrap()
+        );
+        // The ciphertext still binds the input.
+        let mut other_ct = seal_input(b"yes");
+        other_ct.mutation.expected_ct = Some(vec![0xC8; 19]);
+        assert_ne!(
+            journal_input_digest(&yes).unwrap(),
+            journal_input_digest(&other_ct).unwrap()
+        );
+        // Plaintext-free inputs keep the plain RVBI1 input digest.
+        let plain = send_input_bytes();
+        assert_eq!(
+            journal_input_digest(&decode_rvbi1(&plain).unwrap()).unwrap(),
+            input_digest(&plain)
+        );
+    }
+
+    #[test]
     fn promote_handles_before_prepared_promoted_and_rejects_cleared() {
         let (before, _, _, result) = accepted();
         let (prepared, promoted, cleared) = expected_states(&result.intent_bytes);
@@ -1221,8 +1348,9 @@ mod tests {
         assert_eq!(first.rvor_bytes, second.rvor_bytes);
         assert_eq!(decode_rvor1(&first.rvor_bytes).unwrap().flags, 0);
 
+        // Same generation as the intent's before state, different content.
         let mut conflict_live = decode_rvfb1(&before).unwrap();
-        conflict_live.prefix.generation = 9;
+        conflict_live.prefix.auth_root[0] ^= 1;
         let conflict_live = encode_rvfb1(&conflict_live).unwrap();
         let repair = terminalize_conflict(&conflict_live, &result.intent_bytes, 2_000).unwrap();
         let repair_intent = decode_rvbj1(&repair.intent_bytes).unwrap();
@@ -1469,7 +1597,7 @@ mod tests {
     fn terminalize_conflict_rejects_wrong_session_and_role() {
         let (before, _, _, result) = accepted();
         let mut conflict = decode_rvfb1(&before).unwrap();
-        conflict.prefix.generation = 9;
+        conflict.prefix.auth_root[0] ^= 1;
         let same_session = encode_rvfb1(&conflict).unwrap();
         assert!(terminalize_conflict(&same_session, &result.intent_bytes, 2_000).is_ok());
 
@@ -1488,6 +1616,91 @@ mod tests {
             terminalize_conflict(&wrong_role, &result.intent_bytes, 2_000).unwrap_err(),
             ERR_CAS
         );
+    }
+
+    /// prepare → promote → materialize → clear one Send; returns (cleared, intent).
+    fn commit_send(live: &[u8], clock: u64, env: &mut Rvbe1) -> (Vec<u8>, Vec<u8>) {
+        env.clock = clock;
+        let prepared = transition_prepare(
+            live,
+            &send_input_bytes(),
+            &encode_rvbe1(env).unwrap(),
+            &mut LabCrypto::default(),
+        )
+        .unwrap();
+        let promoted = promote_state(live, &prepared.intent_bytes)
+            .unwrap()
+            .state_bytes;
+        let rvor = materialize_rvor(&prepared.intent_bytes).unwrap().rvor_bytes;
+        let cleared = clear_pending(&promoted, &prepared.intent_bytes, &rvor, clock)
+            .unwrap()
+            .state_bytes;
+        (cleared, prepared.intent_bytes)
+    }
+
+    #[test]
+    fn replay_window_evicts_oldest_in_commit_order() {
+        let mut env = Rvbe1::default_caps(0);
+        env.keygen_seed = vec![0x5A; mlkem::SEED_LEN];
+        env.cap_replay_entries = 2;
+        let mut live = before_bytes();
+        let mut ids = Vec::new();
+        for clock in 1..=5 {
+            let (cleared, intent) = commit_send(&live, clock, &mut env);
+            ids.push(decode_rvbj1(&intent).unwrap().header.transition_id);
+            live = cleared;
+        }
+        let state = decode_rvfb1(&live).unwrap();
+        assert_eq!(state.prefix.generation, 5);
+        assert_eq!(
+            state
+                .replays
+                .iter()
+                .map(|record| record.transition_id)
+                .collect::<Vec<_>>(),
+            ids[3..].to_vec()
+        );
+    }
+
+    #[test]
+    fn terminalize_conflict_ignores_stale_intents_of_an_advanced_session() {
+        let mut env = Rvbe1::default_caps(0);
+        env.keygen_seed = vec![0x5A; mlkem::SEED_LEN];
+        let before = before_bytes();
+        let (cleared1, intent1) = commit_send(&before, 1, &mut env);
+
+        // T2 pending from T1's cleared state: T1's journal is merely stale.
+        env.clock = 2;
+        let pending2 = transition_prepare(
+            &cleared1,
+            &send_input_bytes(),
+            &encode_rvbe1(&env).unwrap(),
+            &mut LabCrypto::default(),
+        )
+        .unwrap()
+        .candidate_bytes;
+        assert_eq!(
+            terminalize_conflict(&pending2, &intent1, 3_000).unwrap_err(),
+            ERR_CAS
+        );
+        // Two generations past T1: a crash-leftover journal must not kill it.
+        let (cleared2, _) = commit_send(&cleared1, 2, &mut env);
+        let (cleared3, _) = commit_send(&cleared2, 3, &mut env);
+        for live in [&cleared2, &cleared3] {
+            assert_eq!(
+                terminalize_conflict(live, &intent1, 3_000).unwrap_err(),
+                ERR_CAS
+            );
+        }
+
+        // Real conflicts still repair: a different state in T1's generation…
+        let mut other = decode_rvfb1(&before).unwrap();
+        other.prefix.auth_mac_key[0] ^= 1;
+        assert!(terminalize_conflict(&encode_rvfb1(&other).unwrap(), &intent1, 3_000).is_ok());
+        // …or T1's successor generation reached through a different transition.
+        let mut forked = decode_rvfb1(&cleared1).unwrap();
+        forked.prefix.auth_mac_key[0] ^= 1;
+        assert!(terminalize_conflict(&encode_rvfb1(&forked).unwrap(), &intent1, 3_000).is_ok());
     }
 
     #[derive(Default)]

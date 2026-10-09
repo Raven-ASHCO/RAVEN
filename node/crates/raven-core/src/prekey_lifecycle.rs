@@ -1,9 +1,10 @@
 //! Durable lifecycle for Raven hybrid signed prekeys.
 //!
-//! This actor is deliberately production-disabled and has no live call sites.
-//! It closes the local secret-retention and one-time-prekey race model for
-//! `RavenPrekeyBundleV1` / `PairInitV1`; it does **not** define a confidential
-//! PairInit carrier or activate indexed-session messaging.
+//! The generic PairInit/indexed-session tripwire ([`live_enabled`]) stays off,
+//! but the LAN-direct path (`lan_dispatch`, `LAN_DIRECT_PRODUCTION_ENABLED`)
+//! does instantiate this actor. It closes the local secret-retention and
+//! one-time-prekey race model for `RavenPrekeyBundleV1` / `PairInitV1`; it does
+//! **not** define a confidential PairInit carrier.
 //!
 //! Private X25519 material, ML-KEM seeds, accepted-but-not-handed-off roots,
 //! and the mutation journal are serialized only into a platform-protected
@@ -28,10 +29,13 @@ use crate::pair_init::{
     decode_init, encode_init, init_hash, prekey_bundle_hash, session_id_from_init_hash,
     transcript_hash, verify_init, PairInit, PairInitError, PairInitTrust, INIT_WIRE_LEN,
 };
-use crate::prekey_bundle::{PrekeyBundle, MLKEM768_EK_LEN};
+use crate::prekey_bundle::{PrekeyBundle, PrekeyStore, MLKEM768_EK_LEN};
 
-/// No live endpoint may instantiate this actor until the remaining PairInit
-/// carrier, cross-language transition, and review gates are complete.
+/// Generic production tripwire; stays `false` until the remaining PairInit
+/// carrier, cross-language transition, and review gates are complete. It is
+/// not consulted by [`PrekeyLifecycleActor::open`]: the LAN-direct slice
+/// (`lan_dispatch`, raven-node's listener preflight and periodic prune)
+/// already opens the actor in default builds under its own gate.
 pub const PREKEY_LIFECYCLE_PRODUCTION_ENABLED: bool = false;
 
 pub fn live_enabled() -> bool {
@@ -42,9 +46,18 @@ pub const PREKEY_LIFECYCLE_LOCK_FILE: &str = "prekey_lifecycle.sqlite";
 pub const MAX_PREKEY_GENERATIONS: usize = 4;
 pub const MAX_BUNDLES_PER_GENERATION: usize = 32;
 pub const MAX_ACCEPTED_PREKEY_CLAIMS: usize = 512;
-pub const MAX_PREKEY_DEVICE_ID_BYTES: usize = 64;
+/// Per-initiator share of [`MAX_ACCEPTED_PREKEY_CLAIMS`], keyed by the signed
+/// initiator address (user identity), so one contact cannot exhaust the
+/// global claim table for every other contact.
+pub const MAX_ACCEPTED_PREKEY_CLAIMS_PER_INITIATOR: usize = 32;
+pub const MAX_PREKEY_DEVICE_ID_BYTES: usize = crate::prekey_bundle::MAX_DEVICE_ID_BYTES;
 pub const MAX_PREKEY_BUNDLE_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 pub const MAX_PAIR_INIT_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+/// A publisher replaces its signed prekey once less than this lifetime
+/// remains. PairInit verification requires `PairInit.expires_at_ms <=
+/// bundle.expires_at_ms`, so a bundle inside its last
+/// [`MAX_PAIR_INIT_LIFETIME_MS`] would reject full-length PairInits.
+pub const PREKEY_ROTATION_LEAD_MS: u64 = MAX_PAIR_INIT_LIFETIME_MS + 24 * 60 * 60 * 1_000;
 pub const PREKEY_RETENTION_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 pub const PREKEY_ROOT_HANDOFF_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const MAX_PREKEY_FUTURE_SKEW_MS: u64 = 5 * 60 * 1_000;
@@ -289,6 +302,9 @@ pub struct PrekeyLifecycleStatus {
     /// Numeric only. No identity, device, OTP, key, or transcript identifier
     /// is exposed by the anomaly API.
     pub one_time_reuse_anomalies: u64,
+    /// Claim journals dropped during recovery because their replay failed
+    /// deterministically (numeric only, same redaction rule as above).
+    pub quarantined_claim_journals: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +387,10 @@ struct AcceptedClaim {
     retain_until_ms: u64,
     state: ClaimState,
     provisional_root: Option<[u8; 32]>,
+    /// Signed initiator address used only for the per-initiator claim quota.
+    /// Empty for claims persisted before the quota existed.
+    #[serde(default)]
+    initiator_address: String,
 }
 
 impl Drop for AcceptedClaim {
@@ -399,6 +419,8 @@ struct ProtectedPrekeyState {
     device_id: Option<String>,
     highest_signed_prekey_id: u32,
     one_time_reuse_anomalies: u64,
+    #[serde(default)]
+    quarantined_claim_journals: u64,
     generations: Vec<SecretGeneration>,
     claims: Vec<AcceptedClaim>,
     pending: Option<PendingMutation>,
@@ -413,6 +435,7 @@ impl Default for ProtectedPrekeyState {
             device_id: None,
             highest_signed_prekey_id: 0,
             one_time_reuse_anomalies: 0,
+            quarantined_claim_journals: 0,
             generations: Vec::new(),
             claims: Vec::new(),
             pending: None,
@@ -425,13 +448,33 @@ trait ProtectedPrekeyBackend: Send + Sync {
     fn put(&self, account: &str, value: &[u8]) -> Result<(), PrekeyLifecycleError>;
 }
 
-fn force_locked_file_prekey_backend() -> bool {
-    for key in ["RAVEN_PREKEY_BACKEND", "RAVEN_IDENTITY_BACKEND"] {
-        if std::env::var_os(key).is_some_and(|v| v == "locked-file") {
-            return true;
-        }
+/// Whether the debug locked-file backend (plaintext secret state, 0600) was
+/// requested. Release builds refuse it outright, exactly like the identity
+/// store (`locked-file identity backend is forbidden in Release builds`): a
+/// stray lab variable must never silently put every prekey private key on disk
+/// unencrypted, nor flip the source of truth away from the platform store.
+fn locked_file_override_decision(
+    requested: bool,
+    debug_build: bool,
+) -> Result<bool, PrekeyLifecycleError> {
+    match (requested, debug_build) {
+        (false, _) => Ok(false),
+        (true, true) => Ok(true),
+        (true, false) => Err(PrekeyLifecycleError::ProtectedStoreUnavailable),
     }
-    false
+}
+
+fn locked_file_prekey_backend_requested() -> bool {
+    ["RAVEN_PREKEY_BACKEND", "RAVEN_IDENTITY_BACKEND"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|v| v == "locked-file"))
+}
+
+fn force_locked_file_prekey_backend() -> Result<bool, PrekeyLifecycleError> {
+    locked_file_override_decision(
+        locked_file_prekey_backend_requested(),
+        cfg!(debug_assertions),
+    )
 }
 
 /// Test/lab helper: request the debug locked-file prekey backend.
@@ -446,7 +489,7 @@ pub(crate) fn test_enable_locked_file_prekey_backend() {
     use std::sync::Once;
     static ENABLE: Once = Once::new();
     ENABLE.call_once(|| {
-        if force_locked_file_prekey_backend() {
+        if locked_file_prekey_backend_requested() {
             return;
         }
         // SAFETY: test-only process env for the documented lab/CI backend.
@@ -468,6 +511,44 @@ fn locked_file_put(path: &Path, value: &[u8]) -> Result<(), PrekeyLifecycleError
         .map_err(|_| PrekeyLifecycleError::ProtectedStore)
 }
 
+/// Prekey state in the profile's passphrase vault (non-macOS Unix without a
+/// reachable Secret Service; docs/design/2026-10-linux-keystore.md). Every
+/// test build compiles it so the adapter runs on all CI hosts.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+struct VaultPrekeyBackend {
+    vault: crate::keystore_vault::Vault,
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn vault_prekey_error(error: crate::keystore_vault::VaultError) -> PrekeyLifecycleError {
+    use crate::keystore_vault::VaultError;
+    match error {
+        VaultError::Corrupt(_) => PrekeyLifecycleError::CorruptProtectedState,
+        VaultError::WrongPassphraseOrTampered
+        | VaultError::PassphraseUnavailable(_)
+        | VaultError::UnsafeFile(_)
+        | VaultError::UnsafeParams(_) => PrekeyLifecycleError::ProtectedStoreUnavailable,
+        _ => PrekeyLifecycleError::ProtectedStore,
+    }
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+impl ProtectedPrekeyBackend for VaultPrekeyBackend {
+    fn get(&self, account: &str) -> Result<Option<Vec<u8>>, PrekeyLifecycleError> {
+        let entry = format!("{}{account}", crate::keystore_vault::PREKEY_ENTRY_PREFIX);
+        Ok(self
+            .vault
+            .get(&entry)
+            .map_err(vault_prekey_error)?
+            .map(|mut value| std::mem::take(&mut *value)))
+    }
+
+    fn put(&self, account: &str, value: &[u8]) -> Result<(), PrekeyLifecycleError> {
+        let entry = format!("{}{account}", crate::keystore_vault::PREKEY_ENTRY_PREFIX);
+        self.vault.put(&entry, value).map_err(vault_prekey_error)
+    }
+}
+
 struct PlatformProtectedPrekeyBackend {
     locked_file: Option<PathBuf>,
     #[cfg(windows)]
@@ -482,8 +563,8 @@ impl PlatformProtectedPrekeyBackend {
     ))]
     fn new(data_dir: &Path) -> Result<Self, PrekeyLifecycleError> {
         std::fs::create_dir_all(data_dir).map_err(|_| PrekeyLifecycleError::ProtectedStore)?;
-        let locked_file =
-            force_locked_file_prekey_backend().then(|| data_dir.join("prekey_lifecycle.protected"));
+        let locked_file = force_locked_file_prekey_backend()?
+            .then(|| data_dir.join("prekey_lifecycle.protected"));
 
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         if locked_file.is_none() {
@@ -503,7 +584,7 @@ impl PlatformProtectedPrekeyBackend {
         all(target_os = "linux", target_env = "gnu")
     )))]
     fn new(data_dir: &Path) -> Result<Self, PrekeyLifecycleError> {
-        if force_locked_file_prekey_backend() {
+        if force_locked_file_prekey_backend()? {
             std::fs::create_dir_all(data_dir).map_err(|_| PrekeyLifecycleError::ProtectedStore)?;
             return Ok(Self {
                 locked_file: Some(data_dir.join("prekey_lifecycle.protected")),
@@ -542,8 +623,11 @@ impl ProtectedPrekeyBackend for PlatformProtectedPrekeyBackend {
         if let Some(path) = &self.locked_file {
             return locked_file_get(path);
         }
+        use crate::macos_keychain::{guarded, KeychainWhat};
         use security_framework::passwords::get_generic_password;
-        match get_generic_password(PLATFORM_SERVICE, account) {
+        match guarded(KeychainWhat::PrekeyState, || {
+            get_generic_password(PLATFORM_SERVICE, account)
+        }) {
             Ok(value) => Ok(Some(value)),
             Err(error) if error.code() == -25_300 => Ok(None),
             Err(_) => Err(PrekeyLifecycleError::ProtectedStore),
@@ -554,9 +638,12 @@ impl ProtectedPrekeyBackend for PlatformProtectedPrekeyBackend {
         if let Some(path) = &self.locked_file {
             return locked_file_put(path, value);
         }
+        use crate::macos_keychain::{guarded, KeychainWhat};
         use security_framework::passwords::set_generic_password;
-        set_generic_password(PLATFORM_SERVICE, account, value)
-            .map_err(|_| PrekeyLifecycleError::ProtectedStore)
+        guarded(KeychainWhat::PrekeyState, || {
+            set_generic_password(PLATFORM_SERVICE, account, value)
+        })
+        .map_err(|_| PrekeyLifecycleError::ProtectedStore)
     }
 }
 
@@ -816,13 +903,27 @@ impl fmt::Debug for PrekeyLifecycleActor {
 
 impl PrekeyLifecycleActor {
     /// Opens the only supported platform backend. macOS uses Keychain,
-    /// GNU/Linux uses Secret Service, Windows uses an atomically replaced
-    /// DPAPI blob, and every other target fails closed.
+    /// GNU/Linux uses Secret Service or the passphrase vault (per the
+    /// profile's recorded keystore), musl/other Unix the vault, Windows an
+    /// atomically replaced DPAPI blob, and every other target fails closed.
     pub fn open(data_dir: &Path) -> Result<Self, PrekeyLifecycleError> {
         // rust-linux has no org.freedesktop.secrets. Production `open` is
         // unchanged: this hook is test-only and GNU/Linux-only.
         #[cfg(all(test, target_os = "linux", target_env = "gnu"))]
         test_enable_locked_file_prekey_backend();
+        // Non-macOS Unix: the profile's recorded keystore decides between
+        // Secret Service (below) and the passphrase vault. The debug
+        // locked-file lab override keeps precedence, unchanged.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if !force_locked_file_prekey_backend()?
+            && crate::keystore_select::uses_vault(data_dir, true)
+                .map_err(|_| PrekeyLifecycleError::ProtectedStoreUnavailable)?
+        {
+            let backend = Arc::new(VaultPrekeyBackend {
+                vault: crate::keystore_vault::Vault::for_data_dir(data_dir),
+            });
+            return Self::open_with_backend(data_dir, backend);
+        }
         let backend = Arc::new(PlatformProtectedPrekeyBackend::new(data_dir)?);
         Self::open_with_backend(data_dir, backend)
     }
@@ -917,6 +1018,21 @@ impl PrekeyLifecycleActor {
         Ok(signed_prekey_id)
     }
 
+    /// Publisher rotation: first destroys retired generations whose grace
+    /// has fully elapsed, then installs the strictly newer generation (which
+    /// retires the current active one). Pruning first keeps routine rotation
+    /// every [`MAX_PREKEY_BUNDLE_LIFETIME_MS`] - [`PREKEY_ROTATION_LEAD_MS`]
+    /// inside [`MAX_PREKEY_GENERATIONS`].
+    pub fn rotate_generation(
+        &self,
+        bundles: &[PrekeyBundle],
+        private: PrekeyGenerationPrivate,
+        now_ms: u64,
+    ) -> Result<u32, PrekeyLifecycleError> {
+        self.prune_expired(now_ms)?;
+        self.install_generation(bundles, private, now_ms)
+    }
+
     /// Atomically claims an exact, fully signed PairInit and derives its
     /// responder root. Exact duplicates are idempotent. A different valid
     /// PairInit that reuses one OTP receives a distinct session/root and only
@@ -980,7 +1096,14 @@ impl PrekeyLifecycleActor {
         }) {
             return Err(PrekeyLifecycleError::InitIdConflict);
         }
-        if state.claims.len() >= MAX_ACCEPTED_PREKEY_CLAIMS {
+        if state.claims.len() >= MAX_ACCEPTED_PREKEY_CLAIMS
+            || state
+                .claims
+                .iter()
+                .filter(|claim| claim.initiator_address == value.initiator_address)
+                .count()
+                >= MAX_ACCEPTED_PREKEY_CLAIMS_PER_INITIATOR
+        {
             return Err(PrekeyLifecycleError::ResourceLimit);
         }
         let generation =
@@ -997,13 +1120,26 @@ impl PrekeyLifecycleActor {
             return Err(PrekeyLifecycleError::PairInitOutsideGrace);
         }
 
+        // Every input-dependent step that can fail (generation lookup, X25519
+        // contributory check, decapsulation) runs before the journal exists.
+        // A journal is only persisted for a claim whose replay is known to
+        // succeed, so a hostile PairInit cannot wedge later recovery.
+        let prepared = prepare_claim(&state, value, now_ms)?;
         state.pending = Some(PendingMutation::Claim {
             pair_init_wire: wire,
             accepted_at_ms: now_ms,
         });
         self.store_state(&state)?;
         self.maybe_fault(FaultPoint::ClaimJournal)?;
-        recover_pending_mutation(&mut state)?;
+        // The journal is durable. Commit exactly what recovery would derive
+        // from it (`prepare_claim` is deterministic over this state).
+        if let Some(PendingMutation::Claim {
+            mut pair_init_wire, ..
+        }) = state.pending.take()
+        {
+            pair_init_wire.zeroize();
+        }
+        apply_claim(&mut state, prepared);
         self.store_state(&state)?;
         self.maybe_fault(FaultPoint::ClaimCommit)?;
         let accepted = state
@@ -1152,6 +1288,7 @@ impl PrekeyLifecycleActor {
                 .filter(|claim| claim.state == ClaimState::PendingHandoff)
                 .count(),
             one_time_reuse_anomalies: state.one_time_reuse_anomalies,
+            quarantined_claim_journals: state.quarantined_claim_journals,
         };
         transaction
             .commit()
@@ -1245,6 +1382,20 @@ impl PrekeyLifecycleActor {
             .lock()
             .map_err(|_| PrekeyLifecycleError::LockFailed)? = Some(point);
         Ok(())
+    }
+}
+
+/// True when the bundle published for `identity_ed25519_pub` in `store` must
+/// be replaced: missing, no longer verifiable (expired, bad signature,
+/// corrupt), or inside [`PREKEY_ROTATION_LEAD_MS`] of its signed expiry.
+pub fn local_prekey_rotation_due(
+    store: &PrekeyStore,
+    identity_ed25519_pub: &[u8; 32],
+    now_ms: u64,
+) -> bool {
+    match store.fetch_valid(identity_ed25519_pub, now_ms) {
+        Some(bundle) => bundle.expires_at_ms.saturating_sub(now_ms) < PREKEY_ROTATION_LEAD_MS,
+        None => true,
     }
 }
 
@@ -1423,98 +1574,158 @@ fn recover_pending_mutation(state: &mut ProtectedPrekeyState) -> Result<(), Prek
             mut pair_init_wire,
             accepted_at_ms,
         } => {
-            let value = decode_init(&pair_init_wire)?;
+            let prepared = decode_init(&pair_init_wire)
+                .map_err(PrekeyLifecycleError::from)
+                .and_then(|value| prepare_claim(state, &value, accepted_at_ms));
             pair_init_wire.zeroize();
-            let digest = init_hash(&value)?;
-            if state.claims.iter().any(|claim| {
-                claim.responder_identity == responder_identity_for_init(state, &value)
-                    && claim.responder_device == value.responder_device_ed_pub
-                    && claim.init_id == value.init_id
-                    && claim.init_hash != digest
-            }) {
-                return Err(PrekeyLifecycleError::CorruptProtectedState);
+            match prepared {
+                Ok(prepared) => apply_claim(state, prepared),
+                // Replay is pure computation over the already-validated
+                // protected state, so a failure here would recur on every
+                // open and wedge the actor. The journaled claim never
+                // returned a root; dropping it restores the exact pre-claim
+                // state. Only journals written by builds that persisted
+                // before deriving can reach this branch.
+                Err(_) => {
+                    state.quarantined_claim_journals =
+                        state.quarantined_claim_journals.saturating_add(1);
+                }
             }
-            if state.claims.iter().any(|claim| claim.init_hash == digest) {
-                return Ok(());
-            }
-            let generation = find_generation_for_init(state, &value)
-                .ok_or(PrekeyLifecycleError::CorruptProtectedState)?;
-            let responder_identity = generation.identity_ed25519_pub;
-            let bundle_destroy_after_ms = generation
-                .bundles
-                .iter()
-                .find(|binding| binding.bundle_digest == value.responder_prekey_bundle_hash)
-                .ok_or(PrekeyLifecycleError::CorruptProtectedState)?
-                .destroy_after_ms;
-            let mut selected_secret = if value.one_time_prekey_id == 0 {
-                generation.signed_x25519_secret
-            } else {
-                generation
-                    .one_time
-                    .iter()
-                    .find(|secret| secret.id == value.one_time_prekey_id)
-                    .ok_or(PrekeyLifecycleError::CorruptProtectedState)?
-                    .secret
-            };
-            let mut mlkem_seed: [u8; DK_SEED_LEN] = generation
-                .mlkem768_seed
-                .as_slice()
-                .try_into()
-                .map_err(|_| PrekeyLifecycleError::CorruptProtectedState)?;
-            let transcript = transcript_hash(&value)?;
-            let root_result = respond_hybrid_root(
-                &selected_secret,
-                &value.initiator_ephemeral_x25519_pub,
-                &mlkem_seed,
-                &value.mlkem768_ciphertext,
-                &transcript,
-            );
-            selected_secret.zeroize();
-            mlkem_seed.zeroize();
-            let root = root_result.map_err(|_| PrekeyLifecycleError::CorruptProtectedState)?;
-            let reused = value.one_time_prekey_id != 0
-                && state.claims.iter().any(|claim| {
-                    claim.responder_identity == responder_identity
-                        && claim.responder_device == value.responder_device_ed_pub
-                        && claim.signed_prekey_id == value.signed_prekey_id
-                        && claim.one_time_prekey_id == value.one_time_prekey_id
-                        && claim.init_hash != digest
-                });
-            if reused {
-                state.one_time_reuse_anomalies = state.one_time_reuse_anomalies.saturating_add(1);
-            }
-            let handoff_deadline_ms = accepted_at_ms
-                .checked_add(PREKEY_ROOT_HANDOFF_TIMEOUT_MS)
-                .ok_or(PrekeyLifecycleError::CorruptProtectedState)?;
-            let replay_deadline_ms = bundle_destroy_after_ms;
-            let retain_until_ms = handoff_deadline_ms.max(replay_deadline_ms);
-            let session_id = session_id_from_init_hash(&digest);
-            let claim_id = claim_id(
-                &responder_identity,
-                &value.responder_device_ed_pub,
-                value.signed_prekey_id,
-                value.one_time_prekey_id,
-                &value.init_id,
-                &digest,
-            );
-            state.claims.push(AcceptedClaim {
-                claim_id,
-                responder_identity,
-                responder_device: value.responder_device_ed_pub,
-                signed_prekey_id: value.signed_prekey_id,
-                one_time_prekey_id: value.one_time_prekey_id,
-                init_id: value.init_id,
-                init_hash: digest,
-                session_id,
-                accepted_at_ms,
-                handoff_deadline_ms,
-                retain_until_ms,
-                state: ClaimState::PendingHandoff,
-                provisional_root: Some(root),
-            });
         }
     }
     Ok(())
+}
+
+/// Claim derived from retained generation material but not yet applied.
+enum PreparedClaim {
+    AlreadyAccepted,
+    New {
+        claim: Box<AcceptedClaim>,
+        one_time_reused: bool,
+    },
+}
+
+/// Deterministically derives the accepted claim (including the responder
+/// root) for `value` from `state` without mutating it. First acceptance and
+/// journal recovery both use this, so a claim can only be journaled after
+/// this has already succeeded for the same state.
+fn prepare_claim(
+    state: &ProtectedPrekeyState,
+    value: &PairInit,
+    accepted_at_ms: u64,
+) -> Result<PreparedClaim, PrekeyLifecycleError> {
+    let digest = init_hash(value)?;
+    if state.claims.iter().any(|claim| {
+        claim.responder_identity == responder_identity_for_init(state, value)
+            && claim.responder_device == value.responder_device_ed_pub
+            && claim.init_id == value.init_id
+            && claim.init_hash != digest
+    }) {
+        return Err(PrekeyLifecycleError::InitIdConflict);
+    }
+    if state.claims.iter().any(|claim| claim.init_hash == digest) {
+        return Ok(PreparedClaim::AlreadyAccepted);
+    }
+    let generation =
+        find_generation_for_init(state, value).ok_or(PrekeyLifecycleError::UnknownPrekey)?;
+    let responder_identity = generation.identity_ed25519_pub;
+    generation
+        .bundles
+        .iter()
+        .find(|binding| binding.bundle_digest == value.responder_prekey_bundle_hash)
+        .ok_or(PrekeyLifecycleError::UnknownPrekey)?;
+    let handoff_deadline_ms = accepted_at_ms
+        .checked_add(PREKEY_ROOT_HANDOFF_TIMEOUT_MS)
+        .ok_or(PrekeyLifecycleError::CorruptProtectedState)?;
+    let mut selected_secret = if value.one_time_prekey_id == 0 {
+        generation.signed_x25519_secret
+    } else {
+        generation
+            .one_time
+            .iter()
+            .find(|secret| secret.id == value.one_time_prekey_id)
+            .ok_or(PrekeyLifecycleError::CorruptProtectedState)?
+            .secret
+    };
+    let mut mlkem_seed: [u8; DK_SEED_LEN] = match generation.mlkem768_seed.as_slice().try_into() {
+        Ok(seed) => seed,
+        Err(_) => {
+            selected_secret.zeroize();
+            return Err(PrekeyLifecycleError::CorruptProtectedState);
+        }
+    };
+    let transcript = transcript_hash(value);
+    let root_result = transcript.map(|transcript| {
+        respond_hybrid_root(
+            &selected_secret,
+            &value.initiator_ephemeral_x25519_pub,
+            &mlkem_seed,
+            &value.mlkem768_ciphertext,
+            &transcript,
+        )
+    });
+    selected_secret.zeroize();
+    mlkem_seed.zeroize();
+    // After structural validation the only reachable failure is an X25519
+    // agreement that is all-zero (non-contributory initiator ephemeral).
+    let root = root_result?
+        .map_err(|_| PrekeyLifecycleError::PairInit(PairInitError::NonContributoryKey))?;
+    let one_time_reused = value.one_time_prekey_id != 0
+        && state.claims.iter().any(|claim| {
+            claim.responder_identity == responder_identity
+                && claim.responder_device == value.responder_device_ed_pub
+                && claim.signed_prekey_id == value.signed_prekey_id
+                && claim.one_time_prekey_id == value.one_time_prekey_id
+                && claim.init_hash != digest
+        });
+    // A PairInit is only claimable before its own signed expiry
+    // (`claim_pair_init` rejects `now >= expires_at_ms` before any duplicate
+    // lookup), so replay protection ends there. Retaining the tombstone to the
+    // bundle's `destroy_after_ms` (~37 days) bought nothing but quota pressure:
+    // each one counts against the per-initiator and global claim caps.
+    let retain_until_ms = handoff_deadline_ms.max(value.expires_at_ms);
+    let session_id = session_id_from_init_hash(&digest);
+    let claim_id = claim_id(
+        &responder_identity,
+        &value.responder_device_ed_pub,
+        value.signed_prekey_id,
+        value.one_time_prekey_id,
+        &value.init_id,
+        &digest,
+    );
+    Ok(PreparedClaim::New {
+        claim: Box::new(AcceptedClaim {
+            claim_id,
+            responder_identity,
+            responder_device: value.responder_device_ed_pub,
+            signed_prekey_id: value.signed_prekey_id,
+            one_time_prekey_id: value.one_time_prekey_id,
+            init_id: value.init_id,
+            init_hash: digest,
+            session_id,
+            accepted_at_ms,
+            handoff_deadline_ms,
+            retain_until_ms,
+            state: ClaimState::PendingHandoff,
+            // The claim keeps its own copy; the local `root` is wiped on drop.
+            provisional_root: Some(*root),
+            initiator_address: value.initiator_address.clone(),
+        }),
+        one_time_reused,
+    })
+}
+
+fn apply_claim(state: &mut ProtectedPrekeyState, prepared: PreparedClaim) {
+    if let PreparedClaim::New {
+        claim,
+        one_time_reused,
+    } = prepared
+    {
+        if one_time_reused {
+            state.one_time_reuse_anomalies = state.one_time_reuse_anomalies.saturating_add(1);
+        }
+        state.claims.push(*claim);
+    }
 }
 
 fn responder_identity_for_init(state: &ProtectedPrekeyState, value: &PairInit) -> [u8; 32] {
@@ -1719,6 +1930,8 @@ fn validate_state(state: &ProtectedPrekeyState) -> Result<(), PrekeyLifecycleErr
             || claim.retain_until_ms < claim.accepted_at_ms
             || claim.retain_until_ms < claim.handoff_deadline_ms
             || (claim.state == ClaimState::PendingHandoff) != claim.provisional_root.is_some()
+            || !(claim.initiator_address.is_empty()
+                || claim.initiator_address.len() == crate::pair_init::ADDRESS_LEN)
             || state.claims[..index]
                 .iter()
                 .any(|other| other.claim_id == claim.claim_id)
@@ -1743,6 +1956,7 @@ mod tests {
     use crate::identity::Identity;
     use crate::pair_init::{
         device_certificate_hash, init_signing_bytes, prekey_bundle_hash, PairInitTrust,
+        INIT_SIGNING_DOMAIN,
     };
     use tempfile::TempDir;
 
@@ -1911,6 +2125,21 @@ mod tests {
         }
 
         fn pair(&self, discriminator: u8) -> PairInit {
+            self.pair_from(
+                &self.initiator_user,
+                &self.initiator_device,
+                &self.initiator_cert,
+                discriminator,
+            )
+        }
+
+        fn pair_from(
+            &self,
+            initiator_user: &Identity,
+            initiator_device: &Identity,
+            initiator_cert: &DeviceCertificate,
+            discriminator: u8,
+        ) -> PairInit {
             let mut ephemeral_secret = [0u8; 32];
             ephemeral_secret.fill(0x70u8.wrapping_add(discriminator));
             let ephemeral_public =
@@ -1922,16 +2151,16 @@ mod tests {
             let mut pairing_nonce = [0u8; 32];
             pairing_nonce.fill(discriminator.wrapping_add(9));
             let mut value = PairInit {
-                initiator_address: self.initiator_user.address(),
+                initiator_address: initiator_user.address(),
                 responder_address: self.responder_user.address(),
                 init_id,
                 pairing_nonce,
-                initiator_device_ed_pub: self.initiator_device.public_key_bytes(),
+                initiator_device_ed_pub: initiator_device.public_key_bytes(),
                 responder_device_ed_pub: self.responder_device.public_key_bytes(),
                 initiator_ephemeral_x25519_pub: ephemeral_public,
                 responder_signed_x25519_pub: self.bundle.x25519_pub,
                 responder_one_time_x25519_pub: self.bundle.one_time_x25519_pub.unwrap(),
-                initiator_device_cert_hash: device_certificate_hash(&self.initiator_cert).unwrap(),
+                initiator_device_cert_hash: device_certificate_hash(initiator_cert).unwrap(),
                 responder_device_cert_hash: device_certificate_hash(&self.responder_cert).unwrap(),
                 responder_prekey_bundle_hash: prekey_bundle_hash(&self.bundle).unwrap(),
                 signed_prekey_id: self.bundle.signed_prekey_id,
@@ -1942,10 +2171,33 @@ mod tests {
                 expires_at_ms: self.created_at_ms + MAX_PAIR_INIT_LIFETIME_MS,
                 signature: [0u8; 64],
             };
-            value.signature = self
-                .initiator_device
-                .sign(&init_signing_bytes(&value).unwrap());
+            value.signature = initiator_device.sign(&init_signing_bytes(&value).unwrap());
             value
+        }
+
+        /// Correctly signed PairInit whose initiator ephemeral is the
+        /// low-order point u = 1, built without the (now rejecting) codec,
+        /// plus its exact wire as an older build would have journaled it.
+        fn low_order_pair(&self) -> (PairInit, Vec<u8>) {
+            let honest = self.pair(3);
+            let mut u_one = [0u8; 32];
+            u_one[0] = 1;
+            let mut signing = init_signing_bytes(&honest).unwrap();
+            let offset = signing
+                .windows(32)
+                .position(|window| window == honest.initiator_ephemeral_x25519_pub)
+                .unwrap();
+            signing[offset..offset + 32].copy_from_slice(&u_one);
+            let signature = self.initiator_device.sign(&signing);
+            let mut wire = encode_init(&honest).unwrap();
+            let wire_offset = offset - INIT_SIGNING_DOMAIN.len();
+            wire[wire_offset..wire_offset + 32].copy_from_slice(&u_one);
+            let signature_offset = wire.len() - signature.len();
+            wire[signature_offset..].copy_from_slice(&signature);
+            let mut value = honest;
+            value.initiator_ephemeral_x25519_pub = u_one;
+            value.signature = signature;
+            (value, wire)
         }
 
         fn trust(&self) -> PairInitTrust<'_> {
@@ -2004,7 +2256,7 @@ mod tests {
             &transcript_hash(&pair).unwrap(),
         )
         .unwrap();
-        assert_eq!(*first_root, expected);
+        assert_eq!(*first_root, *expected);
         let mut duplicate = take_claim(
             fixture
                 .actor
@@ -2014,7 +2266,7 @@ mod tests {
         assert_eq!(duplicate.claim_id(), first.claim_id());
         assert_eq!(
             duplicate.take_provisional_root().map(|root| *root),
-            Some(expected)
+            Some(*expected)
         );
         let status = fixture.actor.status().unwrap();
         assert_eq!(status.accepted_claims, 1);
@@ -2461,6 +2713,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(unix), allow(unused_variables))]
     fn lock_file_is_owner_only_on_unix() {
         let fixture = Fixture::new();
         #[cfg(unix)]
@@ -2473,6 +2726,261 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn low_order_initiator_ephemeral_is_rejected_without_wedging_the_actor() {
+        let fixture = Fixture::new();
+        let (hostile, _) = fixture.low_order_pair();
+        assert!(matches!(
+            fixture
+                .actor
+                .claim_pair_init(&hostile, &fixture.trust(), fixture.created_at_ms + 100),
+            Err(PrekeyLifecycleError::PairInit(
+                PairInitError::NonContributoryKey
+            ))
+        ));
+        // Nothing was journaled: every later open/status/claim still works.
+        assert!(fixture.actor.load_state().unwrap().pending.is_none());
+        let reopened = fixture.reopen();
+        let status = reopened.status().unwrap();
+        assert_eq!(status.accepted_claims, 0);
+        assert_eq!(status.quarantined_claim_journals, 0);
+        let mut claim = take_claim(
+            reopened
+                .claim_pair_init(
+                    &fixture.pair(1),
+                    &fixture.trust(),
+                    fixture.created_at_ms + 101,
+                )
+                .unwrap(),
+        );
+        assert!(claim.take_provisional_root().is_some());
+    }
+
+    #[test]
+    fn unrecoverable_claim_journal_from_older_build_is_quarantined() {
+        let fixture = Fixture::new();
+        let (_, wire) = fixture.low_order_pair();
+        // Exactly what a build that journaled before deriving left behind.
+        let mut state = fixture.actor.load_state().unwrap();
+        state.pending = Some(PendingMutation::Claim {
+            pair_init_wire: wire,
+            accepted_at_ms: fixture.created_at_ms + 100,
+        });
+        fixture.actor.store_state(&state).unwrap();
+        drop(state);
+
+        let reopened = fixture.reopen();
+        let status = reopened.status().unwrap();
+        assert_eq!(status.quarantined_claim_journals, 1);
+        assert_eq!(status.accepted_claims, 0);
+        assert!(reopened.load_state().unwrap().pending.is_none());
+        // The actor is usable again and later recoveries do not re-count.
+        take_claim(
+            reopened
+                .claim_pair_init(
+                    &fixture.pair(1),
+                    &fixture.trust(),
+                    fixture.created_at_ms + 101,
+                )
+                .unwrap(),
+        );
+        let status = fixture.reopen().status().unwrap();
+        assert_eq!(status.accepted_claims, 1);
+        assert_eq!(status.quarantined_claim_journals, 1);
+    }
+
+    #[test]
+    fn one_initiator_cannot_exhaust_claims_for_other_initiators() {
+        let fixture = Fixture::new();
+        let now = fixture.created_at_ms + 100;
+        for discriminator in 1..=MAX_ACCEPTED_PREKEY_CLAIMS_PER_INITIATOR as u8 {
+            fixture
+                .actor
+                .claim_pair_init(&fixture.pair(discriminator), &fixture.trust(), now)
+                .unwrap();
+        }
+        let over_quota = fixture.pair(MAX_ACCEPTED_PREKEY_CLAIMS_PER_INITIATOR as u8 + 1);
+        assert!(matches!(
+            fixture
+                .actor
+                .claim_pair_init(&over_quota, &fixture.trust(), now),
+            Err(PrekeyLifecycleError::ResourceLimit)
+        ));
+        assert_eq!(
+            fixture.actor.status().unwrap().accepted_claims,
+            MAX_ACCEPTED_PREKEY_CLAIMS_PER_INITIATOR
+        );
+
+        let other_user = Identity::from_seed(&[0x55; 32]);
+        let other_device = Identity::from_seed(&[0x66; 32]);
+        let other_cert = DeviceCertificate::issue(
+            &other_user,
+            other_device.public_key_bytes(),
+            [0x67; 32],
+            "carol-device",
+            fixture.created_at_ms - 60_000,
+            fixture.created_at_ms + 3 * MAX_PREKEY_BUNDLE_LIFETIME_MS,
+            0,
+        )
+        .unwrap();
+        // Distinct init_id: the collision key is per responder, not per initiator.
+        let other = fixture.pair_from(&other_user, &other_device, &other_cert, 99);
+        let other_trust = PairInitTrust {
+            initiator_certificate: &other_cert,
+            ..fixture.trust()
+        };
+        take_claim(
+            fixture
+                .actor
+                .claim_pair_init(&other, &other_trust, now)
+                .unwrap(),
+        );
+        assert_eq!(
+            fixture.actor.status().unwrap().accepted_claims,
+            MAX_ACCEPTED_PREKEY_CLAIMS_PER_INITIATOR + 1
+        );
+    }
+
+    #[test]
+    fn local_prekey_rotation_is_due_before_pairinit_window_breaks() {
+        let owner = Identity::from_seed(&[0x71; 32]);
+        let created = 1_700_000_000_000;
+        let expires = created + MAX_PREKEY_BUNDLE_LIFETIME_MS;
+        let bundle = PrekeyBundle {
+            identity_ed25519_pub: owner.public_key_bytes(),
+            device_id: "owner-device".into(),
+            x25519_pub: X25519PublicKey::from(&StaticSecret::from([0x72; 32])).to_bytes(),
+            mlkem768_ek: vec![0x73; MLKEM768_EK_LEN],
+            signed_prekey_id: 1,
+            one_time_prekey_id: 0,
+            one_time_x25519_pub: None,
+            created_at_ms: created,
+            expires_at_ms: expires,
+            signature: [0u8; 64],
+        }
+        .sign(&owner)
+        .unwrap();
+        let mut store = PrekeyStore::default();
+        let owner_pub = owner.public_key_bytes();
+        assert!(local_prekey_rotation_due(&store, &owner_pub, created));
+        store.publish(&bundle, created).unwrap();
+        assert!(!local_prekey_rotation_due(&store, &owner_pub, created));
+
+        let last_quiet = expires - PREKEY_ROTATION_LEAD_MS;
+        assert!(!local_prekey_rotation_due(&store, &owner_pub, last_quiet));
+        // A full-length PairInit started at the last non-rotating instant
+        // still fits inside the bundle's validity.
+        assert!(last_quiet + MAX_PAIR_INIT_LIFETIME_MS < expires);
+        assert!(local_prekey_rotation_due(
+            &store,
+            &owner_pub,
+            last_quiet + 1
+        ));
+        // Expired (and past the verification skew) is due, not an error.
+        let expired = expires + 60 * 60 * 1_000;
+        assert!(store.fetch(&owner_pub, expired).is_err());
+        assert!(local_prekey_rotation_due(&store, &owner_pub, expired));
+    }
+
+    #[test]
+    fn claim_tombstone_is_not_retained_past_pairinit_expiry() {
+        let fixture = Fixture::new();
+        let pair = fixture.pair(1);
+        let claim = take_claim(
+            fixture
+                .actor
+                .claim_pair_init(&pair, &fixture.trust(), fixture.created_at_ms + 100)
+                .unwrap(),
+        );
+        fixture
+            .actor
+            .complete_claim(&claim.claim_id(), &claim.session_id())
+            .unwrap();
+        // Replay protection holds for the PairInit's whole signed lifetime...
+        let kept = fixture.actor.prune_expired(pair.expires_at_ms).unwrap();
+        assert_eq!(kept.destroyed_claim_tombstones, 0);
+        assert_eq!(fixture.actor.status().unwrap().accepted_claims, 1);
+        // ...and ends with it: `claim_pair_init` rejects the init from then on,
+        // so keeping the tombstone to the bundle's destroy_after (weeks later)
+        // would only eat the per-initiator and global claim quotas.
+        let pruned = fixture.actor.prune_expired(pair.expires_at_ms + 1).unwrap();
+        assert_eq!(pruned.destroyed_claim_tombstones, 1);
+        assert_eq!(fixture.actor.status().unwrap().accepted_claims, 0);
+        assert!(matches!(
+            fixture
+                .actor
+                .claim_pair_init(&pair, &fixture.trust(), pair.expires_at_ms + 1),
+            Err(PrekeyLifecycleError::PairInit(
+                PairInitError::NotCurrentlyValid
+            ))
+        ));
+    }
+
+    #[test]
+    fn locked_file_override_is_refused_in_release_builds() {
+        assert!(matches!(
+            locked_file_override_decision(true, false),
+            Err(PrekeyLifecycleError::ProtectedStoreUnavailable)
+        ));
+        assert!(matches!(
+            locked_file_override_decision(true, true),
+            Ok(true)
+        ));
+        for debug_build in [false, true] {
+            assert!(matches!(
+                locked_file_override_decision(false, debug_build),
+                Ok(false)
+            ));
+        }
+    }
+
+    #[test]
+    fn rotate_generation_prunes_expired_generations_before_installing() {
+        let fixture = Fixture::new();
+        let next_bundle = |signed_prekey_id: u32, created_at_ms: u64| {
+            let mut bundle = fixture.bundle.clone();
+            bundle.signed_prekey_id = signed_prekey_id;
+            bundle.one_time_prekey_id = 0;
+            bundle.one_time_x25519_pub = None;
+            bundle.created_at_ms = created_at_ms;
+            bundle.expires_at_ms = created_at_ms + MAX_PAIR_INIT_LIFETIME_MS;
+            bundle.signature = [0u8; 64];
+            bundle.sign(&fixture.responder_user).unwrap()
+        };
+        let private = || PrekeyGenerationPrivate::new([0x52; 32], fixture.mlkem_seed, Vec::new());
+        for signed_prekey_id in 2..=MAX_PREKEY_GENERATIONS as u32 {
+            let at = fixture.created_at_ms + u64::from(signed_prekey_id);
+            fixture
+                .actor
+                .install_generation(&[next_bundle(signed_prekey_id, at)], private(), at)
+                .unwrap();
+        }
+        let later =
+            fixture.created_at_ms + 2 * MAX_PAIR_INIT_LIFETIME_MS + PREKEY_RETENTION_GRACE_MS;
+        let fresh = next_bundle(MAX_PREKEY_GENERATIONS as u32 + 1, later);
+        assert!(matches!(
+            fixture
+                .actor
+                .install_generation(std::slice::from_ref(&fresh), private(), later),
+            Err(PrekeyLifecycleError::ResourceLimit)
+        ));
+        assert_eq!(
+            fixture
+                .actor
+                .rotate_generation(std::slice::from_ref(&fresh), private(), later)
+                .unwrap(),
+            MAX_PREKEY_GENERATIONS as u32 + 1
+        );
+        let status = fixture.actor.status().unwrap();
+        assert_eq!(
+            status.active_signed_prekey_id,
+            Some(MAX_PREKEY_GENERATIONS as u32 + 1)
+        );
+        // Only the previously active generation (retired just now) remains
+        // alongside the new one.
+        assert_eq!(status.retained_generations, 2);
     }
 
     #[test]
@@ -2520,5 +3028,39 @@ mod tests {
                 .as_str()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn passphrase_vault_backend_holds_prekey_state() {
+        use crate::keystore_vault::test_support::test_vault;
+        let data_dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(VaultPrekeyBackend {
+            vault: test_vault(data_dir.path(), "prekey vault passphrase").0,
+        });
+        let actor = PrekeyLifecycleActor::open_with_backend(data_dir.path(), backend.clone())
+            .expect("open vault-backed prekey actor");
+        actor.status().expect("status over the vault backend");
+        assert!(backend.get("acct").unwrap().is_none());
+        backend.put("acct", b"state-1").unwrap();
+        backend.put("acct", b"state-2").unwrap();
+        assert_eq!(
+            backend.get("acct").unwrap().as_deref(),
+            Some(&b"state-2"[..])
+        );
+        let names = test_vault(data_dir.path(), "prekey vault passphrase")
+            .0
+            .entry_names()
+            .unwrap();
+        assert!(names.contains(&format!(
+            "{}acct",
+            crate::keystore_vault::PREKEY_ENTRY_PREFIX
+        )));
+        let wrong = VaultPrekeyBackend {
+            vault: test_vault(data_dir.path(), "a wrong passphrase").0,
+        };
+        assert!(matches!(
+            wrong.get("acct"),
+            Err(PrekeyLifecycleError::ProtectedStoreUnavailable)
+        ));
     }
 }

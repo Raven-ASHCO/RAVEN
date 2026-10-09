@@ -13,6 +13,16 @@ compile_error!(
     "unsafe-demo-crypto is forbidden in release builds; establish an authenticated ATSAM session"
 );
 
+// Second layer: `debug_assertions` is only a proxy for the build profile (a
+// release profile can switch it on, e.g. `CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true`
+// or `RUSTFLAGS=-Cdebug-assertions=on`). `RAVEN_BUILD_PROFILE` is Cargo's own
+// `PROFILE`, emitted by `build.rs` (the same signal as the durable-lab release hold).
+#[cfg(feature = "unsafe-demo-crypto")]
+const _: () = assert!(
+    !matches!(env!("RAVEN_BUILD_PROFILE").as_bytes(), b"release"),
+    "unsafe-demo-crypto is forbidden in release builds; establish an authenticated ATSAM session"
+);
+
 #[cfg(feature = "unsafe-demo-crypto")]
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 #[cfg(feature = "unsafe-demo-crypto")]
@@ -239,11 +249,11 @@ pub fn unseal_message(
 fn build_aad(sender: &str, recipient: &str, msg_id: &[u8; 16]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"raven/rvn1/interim-seal/aad");
-    h.update(&[0]);
+    h.update([0]);
     h.update(sender.as_bytes());
-    h.update(&[0]);
+    h.update([0]);
     h.update(recipient.as_bytes());
-    h.update(&[0]);
+    h.update([0]);
     h.update(msg_id);
     h.finalize().into()
 }

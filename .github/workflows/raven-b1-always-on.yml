@@ -10,6 +10,17 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: jobs only read the repository. Third-party actions are
+# pinned to full commit SHAs (the comment names the release); bump them
+# deliberately. RUST_TOOLCHAIN pins rustc/clippy so a new stable release cannot
+# change CI results without a code change — raven-toolchain-canary.yml tracks
+# latest stable separately.
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.98.0"
+
 concurrency:
   group: raven-b1-always-on-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,17 +31,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - name: Secret history scan (CI mode)
         run: bash scripts/secret_history_scan.sh --ci
       - name: Messaging-only product boundary
         run: bash node/scripts/messaging_product_boundary_gate.sh
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: node
           prefix-key: b1-always-on

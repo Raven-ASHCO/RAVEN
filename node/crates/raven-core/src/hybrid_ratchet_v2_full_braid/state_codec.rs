@@ -1,5 +1,9 @@
 //! Canonical RVFB1 state codec — outer prefix + typed tail sections (design §6).
 
+use std::fmt;
+
+use zeroize::Zeroize;
+
 use crate::hybrid_ratchet_v2_full_braid::constants::{
     ACTIVE_SEND_MAX, AGENT_CT1_ACKNOWLEDGED, AGENT_CT2_SAMPLED, AGENT_TERMINAL,
     BRAID_MAX_CANONICAL_STATE_BYTES, FLAG_CT1_ACK_APPLIED, RVFB1_PREFIX,
@@ -33,7 +37,12 @@ pub const SOURCE_KIND_CT2: u8 = 6;
 
 const MAX_INBOUND_SETS: usize = 8;
 const MAX_OBJECTS: usize = 32;
-const MAX_REPLAYS: usize = 64;
+/// Replay window capacity. Records are kept in commit order (oldest first) and
+/// the pipeline evicts the oldest once the window is full.
+pub const MAX_REPLAYS: usize = 64;
+/// Encoded size of one replay record (transition, execution, output digests +
+/// output_len u32 + flags u16).
+pub const REPLAY_RECORD_LEN: usize = 102;
 
 /// Exact TLV tag lengths (design §6.3).
 const TLV_LEN: [(u16, usize); 8] = [
@@ -52,7 +61,7 @@ pub fn agent_requires_ct1_ack(agent: u8) -> bool {
     agent == AGENT_CT1_ACKNOWLEDGED || agent == AGENT_CT2_SAMPLED
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Rvfb1Prefix {
     pub session_id: [u8; 32],
     pub role: u8,
@@ -70,6 +79,32 @@ pub struct Rvfb1Prefix {
     pub pending_before_digest: [u8; 32],
     pub pending_output_digest: [u8; 32],
     pub pending_execution_digest: [u8; 32],
+}
+
+impl fmt::Debug for Rvfb1Prefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rvfb1Prefix")
+            .field("session_id", &self.session_id)
+            .field("role", &self.role)
+            .field("generation", &self.generation)
+            .field("agent", &self.agent)
+            .field("terminal_reason", &self.terminal_reason)
+            .field("braid_agent_epoch", &self.braid_agent_epoch)
+            .field("braid_send_epoch", &self.braid_send_epoch)
+            .field("braid_recv_epoch", &self.braid_recv_epoch)
+            .field("flags", &self.flags)
+            .field("pending_phase", &self.pending_phase)
+            .field("pending_transition_id", &self.pending_transition_id)
+            .field("auth_keys", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Rvfb1Prefix {
+    fn drop(&mut self) {
+        self.auth_root.zeroize();
+        self.auth_mac_key.zeroize();
+    }
 }
 
 impl Rvfb1Prefix {
@@ -133,10 +168,27 @@ pub struct ReplayRecord {
     pub flags: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Agent TLV (ML-KEM `dk`, Encaps1 state, …): value wiped on drop, never printed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct TlvEntry {
     pub tag: u16,
     pub value: Vec<u8>,
+}
+
+impl fmt::Debug for TlvEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlvEntry")
+            .field("tag", &self.tag)
+            .field("len", &self.value.len())
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for TlvEntry {
+    fn drop(&mut self) {
+        self.value.zeroize();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +200,26 @@ pub struct Rvfb1State {
     pub replays: Vec<ReplayRecord>,
     pub tlvs: Vec<TlvEntry>,
     pub tr: Rvft1,
+}
+
+/// Canonicality probe: encodes and wipes the scratch bytes (they hold every
+/// ratchet secret).
+pub fn rvfb1_encodable(state: &Rvfb1State) -> bool {
+    match encode_rvfb1(state) {
+        Ok(mut bytes) => {
+            bytes.zeroize();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether `state` encodes to exactly `bytes`; the scratch encoding is wiped.
+pub fn rvfb1_encodes_to(state: &Rvfb1State, bytes: &[u8]) -> WireResult<bool> {
+    let mut encoded = encode_rvfb1(state)?;
+    let same = encoded == bytes;
+    encoded.zeroize();
+    Ok(same)
 }
 
 impl Rvfb1State {
@@ -462,10 +534,15 @@ fn encode_objects(objects: &[BraidObject]) -> WireResult<Vec<u8>> {
     Ok(out)
 }
 
-fn validate_replays_sorted(replays: &[ReplayRecord]) -> WireResult<()> {
-    for w in replays.windows(2) {
-        if w[0].transition_id >= w[1].transition_id {
-            return Err("rvfb1 replays unsorted".into());
+/// Replay records are a FIFO window in commit order, so canonical form is the
+/// recorded sequence itself; transition ids must be unique.
+fn validate_replays_unique(replays: &[ReplayRecord]) -> WireResult<()> {
+    for (i, record) in replays.iter().enumerate() {
+        if replays[..i]
+            .iter()
+            .any(|prior| prior.transition_id == record.transition_id)
+        {
+            return Err("rvfb1 replays duplicate transition_id".into());
         }
     }
     Ok(())
@@ -486,7 +563,7 @@ fn decode_replays(data: &[u8], off: &mut usize) -> WireResult<Vec<ReplayRecord>>
             flags: read_u16be(data, off)?,
         });
     }
-    validate_replays_sorted(&replays)?;
+    validate_replays_unique(&replays)?;
     Ok(replays)
 }
 
@@ -494,7 +571,7 @@ fn encode_replays(replays: &[ReplayRecord]) -> WireResult<Vec<u8>> {
     if replays.len() > MAX_REPLAYS {
         return Err("rvfb1 too many replays".into());
     }
-    validate_replays_sorted(replays)?;
+    validate_replays_unique(replays)?;
     let mut out = Vec::new();
     write_u16be(&mut out, replays.len() as u16);
     for replay in replays {
@@ -563,7 +640,9 @@ fn validate_tlvs_for_agent(agent: u8, tlvs: &[TlvEntry]) -> WireResult<()> {
 
 fn decode_tlvs(data: &[u8], off: &mut usize) -> WireResult<Vec<TlvEntry>> {
     let count = read_u16be(data, off)? as usize;
-    let mut tlvs = Vec::with_capacity(count);
+    // `count` is attacker-controlled: each TLV needs at least tag(2) + len(4)
+    // bytes, so never reserve more than the remaining bytes can hold.
+    let mut tlvs = Vec::with_capacity(count.min(data.len().saturating_sub(*off) / 6));
     for _ in 0..count {
         let tag = read_u16be(data, off)?;
         let len = read_u32be(data, off)? as usize;
@@ -1021,25 +1100,23 @@ mod tests {
     #[test]
     fn roundtrip_rvft1_with_skipped_maps() {
         let mut state = minimal_state();
-        state.tr = Rvft1 {
-            scka_send_chain: vec![SckaChainEntry {
-                epoch: 1,
-                ck: [0x01; 32],
-                n: 0,
-            }],
-            scka_skipped: vec![SckaSkippedEntry {
-                direction: 0,
-                epoch: 1,
-                n: 0,
-                mk: [0x10; 32],
-            }],
-            ec_skipped: vec![EcSkippedEntry {
-                dh_pub: [0x20; 32],
-                n: 0,
-                mk: [0x21; 32],
-            }],
-            ..minimal_tr()
-        };
+        state.tr = minimal_tr();
+        state.tr.scka_send_chain = vec![SckaChainEntry {
+            epoch: 1,
+            ck: [0x01; 32],
+            n: 0,
+        }];
+        state.tr.scka_skipped = vec![SckaSkippedEntry {
+            direction: 0,
+            epoch: 1,
+            n: 0,
+            mk: [0x10; 32],
+        }];
+        state.tr.ec_skipped = vec![EcSkippedEntry {
+            dh_pub: [0x20; 32],
+            n: 0,
+            mk: [0x21; 32],
+        }];
         let wire = encode_rvfb1(&state).unwrap();
         assert_eq!(decode_rvfb1(&wire).unwrap(), state);
     }
@@ -1065,24 +1142,48 @@ mod tests {
     }
 
     #[test]
-    fn reject_unsorted_replays() {
+    fn debug_output_never_prints_secret_state() {
+        use crate::hybrid_ratchet_v2_full_braid::wire_rvbe1::Rvbe1;
+
         let mut state = minimal_state();
-        state.replays = vec![
-            ReplayRecord {
-                transition_id: [0x02; 32],
-                execution_digest: [0; 32],
-                output_digest: [0; 32],
-                output_len: 0,
-                flags: 0,
-            },
-            ReplayRecord {
-                transition_id: [0x01; 32],
-                execution_digest: [0; 32],
-                output_digest: [0; 32],
-                output_len: 0,
-                flags: 0,
-            },
-        ];
+        state.prefix.auth_root = [0xAB; 32];
+        state.prefix.auth_mac_key = [0xAB; 32];
+        state.tr.scka_rk = [0xAB; 32];
+        state.tr.ec_rk = [0xAB; 32];
+        state.tr.ec_dhs_priv = [0xAB; 32];
+        state.tr.ec_skipped = vec![EcSkippedEntry {
+            dh_pub: [0x01; 32],
+            n: 0,
+            mk: [0xAB; 32],
+        }];
+        let tlv = TlvEntry {
+            tag: 1,
+            value: vec![0xAB; 2400],
+        };
+        let mut env = Rvbe1::default_caps(0);
+        env.keygen_seed = vec![0xAB; 64];
+        env.ec_dh_seed = vec![0xAB; 32];
+        let printed = format!("{state:?}{tlv:?}{env:?}");
+        assert!(printed.contains("<redacted>"));
+        assert!(!printed.contains("171, 171"), "{printed}");
+    }
+
+    #[test]
+    fn replays_keep_commit_order_and_reject_duplicate_ids() {
+        let record = |id: u8| ReplayRecord {
+            transition_id: [id; 32],
+            execution_digest: [0; 32],
+            output_digest: [0; 32],
+            output_len: 0,
+            flags: 0,
+        };
+        let mut state = minimal_state();
+        // FIFO window: newest last, not sorted by transition id.
+        state.replays = vec![record(0x02), record(0x01)];
+        let wire = encode_rvfb1(&state).unwrap();
+        assert_eq!(decode_rvfb1(&wire).unwrap().replays, state.replays);
+
+        state.replays = vec![record(0x02), record(0x01), record(0x02)];
         assert!(encode_rvfb1(&state).is_err());
     }
 

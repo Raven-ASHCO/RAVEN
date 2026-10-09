@@ -31,6 +31,12 @@ macro_rules! cfg_select {
 #[cfg(all(feature = "loadable_extension", feature = "preupdate_hook"))]
 compile_error!("feature \"loadable_extension\" and feature \"preupdate_hook\" cannot be enabled at the same time");
 
+// `loadable_extension` routes to `build_linked` (no bundled amalgamation), which
+// would bypass every bundled-SQLCipher check below (pins, profile guard,
+// release hold). Fail closed instead of silently linking a system library.
+#[cfg(all(feature = "loadable_extension", feature = "bundled-sqlcipher"))]
+compile_error!("feature \"loadable_extension\" cannot be combined with \"bundled-sqlcipher\": it would skip the SQLCipher pin, profile and release-hold checks");
+
 /// Tells whether we're building for Windows. This is more suitable than a plain
 /// `cfg!(windows)`, since the latter does not properly handle cross-compilation
 ///
@@ -154,6 +160,108 @@ fn raven_verify_sqlcipher_4_17_0_pins() {
     println!("cargo:warning=RAVEN SQLCipher 4.17.0 provenance pins verified");
 }
 
+/// Upstream provenance of the ordinary `sqlite3/` amalgamation that every
+/// default Raven build compiles (SQLite 3.53.2). These files are byte-identical
+/// to the crates.io `libsqlite3-sys-0.38.2.crate` archive (SHA-256
+/// f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8); re-derive
+/// with `scripts/verify_sqlcipher_fork_ordinary_sqlite_upstream.sh`. The path
+/// dependency has no Cargo.lock checksum, so these pins are the integrity check.
+#[cfg(any(
+    feature = "bundled",
+    feature = "bundled-windows",
+    feature = "bundled-sqlcipher"
+))]
+const RAVEN_ORDINARY_SQLITE_PINS: [(&str, &str); 6] = [
+    (
+        "sqlite3.c",
+        "0a409f1633283fa31a9126b11fbfd64a1991c5d30defad07e5745d4667f5e23d",
+    ),
+    (
+        "sqlite3.h",
+        "9e69a1353a4288450b0d5239ede11fc7f1f4c8e5eb07491fc8317eacb5b7de7e",
+    ),
+    (
+        "sqlite3ext.h",
+        "ac9645e5c9ff0cf176efdd6e75cb5e98f46295d38e02db5c4d208826a39ab4be",
+    ),
+    (
+        "bindgen_bundled_version.rs",
+        "5b5a37a74dc728fb0bcd041867eb577c03c95e2fe46285262c589a3b1cd4bbac",
+    ),
+    (
+        "bindgen_bundled_version_ext.rs",
+        "445cc206e04a87131d4690742517ee7dcc3a430319bac847ce5e9586f98ee301",
+    ),
+    (
+        "wasm32-wasi-vfs.c",
+        "b95842044da2b8777876b7d3fef8c9711e8c201fb4a4255dbac98729a456bb5d",
+    ),
+];
+
+/// Fail closed before compiling the ordinary amalgamation if any pinned file
+/// differs from upstream (a modified sqlite3.c would otherwise ship in every
+/// production binary with no reviewable diff and no lockfile checksum).
+#[cfg(any(
+    feature = "bundled",
+    feature = "bundled-windows",
+    feature = "bundled-sqlcipher"
+))]
+fn raven_verify_ordinary_sqlite_pins() {
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::io::Read;
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("sqlite3");
+    for (name, expected) in RAVEN_ORDINARY_SQLITE_PINS {
+        let path = dir.join(name);
+        let metadata = path
+            .symlink_metadata()
+            .unwrap_or_else(|e| panic!("ordinary SQLite file missing: {} ({e})", path.display()));
+        if !metadata.file_type().is_file() {
+            panic!(
+                "ordinary SQLite file must be a regular file (not a symlink): {}",
+                path.display()
+            );
+        }
+        let mut f =
+            fs::File::open(&path).unwrap_or_else(|e| panic!("open {} failed: {e}", path.display()));
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 1024 * 64];
+        loop {
+            let n = f
+                .read(&mut buf)
+                .unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()));
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let got = format!("{:x}", hasher.finalize());
+        if got != expected {
+            panic!(
+                "ordinary SQLite provenance SHA-256 mismatch for sqlite3/{name}: got {got}, expected {expected} (upstream libsqlite3-sys 0.38.2)"
+            );
+        }
+        println!("cargo:rerun-if-changed=sqlite3/{name}");
+    }
+}
+
+/// The SQLCipher amalgamation is lab-only (Task 0A.2). Hold release builds
+/// here too, so a dependent that enables `rusqlite/bundled-sqlcipher*`
+/// directly cannot bypass raven-core's `full-braid-durable-lab` release gate.
+///
+/// The panic payload is exactly the raven-core/build.rs hold text. In a warm
+/// target dir this script can run alongside raven-core's hold, and the Task 0A
+/// release-hold gates accept this secondary failure only with that exact
+/// payload (see `scripts/full_braid_task0a_ci_gate.sh`).
+#[cfg(feature = "bundled-sqlcipher")]
+fn raven_require_non_release_sqlcipher_build() {
+    if env::var("PROFILE").is_ok_and(|profile| profile == "release") {
+        eprintln!("libsqlite3-sys-raven: bundled-sqlcipher is lab-only; release builds are held");
+        panic!("FULL_BRAID_SQLCIPHER_NOT_APPROVED");
+    }
+}
+
 /// Forbid host env overrides that can silently weaken or retarget the frozen
 /// SQLCipher codec profile (Task 0A.2 Independent FAIL P0).
 #[cfg(feature = "bundled-sqlcipher")]
@@ -198,6 +306,13 @@ fn main() {
     }
 
     println!("cargo:rerun-if-env-changed=LIBSQLITE3_SYS_USE_PKG_CONFIG");
+    if cfg!(feature = "bundled-sqlcipher") {
+        // Fail closed before the system-library branch below: with the variable
+        // set, that branch links whatever SQLite/SQLCipher pkg-config finds and
+        // never reaches the pin check, profile guard or release hold, all of
+        // which live in `build_bundled::main`.
+        raven_sqlcipher_profile_guard::reject_system_library_redirect();
+    }
     if env::var_os("LIBSQLITE3_SYS_USE_PKG_CONFIG").is_some_and(|s| s != "0")
         || cfg!(feature = "loadable_extension")
     {
@@ -257,8 +372,11 @@ mod build_bundled {
 
         #[cfg(feature = "bundled-sqlcipher")]
         {
-            // Fail closed before compiling any amalgamation object.
+            // Fail closed before compiling any amalgamation object. The pin
+            // check runs first so raven-core's (primary) release hold, which
+            // has no such work to do, is already running when this one fires.
             super::raven_verify_sqlcipher_4_17_0_pins();
+            super::raven_require_non_release_sqlcipher_build();
             if lib_name != "sqlcipher" {
                 panic!(
                     "bundled-sqlcipher selected but lib_name={lib_name}; refusing ordinary SQLite amalgamation"
@@ -272,6 +390,10 @@ mod build_bundled {
                     "ordinary bundled SQLite selected but lib_name={lib_name}; refusing SQLCipher amalgamation"
                 );
             }
+        }
+        if lib_name == "sqlite3" {
+            // Every default build compiles this amalgamation: pin it always.
+            super::raven_verify_ordinary_sqlite_pins();
         }
 
         cfg_select! {
@@ -298,7 +420,6 @@ mod build_bundled {
             .flag("-DSQLITE_ENABLE_FTS3_PARENTHESIS")
             .flag("-DSQLITE_ENABLE_FTS5")
             .flag("-DSQLITE_ENABLE_JSON1")
-            .flag("-DSQLITE_ENABLE_LOAD_EXTENSION=1")
             .flag("-DSQLITE_ENABLE_MEMORY_MANAGEMENT")
             .flag("-DSQLITE_ENABLE_RTREE")
             .flag("-DSQLITE_ENABLE_STAT4")
@@ -309,6 +430,18 @@ mod build_bundled {
             .flag("-DHAVE_ISNAN")
             .flag("-D_POSIX_THREAD_SAFE_FUNCTIONS") // cross compile with MinGW
             .warnings(false);
+
+        if cfg!(feature = "bundled-sqlcipher") {
+            // The SQLCipher profile never loads extensions: compile the
+            // dlopen-based code out (SQLITE_ENABLE_LOAD_EXTENSION only changes
+            // the default connection flags), so no future caller or injected
+            // SQL can load a shared object into the process that holds the
+            // identity and session keys. The runtime `db_config` disable and
+            // readback in the open profile stays as the second layer.
+            cfg.flag("-DSQLITE_OMIT_LOAD_EXTENSION=1");
+        } else {
+            cfg.flag("-DSQLITE_ENABLE_LOAD_EXTENSION=1");
+        }
 
         if cfg!(feature = "bundled-sqlcipher") {
             cfg.flag("-DSQLITE_HAS_CODEC")

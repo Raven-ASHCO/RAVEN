@@ -3,6 +3,8 @@
 use core::ptr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use zeroize::Zeroize;
+
 use crate::hybrid_ratchet_v2_full_braid::constants::{
     BRAID_MAX_CANONICAL_STATE_BYTES, BRAID_MAX_RVOR_RECORD_BYTES, ERR_INTERNAL, ERR_NEED_CAPACITY,
     ERR_OK, ERR_PARSE, MAX_RVBO1,
@@ -10,7 +12,7 @@ use crate::hybrid_ratchet_v2_full_braid::constants::{
 use crate::hybrid_ratchet_v2_full_braid::init::init_write;
 use crate::hybrid_ratchet_v2_full_braid::pipeline::{
     clear_pending, materialize_rvor, promote_state, recover_state, terminalize_conflict,
-    terminalize_expired, transition_prepare, PipelineMeta, MAX_RVBJ1,
+    terminalize_expired, transition_prepare, PipelineMeta, PipelineResult, StateResult, MAX_RVBJ1,
 };
 use crate::hybrid_ratchet_v2_full_braid::state_codec::decode_rvfb1;
 use crate::hybrid_ratchet_v2_full_braid::transition::LabCrypto;
@@ -88,7 +90,75 @@ fn maybe_force_panic() {
     });
 }
 
+/// Caller-provided input region (`ptr`, `len`).
+type InBuf = (*const u8, usize);
+
+/// Largest object any entry point accepts (RVBJ1); longer inputs are PARSE
+/// before a slice is formed, which also keeps `len <= isize::MAX`.
+const MAX_FFI_INPUT_LEN: usize = MAX_RVBJ1;
+
+/// `[start, end)` of a non-empty caller region; `Err` if it wraps the address space.
+fn span(ptr: *const u8, len: usize) -> Result<Option<(usize, usize)>, ()> {
+    if ptr.is_null() || len == 0 {
+        return Ok(None);
+    }
+    let start = ptr as usize;
+    start
+        .checked_add(len)
+        .map(|end| Some((start, end)))
+        .ok_or(())
+}
+
+/// Inputs, outputs and out-parameters must be pairwise disjoint (inputs may
+/// share memory with each other). An aliased output would otherwise be
+/// overwritten — or zeroed on error — while it is still the caller's only copy
+/// of the live state.
+fn regions_alias(
+    ins: &[InBuf],
+    outs: &[OutBuf],
+    sizes: *mut RavenFbSizes,
+    meta: *mut RavenFbResultMeta,
+) -> bool {
+    let mut writable = Vec::with_capacity(outs.len() + 2);
+    for out in outs {
+        match span(out.ptr, out.cap) {
+            Ok(Some(region)) => writable.push(region),
+            Ok(None) => {}
+            Err(()) => return true,
+        }
+    }
+    for (ptr, len) in [
+        (sizes as *const u8, core::mem::size_of::<RavenFbSizes>()),
+        (meta as *const u8, core::mem::size_of::<RavenFbResultMeta>()),
+    ] {
+        match span(ptr, len) {
+            Ok(Some(region)) => writable.push(region),
+            Ok(None) => {}
+            Err(()) => return true,
+        }
+    }
+    let overlaps = |a: (usize, usize), b: (usize, usize)| a.0 < b.1 && b.0 < a.1;
+    for (i, &w) in writable.iter().enumerate() {
+        if writable[..i].iter().any(|&other| overlaps(w, other)) {
+            return true;
+        }
+    }
+    for &(ptr, len) in ins {
+        match span(ptr, len) {
+            Ok(Some(region)) => {
+                if writable.iter().any(|&w| overlaps(region, w)) {
+                    return true;
+                }
+            }
+            Ok(None) => {}
+            Err(()) => return true,
+        }
+    }
+    false
+}
+
 unsafe fn execute<F>(
+    ins: &[InBuf],
     outs: &[OutBuf],
     sizes: *mut RavenFbSizes,
     meta: *mut RavenFbResultMeta,
@@ -97,6 +167,10 @@ unsafe fn execute<F>(
 where
     F: FnOnce() -> i32,
 {
+    if regions_alias(ins, outs, sizes, meta) {
+        // Write nothing: zeroing an aliased output would destroy an input.
+        return ERR_PARSE;
+    }
     let code = match catch_unwind(AssertUnwindSafe(|| {
         maybe_force_panic();
         work()
@@ -122,7 +196,7 @@ unsafe fn input_slice<'a>(input: *const u8, len: usize) -> Result<&'a [u8], i32>
     if len == 0 {
         return Ok(&[]);
     }
-    if input.is_null() {
+    if input.is_null() || len > MAX_FFI_INPUT_LEN {
         return Err(ERR_PARSE);
     }
     // SAFETY: the C caller promises a readable region of `len` bytes.
@@ -146,6 +220,47 @@ unsafe fn copy_output(output: *mut u8, bytes: &[u8]) {
     if !bytes.is_empty() {
         // SAFETY: output_contract validated sufficient writable capacity.
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len()) };
+    }
+}
+
+/// Rust-side copies of canonical state / RVBJ1 bytes hold every ratchet secret;
+/// wipe them once they have been copied to the caller (on every path).
+trait WipeSecrets {
+    fn wipe(&mut self);
+}
+
+impl WipeSecrets for Vec<u8> {
+    fn wipe(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl WipeSecrets for PipelineResult {
+    fn wipe(&mut self) {
+        self.candidate_bytes.zeroize();
+        self.intent_bytes.zeroize();
+    }
+}
+
+impl WipeSecrets for StateResult {
+    fn wipe(&mut self) {
+        self.state_bytes.zeroize();
+    }
+}
+
+struct Wiped<T: WipeSecrets>(T);
+
+impl<T: WipeSecrets> core::ops::Deref for Wiped<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: WipeSecrets> Drop for Wiped<T> {
+    fn drop(&mut self) {
+        self.0.wipe();
     }
 }
 
@@ -221,17 +336,23 @@ pub unsafe extern "C" fn raven_fb_init_measure(
 ) -> i32 {
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&[], out_need, ptr::null_mut(), || {
-            let result = (|| {
-                require_sizes(out_need)?;
-                let init = input_slice(init_ptr, init_len)?;
-                let state = init_write(init)?;
-                let sizes = sizes_for(state.len(), 0, 0)?;
-                write_sizes(out_need, sizes);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[(init_ptr, init_len)],
+            &[],
+            out_need,
+            ptr::null_mut(),
+            || {
+                let result = (|| {
+                    require_sizes(out_need)?;
+                    let init = input_slice(init_ptr, init_len)?;
+                    let state = Wiped(init_write(init)?);
+                    let sizes = sizes_for(state.len(), 0, 0)?;
+                    write_sizes(out_need, sizes);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -254,20 +375,26 @@ pub unsafe extern "C" fn raven_fb_init_write(
     }];
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&outs, ptr::null_mut(), meta_out, || {
-            let result = (|| {
-                require_meta(meta_out)?;
-                output_contract(state_out_ptr, state_cap, 0)?;
-                let init = input_slice(init_ptr, init_len)?;
-                let state = init_write(init)?;
-                output_contract(state_out_ptr, state_cap, state.len())?;
-                let meta = init_pipeline_meta(&state)?;
-                copy_output(state_out_ptr, &state);
-                write_result_meta(meta_out, meta);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[(init_ptr, init_len)],
+            &outs,
+            ptr::null_mut(),
+            meta_out,
+            || {
+                let result = (|| {
+                    require_meta(meta_out)?;
+                    output_contract(state_out_ptr, state_cap, 0)?;
+                    let init = input_slice(init_ptr, init_len)?;
+                    let state = Wiped(init_write(init)?);
+                    output_contract(state_out_ptr, state_cap, state.len())?;
+                    let meta = init_pipeline_meta(&state)?;
+                    copy_output(state_out_ptr, &state);
+                    write_result_meta(meta_out, meta);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -287,26 +414,36 @@ pub unsafe extern "C" fn raven_fb_transition_measure(
 ) -> i32 {
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&[], out_need, ptr::null_mut(), || {
-            let result = (|| {
-                require_sizes(out_need)?;
-                let state = input_slice(state_in_ptr, state_in_len)?;
-                let input = input_slice(input_ptr, input_len)?;
-                let env = input_slice(env_ptr, env_len)?;
-                let mut crypto = LabCrypto::default();
-                let output = transition_prepare(state, input, env, &mut crypto)?;
-                write_sizes(
-                    out_need,
-                    sizes_for(
-                        output.candidate_bytes.len(),
-                        output.outputs_bytes.len(),
-                        output.intent_bytes.len(),
-                    )?,
-                );
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[
+                (state_in_ptr, state_in_len),
+                (input_ptr, input_len),
+                (env_ptr, env_len),
+            ],
+            &[],
+            out_need,
+            ptr::null_mut(),
+            || {
+                let result = (|| {
+                    require_sizes(out_need)?;
+                    let state = input_slice(state_in_ptr, state_in_len)?;
+                    let input = input_slice(input_ptr, input_len)?;
+                    let env = input_slice(env_ptr, env_len)?;
+                    let mut crypto = LabCrypto::default();
+                    let output = Wiped(transition_prepare(state, input, env, &mut crypto)?);
+                    write_sizes(
+                        out_need,
+                        sizes_for(
+                            output.candidate_bytes.len(),
+                            output.outputs_bytes.len(),
+                            output.intent_bytes.len(),
+                        )?,
+                    );
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -350,32 +487,42 @@ pub unsafe extern "C" fn raven_fb_transition_write(
     ];
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&outs, ptr::null_mut(), meta_out, || {
-            let result = (|| {
-                require_meta(meta_out)?;
-                output_contract(candidate_out_ptr, candidate_cap, 0)?;
-                output_contract(outputs_out_ptr, outputs_cap, 0)?;
-                output_contract(intent_out_ptr, intent_cap, 0)?;
-                let state = input_slice(state_in_ptr, state_in_len)?;
-                let input = input_slice(input_ptr, input_len)?;
-                let env = input_slice(env_ptr, env_len)?;
-                let mut crypto = LabCrypto::default();
-                let output = transition_prepare(state, input, env, &mut crypto)?;
-                output_contract(
-                    candidate_out_ptr,
-                    candidate_cap,
-                    output.candidate_bytes.len(),
-                )?;
-                output_contract(outputs_out_ptr, outputs_cap, output.outputs_bytes.len())?;
-                output_contract(intent_out_ptr, intent_cap, output.intent_bytes.len())?;
-                copy_output(candidate_out_ptr, &output.candidate_bytes);
-                copy_output(outputs_out_ptr, &output.outputs_bytes);
-                copy_output(intent_out_ptr, &output.intent_bytes);
-                write_result_meta(meta_out, output.meta);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[
+                (state_in_ptr, state_in_len),
+                (input_ptr, input_len),
+                (env_ptr, env_len),
+            ],
+            &outs,
+            ptr::null_mut(),
+            meta_out,
+            || {
+                let result = (|| {
+                    require_meta(meta_out)?;
+                    output_contract(candidate_out_ptr, candidate_cap, 0)?;
+                    output_contract(outputs_out_ptr, outputs_cap, 0)?;
+                    output_contract(intent_out_ptr, intent_cap, 0)?;
+                    let state = input_slice(state_in_ptr, state_in_len)?;
+                    let input = input_slice(input_ptr, input_len)?;
+                    let env = input_slice(env_ptr, env_len)?;
+                    let mut crypto = LabCrypto::default();
+                    let output = Wiped(transition_prepare(state, input, env, &mut crypto)?);
+                    output_contract(
+                        candidate_out_ptr,
+                        candidate_cap,
+                        output.candidate_bytes.len(),
+                    )?;
+                    output_contract(outputs_out_ptr, outputs_cap, output.outputs_bytes.len())?;
+                    output_contract(intent_out_ptr, intent_cap, output.intent_bytes.len())?;
+                    copy_output(candidate_out_ptr, &output.candidate_bytes);
+                    copy_output(outputs_out_ptr, &output.outputs_bytes);
+                    copy_output(intent_out_ptr, &output.intent_bytes);
+                    write_result_meta(meta_out, output.meta);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -393,17 +540,23 @@ pub unsafe extern "C" fn raven_fb_promote_measure(
 ) -> i32 {
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&[], out_need, ptr::null_mut(), || {
-            let result = (|| {
-                require_sizes(out_need)?;
-                let live = input_slice(live_state_ptr, live_state_len)?;
-                let intent = input_slice(intent_ptr, intent_len)?;
-                let output = promote_state(live, intent)?;
-                write_sizes(out_need, sizes_for(output.state_bytes.len(), 0, 0)?);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[(live_state_ptr, live_state_len), (intent_ptr, intent_len)],
+            &[],
+            out_need,
+            ptr::null_mut(),
+            || {
+                let result = (|| {
+                    require_sizes(out_need)?;
+                    let live = input_slice(live_state_ptr, live_state_len)?;
+                    let intent = input_slice(intent_ptr, intent_len)?;
+                    let output = Wiped(promote_state(live, intent)?);
+                    write_sizes(out_need, sizes_for(output.state_bytes.len(), 0, 0)?);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -428,20 +581,26 @@ pub unsafe extern "C" fn raven_fb_promote_write(
     }];
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&outs, ptr::null_mut(), meta_out, || {
-            let result = (|| {
-                require_meta(meta_out)?;
-                output_contract(state_out_ptr, state_cap, 0)?;
-                let live = input_slice(live_state_ptr, live_state_len)?;
-                let intent = input_slice(intent_ptr, intent_len)?;
-                let output = promote_state(live, intent)?;
-                output_contract(state_out_ptr, state_cap, output.state_bytes.len())?;
-                copy_output(state_out_ptr, &output.state_bytes);
-                write_result_meta(meta_out, output.meta);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[(live_state_ptr, live_state_len), (intent_ptr, intent_len)],
+            &outs,
+            ptr::null_mut(),
+            meta_out,
+            || {
+                let result = (|| {
+                    require_meta(meta_out)?;
+                    output_contract(state_out_ptr, state_cap, 0)?;
+                    let live = input_slice(live_state_ptr, live_state_len)?;
+                    let intent = input_slice(intent_ptr, intent_len)?;
+                    let output = Wiped(promote_state(live, intent)?);
+                    output_contract(state_out_ptr, state_cap, output.state_bytes.len())?;
+                    copy_output(state_out_ptr, &output.state_bytes);
+                    write_result_meta(meta_out, output.meta);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -457,16 +616,22 @@ pub unsafe extern "C" fn raven_fb_rvor_materialize_measure(
 ) -> i32 {
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&[], out_need, ptr::null_mut(), || {
-            let result = (|| {
-                require_sizes(out_need)?;
-                let intent = input_slice(intent_ptr, intent_len)?;
-                let output = materialize_rvor(intent)?;
-                write_sizes(out_need, sizes_for(0, output.rvor_bytes.len(), 0)?);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[(intent_ptr, intent_len)],
+            &[],
+            out_need,
+            ptr::null_mut(),
+            || {
+                let result = (|| {
+                    require_sizes(out_need)?;
+                    let intent = input_slice(intent_ptr, intent_len)?;
+                    let output = materialize_rvor(intent)?;
+                    write_sizes(out_need, sizes_for(0, output.rvor_bytes.len(), 0)?);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -489,19 +654,25 @@ pub unsafe extern "C" fn raven_fb_rvor_materialize_write(
     }];
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&outs, ptr::null_mut(), meta_out, || {
-            let result = (|| {
-                require_meta(meta_out)?;
-                output_contract(rvor_out_ptr, rvor_cap, 0)?;
-                let intent = input_slice(intent_ptr, intent_len)?;
-                let output = materialize_rvor(intent)?;
-                output_contract(rvor_out_ptr, rvor_cap, output.rvor_bytes.len())?;
-                copy_output(rvor_out_ptr, &output.rvor_bytes);
-                write_result_meta(meta_out, output.meta);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[(intent_ptr, intent_len)],
+            &outs,
+            ptr::null_mut(),
+            meta_out,
+            || {
+                let result = (|| {
+                    require_meta(meta_out)?;
+                    output_contract(rvor_out_ptr, rvor_cap, 0)?;
+                    let intent = input_slice(intent_ptr, intent_len)?;
+                    let output = materialize_rvor(intent)?;
+                    output_contract(rvor_out_ptr, rvor_cap, output.rvor_bytes.len())?;
+                    copy_output(rvor_out_ptr, &output.rvor_bytes);
+                    write_result_meta(meta_out, output.meta);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -523,18 +694,28 @@ pub unsafe extern "C" fn raven_fb_clear_pending_measure(
 ) -> i32 {
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&[], out_need, ptr::null_mut(), || {
-            let result = (|| {
-                require_sizes(out_need)?;
-                let live = input_slice(live_state_ptr, live_state_len)?;
-                let intent = input_slice(intent_ptr, intent_len)?;
-                let rvor = input_slice(rvor_ptr, rvor_len)?;
-                let output = clear_pending(live, intent, rvor, now_ms)?;
-                write_sizes(out_need, sizes_for(output.state_bytes.len(), 0, 0)?);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[
+                (live_state_ptr, live_state_len),
+                (intent_ptr, intent_len),
+                (rvor_ptr, rvor_len),
+            ],
+            &[],
+            out_need,
+            ptr::null_mut(),
+            || {
+                let result = (|| {
+                    require_sizes(out_need)?;
+                    let live = input_slice(live_state_ptr, live_state_len)?;
+                    let intent = input_slice(intent_ptr, intent_len)?;
+                    let rvor = input_slice(rvor_ptr, rvor_len)?;
+                    let output = Wiped(clear_pending(live, intent, rvor, now_ms)?);
+                    write_sizes(out_need, sizes_for(output.state_bytes.len(), 0, 0)?);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -563,21 +744,31 @@ pub unsafe extern "C" fn raven_fb_clear_pending_write(
     }];
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&outs, ptr::null_mut(), meta_out, || {
-            let result = (|| {
-                require_meta(meta_out)?;
-                output_contract(state_out_ptr, state_cap, 0)?;
-                let live = input_slice(live_state_ptr, live_state_len)?;
-                let intent = input_slice(intent_ptr, intent_len)?;
-                let rvor = input_slice(rvor_ptr, rvor_len)?;
-                let output = clear_pending(live, intent, rvor, now_ms)?;
-                output_contract(state_out_ptr, state_cap, output.state_bytes.len())?;
-                copy_output(state_out_ptr, &output.state_bytes);
-                write_result_meta(meta_out, output.meta);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[
+                (live_state_ptr, live_state_len),
+                (intent_ptr, intent_len),
+                (rvor_ptr, rvor_len),
+            ],
+            &outs,
+            ptr::null_mut(),
+            meta_out,
+            || {
+                let result = (|| {
+                    require_meta(meta_out)?;
+                    output_contract(state_out_ptr, state_cap, 0)?;
+                    let live = input_slice(live_state_ptr, live_state_len)?;
+                    let intent = input_slice(intent_ptr, intent_len)?;
+                    let rvor = input_slice(rvor_ptr, rvor_len)?;
+                    let output = Wiped(clear_pending(live, intent, rvor, now_ms)?);
+                    output_contract(state_out_ptr, state_cap, output.state_bytes.len())?;
+                    copy_output(state_out_ptr, &output.state_bytes);
+                    write_result_meta(meta_out, output.meta);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -595,17 +786,23 @@ pub unsafe extern "C" fn raven_fb_recover_measure(
 ) -> i32 {
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&[], out_need, ptr::null_mut(), || {
-            let result = (|| {
-                require_sizes(out_need)?;
-                let live = input_slice(live_state_ptr, live_state_len)?;
-                let intent = input_slice(intent_ptr, intent_len)?;
-                let output = recover_state(live, intent)?;
-                write_sizes(out_need, sizes_for(output.state_bytes.len(), 0, 0)?);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[(live_state_ptr, live_state_len), (intent_ptr, intent_len)],
+            &[],
+            out_need,
+            ptr::null_mut(),
+            || {
+                let result = (|| {
+                    require_sizes(out_need)?;
+                    let live = input_slice(live_state_ptr, live_state_len)?;
+                    let intent = input_slice(intent_ptr, intent_len)?;
+                    let output = Wiped(recover_state(live, intent)?);
+                    write_sizes(out_need, sizes_for(output.state_bytes.len(), 0, 0)?);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -630,20 +827,26 @@ pub unsafe extern "C" fn raven_fb_recover_write(
     }];
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&outs, ptr::null_mut(), meta_out, || {
-            let result = (|| {
-                require_meta(meta_out)?;
-                output_contract(state_out_ptr, state_cap, 0)?;
-                let live = input_slice(live_state_ptr, live_state_len)?;
-                let intent = input_slice(intent_ptr, intent_len)?;
-                let output = recover_state(live, intent)?;
-                output_contract(state_out_ptr, state_cap, output.state_bytes.len())?;
-                copy_output(state_out_ptr, &output.state_bytes);
-                write_result_meta(meta_out, output.meta);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[(live_state_ptr, live_state_len), (intent_ptr, intent_len)],
+            &outs,
+            ptr::null_mut(),
+            meta_out,
+            || {
+                let result = (|| {
+                    require_meta(meta_out)?;
+                    output_contract(state_out_ptr, state_cap, 0)?;
+                    let live = input_slice(live_state_ptr, live_state_len)?;
+                    let intent = input_slice(intent_ptr, intent_len)?;
+                    let output = Wiped(recover_state(live, intent)?);
+                    output_contract(state_out_ptr, state_cap, output.state_bytes.len())?;
+                    copy_output(state_out_ptr, &output.state_bytes);
+                    write_result_meta(meta_out, output.meta);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -662,20 +865,29 @@ pub unsafe extern "C" fn raven_fb_terminalize_conflict_measure(
 ) -> i32 {
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&[], out_need, ptr::null_mut(), || {
-            let result = (|| {
-                require_sizes(out_need)?;
-                let live = input_slice(live_state_ptr, live_state_len)?;
-                let original = input_slice(original_intent_ptr, original_intent_len)?;
-                let output = terminalize_conflict(live, original, now_ms)?;
-                write_sizes(
-                    out_need,
-                    sizes_for(output.candidate_bytes.len(), 0, output.intent_bytes.len())?,
-                );
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[
+                (live_state_ptr, live_state_len),
+                (original_intent_ptr, original_intent_len),
+            ],
+            &[],
+            out_need,
+            ptr::null_mut(),
+            || {
+                let result = (|| {
+                    require_sizes(out_need)?;
+                    let live = input_slice(live_state_ptr, live_state_len)?;
+                    let original = input_slice(original_intent_ptr, original_intent_len)?;
+                    let output = Wiped(terminalize_conflict(live, original, now_ms)?);
+                    write_sizes(
+                        out_need,
+                        sizes_for(output.candidate_bytes.len(), 0, output.intent_bytes.len())?,
+                    );
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -711,31 +923,40 @@ pub unsafe extern "C" fn raven_fb_terminalize_conflict_write(
     ];
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&outs, ptr::null_mut(), meta_out, || {
-            let result = (|| {
-                require_meta(meta_out)?;
-                output_contract(terminal_candidate_out_ptr, terminal_candidate_cap, 0)?;
-                output_contract(repair_intent_out_ptr, repair_intent_cap, 0)?;
-                let live = input_slice(live_state_ptr, live_state_len)?;
-                let original = input_slice(original_intent_ptr, original_intent_len)?;
-                let output = terminalize_conflict(live, original, now_ms)?;
-                output_contract(
-                    terminal_candidate_out_ptr,
-                    terminal_candidate_cap,
-                    output.candidate_bytes.len(),
-                )?;
-                output_contract(
-                    repair_intent_out_ptr,
-                    repair_intent_cap,
-                    output.intent_bytes.len(),
-                )?;
-                copy_output(terminal_candidate_out_ptr, &output.candidate_bytes);
-                copy_output(repair_intent_out_ptr, &output.intent_bytes);
-                write_result_meta(meta_out, output.meta);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[
+                (live_state_ptr, live_state_len),
+                (original_intent_ptr, original_intent_len),
+            ],
+            &outs,
+            ptr::null_mut(),
+            meta_out,
+            || {
+                let result = (|| {
+                    require_meta(meta_out)?;
+                    output_contract(terminal_candidate_out_ptr, terminal_candidate_cap, 0)?;
+                    output_contract(repair_intent_out_ptr, repair_intent_cap, 0)?;
+                    let live = input_slice(live_state_ptr, live_state_len)?;
+                    let original = input_slice(original_intent_ptr, original_intent_len)?;
+                    let output = Wiped(terminalize_conflict(live, original, now_ms)?);
+                    output_contract(
+                        terminal_candidate_out_ptr,
+                        terminal_candidate_cap,
+                        output.candidate_bytes.len(),
+                    )?;
+                    output_contract(
+                        repair_intent_out_ptr,
+                        repair_intent_cap,
+                        output.intent_bytes.len(),
+                    )?;
+                    copy_output(terminal_candidate_out_ptr, &output.candidate_bytes);
+                    copy_output(repair_intent_out_ptr, &output.intent_bytes);
+                    write_result_meta(meta_out, output.meta);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -757,21 +978,31 @@ pub unsafe extern "C" fn raven_fb_terminalize_expired_measure(
 ) -> i32 {
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&[], out_need, ptr::null_mut(), || {
-            let result = (|| {
-                require_sizes(out_need)?;
-                let live = input_slice(live_state_ptr, live_state_len)?;
-                let original = input_slice(original_intent_ptr, original_intent_len)?;
-                let rvor = input_slice(rvor_ptr, rvor_len)?;
-                let output = terminalize_expired(live, original, rvor, now_ms)?;
-                write_sizes(
-                    out_need,
-                    sizes_for(output.candidate_bytes.len(), 0, output.intent_bytes.len())?,
-                );
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[
+                (live_state_ptr, live_state_len),
+                (original_intent_ptr, original_intent_len),
+                (rvor_ptr, rvor_len),
+            ],
+            &[],
+            out_need,
+            ptr::null_mut(),
+            || {
+                let result = (|| {
+                    require_sizes(out_need)?;
+                    let live = input_slice(live_state_ptr, live_state_len)?;
+                    let original = input_slice(original_intent_ptr, original_intent_len)?;
+                    let rvor = input_slice(rvor_ptr, rvor_len)?;
+                    let output = Wiped(terminalize_expired(live, original, rvor, now_ms)?);
+                    write_sizes(
+                        out_need,
+                        sizes_for(output.candidate_bytes.len(), 0, output.intent_bytes.len())?,
+                    );
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -809,32 +1040,42 @@ pub unsafe extern "C" fn raven_fb_terminalize_expired_write(
     ];
     // SAFETY: all raw-pointer access remains inside checked helpers.
     unsafe {
-        execute(&outs, ptr::null_mut(), meta_out, || {
-            let result = (|| {
-                require_meta(meta_out)?;
-                output_contract(terminal_candidate_out_ptr, terminal_candidate_cap, 0)?;
-                output_contract(repair_intent_out_ptr, repair_intent_cap, 0)?;
-                let live = input_slice(live_state_ptr, live_state_len)?;
-                let original = input_slice(original_intent_ptr, original_intent_len)?;
-                let rvor = input_slice(rvor_ptr, rvor_len)?;
-                let output = terminalize_expired(live, original, rvor, now_ms)?;
-                output_contract(
-                    terminal_candidate_out_ptr,
-                    terminal_candidate_cap,
-                    output.candidate_bytes.len(),
-                )?;
-                output_contract(
-                    repair_intent_out_ptr,
-                    repair_intent_cap,
-                    output.intent_bytes.len(),
-                )?;
-                copy_output(terminal_candidate_out_ptr, &output.candidate_bytes);
-                copy_output(repair_intent_out_ptr, &output.intent_bytes);
-                write_result_meta(meta_out, output.meta);
-                Ok::<(), i32>(())
-            })();
-            result.map_or_else(|code| code, |()| ERR_OK)
-        })
+        execute(
+            &[
+                (live_state_ptr, live_state_len),
+                (original_intent_ptr, original_intent_len),
+                (rvor_ptr, rvor_len),
+            ],
+            &outs,
+            ptr::null_mut(),
+            meta_out,
+            || {
+                let result = (|| {
+                    require_meta(meta_out)?;
+                    output_contract(terminal_candidate_out_ptr, terminal_candidate_cap, 0)?;
+                    output_contract(repair_intent_out_ptr, repair_intent_cap, 0)?;
+                    let live = input_slice(live_state_ptr, live_state_len)?;
+                    let original = input_slice(original_intent_ptr, original_intent_len)?;
+                    let rvor = input_slice(rvor_ptr, rvor_len)?;
+                    let output = Wiped(terminalize_expired(live, original, rvor, now_ms)?);
+                    output_contract(
+                        terminal_candidate_out_ptr,
+                        terminal_candidate_cap,
+                        output.candidate_bytes.len(),
+                    )?;
+                    output_contract(
+                        repair_intent_out_ptr,
+                        repair_intent_cap,
+                        output.intent_bytes.len(),
+                    )?;
+                    copy_output(terminal_candidate_out_ptr, &output.candidate_bytes);
+                    copy_output(repair_intent_out_ptr, &output.intent_bytes);
+                    write_result_meta(meta_out, output.meta);
+                    Ok::<(), i32>(())
+                })();
+                result.map_or_else(|code| code, |()| ERR_OK)
+            },
+        )
     }
 }
 
@@ -1072,6 +1313,80 @@ mod tests {
     }
 
     #[test]
+    fn aliased_output_is_rejected_without_touching_the_live_state() {
+        let (before, original_intent, _) = ffi_prepare();
+        // Recover "echoes live state", so writing it in place is tempting; an
+        // error must not zero the caller's only copy through the alias.
+        let mut live = before.clone();
+        let len = live.len();
+        let mut meta = RavenFbResultMeta::default();
+        let bogus_intent = [0xEE; 64];
+        let code = unsafe {
+            raven_fb_recover_write(
+                live.as_ptr(),
+                len,
+                bogus_intent.as_ptr(),
+                bogus_intent.len(),
+                live.as_mut_ptr(),
+                len,
+                &mut meta,
+            )
+        };
+        assert_eq!(code, ERR_PARSE);
+        assert_eq!(live, before);
+
+        // Even a call that would otherwise succeed is refused while aliased.
+        let code = unsafe {
+            raven_fb_recover_write(
+                live.as_ptr(),
+                len,
+                original_intent.as_ptr(),
+                original_intent.len(),
+                live.as_mut_ptr(),
+                len,
+                &mut meta,
+            )
+        };
+        assert_eq!(code, ERR_PARSE);
+        assert_eq!(live, before);
+
+        // Overlapping outputs are rejected too.
+        let mut outputs = vec![0u8; MAX_RVBJ1];
+        let base = outputs.as_mut_ptr();
+        let code = unsafe {
+            raven_fb_terminalize_conflict_write(
+                before.as_ptr(),
+                before.len(),
+                original_intent.as_ptr(),
+                original_intent.len(),
+                2_000,
+                base,
+                BRAID_MAX_CANONICAL_STATE_BYTES,
+                base.add(16),
+                MAX_RVBJ1 - 16,
+                &mut meta,
+            )
+        };
+        assert_eq!(code, ERR_PARSE);
+    }
+
+    #[test]
+    fn oversized_input_length_is_parse_before_slicing() {
+        let init = sample_init_bytes();
+        let mut need = RavenFbSizes::default();
+        assert_eq!(
+            unsafe { raven_fb_init_measure(init.as_ptr(), usize::MAX, &mut need) },
+            ERR_PARSE
+        );
+        let big = vec![0u8; MAX_FFI_INPUT_LEN + 1];
+        assert_eq!(
+            unsafe { raven_fb_init_measure(big.as_ptr(), big.len(), &mut need) },
+            ERR_PARSE
+        );
+        assert_eq!(need, RavenFbSizes::default());
+    }
+
+    #[test]
     fn caught_panic_returns_internal_and_zeroes_outputs() {
         let init = sample_init_bytes();
         let mut need = RavenFbSizes {
@@ -1224,7 +1539,7 @@ mod tests {
     fn terminalize_conflict_measure_write_produces_repair_intent() {
         let (before, original_intent, _) = ffi_prepare();
         let mut conflict = decode_rvfb1(&before).unwrap();
-        conflict.prefix.generation = 77;
+        conflict.prefix.auth_root[0] ^= 1;
         let conflict = encode_rvfb1(&conflict).unwrap();
 
         let mut need = RavenFbSizes::default();

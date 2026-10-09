@@ -1,6 +1,10 @@
 //! RVFI1 init parse + post-init state bootstrap (design §4.2).
 
-use crate::hybrid_ratchet_v2::{kdf_rk, ratchet_init_alice_scka, ratchet_init_bob_scka};
+use std::fmt;
+
+use zeroize::Zeroize;
+
+use crate::hybrid_ratchet_v2::{ratchet_init_alice_scka, ratchet_init_bob_scka, SckaInitOut};
 use crate::hybrid_ratchet_v2_full_braid::authenticator::AuthState;
 use crate::hybrid_ratchet_v2_full_braid::constants::{
     AGENT_KEYS_UNSAMPLED, AGENT_NO_HEADER_RECEIVED, ERR_PARSE,
@@ -12,8 +16,7 @@ use crate::hybrid_ratchet_v2_full_braid::wire_rvft1::{Rvft1, SckaChainEntry};
 use crate::hybrid_ratchet_v2_full_braid::wire_util::{
     expect_magic, read_array32, read_bytes, read_u8, reject_trailing, WireResult,
 };
-use crate::hybrid_ratchet_v2_tr::x25519_dh;
-use crate::hybrid_ratchet_v2_tr::x25519_public;
+use crate::hybrid_ratchet_v2_tr::{ec_dr_init_alice, ec_dr_init_bob, x25519_public, EcDrState};
 
 pub const RVFI1_MAGIC: &[u8; 8] = b"RVFI1\0\0\0";
 pub const RVFI1_LEN: usize = 176;
@@ -22,7 +25,8 @@ pub const RVFI1_SCHEMA: u16 = 1;
 pub const ROLE_ALICE: u8 = 0;
 pub const ROLE_BOB: u8 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Session roots and the role DH private key: wiped on drop, redacted from Debug.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Rvfi1 {
     pub session_id: [u8; 32],
     pub role: u8,
@@ -30,6 +34,25 @@ pub struct Rvfi1 {
     pub sk_scka: [u8; 32],
     pub bob_spk_pub: [u8; 32],
     pub role_material: [u8; 32],
+}
+
+impl fmt::Debug for Rvfi1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rvfi1")
+            .field("session_id", &self.session_id)
+            .field("role", &self.role)
+            .field("bob_spk_pub", &self.bob_spk_pub)
+            .field("secrets", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for Rvfi1 {
+    fn drop(&mut self) {
+        self.sk_ec.zeroize();
+        self.sk_scka.zeroize();
+        self.role_material.zeroize();
+    }
 }
 
 pub fn decode_rvfi1(data: &[u8]) -> WireResult<Rvfi1> {
@@ -94,71 +117,53 @@ fn scka_init_chain(ck: [u8; 32]) -> Vec<SckaChainEntry> {
     vec![SckaChainEntry { epoch: 0, ck, n: 0 }]
 }
 
+/// Copy an initialised EC Double Ratchet into RVFT1 (no skipped keys at init).
+fn rvft1_from_ec(ec: &EcDrState, scka: &SckaInitOut) -> Rvft1 {
+    Rvft1 {
+        scka_rk: scka.rk,
+        scka_sending_epoch: 0,
+        scka_receiving_epoch: 0,
+        scka_send_chain: scka_init_chain(scka.ck_send),
+        scka_recv_chain: scka_init_chain(scka.ck_recv),
+        scka_send_pn: 0,
+        scka_skipped: Vec::new(),
+        ec_rk: ec.rk,
+        ec_dhs_priv: ec.dhs_priv,
+        ec_dhs_pub: ec.dhs_pub,
+        ec_dhr_present: ec.dhr_pub.is_some() as u8,
+        ec_dhr_pub: ec.dhr_pub.unwrap_or([0u8; 32]),
+        ec_ck_send_present: ec.cks.is_some() as u8,
+        ec_ck_recv_present: ec.ckr.is_some() as u8,
+        ec_ck_send: ec.cks.unwrap_or([0u8; 32]),
+        ec_ck_recv: ec.ckr.unwrap_or([0u8; 32]),
+        ec_ns: ec.ns,
+        ec_nr: ec.nr,
+        ec_pn: ec.pn,
+        ec_skipped: Vec::new(),
+    }
+}
+
+/// Alice: `SK_ec` is the EC root only; her ratchet key is the ephemeral
+/// `role_material`, whose DH with Bob's SPK seeds her first sending chain.
 fn rvft1_alice_init(
     sk_ec: &[u8; 32],
     sk_scka: &[u8; 32],
     bob_spk_pub: &[u8; 32],
-    alice_dh_seed: &[u8; 32],
+    alice_dh_priv: &[u8; 32],
 ) -> WireResult<Rvft1> {
-    let dh_ss = x25519_dh(alice_dh_seed, bob_spk_pub).map_err(|e| e.to_string())?;
-    let mut rk = [0u8; 32];
-    rk.copy_from_slice(sk_ec);
-    let (ec_rk, ec_ck_send) = kdf_rk(&rk, &dh_ss).map_err(|e| e.to_string())?;
-    let ec_dhs_pub = x25519_public(sk_ec).map_err(|e| e.to_string())?;
-    let scka = ratchet_init_alice_scka(sk_scka);
-
-    Ok(Rvft1 {
-        scka_rk: scka.rk,
-        scka_sending_epoch: 0,
-        scka_receiving_epoch: 0,
-        scka_send_chain: scka_init_chain(scka.ck_send),
-        scka_recv_chain: scka_init_chain(scka.ck_recv),
-        scka_send_pn: 0,
-        scka_skipped: Vec::new(),
-        ec_rk,
-        ec_dhs_priv: *sk_ec,
-        ec_dhs_pub,
-        ec_dhr_present: 1,
-        ec_dhr_pub: *bob_spk_pub,
-        ec_ck_send_present: 1,
-        ec_ck_recv_present: 0,
-        ec_ck_send,
-        ec_ck_recv: [0u8; 32],
-        ec_ns: 0,
-        ec_nr: 0,
-        ec_pn: 0,
-        ec_skipped: Vec::new(),
-    })
+    let ec = ec_dr_init_alice(sk_ec, alice_dh_priv, bob_spk_pub).map_err(|e| e.to_string())?;
+    Ok(rvft1_from_ec(&ec, &ratchet_init_alice_scka(sk_scka)))
 }
 
-fn rvft1_bob_init(sk_ec: &[u8; 32], sk_scka: &[u8; 32]) -> WireResult<Rvft1> {
-    let ec_dhs_pub = x25519_public(sk_ec).map_err(|e| e.to_string())?;
-    let scka = ratchet_init_bob_scka(sk_scka);
-    let mut rk = [0u8; 32];
-    rk.copy_from_slice(sk_ec);
-
-    Ok(Rvft1 {
-        scka_rk: scka.rk,
-        scka_sending_epoch: 0,
-        scka_receiving_epoch: 0,
-        scka_send_chain: scka_init_chain(scka.ck_send),
-        scka_recv_chain: scka_init_chain(scka.ck_recv),
-        scka_send_pn: 0,
-        scka_skipped: Vec::new(),
-        ec_rk: rk,
-        ec_dhs_priv: *sk_ec,
-        ec_dhs_pub,
-        ec_dhr_present: 0,
-        ec_dhr_pub: [0u8; 32],
-        ec_ck_send_present: 0,
-        ec_ck_recv_present: 0,
-        ec_ck_send: [0u8; 32],
-        ec_ck_recv: [0u8; 32],
-        ec_ns: 0,
-        ec_nr: 0,
-        ec_pn: 0,
-        ec_skipped: Vec::new(),
-    })
+/// Bob: his ratchet key is the SPK private key (`role_material`); `SK_ec` is
+/// the EC root only and is never used as a DH private key.
+fn rvft1_bob_init(
+    sk_ec: &[u8; 32],
+    sk_scka: &[u8; 32],
+    bob_spk_priv: &[u8; 32],
+) -> WireResult<Rvft1> {
+    let ec = ec_dr_init_bob(sk_ec, bob_spk_priv).map_err(|e| e.to_string())?;
+    Ok(rvft1_from_ec(&ec, &ratchet_init_bob_scka(sk_scka)))
 }
 
 pub fn init_state_from_rvfi1(init: &Rvfi1) -> WireResult<Rvfb1State> {
@@ -215,7 +220,7 @@ pub fn init_state_from_rvfi1(init: &Rvfi1) -> WireResult<Rvfb1State> {
                 objects: Vec::new(),
                 replays: Vec::new(),
                 tlvs: Vec::new(),
-                tr: rvft1_bob_init(&init.sk_ec, &init.sk_scka)?,
+                tr: rvft1_bob_init(&init.sk_ec, &init.sk_scka, &init.role_material)?,
             })
         }
         _ => Err("rvfi1 role".into()),
@@ -321,6 +326,67 @@ mod tests {
         let decoded = decode_rvfb1(&wire).unwrap();
         assert_eq!(decoded.prefix.agent, AGENT_NO_HEADER_RECEIVED);
         assert_eq!(decoded.inbound_sets, state.inbound_sets);
+    }
+
+    #[test]
+    fn root_key_is_never_a_dh_private_key_and_bob_derives_alice_chain() {
+        use crate::hybrid_ratchet_v2_tr::{ec_dr_decrypt, ec_dr_encrypt, EcDrHeader};
+
+        let sk_ec = [0x61; 32];
+        let sk_scka = [0x62; 32];
+        let bob_priv = [0x63; 32];
+        let alice = init_state_from_rvfi1(
+            &decode_rvfi1(&sample_rvfi1(ROLE_ALICE, sk_ec, sk_scka, bob_priv)).unwrap(),
+        )
+        .unwrap();
+        let bob = init_state_from_rvfi1(
+            &decode_rvfi1(&sample_rvfi1(ROLE_BOB, sk_ec, sk_scka, bob_priv)).unwrap(),
+        )
+        .unwrap();
+
+        // Alice ratchets with her ephemeral role_material; Bob with his SPK.
+        assert_eq!(alice.tr.ec_dhs_priv, [0xA1; 32]);
+        assert_eq!(alice.tr.ec_dhs_pub, x25519_public(&[0xA1; 32]).unwrap());
+        assert_eq!(bob.tr.ec_dhs_priv, bob_priv);
+        assert_eq!(bob.tr.ec_dhs_pub, x25519_public(&bob_priv).unwrap());
+        assert_eq!(alice.tr.ec_dhr_pub, bob.tr.ec_dhs_pub);
+        assert_ne!(alice.tr.ec_dhs_priv, sk_ec);
+        assert_ne!(bob.tr.ec_dhs_priv, sk_ec);
+        assert_ne!(alice.tr.ec_dhs_pub, bob.tr.ec_dhs_pub);
+        assert_eq!(bob.tr.ec_rk, sk_ec);
+        assert_eq!(bob.tr.ec_ck_send_present, 0);
+
+        // Bob's first receive reproduces Alice's first message key.
+        let to_ec = |tr: &Rvft1| crate::hybrid_ratchet_v2_tr::EcDrState {
+            rk: tr.ec_rk,
+            dhs_priv: tr.ec_dhs_priv,
+            dhs_pub: tr.ec_dhs_pub,
+            dhr_pub: (tr.ec_dhr_present == 1).then_some(tr.ec_dhr_pub),
+            cks: (tr.ec_ck_send_present == 1).then_some(tr.ec_ck_send),
+            ckr: (tr.ec_ck_recv_present == 1).then_some(tr.ec_ck_recv),
+            ns: tr.ec_ns,
+            nr: tr.ec_nr,
+            pn: tr.ec_pn,
+            mkskipped: Default::default(),
+        };
+        let (_, header, alice_mk) = ec_dr_encrypt(&to_ec(&alice.tr)).unwrap();
+        assert_eq!(
+            header,
+            EcDrHeader {
+                dh_pub: alice.tr.ec_dhs_pub,
+                pn: 0,
+                n: 0
+            }
+        );
+        let (_, bob_mk) = ec_dr_decrypt(
+            &to_ec(&bob.tr),
+            &header,
+            crate::hybrid_ratchet_v2::MAX_SKIP,
+            Some(&[0x64; 32]),
+            16,
+        )
+        .unwrap();
+        assert_eq!(bob_mk, alice_mk);
     }
 
     #[test]

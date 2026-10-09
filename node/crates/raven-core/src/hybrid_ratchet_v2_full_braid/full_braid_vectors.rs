@@ -335,6 +335,31 @@ fn shared_vector_sm_round_001_runs_transition_prepare() {
 }
 
 #[test]
+fn shared_vector_rvfi1_init_001_matches_python_init() {
+    use crate::hybrid_ratchet_v2_full_braid::init::init_write;
+    use crate::hybrid_ratchet_v2_full_braid::state_codec::decode_rvfb1;
+
+    let v = load("full_braid_rvfi1_init_001.json");
+    assert_eq!(v["production_enabled"], false);
+    for role in ["alice", "bob"] {
+        let init = hex_bytes(v["inputs"][format!("{role}_rvfi1_hex")].as_str().unwrap());
+        let state = init_write(&init).unwrap();
+        assert_eq!(
+            hex::encode(&state),
+            v["expected"][format!("{role}_rvfb1_hex")].as_str().unwrap(),
+            "{role}"
+        );
+        assert_eq!(
+            hex::encode(decode_rvfb1(&state).unwrap().tr.ec_dhs_pub),
+            v["expected"][format!("{role}_ec_dhs_pub_hex")]
+                .as_str()
+                .unwrap(),
+            "{role}"
+        );
+    }
+}
+
+#[test]
 fn shared_vector_full_exchange_2pq_2dh_001_replays_aead_checkpoints() {
     use crate::hybrid_ratchet_v2_full_braid::agent::{
         AGENT_EK_SENT_CT1_RECEIVED, AGENT_HEADER_RECEIVED,
@@ -393,10 +418,12 @@ fn shared_vector_full_exchange_2pq_2dh_001_replays_aead_checkpoints() {
                 assert_eq!(before.prefix.agent, AGENT_EK_SENT_CT1_RECEIVED, "{name}");
                 assert_eq!(input.mutation.mode, MODE_OPEN, "{name}");
                 assert_eq!(env.ec_dh_seed.len(), 32, "{name}");
-                assert_ne!(
+                // One ciphertext per hybrid key: the receive confirm opens the
+                // peer's RVBO1 sealed_ct byte-for-byte (no second seal).
+                assert_eq!(
                     prior_send_sealed.as_ref(),
                     Some(&input.mutation.body),
-                    "{name}: Receive ciphertext must use its own RVBC1 AD"
+                    "{name}: Receive must open the peer's exact sealed_ct"
                 );
             }
             _ => panic!("{name}: invalid operation"),
@@ -650,4 +677,165 @@ fn shared_vector_full_exchange_2pq_2dh_001_replays_aead_checkpoints() {
     assert_eq!(delivered[0], N_CT1 as u64);
     assert_eq!(delivered[1], N_CT1 as u64);
     assert_eq!(delivered.last().unwrap(), 1);
+}
+
+/// Strictness sweeps for every Full Braid wire codec, built from real fixtures
+/// (the frozen `full_braid_sm_round_001` states/intents/outputs/inputs/envs).
+///
+/// The shared `wire_negatives` vector only dispatches RVBE1/RVBI1, so a dropped
+/// `reject_trailing` or bounds check in any other decoder would otherwise ship
+/// unnoticed. For each codec: the fixture round-trips byte-exactly, every
+/// proper prefix is rejected, one trailing byte is rejected, and every
+/// single-byte corruption either fails or decodes to something that re-encodes
+/// to exactly the corrupted bytes (no lenient, non-canonical acceptance).
+mod codec_sweeps {
+    use super::{hex_bytes, load};
+    use crate::hybrid_ratchet_v2_full_braid::pipeline::materialize_rvor;
+    use crate::hybrid_ratchet_v2_full_braid::state_codec::{decode_rvfb1, encode_rvfb1};
+    use crate::hybrid_ratchet_v2_full_braid::wire_rvbc1::{decode_rvbc1, encode_rvbc1};
+    use crate::hybrid_ratchet_v2_full_braid::wire_rvbe1::{decode_rvbe1, encode_rvbe1};
+    use crate::hybrid_ratchet_v2_full_braid::wire_rvbi1::{decode_rvbi1, encode_rvbi1};
+    use crate::hybrid_ratchet_v2_full_braid::wire_rvbj1::{decode_rvbj1, encode_rvbj1};
+    use crate::hybrid_ratchet_v2_full_braid::wire_rvbm1::{decode_rvbm1, encode_rvbm1, Rvbm1};
+    use crate::hybrid_ratchet_v2_full_braid::wire_rvbo1::{decode_rvbo1, encode_rvbo1};
+    use crate::hybrid_ratchet_v2_full_braid::wire_rvch1::{decode_rvch1, encode_rvch1, Rvch1};
+    use crate::hybrid_ratchet_v2_full_braid::wire_rvft1::{decode_rvft1, encode_rvft1};
+    use crate::hybrid_ratchet_v2_full_braid::wire_rvor1::{decode_rvor1, encode_rvor1};
+    use crate::hybrid_ratchet_v2_full_braid::wire_rvqi1::{
+        decode_rvqi1, encode_rvqi1, Rvqi1, RVQI1_STATUS_QUARANTINED,
+    };
+
+    /// `accept` returns the canonical re-encoding when the input decodes.
+    fn sweep(name: &str, valid: &[u8], accept: impl Fn(&[u8]) -> Option<Vec<u8>>) {
+        assert_eq!(
+            accept(valid).as_deref(),
+            Some(valid),
+            "{name}: fixture must round-trip byte-exactly"
+        );
+        for cut in 0..valid.len() {
+            assert!(
+                accept(&valid[..cut]).is_none(),
+                "{name}: truncation to {cut} of {} bytes was accepted",
+                valid.len()
+            );
+        }
+        let mut longer = valid.to_vec();
+        longer.push(0);
+        assert!(accept(&longer).is_none(), "{name}: trailing byte accepted");
+        for index in 0..valid.len() {
+            for mask in [0x01u8, 0x80, 0xFF] {
+                let mut mutated = valid.to_vec();
+                mutated[index] ^= mask;
+                if let Some(reencoded) = accept(&mutated) {
+                    assert_eq!(
+                        reencoded, mutated,
+                        "{name}: byte {index} ^ {mask:#04x} decoded non-canonically"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_full_braid_codec_rejects_truncation_and_stays_canonical() {
+        let v = load("full_braid_sm_round_001.json");
+        let (inputs, expected) = (&v["inputs"], &v["expected"]);
+        let hex = |value: &serde_json::Value| hex_bytes(value.as_str().unwrap());
+
+        let bob_candidate = hex(&expected["bob_candidate_hex"]);
+        let alice_candidate = hex(&expected["alice_candidate_hex"]);
+        let alice_intent = hex(&expected["alice_intent_hex"]);
+        let bob_intent = hex(&expected["bob_intent_hex"]);
+        let alice_rvbo1 = hex(&expected["alice_rvbo1_hex"]);
+
+        sweep("RVFB1 (bob)", &bob_candidate, |b| {
+            decode_rvfb1(b)
+                .ok()
+                .map(|s| encode_rvfb1(&s).expect("accepted RVFB1 re-encodes"))
+        });
+        sweep("RVFB1 (alice)", &alice_candidate, |b| {
+            decode_rvfb1(b)
+                .ok()
+                .map(|s| encode_rvfb1(&s).expect("accepted RVFB1 re-encodes"))
+        });
+        sweep(
+            "RVFT1",
+            &encode_rvft1(&decode_rvfb1(&bob_candidate).unwrap().tr).unwrap(),
+            |b| {
+                decode_rvft1(b)
+                    .ok()
+                    .map(|t| encode_rvft1(&t).expect("accepted RVFT1 re-encodes"))
+            },
+        );
+        for (name, intent) in [
+            ("RVBJ1 (alice)", &alice_intent),
+            ("RVBJ1 (bob)", &bob_intent),
+        ] {
+            sweep(name, intent, |b| {
+                decode_rvbj1(b)
+                    .ok()
+                    .map(|j| encode_rvbj1(&j).expect("accepted RVBJ1 re-encodes"))
+            });
+        }
+        sweep("RVBO1", &alice_rvbo1, |b| {
+            decode_rvbo1(b)
+                .ok()
+                .map(|o| encode_rvbo1(&o).expect("accepted RVBO1 re-encodes"))
+        });
+        let frame = decode_rvbo1(&alice_rvbo1).unwrap().frames.remove(0);
+        sweep("RVBC1", &frame, |b| {
+            decode_rvbc1(b)
+                .ok()
+                .map(|c| encode_rvbc1(&c).expect("accepted RVBC1 re-encodes"))
+        });
+        let rvor = materialize_rvor(&alice_intent).unwrap().rvor_bytes;
+        sweep("RVOR1", &rvor, |b| {
+            decode_rvor1(b)
+                .ok()
+                .map(|r| encode_rvor1(&r).expect("accepted RVOR1 re-encodes"))
+        });
+        for key in ["send_input_hex", "receive_input_hex"] {
+            sweep(&format!("RVBI1 ({key})"), &hex(&inputs[key]), |b| {
+                decode_rvbi1(b)
+                    .ok()
+                    .map(|i| encode_rvbi1(&i).expect("accepted RVBI1 re-encodes"))
+            });
+        }
+        for key in ["send_env_hex", "receive_env_hex"] {
+            sweep(&format!("RVBE1 ({key})"), &hex(&inputs[key]), |b| {
+                decode_rvbe1(b)
+                    .ok()
+                    .map(|e| encode_rvbe1(&e).expect("accepted RVBE1 re-encodes"))
+            });
+        }
+        sweep("RVBM1", &encode_rvbm1(&Rvbm1::no_aead()).unwrap(), |b| {
+            decode_rvbm1(b)
+                .ok()
+                .map(|m| encode_rvbm1(&m).expect("accepted RVBM1 re-encodes"))
+        });
+        let rvqi = encode_rvqi1(&Rvqi1 {
+            transition_id: [0x11; 32],
+            object_digest: [0x22; 32],
+            status: RVQI1_STATUS_QUARANTINED,
+            cas_tag: 7,
+        })
+        .unwrap();
+        sweep("RVQI1", &rvqi, |b| {
+            decode_rvqi1(b)
+                .ok()
+                .map(|q| encode_rvqi1(&q).expect("accepted RVQI1 re-encodes"))
+        });
+        let rvch = encode_rvch1(&Rvch1 {
+            ec_dh_pub: [0x33; 32],
+            ec_pn: 1,
+            ec_n: 2,
+            scka_epoch: 3,
+            scka_pn: 4,
+            scka_n: 5,
+            direction: 1,
+        });
+        sweep("RVCH1", &rvch, |b| {
+            decode_rvch1(b).ok().map(|c| encode_rvch1(&c))
+        });
+    }
 }

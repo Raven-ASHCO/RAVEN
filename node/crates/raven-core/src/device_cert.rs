@@ -4,9 +4,17 @@
 //! channel; this module implements issuance, local store, expiry checks, and a
 //! local revocation denylist (software substitute until a dedicated revocation
 //! record type is frozen).
+//!
+//! Device tier (current, collapsed): the local certificate certifies the
+//! identity key itself (`device_ed_pub == user_ed_pub`) with one X25519 device
+//! key per data dir, so every local `device_id` shares one lineage. Revoking any
+//! local lineage retires the identity key's device role
+//! (RAVEN_DEVICE_REVOCATION_V1 §2.2, §9.1); per-install device keys are not
+//! implemented.
 
 use crate::identity::Identity;
 use crate::paths::PRIMARY_DEVICE_ID;
+use crate::prekey_lifecycle::MAX_PREKEY_FUTURE_SKEW_MS;
 use crate::records::device_cert_signing_bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
@@ -114,6 +122,46 @@ impl DeviceCertificate {
     }
 }
 
+/// Lineage identifiers of a certificate retired by the local registry
+/// (RAVEN_DEVICE_REVOCATION_V1 §2.1). Retained after the cert itself is
+/// dropped so a re-issued certificate that reuses any retired identifier under
+/// a new `device_id` is still denied (§2.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevokedDeviceLineage {
+    pub device_id: String,
+    #[serde(serialize_with = "ser_32", deserialize_with = "de_32")]
+    pub device_ed_pub: [u8; 32],
+    #[serde(serialize_with = "ser_32", deserialize_with = "de_32")]
+    pub device_x_pub: [u8; 32],
+    #[serde(serialize_with = "ser_32", deserialize_with = "de_32")]
+    pub device_cert_hash: [u8; 32],
+}
+
+impl RevokedDeviceLineage {
+    pub fn of(cert: &DeviceCertificate) -> Result<Self, String> {
+        Ok(Self {
+            device_id: cert.device_id.clone(),
+            device_ed_pub: cert.device_ed_pub,
+            device_x_pub: cert.device_x_pub,
+            device_cert_hash: crate::pair_init::device_certificate_hash(cert)
+                .map_err(|e| format!("device cert hash: {e}"))?,
+        })
+    }
+
+    /// True if `cert` reuses any identifier of this retired lineage.
+    pub fn covers(&self, cert: &DeviceCertificate) -> Result<bool, String> {
+        if self.device_id.as_bytes() == cert.device_id.as_bytes()
+            || self.device_ed_pub == cert.device_ed_pub
+            || self.device_x_pub == cert.device_x_pub
+        {
+            return Ok(true);
+        }
+        let hash = crate::pair_init::device_certificate_hash(cert)
+            .map_err(|e| format!("device cert hash: {e}"))?;
+        Ok(self.device_cert_hash == hash)
+    }
+}
+
 /// Local multi-device registry for one user identity.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DeviceRegistry {
@@ -121,12 +169,15 @@ pub struct DeviceRegistry {
     pub certs: HashMap<String, DeviceCertificate>,
     /// Locally revoked device_ids (no network push in V1).
     pub revoked: HashSet<String>,
+    /// Full lineage of every revoked cert the registry held (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_lineage: Vec<RevokedDeviceLineage>,
 }
 
 impl DeviceRegistry {
     pub fn add(&mut self, cert: DeviceCertificate, now_ms: u64) -> Result<(), String> {
         cert.verify(now_ms)?;
-        if self.revoked.contains(&cert.device_id) {
+        if self.denies_lineage(&cert)? {
             return Err("DEVICE_REVOKED".into());
         }
         self.certs.insert(cert.device_id.clone(), cert);
@@ -135,7 +186,18 @@ impl DeviceRegistry {
 
     pub fn revoke(&mut self, device_id: &str) -> bool {
         self.revoked.insert(device_id.to_string());
-        self.certs.remove(device_id);
+        if let Some(cert) = self.certs.remove(device_id) {
+            // Keep the retired lineage; a hash failure still retires the keys.
+            let lineage = RevokedDeviceLineage::of(&cert).unwrap_or(RevokedDeviceLineage {
+                device_id: cert.device_id.clone(),
+                device_ed_pub: cert.device_ed_pub,
+                device_x_pub: cert.device_x_pub,
+                device_cert_hash: [0u8; 32],
+            });
+            if !self.revoked_lineage.contains(&lineage) {
+                self.revoked_lineage.push(lineage);
+            }
+        }
         true
     }
 
@@ -143,12 +205,26 @@ impl DeviceRegistry {
         self.revoked.contains(device_id)
     }
 
+    /// True if `cert` is revoked by `device_id` or reuses any identifier
+    /// (`device_ed_pub`, `device_x_pub`, `device_cert_hash`) of a retired lineage.
+    pub fn denies_lineage(&self, cert: &DeviceCertificate) -> Result<bool, String> {
+        if self.revoked.contains(&cert.device_id) {
+            return Ok(true);
+        }
+        for lineage in &self.revoked_lineage {
+            if lineage.covers(cert)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn is_authorized(&self, device_id: &str, now_ms: u64) -> bool {
         if self.revoked.contains(device_id) {
             return false;
         }
         match self.certs.get(device_id) {
-            Some(c) => c.verify(now_ms).is_ok(),
+            Some(c) => c.verify(now_ms).is_ok() && matches!(self.denies_lineage(c), Ok(false)),
             None => false,
         }
     }
@@ -156,7 +232,7 @@ impl DeviceRegistry {
     pub fn lookup_by_ed_pub(&self, ed: &[u8; 32], now_ms: u64) -> Option<&DeviceCertificate> {
         self.certs.values().find(|c| {
             &c.device_ed_pub == ed
-                && !self.revoked.contains(&c.device_id)
+                && matches!(self.denies_lineage(c), Ok(false))
                 && c.verify(now_ms).is_ok()
         })
     }
@@ -242,6 +318,17 @@ fn load_or_create_device_x25519(data_dir: &Path) -> Result<[u8; 32], String> {
     Ok(public)
 }
 
+/// How far before "now" a locally issued device certificate starts
+/// (`not_before`). [`DeviceCertificate::verify`] is strict: a peer whose clock is
+/// behind the issuer's rejects a young certificate as `DEVICE_CERT_NOT_YET_VALID`.
+/// PairInit tolerates peer clocks up to [`MAX_PREKEY_FUTURE_SKEW_MS`] ahead (prekey
+/// and init stamps), and that tolerance is only worth anything if the certificate
+/// the same peer presents is already valid for such a peer, right after `ash init`
+/// too. So the start is backdated by that skew plus a margin (a 60 s backdate made
+/// every certificate younger than `skew - 60 s` unusable for a peer 2-5 minutes
+/// behind).
+pub const LOCAL_CERT_BACKDATE_MS: u64 = MAX_PREKEY_FUTURE_SKEW_MS + 5 * 60 * 1_000;
+
 /// Issue or reuse the local primary device certificate for this identity.
 pub fn ensure_local_device_certificate(
     data_dir: &Path,
@@ -254,10 +341,20 @@ pub fn ensure_local_device_certificate(
         } else {
             device_id
         };
+        // RAVEN_DEVICE_REVOCATION_V1 §2.3: every lineage must stay revocable.
+        if device_id.len() > 64 {
+            return Err("DEVICE_ID_LENGTH: device_id must be 1..64 bytes".into());
+        }
         let mut reg = load_device_registry_checked(data_dir)?;
         let now = now_ms();
         if let Some(existing) = reg.certs.get(device_id).cloned() {
-            if existing.device_ed_pub == id.public_key_bytes() && existing.verify(now).is_ok() {
+            // A cert whose lineage was retired (even under another device_id)
+            // is never reused; re-issuance below then fails with DEVICE_REVOKED.
+            if existing.device_ed_pub == id.public_key_bytes()
+                && existing.user_ed_pub == id.public_key_bytes()
+                && existing.verify(now).is_ok()
+                && !reg.denies_lineage(&existing)?
+            {
                 return Ok((existing, reg));
             }
         }
@@ -267,7 +364,7 @@ pub fn ensure_local_device_certificate(
             id.public_key_bytes(),
             x_pub,
             device_id,
-            now.saturating_sub(60_000),
+            now.saturating_sub(LOCAL_CERT_BACKDATE_MS),
             now.saturating_add(365 * 24 * 3600 * 1000),
             0,
         )?;
@@ -287,6 +384,47 @@ pub fn save_device_registry(data_dir: &Path, reg: &DeviceRegistry) -> Result<(),
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A peer whose clock is behind ours by up to the PairInit skew tolerance
+    /// must still accept a *freshly issued* local certificate (the same time
+    /// error `verify_init` / `verify_response` already forgive for prekeys).
+    #[test]
+    fn fresh_local_certificate_is_valid_for_a_peer_clock_within_the_skew() {
+        crate::identity_store::test_enable_locked_file_identity_backend();
+        let id = Identity::from_seed(&[0xd1; 32]);
+        let dir = tempdir().unwrap();
+        let before = super::now_ms();
+        let (cert, _) = ensure_local_device_certificate(dir.path(), &id, "ash-primary").unwrap();
+        const { assert!(LOCAL_CERT_BACKDATE_MS > MAX_PREKEY_FUTURE_SKEW_MS) };
+        // A peer 4 minutes behind (inside the tolerance) accepts it at once...
+        let behind = before.saturating_sub(4 * 60 * 1_000);
+        cert.verify(behind)
+            .expect("fresh cert, peer clock 4 min behind");
+        // ...and so does one exactly at the tolerance.
+        cert.verify(before.saturating_sub(MAX_PREKEY_FUTURE_SKEW_MS))
+            .expect("fresh cert, peer clock at the skew tolerance");
+        // Strictness is intact: a peer far behind still refuses it.
+        assert_eq!(
+            cert.verify(before.saturating_sub(LOCAL_CERT_BACKDATE_MS + 60_000))
+                .unwrap_err(),
+            "DEVICE_CERT_NOT_YET_VALID"
+        );
+        // The 60 s backdate it replaces would have failed the 4-minute case.
+        let old_style = DeviceCertificate::issue(
+            &id,
+            id.public_key_bytes(),
+            [3u8; 32],
+            "ash-primary",
+            before.saturating_sub(60_000),
+            before + 3_600_000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            old_style.verify(behind).unwrap_err(),
+            "DEVICE_CERT_NOT_YET_VALID"
+        );
+    }
 
     #[test]
     fn add_and_revoke_device() {
@@ -323,6 +461,74 @@ mod tests {
         )
         .unwrap();
         assert!(reg.add(cert2, 100).is_err());
+    }
+
+    fn issue_for(user: &Identity, ed: [u8; 32], x: [u8; 32], id: &str) -> DeviceCertificate {
+        DeviceCertificate::issue(user, ed, x, id, 1, u64::MAX / 2, 0).unwrap()
+    }
+
+    /// RAVEN_DEVICE_REVOCATION_V1 §2.2: a retired lineage stays denied when the
+    /// same keys are re-certified under a new device_id.
+    #[test]
+    fn revoked_lineage_blocks_recertification_under_new_device_id() {
+        let user = Identity::generate();
+        let device = Identity::generate();
+        let mut reg = DeviceRegistry::default();
+        reg.add(
+            issue_for(&user, device.public_key_bytes(), [5; 32], "old"),
+            100,
+        )
+        .unwrap();
+        reg.revoke("old");
+
+        let same_ed = issue_for(&user, device.public_key_bytes(), [6; 32], "new-1");
+        assert!(reg.denies_lineage(&same_ed).unwrap());
+        assert_eq!(reg.add(same_ed.clone(), 100).unwrap_err(), "DEVICE_REVOKED");
+        let same_x = issue_for(
+            &user,
+            Identity::generate().public_key_bytes(),
+            [5; 32],
+            "new-2",
+        );
+        assert_eq!(reg.add(same_x, 100).unwrap_err(), "DEVICE_REVOKED");
+        let fresh = issue_for(
+            &user,
+            Identity::generate().public_key_bytes(),
+            [7; 32],
+            "new-3",
+        );
+        reg.add(fresh, 100).unwrap();
+        assert!(reg.is_authorized("new-3", 100));
+
+        let dir = tempdir().unwrap();
+        save_device_registry(dir.path(), &reg).unwrap();
+        let loaded = load_device_registry_checked(dir.path()).unwrap();
+        assert!(loaded.denies_lineage(&same_ed).unwrap());
+    }
+
+    /// Collapsed tier: every local cert is the identity key + the one device
+    /// X25519 key, so retiring any local lineage retires them all; the primary
+    /// must not be silently re-issued over the retired keys.
+    #[test]
+    fn ensure_local_refuses_reissue_over_revoked_collapsed_lineage() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let (second, _) = ensure_local_device_certificate(dir.path(), &id, "second").unwrap();
+        assert_eq!(second.device_ed_pub, id.public_key_bytes());
+        let (primary, _) =
+            ensure_local_device_certificate(dir.path(), &id, PRIMARY_DEVICE_ID).unwrap();
+        with_device_registry_lock(dir.path(), || {
+            let mut reg = load_device_registry_checked(dir.path())?;
+            reg.revoke("second");
+            save_device_registry(dir.path(), &reg)
+        })
+        .unwrap();
+        let reg = load_device_registry_checked(dir.path()).unwrap();
+        assert!(reg.denies_lineage(&primary).unwrap());
+        assert_eq!(
+            ensure_local_device_certificate(dir.path(), &id, PRIMARY_DEVICE_ID).unwrap_err(),
+            "DEVICE_REVOKED"
+        );
     }
 
     #[test]

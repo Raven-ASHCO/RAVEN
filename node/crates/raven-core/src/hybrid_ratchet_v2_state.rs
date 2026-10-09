@@ -7,11 +7,14 @@ use chacha20poly1305::{
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use zeroize::Zeroize;
 
 use crate::hybrid_ratchet_v2::{
     hkdf_sha256, kdf_ck, ratchet_init_alice_scka, ratchet_init_bob_scka, MAX_SKIP, PROFILE,
     SPQR_PROTOCOL_INFO,
 };
+use crate::hybrid_ratchet_v2_tr::MAX_MKSKIPPED_RETAINED;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -33,15 +36,49 @@ pub fn kdf_scka_rk(rk: &[u8; 32], ss: &[u8; 32]) -> Result<([u8; 32], [u8; 32]),
     Ok((rk2, ck))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// SCKA epoch/chain KAT state. Epochs are `EPOCH_TYPE = u64` (ATSAM §5.1) and
+/// every increment fails closed instead of wrapping; root/chain keys are wiped
+/// on drop and never printed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SckaEpochState {
     pub rk: [u8; 32],
     pub ck_send: [u8; 32],
     pub ck_recv: [u8; 32],
-    pub sending_epoch: u32,
-    pub receiving_epoch: u32,
+    pub sending_epoch: u64,
+    pub receiving_epoch: u64,
     pub send_ctr: u32,
     pub recv_ctr: u32,
+}
+
+impl fmt::Debug for SckaEpochState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SckaEpochState")
+            .field("sending_epoch", &self.sending_epoch)
+            .field("receiving_epoch", &self.receiving_epoch)
+            .field("send_ctr", &self.send_ctr)
+            .field("recv_ctr", &self.recv_ctr)
+            .field("keys", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for SckaEpochState {
+    fn drop(&mut self) {
+        self.rk.zeroize();
+        self.ck_send.zeroize();
+        self.ck_recv.zeroize();
+    }
+}
+
+fn next_epoch(epoch: u64) -> Result<u64, String> {
+    epoch
+        .checked_add(1)
+        .ok_or_else(|| "SCKA epoch overflow (EPOCH_TYPE=u64 MUST NOT wrap)".to_string())
+}
+
+fn next_ctr(ctr: u32, what: &str) -> Result<u32, String> {
+    ctr.checked_add(1)
+        .ok_or_else(|| format!("{what} counter overflow"))
 }
 
 pub fn scka_from_init(alice: bool, sk: &[u8; 32]) -> SckaEpochState {
@@ -70,7 +107,7 @@ pub fn scka_epoch_promote_initiator(
         rk: rk2,
         ck_send: ck,
         ck_recv: state.ck_recv,
-        sending_epoch: state.sending_epoch + 1,
+        sending_epoch: next_epoch(state.sending_epoch)?,
         receiving_epoch: state.receiving_epoch,
         send_ctr: 0,
         recv_ctr: state.recv_ctr,
@@ -87,31 +124,33 @@ pub fn scka_epoch_promote_responder(
         ck_send: state.ck_send,
         ck_recv: ck,
         sending_epoch: state.sending_epoch,
-        receiving_epoch: state.receiving_epoch + 1,
+        receiving_epoch: next_epoch(state.receiving_epoch)?,
         send_ctr: state.send_ctr,
         recv_ctr: 0,
     })
 }
 
-pub fn scka_next_send_mk(state: &SckaEpochState) -> (SckaEpochState, [u8; 32]) {
+pub fn scka_next_send_mk(state: &SckaEpochState) -> Result<(SckaEpochState, [u8; 32]), String> {
+    let send_ctr = next_ctr(state.send_ctr, "SCKA send")?;
     let (ck2, mk) = kdf_ck(&state.ck_send);
-    (
+    Ok((
         SckaEpochState {
             rk: state.rk,
             ck_send: ck2,
             ck_recv: state.ck_recv,
             sending_epoch: state.sending_epoch,
             receiving_epoch: state.receiving_epoch,
-            send_ctr: state.send_ctr + 1,
+            send_ctr,
             recv_ctr: state.recv_ctr,
         },
         mk,
-    )
+    ))
 }
 
-pub fn scka_next_recv_mk(state: &SckaEpochState) -> (SckaEpochState, [u8; 32]) {
+pub fn scka_next_recv_mk(state: &SckaEpochState) -> Result<(SckaEpochState, [u8; 32]), String> {
+    let recv_ctr = next_ctr(state.recv_ctr, "SCKA recv")?;
     let (ck2, mk) = kdf_ck(&state.ck_recv);
-    (
+    Ok((
         SckaEpochState {
             rk: state.rk,
             ck_send: state.ck_send,
@@ -119,10 +158,10 @@ pub fn scka_next_recv_mk(state: &SckaEpochState) -> (SckaEpochState, [u8; 32]) {
             sending_epoch: state.sending_epoch,
             receiving_epoch: state.receiving_epoch,
             send_ctr: state.send_ctr,
-            recv_ctr: state.recv_ctr + 1,
+            recv_ctr,
         },
         mk,
-    )
+    ))
 }
 
 fn mk_key(dh_pub: &[u8; 32], n: u32) -> [u8; 36] {
@@ -132,12 +171,34 @@ fn mk_key(dh_pub: &[u8; 32], n: u32) -> [u8; 36] {
     k
 }
 
-#[derive(Clone, Debug, Default)]
+/// EC receive chain KAT state: chain and skipped message keys are wiped on drop
+/// and redacted from Debug.
+#[derive(Clone, Default)]
 pub struct EcRecvState {
     pub ck: [u8; 32],
     pub n: u32,
     pub dh_pub: [u8; 32],
     pub mkskipped: BTreeMap<[u8; 36], [u8; 32]>,
+}
+
+impl fmt::Debug for EcRecvState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EcRecvState")
+            .field("n", &self.n)
+            .field("dh_pub", &self.dh_pub)
+            .field("mkskipped_len", &self.mkskipped.len())
+            .field("keys", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for EcRecvState {
+    fn drop(&mut self) {
+        self.ck.zeroize();
+        for mk in self.mkskipped.values_mut() {
+            mk.zeroize();
+        }
+    }
 }
 
 impl EcRecvState {
@@ -154,23 +215,40 @@ impl EcRecvState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EcSendState {
     pub ck: [u8; 32],
     pub n: u32,
     pub dh_pub: [u8; 32],
 }
 
-pub fn ec_send_mk(state: &EcSendState) -> (EcSendState, [u8; 32]) {
+impl fmt::Debug for EcSendState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EcSendState")
+            .field("n", &self.n)
+            .field("dh_pub", &self.dh_pub)
+            .field("ck", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for EcSendState {
+    fn drop(&mut self) {
+        self.ck.zeroize();
+    }
+}
+
+pub fn ec_send_mk(state: &EcSendState) -> Result<(EcSendState, [u8; 32]), String> {
+    let n = next_ctr(state.n, "EC send")?;
     let (ck2, mk) = kdf_ck(&state.ck);
-    (
+    Ok((
         EcSendState {
             ck: ck2,
-            n: state.n + 1,
+            n,
             dh_pub: state.dh_pub,
         },
         mk,
-    )
+    ))
 }
 
 pub fn ec_skip_keys(
@@ -184,6 +262,10 @@ pub fn ec_skip_keys(
     let skip_count = until_n - state.n;
     if skip_count > max_skip {
         return Err("MAX_SKIP exceeded".into());
+    }
+    // Global bound across chains, matching the DR retention cap.
+    if state.mkskipped.len() + skip_count as usize > MAX_MKSKIPPED_RETAINED {
+        return Err("MAX_MKSKIPPED_RETAINED exceeded".into());
     }
     let mut ck = state.ck;
     let mut n = state.n;
@@ -216,17 +298,18 @@ pub fn ec_try_skipped(
     }
 }
 
-pub fn ec_recv_in_order(state: &EcRecvState) -> (EcRecvState, [u8; 32]) {
+pub fn ec_recv_in_order(state: &EcRecvState) -> Result<(EcRecvState, [u8; 32]), String> {
+    let n = next_ctr(state.n, "EC recv")?;
     let (ck2, mk) = kdf_ck(&state.ck);
-    (
+    Ok((
         EcRecvState {
             ck: ck2,
-            n: state.n + 1,
+            n,
             dh_pub: state.dh_pub,
             mkskipped: state.mkskipped.clone(),
         },
         mk,
-    )
+    ))
 }
 
 pub fn ec_recv_message(
@@ -250,7 +333,7 @@ pub fn ec_recv_message(
     } else {
         st
     };
-    Ok(ec_recv_in_order(&st))
+    ec_recv_in_order(&st)
 }
 
 #[derive(Clone, Debug)]
@@ -585,15 +668,15 @@ pub fn run_braid_epoch_matrix(
     let bob1r = scka_epoch_promote_responder(&bob, ss1)?;
     assert_eq!(alice1i.rk, bob1r.rk);
     assert_eq!(alice1i.ck_send, bob1r.ck_recv);
-    let (alice1, a_mk) = scka_next_send_mk(&alice1i);
-    let (bob1, b_mk) = scka_next_recv_mk(&bob1r);
+    let (alice1, a_mk) = scka_next_send_mk(&alice1i)?;
+    let (bob1, b_mk) = scka_next_recv_mk(&bob1r)?;
     assert_eq!(a_mk, b_mk);
     let bob2i = scka_epoch_promote_initiator(&bob1, ss2)?;
     let alice2r = scka_epoch_promote_responder(&alice1, ss2)?;
     assert_eq!(bob2i.rk, alice2r.rk);
     assert_eq!(bob2i.ck_send, alice2r.ck_recv);
-    let (_bob2, b_mk2) = scka_next_send_mk(&bob2i);
-    let (_alice2, a_mk2) = scka_next_recv_mk(&alice2r);
+    let (_bob2, b_mk2) = scka_next_send_mk(&bob2i)?;
+    let (_alice2, a_mk2) = scka_next_recv_mk(&alice2r)?;
     assert_eq!(b_mk2, a_mk2);
     Ok(serde_json::json!({
         "directions_reordered": true,
@@ -626,7 +709,7 @@ pub fn run_ec_ooo_matrix(ck0: &[u8; 32], dh_pub: &[u8; 32]) -> Result<serde_json
     };
     let mut mks = Vec::new();
     for _ in 0..4 {
-        let (s, mk) = ec_send_mk(&send);
+        let (s, mk) = ec_send_mk(&send)?;
         send = s;
         mks.push(mk);
     }
@@ -732,6 +815,67 @@ mod tests {
         let mut a = [0u8; 32];
         a.copy_from_slice(&v);
         a
+    }
+
+    #[test]
+    fn scka_epochs_are_u64_and_fail_closed_instead_of_wrapping() {
+        let mut state = scka_from_init(true, &[0x42; 32]);
+        state.sending_epoch = u64::from(u32::MAX);
+        state.receiving_epoch = u64::from(u32::MAX);
+        let ss = [0x07; 32];
+        // Past the old u32 range: no wrap to 0.
+        assert_eq!(
+            scka_epoch_promote_initiator(&state, &ss)
+                .unwrap()
+                .sending_epoch,
+            u64::from(u32::MAX) + 1
+        );
+        assert_eq!(
+            scka_epoch_promote_responder(&state, &ss)
+                .unwrap()
+                .receiving_epoch,
+            u64::from(u32::MAX) + 1
+        );
+        state.sending_epoch = u64::MAX;
+        state.receiving_epoch = u64::MAX;
+        assert!(scka_epoch_promote_initiator(&state, &ss).is_err());
+        assert!(scka_epoch_promote_responder(&state, &ss).is_err());
+        state.send_ctr = u32::MAX;
+        state.recv_ctr = u32::MAX;
+        assert!(scka_next_send_mk(&state).is_err());
+        assert!(scka_next_recv_mk(&state).is_err());
+        let send = EcSendState {
+            ck: [0x01; 32],
+            n: u32::MAX,
+            dh_pub: [0x02; 32],
+        };
+        assert!(ec_send_mk(&send).is_err());
+        // Secrets never reach Debug output.
+        let printed = format!("{state:?}{send:?}");
+        assert!(printed.contains("<redacted>"));
+        assert!(!printed.contains("rk:") && !printed.contains("[1, 1, 1"));
+    }
+
+    #[test]
+    fn ec_skip_keys_enforces_global_retention_cap() {
+        let mut state = EcRecvState {
+            ck: [0x03; 32],
+            n: 0,
+            dh_pub: [0x04; 32],
+            mkskipped: BTreeMap::new(),
+        };
+        for n in 0..1500u32 {
+            state.mkskipped.insert(mk_key(&[0x05; 32], n), [0x06; 32]);
+        }
+        // Within MAX_SKIP for this chain, but past the total retention cap.
+        assert_eq!(
+            ec_skip_keys(&state, 600, MAX_SKIP).unwrap_err(),
+            "MAX_MKSKIPPED_RETAINED exceeded"
+        );
+        assert_eq!(
+            ec_skip_keys(&state, 500, MAX_SKIP).unwrap().mkskipped.len(),
+            MAX_MKSKIPPED_RETAINED
+        );
     }
 
     #[test]

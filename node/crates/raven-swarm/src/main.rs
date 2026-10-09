@@ -1,6 +1,13 @@
 //! Two-node libp2p swarm: TCP (+ optional QUIC listen) + Noise/Yamux + Kad put/get
 //! of signed `PeerRecord`. Separates libp2p PeerId from Raven Ed25519 identity.
 //! No FastAPI / HTTP API in path.
+//!
+//! The swarm, the Kad record validation and the key derivation live in
+//! [`raven_swarm::kad_node`]; this binary is the CLI around them.
+//!
+//! `serve` re-signs and re-publishes its own record every
+//! `SERVE_RECORD_REFRESH`, well inside the `SERVE_RECORD_TTL_MS` validity,
+//! so a long run never leaves remote nodes holding only an expired copy.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -8,25 +15,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use libp2p::identity::Keypair;
-use libp2p::kad::store::{MemoryStore, RecordStore};
-use libp2p::kad::{self, Mode, Quorum, Record, RecordKey};
+use libp2p::kad::{self, RecordKey};
 use libp2p::multiaddr::Protocol;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{identify, noise, ping, tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
+use libp2p::swarm::SwarmEvent;
+use libp2p::{Multiaddr, PeerId, Swarm};
 use raven_core::bootstrap::{load_bootstrap, save_bootstrap, BootstrapConfig};
-use raven_core::discovery::PeerRecord;
 use raven_core::identity::Identity;
-use raven_core::CAP_INTERNET;
+use raven_swarm::kad_node::{
+    build_swarm, dht_key_for, on_inbound_put, publish_own_record, verify_found_record,
+    RavenBehaviour, RavenBehaviourEvent, SERVE_RECORD_REFRESH,
+};
+use raven_swarm::liveness::{close_if_dead, reconnect_delay, retry_jitter};
 
-const RAVEN_KAD: StreamProtocol = StreamProtocol::new("/raven/kad/1.0.0");
-
-#[derive(NetworkBehaviour)]
-struct RavenBehaviour {
-    kad: kad::Behaviour<MemoryStore>,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
-}
+/// Attempts at the one dial `dial` makes (the first plus its retries).
+const MAX_PRIMARY_DIAL_ATTEMPTS: u32 = 3;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -105,50 +107,9 @@ fn load_or_create_identity(data_dir: &std::path::Path) -> Result<Identity, Box<d
     Ok(raven_core::load_or_create_identity(data_dir).map(|(id, _)| id)?)
 }
 
-fn libp2p_keypair_from_raven(id: &Identity) -> Keypair {
-    // Separate namespaces: derive libp2p key from a domain-separated hash of the
-    // Raven seed so PeerId ≠ Raven address, but is stable per data-dir.
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"raven/libp2p-peer-key/v1");
-    h.update(id.seed_bytes());
-    let d = h.finalize();
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&d);
-    Keypair::ed25519_from_bytes(seed).expect("ed25519 key")
-}
-
-fn build_swarm(id: &Identity) -> Result<libp2p::Swarm<RavenBehaviour>, Box<dyn Error>> {
-    let kp = libp2p_keypair_from_raven(id);
-    let peer_id = kp.public().to_peer_id();
-    let swarm = SwarmBuilder::with_existing_identity(kp)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default().nodelay(true),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_quic()
-        .with_behaviour(|key| {
-            let store = MemoryStore::new(peer_id);
-            let mut kad_cfg = kad::Config::new(RAVEN_KAD);
-            kad_cfg.set_query_timeout(Duration::from_secs(20));
-            let mut kad = kad::Behaviour::with_config(peer_id, store, kad_cfg);
-            kad.set_mode(Some(Mode::Server));
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/raven/identify/1.0.0".into(),
-                key.public(),
-            ));
-            let ping = ping::Behaviour::default();
-            RavenBehaviour {
-                kad,
-                identify,
-                ping,
-            }
-        })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-        .build();
-    Ok(swarm)
+/// First TCP listen address, the one `serve` announces.
+fn first_tcp(mut addresses: impl Iterator<Item = Multiaddr>) -> Option<Multiaddr> {
+    addresses.find(|a| a.iter().any(|p| matches!(p, Protocol::Tcp(_))))
 }
 
 async fn cmd_serve(
@@ -167,6 +128,7 @@ async fn cmd_serve(
     println!("libp2p_peer_id={local_peer}");
     println!("note=libp2p PeerId is domain-separated from Raven identity");
 
+    let own_key = RecordKey::new(&dht_key_for(&raven_id.public_key_bytes()));
     let listen_maddr: Multiaddr = listen.parse()?;
     swarm.listen_on(listen_maddr.clone())?;
     if quic {
@@ -204,9 +166,13 @@ async fn cmd_serve(
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    let mut announced = false;
-    let mut put_done = false;
-    let mut listened: Option<Multiaddr> = None;
+    // Address our PeerRecord currently announces (the first TCP listener).
+    let mut announced: Option<Multiaddr> = None;
+    let mut refresh = tokio::time::interval_at(
+        tokio::time::Instant::now() + SERVE_RECORD_REFRESH,
+        SERVE_RECORD_REFRESH,
+    );
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         if tokio::time::Instant::now() > deadline {
@@ -219,53 +185,34 @@ async fn cmd_serve(
                         println!("listen_addr={address}");
                         // Prefer TCP for the smoke dial address.
                         if address.iter().any(|p| matches!(p, Protocol::Tcp(_))) {
-                            listened = Some(address.clone());
                             if let Some(ref path) = write_multiaddr {
                                 std::fs::write(path, address.to_string())?;
                             }
                             if let Some(ref path) = write_peer_id {
                                 std::fs::write(path, local_peer.to_string())?;
                             }
-                            if !announced {
-                                announced = true;
-                                let dial = address.to_string();
-                                let rec = PeerRecord {
-                                    dial: dial.clone(),
-                                    ed25519_pub: [0u8; 32],
-                                    // This binary speaks Raven's Internet
-                                    // request/response protocol. It is not a
-                                    // Circuit Relay server.
-                                    caps: CAP_INTERNET,
-                                    expires_at_ms: now_ms() + 3_600_000,
-                                    signature: [0u8; 64],
-                                }
-                                .sign(&raven_id)?;
-                                let key = RecordKey::new(&rec.dht_key());
-                                let value = rec.encode()?;
-                                let record = Record {
-                                    key: key.clone(),
-                                    value,
-                                    publisher: Some(local_peer),
-                                    expires: None,
-                                };
-                                // Local store first (solo-node Quorum put would fail).
-                                swarm
-                                    .behaviour_mut()
-                                    .kad
-                                    .store_mut()
-                                    .put(record.clone())
-                                    .map_err(|e| format!("local kad put: {e}"))?;
+                            if announced.is_none() {
+                                let rec = publish_own_record(
+                                    &mut swarm,
+                                    &raven_id,
+                                    &address.to_string(),
+                                    now_ms(),
+                                )?;
+                                announced = Some(address);
                                 println!("kad_put_ok key={}", hex::encode(rec.dht_key()));
-                                put_done = true;
-                                // Also start a network put once a peer dials (replication).
-                                let _ = swarm
-                                    .behaviour_mut()
-                                    .kad
-                                    .put_record(record, Quorum::One);
                                 if exit_after_put {
                                     return Ok(());
                                 }
                             }
+                        }
+                    }
+                    SwarmEvent::ExpiredListenAddr { address, .. } if announced.as_ref() == Some(&address) => {
+                        // The announced interface went away: move the record to
+                        // another TCP listener now rather than at the next refresh.
+                        announced = first_tcp(swarm.listeners().filter(|a| **a != address).cloned());
+                        if let Some(next) = &announced {
+                            publish_own_record(&mut swarm, &raven_id, &next.to_string(), now_ms())?;
+                            println!("kad_put_readdressed");
                         }
                     }
                     SwarmEvent::Behaviour(RavenBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
@@ -281,11 +228,19 @@ async fn cmd_serve(
                         // Solo listen: network quorum may fail until a peer dials — local put already OK.
                         println!("kad_network_put_pending={e}");
                     }
+                    SwarmEvent::Behaviour(RavenBehaviourEvent::Kad(kad::Event::InboundRequest {
+                        request: kad::InboundRequest::PutRecord { record: Some(record), .. },
+                    })) => {
+                        on_inbound_put(&mut swarm, &own_key, record);
+                    }
+                    SwarmEvent::Behaviour(RavenBehaviourEvent::Ping(event)) => {
+                        // libp2p only reports a dead connection; closing it is ours to do.
+                        if close_if_dead(&mut swarm, &event) {
+                            println!("connection_closed_after_ping_failure");
+                        }
+                    }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         println!("connection_established peer={peer_id}");
-                        if put_done {
-                            // Keep serving a bit so dialer can GET; if dialer already done, smoke script kills us.
-                        }
                     }
                     SwarmEvent::IncomingConnection { .. } => {
                         println!("incoming_connection");
@@ -293,9 +248,16 @@ async fn cmd_serve(
                     _ => {}
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                let _ = &listened;
+            _ = refresh.tick() => {
+                // Re-sign well before the signature expires; remote nodes
+                // reject an expired record, so a one-shot announce would make
+                // this node undiscoverable after SERVE_RECORD_TTL_MS.
+                if let Some(address) = &announced {
+                    publish_own_record(&mut swarm, &raven_id, &address.to_string(), now_ms())?;
+                    println!("kad_put_refreshed");
+                }
             }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
 }
@@ -312,7 +274,8 @@ async fn cmd_dial(
     let remote_peer: PeerId = peer_id.parse()?;
     let remote_addr: Multiaddr = peer.parse()?;
 
-    // Honor bootstrap.json if present (manual peers only path).
+    // Report bootstrap.json (manual peers only path). This smoke dialer only
+    // dials --peer; bootstrap peers are printed, not dialed.
     let boot = load_bootstrap(&data_dir);
     if boot.manual_peer_only_ok() {
         println!("bootstrap_mode=manual_peer_only");
@@ -330,7 +293,8 @@ async fn cmd_dial(
         .behaviour_mut()
         .kad
         .add_address(&remote_peer, remote_addr.clone());
-    swarm.dial(remote_addr.with(Protocol::P2p(remote_peer)))?;
+    let dial_addr = remote_addr.with(Protocol::P2p(remote_peer));
+    swarm.dial(dial_addr.clone())?;
 
     let pub_bytes = hex::decode(raven_pub_hex.trim())?;
     if pub_bytes.len() != 32 {
@@ -338,22 +302,56 @@ async fn cmd_dial(
     }
     let mut raven_pub = [0u8; 32];
     raven_pub.copy_from_slice(&pub_bytes);
-    // DHT key same as PeerRecord::dht_key
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"rvn1/peer-key");
-    hasher.update(raven_pub);
-    let dht_key: [u8; 32] = hasher.finalize().into();
+    let dht_key = dht_key_for(&raven_pub);
+    let own_key = RecordKey::new(&dht_key_for(&raven_id.public_key_bytes()));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    run_dial(
+        &mut swarm,
+        remote_peer,
+        dial_addr,
+        &dht_key,
+        &raven_pub,
+        &own_key,
+        deadline,
+    )
+    .await
+}
+
+/// Drive an already-dialed `swarm` until the signed PeerRecord of `raven_pub`
+/// has been fetched over Kad and verified, or `deadline` passes.
+async fn run_dial(
+    swarm: &mut Swarm<RavenBehaviour>,
+    remote_peer: PeerId,
+    dial_addr: Multiaddr,
+    dht_key: &[u8; 32],
+    raven_pub: &[u8; 32],
+    own_key: &RecordKey,
+    deadline: tokio::time::Instant,
+) -> Result<(), Box<dyn Error>> {
     let mut connected = false;
     let mut get_started = false;
+    let mut verified = false;
+    // Failed attempts at the primary dial, and when the next one is due.
+    let mut dial_failures = 0u32;
+    let mut redial_at: Option<tokio::time::Instant> = None;
 
     loop {
-        if tokio::time::Instant::now() > deadline {
-            return Err("dial timeout".into());
-        }
         tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err("dial timeout".into());
+            }
+            _ = async {
+                match redial_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                redial_at = None;
+                if !connected && swarm.dial(dial_addr.clone()).is_err() {
+                    return Err("dial error: redial refused".into());
+                }
+            }
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -361,35 +359,73 @@ async fn cmd_dial(
                         connected = true;
                         if !get_started {
                             get_started = true;
-                            let key = RecordKey::new(&dht_key);
+                            let key = RecordKey::new(dht_key);
                             swarm.behaviour_mut().kad.get_record(key);
                             println!("kad_get_started key={}", hex::encode(dht_key));
                         }
                     }
-                    SwarmEvent::OutgoingConnectionError { error, .. } => {
-                        return Err(format!("dial error: {error}").into());
+                    // Kad also dials peers it learns from GET_VALUE responses, and
+                    // one unreachable or hostile one must not end the lookup.
+                    // Only a failure of the explicit --peer dial is ours; the
+                    // lookup's own 20 s timeout and the deadline end the rest.
+                    SwarmEvent::OutgoingConnectionError { peer_id: Some(failed), error, .. }
+                        if failed == remote_peer =>
+                    {
+                        if connected {
+                            // Another address of the peer failed; we are already in.
+                            println!("kad_outgoing_error_ignored");
+                        } else {
+                            dial_failures += 1;
+                            if dial_failures >= MAX_PRIMARY_DIAL_ATTEMPTS {
+                                return Err(format!("dial error: {error}").into());
+                            }
+                            println!("dial_retry attempt={dial_failures}");
+                            redial_at = Some(
+                                tokio::time::Instant::now()
+                                    + reconnect_delay(dial_failures - 1, retry_jitter()),
+                            );
+                        }
+                    }
+                    SwarmEvent::OutgoingConnectionError { .. } => {
+                        println!("kad_outgoing_error_ignored");
+                    }
+                    SwarmEvent::Behaviour(RavenBehaviourEvent::Ping(event)) => {
+                        // libp2p only reports a dead connection; closing it is ours to do.
+                        if close_if_dead(swarm, &event) {
+                            println!("connection_closed_after_ping_failure");
+                        }
                     }
                     SwarmEvent::Behaviour(RavenBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
                         result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_rec))),
                         ..
                     })) => {
-                        let rec = PeerRecord::decode(&peer_rec.record.value)?;
-                        rec.verify(now_ms())?;
-                        if rec.ed25519_pub != raven_pub {
-                            return Err("peer record pub mismatch".into());
-                        }
-                        println!("kad_get_ok dial={}", rec.dial);
-                        println!("peer_record_verified=1");
-                        if connected {
-                            println!("=== LIBP2P SWARM DIAL+KAD OK (no FastAPI) ===");
-                            return Ok(());
+                        // One bad (or poisoned) record must not end discovery:
+                        // skip it and keep reading the query's other results.
+                        match verify_found_record(&peer_rec.record, dht_key, raven_pub, now_ms()) {
+                            Ok(rec) => {
+                                verified = true;
+                                println!("kad_get_ok dial={}", rec.dial);
+                                println!("peer_record_verified=1");
+                                if connected {
+                                    println!("=== LIBP2P SWARM DIAL+KAD OK (no FastAPI) ===");
+                                    return Ok(());
+                                }
+                            }
+                            Err(e) => println!("kad_get_skip_invalid_record={e}"),
                         }
                     }
                     SwarmEvent::Behaviour(RavenBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
                         result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. })),
                         ..
                     })) => {
-                        // keep waiting for FoundRecord
+                        if !verified {
+                            return Err("kad get finished without a valid peer record".into());
+                        }
+                    }
+                    SwarmEvent::Behaviour(RavenBehaviourEvent::Kad(kad::Event::InboundRequest {
+                        request: kad::InboundRequest::PutRecord { record: Some(record), .. },
+                    })) => {
+                        on_inbound_put(swarm, own_key, record);
                     }
                     SwarmEvent::Behaviour(RavenBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
                         result: kad::QueryResult::GetRecord(Err(e)),
@@ -480,5 +516,94 @@ async fn main() -> Result<(), Box<dyn Error>> {
             no_raven_defaults,
         } => cmd_bootstrap_init(data_dir, manual_peer, custom, no_raven_defaults),
         Commands::BootstrapShow { data_dir } => cmd_bootstrap_show(data_dir),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::kad::store::RecordStore;
+    use libp2p::kad::Record;
+
+    async fn listen_tcp(swarm: &mut Swarm<RavenBehaviour>) -> Multiaddr {
+        swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+                    return address;
+                }
+            }
+        })
+        .await
+        .expect("listen timeout")
+    }
+
+    /// Keep a serving swarm answering requests for the rest of the test.
+    fn serve_in_background(mut swarm: Swarm<RavenBehaviour>) {
+        tokio::spawn(async move {
+            loop {
+                swarm.select_next_some().await;
+            }
+        });
+    }
+
+    /// Regression: any `OutgoingConnectionError` ended `dial`, including the
+    /// failure of a dial Kad made on its own to a peer it learned from a
+    /// GET_VALUE answer. Here the first answer is poisoned and points at a
+    /// dead peer (whose dial fails at once) and at the real owner of the record.
+    #[tokio::test]
+    async fn lookup_survives_a_failing_third_party_dial() {
+        let owner_id = Identity::from_seed(&[20; 32]);
+        let hub_id = Identity::from_seed(&[21; 32]);
+        let seeker_id = Identity::from_seed(&[22; 32]);
+        let mut owner = build_swarm(&owner_id).unwrap();
+        let mut hub = build_swarm(&hub_id).unwrap();
+        let mut seeker = build_swarm(&seeker_id).unwrap();
+        let (owner_peer, hub_peer) = (*owner.local_peer_id(), *hub.local_peer_id());
+        let owner_addr = listen_tcp(&mut owner).await;
+        let hub_addr = listen_tcp(&mut hub).await;
+        publish_own_record(&mut owner, &owner_id, &owner_addr.to_string(), now_ms()).unwrap();
+
+        let owner_pub = owner_id.public_key_bytes();
+        let dht_key = dht_key_for(&owner_pub);
+        let closed_port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let dead_peer = PeerId::random();
+        let dead_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{closed_port}").parse().unwrap();
+        // The hub answers with garbage under the owner's key, plus two hints.
+        hub.behaviour_mut()
+            .kad
+            .store_mut()
+            .put(Record {
+                key: RecordKey::new(&dht_key),
+                value: b"poison".to_vec(),
+                publisher: None,
+                expires: None,
+            })
+            .unwrap();
+        hub.behaviour_mut().kad.add_address(&dead_peer, dead_addr);
+        hub.behaviour_mut().kad.add_address(&owner_peer, owner_addr);
+        serve_in_background(owner);
+        serve_in_background(hub);
+
+        let dial_addr = hub_addr.clone().with(Protocol::P2p(hub_peer));
+        seeker.behaviour_mut().kad.add_address(&hub_peer, hub_addr);
+        seeker.dial(dial_addr.clone()).unwrap();
+        let own_key = RecordKey::new(&dht_key_for(&seeker_id.public_key_bytes()));
+        let result = run_dial(
+            &mut seeker,
+            hub_peer,
+            dial_addr,
+            &dht_key,
+            &owner_pub,
+            &own_key,
+            tokio::time::Instant::now() + Duration::from_secs(15),
+        )
+        .await;
+        assert!(result.is_ok(), "lookup aborted: {:?}", result.err());
     }
 }

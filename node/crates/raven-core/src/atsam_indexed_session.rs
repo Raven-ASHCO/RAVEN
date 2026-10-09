@@ -1,8 +1,15 @@
 //! ATSAM Indexed Session Profile V1 byte-exact reference primitives.
 //!
-//! This is deliberately **not** wired into `raven-node`, endpoint routing, or
-//! the shipping RVNA1 classifier.  A future signed, versioned PairInit must
-//! negotiate and transcript-bind [`PROFILE_ID`] before production activation.
+//! These are live: through `indexed_session_store` and `lan_dispatch` they
+//! seal and open the RVNA1 proto `0x03` messages and ACKs of the LAN-direct
+//! slice, which raven-node's listener and `ash` run in default builds
+//! (`lan_gate::LAN_DIRECT_PRODUCTION_ENABLED` is `true`). The internet-direct
+//! slice uses the same path behind its own gate
+//! (`internet_gate::INTERNET_DIRECT_PRODUCTION_ENABLED`, `false`). The generic
+//! [`PRODUCTION_ENABLED`] tripwire below stays `false`, and the shipping
+//! RVNA1 classifier (`seal::classify_sealed_body`) still does not treat proto
+//! `0x03` as a known class. A future signed, versioned PairInit must negotiate
+//! and transcript-bind [`PROFILE_ID`] before generic production activation.
 //! Protocol byte `0x03` avoids silently reinterpreting existing RVNA1 v2.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -10,6 +17,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::ack::Ack;
 use crate::address::{decode_address, ADDRESS_VERSION};
@@ -36,6 +44,13 @@ pub const ACK_PLAINTEXT_LEN: usize = 101;
 pub const ACK_SEALED_WIRE_LEN: usize = 143;
 pub const INDEXED_SEALED_HEADER_LEN: usize = 26;
 pub const INDEXED_SEALED_MIN_WIRE_LEN: usize = INDEXED_SEALED_HEADER_LEN + 16;
+/// The stateless `*_key_at_index` helpers and `seal_ack`/`open_ack` re-derive
+/// from `CK_0` and do O(index) HKDF work, in `open_ack` before any
+/// authentication. They have no persisted counter, so skips are bounded
+/// relative to index 0; the durable endpoint store bounds its receive jumps
+/// relative to its own counter instead. Derivation below the bound is
+/// unchanged.
+pub const MAX_STATELESS_CHAIN_INDEX: u32 = crate::atsam_aead::MAX_PORTABLE_CHAIN_INDEX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -78,6 +93,8 @@ pub enum IndexedSessionError {
     InvalidIndexedMessageHeader,
     #[error("ChaCha20-Poly1305 authentication failed")]
     AuthenticationFailed,
+    #[error("chain index exceeds the stateless derivation bound")]
+    ChainIndexTooLarge,
 }
 
 /// Parses only the fixed, bounded RVNA1 indexed header. This is candidate
@@ -213,12 +230,20 @@ fn endpoints<'a>(
     })
 }
 
-fn chain_key_at_index(root: &[u8; 32], sender: &str, recipient: &str, index: u32) -> [u8; 32] {
-    let mut chain_key = initial_chain_key(root, sender, recipient);
-    for _ in 0..index {
-        chain_key = advance_chain_key(&chain_key);
+fn chain_key_at_index(
+    root: &[u8; 32],
+    sender: &str,
+    recipient: &str,
+    index: u32,
+) -> Result<Zeroizing<[u8; 32]>, IndexedSessionError> {
+    if index > MAX_STATELESS_CHAIN_INDEX {
+        return Err(IndexedSessionError::ChainIndexTooLarge);
     }
-    chain_key
+    let mut chain_key = Zeroizing::new(initial_chain_key(root, sender, recipient));
+    for _ in 0..index {
+        *chain_key = advance_chain_key(&chain_key);
+    }
+    Ok(chain_key)
 }
 
 /// Existing ATSAM message lane; this profile does not change its KDF.
@@ -230,7 +255,7 @@ pub fn message_key_at_index(
     index: u32,
 ) -> Result<[u8; 32], IndexedSessionError> {
     let (sender, recipient) = endpoints(initiator_address, responder_address, direction)?;
-    let chain_key = chain_key_at_index(root, sender, recipient, index);
+    let chain_key = chain_key_at_index(root, sender, recipient, index)?;
     Ok(message_key(&chain_key, sender, recipient))
 }
 
@@ -246,12 +271,8 @@ pub fn ack_chain_key_at_index(
     index: u32,
 ) -> Result<[u8; 32], IndexedSessionError> {
     let (sender, recipient) = endpoints(initiator_address, responder_address, direction)?;
-    Ok(chain_key_at_index(
-        &ack_base_key(root),
-        sender,
-        recipient,
-        index,
-    ))
+    let ack_base = Zeroizing::new(ack_base_key(root));
+    Ok(*chain_key_at_index(&ack_base, sender, recipient, index)?)
 }
 
 pub fn ack_key_at_index(
@@ -262,8 +283,13 @@ pub fn ack_key_at_index(
     index: u32,
 ) -> Result<[u8; 32], IndexedSessionError> {
     let (sender, recipient) = endpoints(initiator_address, responder_address, direction)?;
-    let chain_key =
-        ack_chain_key_at_index(root, initiator_address, responder_address, direction, index)?;
+    let chain_key = Zeroizing::new(ack_chain_key_at_index(
+        root,
+        initiator_address,
+        responder_address,
+        direction,
+        index,
+    )?);
     Ok(message_key(&chain_key, sender, recipient))
 }
 
@@ -276,7 +302,8 @@ pub fn route_direction_key(root: &[u8; 32], direction: Direction) -> [u8; 32] {
     info.extend_from_slice(LABEL_ROUTE_DIRECTION);
     info.push(0);
     info.push(direction as u8);
-    hkdf32(&route_master_key(root), &info)
+    let master = Zeroizing::new(route_master_key(root));
+    hkdf32(&*master, &info)
 }
 
 pub fn route_coordinates(
@@ -301,11 +328,8 @@ pub fn derive_route_tag(
     direction: Direction,
 ) -> Result<[u8; 16], IndexedSessionError> {
     let (epoch, counter) = route_coordinates(created_at_ms, index, env_type, direction)?;
-    Ok(routing_tag::derive(
-        &route_direction_key(root, direction),
-        epoch,
-        counter,
-    ))
+    let key = Zeroizing::new(route_direction_key(root, direction));
+    Ok(routing_tag::derive(&*key, epoch, counter))
 }
 
 pub fn mailbox_coordinates(unix_ms: u64, direction: Direction) -> (u64, u64) {
@@ -318,7 +342,8 @@ pub fn derive_mailbox_tags(
     direction: Direction,
 ) -> ([u8; 16], [u8; 16]) {
     let (day_epoch, slot) = mailbox_coordinates(unix_ms, direction);
-    let mailbox = mailbox_tag(&route_direction_key(root, direction), day_epoch, slot);
+    let key = Zeroizing::new(route_direction_key(root, direction));
+    let mailbox = mailbox_tag(&*key, day_epoch, slot);
     let store = store_tag_from_mailbox(&mailbox);
     (mailbox, store)
 }
@@ -411,9 +436,15 @@ pub fn seal_ack(
 ) -> Result<Vec<u8>, IndexedSessionError> {
     decode_signed_ack(plaintext)?;
     let (sender, recipient) = endpoints(initiator_address, responder_address, direction)?;
-    let key = ack_key_at_index(root, initiator_address, responder_address, direction, index)?;
+    let key = Zeroizing::new(ack_key_at_index(
+        root,
+        initiator_address,
+        responder_address,
+        direction,
+        index,
+    )?);
     let aad = build_aad(index, sender, recipient, outer_message_id)?;
-    let ciphertext = ChaCha20Poly1305::new((&key).into())
+    let ciphertext = ChaCha20Poly1305::new((&*key).into())
         .encrypt(
             Nonce::from_slice(nonce12),
             Payload {
@@ -448,10 +479,19 @@ pub fn open_ack(
         return Err(IndexedSessionError::InvalidSealedAckHeader);
     }
     let index = u32::from_be_bytes(wire[10..14].try_into().expect("fixed slice"));
+    if index > MAX_STATELESS_CHAIN_INDEX {
+        return Err(IndexedSessionError::ChainIndexTooLarge);
+    }
     let (sender, recipient) = endpoints(initiator_address, responder_address, direction)?;
-    let key = ack_key_at_index(root, initiator_address, responder_address, direction, index)?;
+    let key = Zeroizing::new(ack_key_at_index(
+        root,
+        initiator_address,
+        responder_address,
+        direction,
+        index,
+    )?);
     let aad = build_aad(index, sender, recipient, outer_message_id)?;
-    let plaintext = ChaCha20Poly1305::new((&key).into())
+    let plaintext = ChaCha20Poly1305::new((&*key).into())
         .decrypt(
             Nonce::from_slice(&wire[14..26]),
             Payload {
@@ -573,6 +613,68 @@ mod tests {
                 &wire,
             ),
             Err(IndexedSessionError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn stateless_index_work_is_bounded_before_authentication() {
+        let (alice, bob) = fixture_addresses();
+        let root = [0x21; 32];
+        let direction = Direction::InitiatorToResponder;
+        let at_limit = MAX_STATELESS_CHAIN_INDEX;
+        assert!(message_key_at_index(&root, &alice, &bob, direction, at_limit).is_ok());
+        for index in [MAX_STATELESS_CHAIN_INDEX + 1, u32::MAX] {
+            assert_eq!(
+                message_key_at_index(&root, &alice, &bob, direction, index),
+                Err(IndexedSessionError::ChainIndexTooLarge)
+            );
+            assert_eq!(
+                ack_key_at_index(&root, &alice, &bob, direction, index),
+                Err(IndexedSessionError::ChainIndexTooLarge)
+            );
+        }
+        // A forged ACK claiming index 0xFFFFFFFF is rejected without walking
+        // the chain (this previously ran ~4.3e9 HKDF steps).
+        let record = Ack {
+            acked_message_id: [0x01; 16],
+            status: 1,
+            ack_nonce: [0x02; 12],
+            created_at: 1_700_000_001_000,
+        };
+        let plaintext = encode_signed_ack(&SignedAck {
+            record,
+            signature: [0x55; 64],
+        })
+        .unwrap();
+        let outer_id = [0x03; 16];
+        let mut wire = seal_ack(
+            &root,
+            &alice,
+            &bob,
+            direction,
+            0,
+            &outer_id,
+            &plaintext,
+            &[0x04; 12],
+        )
+        .unwrap();
+        wire[10..14].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            open_ack(&root, &alice, &bob, direction, &outer_id, &wire),
+            Err(IndexedSessionError::ChainIndexTooLarge)
+        );
+        assert_eq!(
+            seal_ack(
+                &root,
+                &alice,
+                &bob,
+                direction,
+                MAX_STATELESS_CHAIN_INDEX + 1,
+                &outer_id,
+                &plaintext,
+                &[0x04; 12]
+            ),
+            Err(IndexedSessionError::ChainIndexTooLarge)
         );
     }
 

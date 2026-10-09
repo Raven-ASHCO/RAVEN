@@ -5,10 +5,11 @@
 //!
 //! Invariants: same message_id; no protocol translation; hop/TTL/dedup/size limits.
 
-use crate::bridge::{prepare_forward, BridgeRole, DropReason, EnvelopeIdentity};
-use crate::envelope::{EnvType, Envelope};
+use crate::bridge::{is_relayable_type, prepare_forward, BridgeRole, DropReason, EnvelopeIdentity};
+use crate::carrier_admission::admit_relayable;
+use crate::envelope::Envelope;
 use crate::forward_queue::{
-    ForwardItem, ForwardQueue, ForwardQueueError, ForwardState, PeerRateDecision,
+    EnqueueOutcome, ForwardItem, ForwardQueue, ForwardQueueError, ForwardState, PeerRateDecision,
     MAX_ENVELOPE_BYTES,
 };
 use crate::transport::{plan_paths, select_path, PathChoice, PathContext, TransportKind};
@@ -131,7 +132,10 @@ impl MessageRouter {
                 reason: DropReason::Malformed,
             };
         };
-        if EnvType::from_u8(env.env_type).is_none() {
+        // Same policy as `bridge::decide`: only Message and Ack are relayed or
+        // delivered. Checked before the replay lookup so no seen-state is
+        // written for a type that is never carried.
+        if !is_relayable_type(env.env_type) {
             return RouterOutcome::Dropped {
                 reason: DropReason::UnsupportedType,
             };
@@ -139,6 +143,14 @@ impl MessageRouter {
         if inbound.now_ms > env.expires_at {
             return RouterOutcome::Dropped {
                 reason: DropReason::Expired,
+            };
+        }
+        // Custody allow-list (F3): only sealed indexed-session messages and
+        // ACKs, never a PairInit / PairResponse, demo or plaintext frame. Also
+        // before the replay lookup: a refused object leaves no seen-state.
+        if let Err(refusal) = admit_relayable(&inbound.packed, inbound.now_ms) {
+            return RouterOutcome::Dropped {
+                reason: DropReason::NotAdmitted(refusal),
             };
         }
 
@@ -153,15 +165,17 @@ impl MessageRouter {
             };
         }
 
-        // Endpoint may accept when not forcing bridge and endpoint role on.
-        // Bridge path always for cross-transport when bridge enabled.
+        // The router sees opaque envelopes only and has no way to tell whether
+        // this node is the destination (routing_tag is not addressable here).
+        // With the bridge enabled it therefore always relays; the endpoint
+        // branch is reached only when the bridge is off or has no egress.
+        // Multi-role nodes run endpoint ingest separately (see
+        // `bridge::classify_multi_role` for the destination-first rule).
         let want_bridge = force_bridge
             || (self.bridge_enabled
                 && self.pick_egress(inbound.ingress).is_some()
                 && !self.endpoint_only_mode());
 
-        // Multi-role: if bridge enabled and ingress needs cross-transport, bridge wins
-        // over local endpoint for Message (ACK reverse also bridges).
         if want_bridge && self.bridge_enabled {
             return self.queue_or_forward(queue, &env, &inbound, identity);
         }
@@ -229,13 +243,22 @@ impl MessageRouter {
             expires_at_ms: env.expires_at,
             previous_hop: inbound.previous_hop.clone(),
         };
-        if let Err(e) = queue.enqueue(&item) {
-            return match e {
-                ForwardQueueError::QueueFull(_) => RouterOutcome::Dropped {
-                    reason: DropReason::Malformed,
-                },
-                other => RouterOutcome::Error(other.to_string()),
-            };
+        match queue.enqueue(&item) {
+            Ok(EnqueueOutcome::Inserted) => {}
+            // The object already has a pending row or a dedup tombstone (the
+            // bounded seen cache may have evicted it): a replay, never a
+            // second custody or a re-forward.
+            Ok(EnqueueOutcome::AlreadyPresent(_)) => {
+                return RouterOutcome::Dropped {
+                    reason: DropReason::Duplicate,
+                };
+            }
+            Err(ForwardQueueError::QueueFull(_)) => {
+                return RouterOutcome::Dropped {
+                    reason: DropReason::StoreFull,
+                };
+            }
+            Err(other) => return RouterOutcome::Error(other.to_string()),
         }
         if let Err(e) = queue.mark_object_seen(
             &identity.object_digest,
@@ -283,6 +306,12 @@ impl MessageRouter {
                 let _ = queue.mark_object_state(&item.object_digest, ForwardState::Expired);
                 continue;
             }
+            // Rows stored before the custody allow-list existed (or by another
+            // writer of this queue) are re-checked before they leave custody.
+            if admit_relayable(&item.packed_envelope, now_ms).is_err() {
+                let _ = queue.mark_object_state(&item.object_digest, ForwardState::Failed);
+                continue;
+            }
             let id = EnvelopeIdentity::from_envelope(&env);
             out.push((item, id));
         }
@@ -290,12 +319,11 @@ impl MessageRouter {
     }
 }
 
-/// Bridge role helper for decide() compatibility.
-pub fn router_role(bridge: bool, endpoint: bool) -> BridgeRole {
-    if bridge && !endpoint {
-        BridgeRole::Relay
-    } else if bridge {
-        // Multi-role machine: bridge subsystem still uses Relay semantics for opaque forward.
+/// Bridge role helper for decide() compatibility. A multi-role machine's
+/// bridge subsystem still uses Relay semantics for opaque forward, so the
+/// endpoint flag does not change the answer.
+pub fn router_role(bridge: bool, _endpoint: bool) -> BridgeRole {
+    if bridge {
         BridgeRole::Relay
     } else {
         BridgeRole::Endpoint
@@ -305,10 +333,14 @@ pub fn router_role(bridge: bool, endpoint: bool) -> BridgeRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::carrier_admission::{opaque_indexed_body_for_tests, CustodyRefusal, RelayableKind};
+    use crate::envelope::EnvType;
     use crate::identity::Identity;
     use tempfile::tempdir;
 
-    /// SQLite stores expires as i64 — keep test values <= i64::MAX.
+    /// SQLite stores expires as i64 — keep test values <= i64::MAX. The body
+    /// gets the sealed indexed-session shape custody admits (still opaque), and
+    /// the validity is capped at one hour after the tests' clock (~0).
     fn pack_msg(hop: u8, expires: u64, body: &[u8]) -> (Vec<u8>, Identity) {
         let id = Identity::generate();
         let mut env = Envelope {
@@ -318,12 +350,12 @@ mod tests {
             routing_tag: [1u8; 16],
             dest_device_hint: 0,
             created_at: 1,
-            expires_at: expires,
+            expires_at: expires.min(60 * 60 * 1000),
             hop_limit: hop,
             replication_budget: 3,
             anti_replay_nonce: [2u8; 12],
             ratchet_header_ciphertext: vec![],
-            message_ciphertext: body.to_vec(),
+            message_ciphertext: opaque_indexed_body_for_tests(RelayableKind::Message, body),
             sender_authentication: vec![],
         };
         env.sign_with(&id);
@@ -508,6 +540,91 @@ mod tests {
         let recovered = router.recover_pending(&q, 20).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].0.message_id, mid);
+    }
+
+    /// F3: a PairInit wrapped as an ordinary message (addresses and trust
+    /// material in clear) or a plaintext body never enters custody, and leaves
+    /// no seen-state behind.
+    #[test]
+    fn pairing_and_plaintext_frames_never_enter_custody() {
+        use crate::pair_init::{INIT_MAGIC, INIT_WIRE_LEN};
+        use crate::pair_init_lan_oob::{wrap_oob_wire, PairInitOobKind};
+        let dir = tempdir().unwrap();
+        let q = ForwardQueue::open(&dir.path().join("f.sqlite")).unwrap();
+        let router = MessageRouter {
+            bridge_enabled: true,
+            endpoint_enabled: false,
+            ..Default::default()
+        };
+        let mut init = INIT_MAGIC.to_vec();
+        init.resize(INIT_WIRE_LEN, 0x03);
+        let pair_init = wrap_oob_wire(
+            &init,
+            PairInitOobKind::PairInit,
+            &Identity::generate(),
+            [0; 16],
+            5,
+            &mut rand::thread_rng(),
+        )
+        .unwrap();
+        let mut plain = Envelope::unpack(&pack_msg(5, i64::MAX as u64, b"x").0).unwrap();
+        plain.message_ciphertext = b"hello in the clear".to_vec();
+        plain.sign_with(&Identity::generate());
+        for (packed, want) in [
+            (pair_init, CustodyRefusal::PairingMaterial),
+            (plain.pack(), CustodyRefusal::NotSealedIndexed),
+        ] {
+            let digest =
+                crate::bridge::authenticated_object_digest(&Envelope::unpack(&packed).unwrap());
+            for ingress in [TransportKind::Lan, TransportKind::MockBle] {
+                match router.handle_inbound(
+                    &q,
+                    InboundEnvelope {
+                        packed: packed.clone(),
+                        ingress,
+                        previous_hop: "x".into(),
+                        now_ms: 10,
+                    },
+                    true,
+                ) {
+                    RouterOutcome::Dropped {
+                        reason: DropReason::NotAdmitted(got),
+                    } => assert_eq!(got, want),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert!(!q.object_was_seen(&digest).unwrap());
+        }
+        assert_eq!(q.count_all().unwrap(), 0);
+    }
+
+    /// A row that reached the queue without admission (an older build, another
+    /// writer) is failed at recovery instead of being forwarded.
+    #[test]
+    fn recovery_fails_rows_custody_would_not_admit() {
+        let dir = tempdir().unwrap();
+        let q = ForwardQueue::open(&dir.path().join("f.sqlite")).unwrap();
+        let mut plain = Envelope::unpack(&pack_msg(5, i64::MAX as u64, b"x").0).unwrap();
+        plain.message_ciphertext = b"legacy plaintext row".to_vec();
+        plain.sign_with(&Identity::generate());
+        let digest = crate::bridge::authenticated_object_digest(&plain);
+        q.enqueue(&ForwardItem {
+            object_digest: digest,
+            message_id: plain.message_id,
+            packed_envelope: plain.pack(),
+            ingress: TransportKind::Lan,
+            egress: TransportKind::MockBle,
+            state: ForwardState::Queued,
+            created_at_ms: 1,
+            expires_at_ms: plain.expires_at,
+            previous_hop: "old".into(),
+        })
+        .unwrap();
+        assert!(MessageRouter::default()
+            .recover_pending(&q, 20)
+            .unwrap()
+            .is_empty());
+        assert_eq!(q.count_pending().unwrap(), 0);
     }
 
     #[test]

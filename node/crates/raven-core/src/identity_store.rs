@@ -3,8 +3,12 @@
 //! Platform backends (never log or print seed bytes):
 //! - macOS: Keychain (generic password)
 //! - Windows: DPAPI-protected `identity.seed` file
-//! - Linux: Secret Service (glibc) — *loading only*; creation stays fail-closed
-//!   until R1 authorizes an add-only prompt-free backend
+//! - GNU/Linux: Secret Service (glibc) when an unlocked keyring answers,
+//!   created add-only and prompt-free through the Raven fork
+//!   (`create_item_no_prompt`, R1 2026-10-08); otherwise the passphrase vault
+//!   (`keystore_vault`). The per-profile choice is recorded and never changes
+//!   silently (`keystore_select`, docs/design/2026-10-linux-keystore.md).
+//! - musl / other non-macOS Unix: the passphrase vault only
 //! - locked-file mode is an explicit lab/CI override only (debug builds).
 //!   First-install and unmarked-seed load require proven platform absence
 //!   (`Ok(None)`). macOS `SecureStore` (locked/denied Keychain) is Continuity.
@@ -12,6 +16,14 @@
 //!   (no session bus or no `org.freedesktop.secrets`) as no store.
 //!
 //! Legacy plaintext `identity.seed` (exactly 32 raw bytes) is migrated on first load.
+//! Removing the plaintext file afterwards is **best-effort**: it is overwritten
+//! in place, fsynced and unlinked, but copy-on-write filesystems (APFS, btrfs,
+//! ZFS), snapshots, backups and SSD wear levelling can retain the old bytes.
+//! Treat a seed that ever sat on disk in plaintext as exposed to disk forensics.
+//!
+//! In memory the seed is zeroized on a best-effort basis only: the loaders hand
+//! it back as a plain `[u8; 32]`, so copies can linger in dead stack frames
+//! until overwritten, and a core dump or swap page may still contain it.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -50,6 +62,9 @@ pub enum IdentityStoreBackend {
     WindowsDpapiFile,
     LinuxSecretService,
     LockedFile,
+    /// Passphrase vault (`keystore.vault`, entry `identity-seed`): non-macOS
+    /// Unix without a reachable Secret Service.
+    PassphraseVault,
 }
 
 impl IdentityStoreBackend {
@@ -59,6 +74,7 @@ impl IdentityStoreBackend {
             Self::WindowsDpapiFile => "windows-dpapi-file",
             Self::LinuxSecretService => "linux-secret-service",
             Self::LockedFile => "locked-file",
+            Self::PassphraseVault => "passphrase-vault",
         }
     }
 
@@ -68,6 +84,7 @@ impl IdentityStoreBackend {
             "windows-dpapi-file" => Some(Self::WindowsDpapiFile),
             "linux-secret-service" => Some(Self::LinuxSecretService),
             "locked-file" => Some(Self::LockedFile),
+            "passphrase-vault" => Some(Self::PassphraseVault),
             _ => None,
         }
     }
@@ -78,6 +95,7 @@ impl IdentityStoreBackend {
             Self::WindowsDpapiFile => 2,
             Self::LinuxSecretService => 3,
             Self::LockedFile => 4,
+            Self::PassphraseVault => 5,
         }
     }
 
@@ -87,6 +105,7 @@ impl IdentityStoreBackend {
             2 => Some(Self::WindowsDpapiFile),
             3 => Some(Self::LinuxSecretService),
             4 => Some(Self::LockedFile),
+            5 => Some(Self::PassphraseVault),
             _ => None,
         }
     }
@@ -254,6 +273,139 @@ fn binding_exists_checked(data_dir: &Path) -> Result<bool, IdentityStoreError> {
     }
 }
 
+/// Profile entries that may exist before the first identity is created, by
+/// exact name: files that read-only commands (`status`, `bridge`, the ash menus,
+/// `bootstrap`/policy setup) or the OS leave behind in a fresh profile and that
+/// carry no identity-bound state.
+const FIRST_INSTALL_INERT_FILES: [&str; 9] = [
+    IDENTITY_STORE_LOCK_NAME,
+    // Non-secret keystore choice (non-macOS Unix); the vault itself is not inert.
+    crate::keystore_select::KEYSTORE_MARKER_NAME,
+    ".identity_store.lock.sqlite-wal",
+    ".identity_store.lock.sqlite-shm",
+    ".identity_store.lock.sqlite-journal",
+    "bootstrap.json",
+    // `save_bootstrap` keeps an unreadable bootstrap.json here before replacing it.
+    "bootstrap.json.corrupt",
+    "node_policy.json",
+    // Finder metadata.
+    ".DS_Store",
+];
+/// Relay custody database opened (and so created) by `raven-node status` /
+/// `bridge` on a profile with no identity. Inert only while it holds no rows.
+const FIRST_INSTALL_EMPTY_DB: &str = "forward_queue.sqlite";
+
+fn sqlite_base_name(name: &str) -> &str {
+    ["-wal", "-shm", "-journal"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name)
+}
+
+/// `DataDirLock` files (`.<name>.lock.sqlite`): a lock is `BEGIN EXCLUSIVE`
+/// on a database that never gets a schema, so a genuine one is a 0-byte file.
+fn is_lock_database_name(base: &str) -> bool {
+    base.starts_with('.') && base.ends_with(".lock.sqlite")
+}
+
+/// True when every user table of the SQLite database at `path` is empty.
+/// Fail-closed: any open or query error counts as "not empty".
+fn sqlite_database_has_no_rows(path: &Path) -> bool {
+    use rusqlite::{Connection, OpenFlags};
+    let Ok(conn) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    let _ = conn.busy_timeout(Duration::from_secs(5));
+    let tables: Result<Vec<String>, _> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .and_then(|rows| rows.collect())
+        });
+    let Ok(tables) = tables else {
+        return false;
+    };
+    tables.iter().all(|table| {
+        let sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM \"{}\")",
+            table.replace('"', "\"\"")
+        );
+        matches!(conn.query_row(&sql, [], |row| row.get::<_, i64>(0)), Ok(0))
+    })
+}
+
+/// The IPC server's own artifacts, which `raven-node ipc` (and an auto-started
+/// `service` whose preflight failed) leave in a profile that has no identity
+/// yet: the endpoint socket, its instance lock and the service log. `None` for
+/// every other name. Each is judged by what it really is (`symlink_metadata`,
+/// so a symlink or a directory under the name is never accepted).
+fn ipc_leftover_is_inert(data_dir: &Path, name: &str) -> Option<bool> {
+    let socket = crate::ipc::SOCKET_FILE_NAME;
+    let path = data_dir.join(name);
+    let meta = || std::fs::symlink_metadata(&path).ok();
+    if name == socket {
+        // Windows serves a named pipe: there is no socket file to tolerate.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            return Some(meta().is_some_and(|m| m.file_type().is_socket()));
+        }
+        #[cfg(not(unix))]
+        return Some(false);
+    }
+    if name.strip_prefix(socket) == Some(".lock") {
+        // `flock` target created with O_CREAT and never written to.
+        return Some(meta().is_some_and(|m| m.file_type().is_file() && m.len() == 0));
+    }
+    if name == crate::paths::SERVICE_LOG_NAME {
+        // Daemon stdout/stderr: diagnostics, no identity-bound state (a daemon
+        // cannot get past its identity preflight on a profile without one).
+        return Some(meta().is_some_and(|m| m.file_type().is_file()));
+    }
+    None
+}
+
+/// Whether one profile entry is derived or empty bookkeeping that cannot
+/// indicate an established profile. Everything else (contacts, chat history,
+/// the outbound queue, device keys, ...) must keep failing closed: allowing it
+/// would let a deleted or locked secure store mint a second identity.
+fn first_install_entry_is_inert(data_dir: &Path, name: &str) -> bool {
+    if FIRST_INSTALL_INERT_FILES.contains(&name) {
+        return true;
+    }
+    if let Some(inert) = ipc_leftover_is_inert(data_dir, name) {
+        return inert;
+    }
+    let base = sqlite_base_name(name);
+    let is_lock = is_lock_database_name(base);
+    if !is_lock && base != FIRST_INSTALL_EMPTY_DB {
+        return false;
+    }
+    let is_sidecar = base != name;
+    let regular = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false)
+    };
+    let base_path = data_dir.join(base);
+    if !regular(&data_dir.join(name)) || !regular(&base_path) {
+        // Symlinks, directories, and sidecars whose database is missing.
+        return false;
+    }
+    if is_sidecar {
+        // The database entry is judged on its own turn through the directory.
+        return true;
+    }
+    if is_lock {
+        std::fs::metadata(&base_path).is_ok_and(|m| m.len() == 0)
+    } else {
+        sqlite_database_has_no_rows(&base_path)
+    }
+}
+
 fn require_proven_first_install(
     data_dir: &Path,
     marker: Option<IdentityStoreBackend>,
@@ -264,16 +416,9 @@ fn require_proven_first_install(
         ));
     }
     // A missing root inside an established profile is identity loss, not first
-    // install. Keep this allow-list deliberately small and future-proof:
-    // unknown state must be reviewed/recovered, never silently rebound.
-    let allowed = [
-        IDENTITY_STORE_LOCK_NAME,
-        ".identity_store.lock.sqlite-wal",
-        ".identity_store.lock.sqlite-shm",
-        ".identity_store.lock.sqlite-journal",
-        "bootstrap.json",
-        "node_policy.json",
-    ];
+    // install. Keep the allow-list deliberately small and future-proof:
+    // unknown state must be reviewed/recovered, never silently rebound. Only
+    // inert, derived or empty files pass (see `first_install_entry_is_inert`).
     let entries = std::fs::read_dir(data_dir).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
     for entry in entries {
         let entry = entry.map_err(|e| IdentityStoreError::Io(e.to_string()))?;
@@ -281,9 +426,9 @@ fn require_proven_first_install(
             .file_name()
             .into_string()
             .map_err(|_| IdentityStoreError::Continuity("profile entry name is not canonical"))?;
-        if !allowed.contains(&name.as_str()) {
+        if !first_install_entry_is_inert(data_dir, &name) {
             return Err(IdentityStoreError::Continuity(
-                "profile contains state but has no identity continuity record",
+                "profile contains state but has no identity continuity record; if this profile was never initialised, move the stray files out of the data dir, otherwise restore the missing identity",
             ));
         }
     }
@@ -294,15 +439,49 @@ fn acquire_identity_store_lock(
     data_dir: &Path,
 ) -> Result<crate::paths::DataDirLock, IdentityStoreError> {
     const MAX_WAIT: Duration = Duration::from_secs(60);
+    acquire_identity_store_lock_with(
+        data_dir,
+        crate::macos_keychain::FIRST_HINT_AFTER,
+        MAX_WAIT,
+        |waited| {
+            use std::io::Write;
+            // A closed stderr must not fail the load.
+            let notice = crate::macos_keychain::lock_wait_notice(waited.as_secs());
+            let _ = std::io::stderr().write_all(notice.as_bytes());
+        },
+    )
+}
+
+/// [`acquire_identity_store_lock`] with its timings and the notice injected.
+/// Every attempt waits `notice_after` for the lock. The holder may itself be
+/// blocked in a macOS Keychain dialog (it keeps this lock until the dialog is
+/// answered), and a silent wait behind it looks like a freeze: the first attempt
+/// that finds the lock held calls `on_wait` once with the time waited so far.
+/// Attempts then continue until `max_wait` has passed.
+fn acquire_identity_store_lock_with(
+    data_dir: &Path,
+    notice_after: Duration,
+    max_wait: Duration,
+    mut on_wait: impl FnMut(Duration),
+) -> Result<crate::paths::DataDirLock, IdentityStoreError> {
     const RETRY_DELAY: Duration = Duration::from_millis(50);
     let started = Instant::now();
+    let mut announced = false;
     loop {
-        match crate::paths::DataDirLock::acquire(data_dir, IDENTITY_STORE_LOCK_NAME) {
+        match crate::paths::DataDirLock::acquire_within(
+            data_dir,
+            IDENTITY_STORE_LOCK_NAME,
+            notice_after,
+        ) {
             Ok(lock) => return Ok(lock),
-            Err(e)
-                if started.elapsed() < MAX_WAIT
-                    && (e.contains("database is locked") || e.contains("database is busy")) =>
-            {
+            Err(e) if e.contains("database is locked") || e.contains("database is busy") => {
+                if !announced {
+                    announced = true;
+                    on_wait(started.elapsed());
+                }
+                if started.elapsed() >= max_wait {
+                    return Err(IdentityStoreError::Io(e));
+                }
                 std::thread::sleep(RETRY_DELAY);
             }
             Err(e) => return Err(IdentityStoreError::Io(e)),
@@ -331,7 +510,7 @@ fn finish_loaded_identity(
 }
 
 fn write_marker(data_dir: &Path, backend: IdentityStoreBackend) -> Result<(), IdentityStoreError> {
-    std::fs::create_dir_all(data_dir).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
+    crate::paths::ensure_private_dir(data_dir).map_err(IdentityStoreError::Io)?;
     crate::paths::atomic_write_private(
         &marker_path(data_dir),
         format!("{}\n", backend.as_str()).as_bytes(),
@@ -396,12 +575,96 @@ fn locked_file_backend_enabled() -> Result<bool, IdentityStoreError> {
     allow(dead_code)
 )]
 fn wipe_seed_file(path: &Path) -> Result<(), IdentityStoreError> {
-    if path.exists() {
-        let zeros = [0u8; 64];
-        let _ = std::fs::write(path, &zeros[..32]);
-        std::fs::remove_file(path).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
+    let io = |e: std::io::Error| IdentityStoreError::Io(e.to_string());
+    match std::fs::symlink_metadata(path) {
+        // Scrubbing is best-effort (see the module docs on copy-on-write
+        // storage), removal is not. A failed scrub, such as a read-only or
+        // non-writable legacy file or ENOSPC on a copy-on-write volume, must
+        // never keep the plaintext name around: that leaves the seed fully
+        // readable and makes every later identity load fail in reconcile.
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let _ = scrub_seed_file_in_place(path, &metadata);
+        }
+        // Never write through a symlink or into a special file; just drop the name.
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io(e)),
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io(e)),
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(io)?;
     }
     Ok(())
+}
+
+/// Overwrite the seed file's bytes in place and force them out. No truncate:
+/// a truncating write lets the filesystem free the old blocks untouched. A
+/// legacy file the user made read-only is made owner-writable first (it is
+/// Raven's own file and is about to be deleted).
+#[cfg_attr(
+    not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))),
+    allow(dead_code)
+)]
+fn scrub_seed_file_in_place(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::io::Write;
+    let open = || std::fs::OpenOptions::new().write(true).open(path);
+    let mut file = match open() {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            make_owner_writable(path, metadata)?;
+            open()?
+        }
+        Err(e) => return Err(e),
+    };
+    let zeros = [0u8; 4096];
+    let mut remaining = file.metadata()?.len();
+    while remaining > 0 {
+        let chunk = remaining.min(zeros.len() as u64) as usize;
+        file.write_all(&zeros[..chunk])?;
+        remaining -= chunk as u64;
+    }
+    file.sync_all()
+}
+
+#[cfg(unix)]
+#[cfg_attr(
+    not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))),
+    allow(dead_code)
+)]
+fn make_owner_writable(path: &Path, _metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+fn make_owner_writable(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    let mut permissions = metadata.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions)
+}
+
+/// Finish a just-created (`create_new`) seed file. When writing or syncing it
+/// failed (ENOSPC, a kill between create and fsync is the same hazard) remove
+/// the partial file: `create_new` forbids re-creating it, and a short
+/// `identity.seed` is `Corrupt` on every later load, which would wedge the
+/// profile until the user deleted it by hand.
+fn finish_new_seed_file(
+    path: &Path,
+    written: std::io::Result<()>,
+) -> Result<(), IdentityStoreError> {
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(path);
+        IdentityStoreError::Io(e.to_string())
+    })
 }
 
 #[cfg(unix)]
@@ -410,7 +673,7 @@ fn write_locked_seed_file(path: &Path, seed: &[u8; 32]) -> Result<(), IdentitySt
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
+        crate::paths::ensure_private_dir(parent).map_err(IdentityStoreError::Io)?;
     }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -418,17 +681,13 @@ fn write_locked_seed_file(path: &Path, seed: &[u8; 32]) -> Result<(), IdentitySt
         .mode(0o600)
         .open(path)
         .map_err(|e| IdentityStoreError::Io(e.to_string()))?;
-    f.write_all(seed)
-        .map_err(|e| IdentityStoreError::Io(e.to_string()))?;
-    f.sync_all()
-        .map_err(|e| IdentityStoreError::Io(e.to_string()))?;
-    Ok(())
+    finish_new_seed_file(path, f.write_all(seed).and_then(|_| f.sync_all()))
 }
 
 #[cfg(not(unix))]
 fn write_locked_seed_file(path: &Path, seed: &[u8; 32]) -> Result<(), IdentityStoreError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
+        crate::paths::ensure_private_dir(parent).map_err(IdentityStoreError::Io)?;
     }
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -436,9 +695,7 @@ fn write_locked_seed_file(path: &Path, seed: &[u8; 32]) -> Result<(), IdentitySt
         .create_new(true)
         .open(path)
         .map_err(|e| IdentityStoreError::Io(e.to_string()))?;
-    file.write_all(seed)
-        .and_then(|_| file.sync_all())
-        .map_err(|e| IdentityStoreError::Io(e.to_string()))
+    finish_new_seed_file(path, file.write_all(seed).and_then(|_| file.sync_all()))
 }
 
 fn read_raw_seed_file(path: &Path) -> Result<Option<Vec<u8>>, IdentityStoreError> {
@@ -480,56 +737,69 @@ fn reconcile_secure_and_raw_seed(
 
 #[cfg(target_os = "macos")]
 fn keychain_set(account: &str, seed: &[u8; 32]) -> Result<(), IdentityStoreError> {
+    use crate::macos_keychain::{guarded, KeychainWhat};
     use security_framework::os::macos::keychain::SecKeychain;
-    let keychain = SecKeychain::default()
-        .map_err(|e| IdentityStoreError::SecureStore(format!("keychain default: {e}")))?;
-    // Add-only is essential: a create race or unexpected pre-existing item
-    // must fail and be reconciled by strict readback, never overwrite a root.
-    keychain
-        .add_generic_password(KEYCHAIN_SERVICE, account, seed)
-        .map_err(|e| IdentityStoreError::SecureStore(format!("keychain add: {e}")))
+    guarded(KeychainWhat::IdentitySeed, || {
+        let keychain = SecKeychain::default()
+            .map_err(|e| IdentityStoreError::SecureStore(format!("keychain default: {e}")))?;
+        // Add-only is essential: a create race or unexpected pre-existing item
+        // must fail and be reconciled by strict readback, never overwrite a root.
+        keychain
+            .add_generic_password(KEYCHAIN_SERVICE, account, seed)
+            .map_err(|e| IdentityStoreError::SecureStore(format!("keychain add: {e}")))
+    })
 }
 
 #[cfg(target_os = "macos")]
 fn keychain_get(account: &str) -> Result<Option<[u8; 32]>, IdentityStoreError> {
+    use crate::macos_keychain::{guarded, KeychainWhat};
     use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
     use security_framework::passwords::get_generic_password;
     use security_framework_sys::base::errSecItemNotFound;
     use zeroize::Zeroizing;
 
-    let mut query = ItemSearchOptions::new();
-    query
-        .class(ItemClass::generic_password())
-        .service(KEYCHAIN_SERVICE)
-        .account(account)
-        .load_attributes(true)
-        .limit(Limit::All);
-    match query.search() {
-        Ok(results) => {
-            if results.len() != 1 {
-                return Err(IdentityStoreError::Continuity(
-                    "duplicate Keychain identity items",
-                ));
+    // Search and read are both Keychain round trips; either can sit behind a
+    // macOS access dialog, so one guard covers the pair.
+    guarded(KeychainWhat::IdentitySeed, || {
+        let mut query = ItemSearchOptions::new();
+        query
+            .class(ItemClass::generic_password())
+            .service(KEYCHAIN_SERVICE)
+            .account(account)
+            .load_attributes(true)
+            .limit(Limit::All);
+        match query.search() {
+            Ok(results) => {
+                if results.len() != 1 {
+                    return Err(IdentityStoreError::Continuity(
+                        "duplicate Keychain identity items",
+                    ));
+                }
+                let bytes = Zeroizing::new(
+                    get_generic_password(KEYCHAIN_SERVICE, account).map_err(|e| {
+                        IdentityStoreError::SecureStore(format!(
+                            "keychain read status {}",
+                            e.code()
+                        ))
+                    })?,
+                );
+                if bytes.len() != 32 {
+                    return Err(IdentityStoreError::Corrupt);
+                }
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&bytes);
+                Ok(Some(seed))
             }
-            let bytes = Zeroizing::new(get_generic_password(KEYCHAIN_SERVICE, account).map_err(
-                |e| IdentityStoreError::SecureStore(format!("keychain read status {}", e.code())),
-            )?);
-            if bytes.len() != 32 {
-                return Err(IdentityStoreError::Corrupt);
-            }
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&bytes);
-            Ok(Some(seed))
+            // `get_generic_password` documents this exact OSStatus as the only
+            // proof that no matching item exists. Locked/denied/unavailable must
+            // never be reinterpreted as first install.
+            Err(e) if e.code() == errSecItemNotFound => Ok(None),
+            Err(e) => Err(IdentityStoreError::SecureStore(format!(
+                "keychain get status {}",
+                e.code()
+            ))),
         }
-        // `get_generic_password` documents this exact OSStatus as the only
-        // proof that no matching item exists. Locked/denied/unavailable must
-        // never be reinterpreted as first install.
-        Err(e) if e.code() == errSecItemNotFound => Ok(None),
-        Err(e) => Err(IdentityStoreError::SecureStore(format!(
-            "keychain get status {}",
-            e.code()
-        ))),
-    }
+    })
 }
 
 #[cfg(all(target_os = "macos", test))]
@@ -538,10 +808,13 @@ fn keychain_status_is_proven_absent(status: i32) -> bool {
     status == errSecItemNotFound
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(test, feature = "test-helpers")))]
 fn keychain_delete(account: &str) {
+    use crate::macos_keychain::{guarded, KeychainWhat};
     use security_framework::passwords::delete_generic_password;
-    let _ = delete_generic_password(KEYCHAIN_SERVICE, account);
+    let _ = guarded(KeychainWhat::IdentitySeed, || {
+        delete_generic_password(KEYCHAIN_SERVICE, account)
+    });
 }
 
 // --- Windows DPAPI ----------------------------------------------------------
@@ -586,7 +859,7 @@ fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, IdentityStoreError> {
 }
 
 #[cfg(windows)]
-fn dpapi_unprotect(blob: &[u8]) -> Result<Vec<u8>, IdentityStoreError> {
+fn dpapi_unprotect(blob: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, IdentityStoreError> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
         CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
@@ -617,8 +890,11 @@ fn dpapi_unprotect(blob: &[u8]) -> Result<Vec<u8>, IdentityStoreError> {
         ));
     }
     let slice = unsafe { std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize) };
-    let out = slice.to_vec();
+    let out = zeroize::Zeroizing::new(slice.to_vec());
     unsafe {
+        // The plaintext seed must not survive in freed heap (SecureZeroMemory
+        // equivalent: zeroize uses volatile writes).
+        std::slice::from_raw_parts_mut(data_out.pbData, data_out.cbData as usize).zeroize();
         LocalFree(data_out.pbData as _);
     }
     Ok(out)
@@ -717,8 +993,7 @@ fn load_dpapi_seed_file(path: &Path) -> Result<Option<[u8; 32]>, IdentityStoreEr
     if bytes[DPAPI_MAGIC.len()] != DPAPI_VERSION {
         return Err(IdentityStoreError::Corrupt);
     }
-    use zeroize::Zeroizing;
-    let plain = Zeroizing::new(dpapi_unprotect(&bytes[DPAPI_MAGIC.len() + 1..])?);
+    let plain = dpapi_unprotect(&bytes[DPAPI_MAGIC.len() + 1..])?;
     if plain.len() != 32 {
         return Err(IdentityStoreError::Corrupt);
     }
@@ -730,19 +1005,33 @@ fn load_dpapi_seed_file(path: &Path) -> Result<Option<[u8; 32]>, IdentityStoreEr
 // --- Linux Secret Service (glibc / desktop session) -------------------------
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+const SECRET_SERVICE_IDENTITY_LABEL: &str = "RAVEN node identity seed";
+
+/// R1 (owner decision 2026-10-08): add-only, prompt-free identity creation
+/// through the frozen Raven fork. `create_item_no_prompt` requires the DH
+/// session, hard-wires the D-Bus `replace` flag to false, refuses a provider
+/// prompt (`PromptRequired`) and a locked collection (`Locked`); Raven never
+/// calls `Unlock`. Exclusion comes from the identity-store lock plus the
+/// proven-absent search before this call, and the strict readback after it
+/// (exactly one item) catches a duplicate created behind our back.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn secret_service_set(account: &str, seed: &[u8; 32]) -> Result<(), IdentityStoreError> {
-    // R0 stop-line: GNU/Linux identity *creation* stays fail-closed until R1
-    // explicitly authorizes an add-only, prompt-free create backend. The
-    // upstream crates.io client has no such API, and the frozen no-prompt fork
-    // must never gain a live Raven callsite before R1 (enforced by
-    // scripts/linux_secret_service_r0_hard_stop.sh). Loading, verifying, and
-    // deleting existing Secret Service identities remain fully available.
-    let _ = (account, seed);
-    Err(IdentityStoreError::SecureStore(
-        "GNU/Linux Secret Service identity creation is disabled before R1 (fail-closed); \
-         existing identities still load"
-            .into(),
-    ))
+    use secret_service::{EncryptionType, SecretService};
+    use std::collections::HashMap;
+    let ss = SecretService::new(EncryptionType::Dh)
+        .map_err(|e| IdentityStoreError::SecureStore(format!("secret-service connect: {e}")))?;
+    let collection = ss
+        .get_default_collection()
+        .map_err(|e| IdentityStoreError::SecureStore(format!("secret-service collection: {e}")))?;
+    collection
+        .create_item_no_prompt(
+            SECRET_SERVICE_IDENTITY_LABEL,
+            HashMap::from([("service", KEYCHAIN_SERVICE), ("account", account)]),
+            seed,
+            "application/octet-stream",
+        )
+        .map(|_| ())
+        .map_err(|e| IdentityStoreError::SecureStore(format!("secret-service create: {e}")))
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -789,10 +1078,17 @@ fn secret_service_get(account: &str) -> Result<Option<[u8; 32]>, IdentityStoreEr
         || item
             .get_label()
             .map_err(|e| IdentityStoreError::SecureStore(format!("secret-service label: {e}")))?
-            != "RAVEN node identity seed"
-        || item.get_secret_content_type().map_err(|e| {
-            IdentityStoreError::SecureStore(format!("secret-service content type: {e}"))
-        })? != "text/plain"
+            != SECRET_SERVICE_IDENTITY_LABEL
+        // R1 content-type policy: Raven creates `application/octet-stream`;
+        // GNOME Keyring reports it back as `text/plain` (R0 observation).
+        || !matches!(
+            item.get_secret_content_type()
+                .map_err(|e| {
+                    IdentityStoreError::SecureStore(format!("secret-service content type: {e}"))
+                })?
+                .as_str(),
+            "text/plain" | "application/octet-stream"
+        )
     {
         return Err(IdentityStoreError::Corrupt);
     }
@@ -808,7 +1104,11 @@ fn secret_service_get(account: &str) -> Result<Option<[u8; 32]>, IdentityStoreEr
     Ok(Some(seed))
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(test, feature = "test-helpers")
+))]
 fn secret_service_delete(account: &str) {
     use secret_service::{EncryptionType, SecretService};
     use std::collections::HashMap;
@@ -834,7 +1134,7 @@ fn store_seed(
     data_dir: &Path,
     seed: &[u8; 32],
 ) -> Result<IdentityStoreBackend, IdentityStoreError> {
-    std::fs::create_dir_all(data_dir).map_err(|e| IdentityStoreError::Io(e.to_string()))?;
+    crate::paths::ensure_private_dir(data_dir).map_err(IdentityStoreError::Io)?;
     let path = seed_path(data_dir);
     #[cfg(not(windows))]
     let account = account_for_data_dir(data_dir);
@@ -865,6 +1165,12 @@ fn store_seed(
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
+        let keystore = crate::keystore_select::resolve(data_dir, true)
+            .map_err(IdentityStoreError::SecureStore)?;
+        if keystore == crate::keystore_select::KeystoreBackend::PassphraseVault {
+            let vault = crate::keystore_vault::Vault::for_data_dir(data_dir);
+            return store_vault_seed(data_dir, &vault, &path, seed);
+        }
         secret_service_set(&account, seed)?;
         let mut stored = secret_service_get(&account)?.ok_or(IdentityStoreError::Continuity(
             "Secret Service create had no readable result",
@@ -887,11 +1193,11 @@ fn store_seed(
         not(all(target_os = "linux", target_env = "gnu"))
     ))]
     {
-        let _ = (account, path, seed);
-        return Err(IdentityStoreError::SecureStore(
-            "no protected identity backend on this Unix target; locked-file requires explicit lab override"
-                .into(),
-        ));
+        // musl / other Unix: no Secret Service client, the passphrase vault only.
+        let _ = account;
+        crate::keystore_select::resolve(data_dir, true).map_err(IdentityStoreError::SecureStore)?;
+        let vault = crate::keystore_vault::Vault::for_data_dir(data_dir);
+        return store_vault_seed(data_dir, &vault, &path, seed);
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -910,6 +1216,92 @@ fn bytes_to_seed(bytes: &[u8]) -> Result<[u8; 32], IdentityStoreError> {
     let mut seed = [0u8; 32];
     seed.copy_from_slice(bytes);
     Ok(seed)
+}
+
+// --- Passphrase vault (non-macOS Unix without Secret Service) ---------------
+//
+// Compiled into every test build so the vault-backed identity logic is
+// exercised on macOS / Windows CI hosts as well.
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn vault_error(error: crate::keystore_vault::VaultError) -> IdentityStoreError {
+    IdentityStoreError::SecureStore(format!("passphrase vault: {error}"))
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn vault_get_seed(
+    vault: &crate::keystore_vault::Vault,
+) -> Result<Option<[u8; 32]>, IdentityStoreError> {
+    vault
+        .get(crate::keystore_vault::IDENTITY_SEED_ENTRY)
+        .map_err(vault_error)?
+        .map(|bytes| bytes_to_seed(&bytes))
+        .transpose()
+}
+
+/// First-install (or migration) write: add-only, verified by readback.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn store_vault_seed(
+    data_dir: &Path,
+    vault: &crate::keystore_vault::Vault,
+    path: &Path,
+    seed: &[u8; 32],
+) -> Result<IdentityStoreBackend, IdentityStoreError> {
+    vault
+        .insert_new(crate::keystore_vault::IDENTITY_SEED_ENTRY, seed)
+        .map_err(vault_error)?;
+    let mut stored = vault_get_seed(vault)?.ok_or(IdentityStoreError::Continuity(
+        "passphrase vault create had no readable result",
+    ))?;
+    if stored != *seed {
+        stored.zeroize();
+        return Err(IdentityStoreError::Continuity(
+            "passphrase vault readback changed identity",
+        ));
+    }
+    stored.zeroize();
+    wipe_seed_file(path)?;
+    write_marker(data_dir, IdentityStoreBackend::PassphraseVault)?;
+    Ok(IdentityStoreBackend::PassphraseVault)
+}
+
+/// Same continuity rules as the Keychain / Secret Service loaders: a recorded
+/// vault identity that is missing never becomes a first install, and a wrong
+/// passphrase or damaged vault is an error, not absence.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn load_vault_seed_with_migrate(
+    data_dir: &Path,
+    vault: &crate::keystore_vault::Vault,
+    path: &Path,
+    marker: Option<IdentityStoreBackend>,
+) -> Result<Option<([u8; 32], IdentityStoreBackend)>, IdentityStoreError> {
+    if marker.is_some() && marker != Some(IdentityStoreBackend::PassphraseVault) {
+        return Err(IdentityStoreError::Continuity(
+            "identity backend marker conflicts with the profile's passphrase vault",
+        ));
+    }
+    if let Some(seed) = vault_get_seed(vault)? {
+        reconcile_secure_and_raw_seed(path, &seed)?;
+        return Ok(Some((seed, IdentityStoreBackend::PassphraseVault)));
+    }
+    if marker == Some(IdentityStoreBackend::PassphraseVault) {
+        return Err(IdentityStoreError::Continuity(
+            "recorded passphrase-vault identity is missing",
+        ));
+    }
+    if let Some(mut bytes) = read_raw_seed_file(path)? {
+        if !is_legacy_plaintext(&bytes) {
+            bytes.zeroize();
+            return Err(IdentityStoreError::Corrupt);
+        }
+        let seed = bytes_to_seed(&bytes)?;
+        bytes.zeroize();
+        // Verified migration: add-only insert, readback, then wipe + marker.
+        let backend = store_vault_seed(data_dir, vault, path, &seed)?;
+        return Ok(Some((seed, backend)));
+    }
+    require_proven_first_install(data_dir, marker)?;
+    Ok(None)
 }
 
 /// Locked-file lab/CI (debug only) may proceed only when Keychain is
@@ -1147,6 +1539,12 @@ fn load_seed_with_migrate(
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
+        let keystore = crate::keystore_select::resolve(data_dir, false)
+            .map_err(IdentityStoreError::SecureStore)?;
+        if keystore == crate::keystore_select::KeystoreBackend::PassphraseVault {
+            let vault = crate::keystore_vault::Vault::for_data_dir(data_dir);
+            return load_vault_seed_with_migrate(data_dir, &vault, &path, marker);
+        }
         if marker.is_some() && marker != Some(IdentityStoreBackend::LinuxSecretService) {
             return Err(IdentityStoreError::Continuity(
                 "identity backend marker is not valid on GNU/Linux",
@@ -1204,16 +1602,12 @@ fn load_seed_with_migrate(
         not(all(target_os = "linux", target_env = "gnu"))
     ))]
     {
+        // musl / other Unix: the passphrase vault only.
         let _ = account;
-        if marker.is_some()
-            || read_raw_seed_file(&path)?.is_some()
-            || binding_exists_checked(data_dir)?
-        {
-            return Err(IdentityStoreError::SecureStore(
-                "protected identity backend unavailable on this Unix target".into(),
-            ));
-        }
-        return Ok(None);
+        crate::keystore_select::resolve(data_dir, false)
+            .map_err(IdentityStoreError::SecureStore)?;
+        let vault = crate::keystore_vault::Vault::for_data_dir(data_dir);
+        return load_vault_seed_with_migrate(data_dir, &vault, &path, marker);
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1224,9 +1618,47 @@ fn load_seed_with_migrate(
 }
 
 /// Load identity if present (migrating legacy plaintext seed files).
+///
+/// **Blocking.** Every call takes the cross-process identity-store lock (a
+/// SQLite `BEGIN EXCLUSIVE` with a 3 s busy wait inside a retry loop of up to
+/// 60 s; a holder blocked in a macOS Keychain dialog keeps it, so a wait of 3 s
+/// prints a one-time notice on stderr) and does a Keychain / Secret Service
+/// round trip; nothing is cached.
+/// Async code must not call this on a runtime worker thread (a tokio worker
+/// stuck here cannot be pre-empted by `tokio::time::timeout`): run it on a
+/// blocking thread such as `tokio::task::spawn_blocking`, and prefer loading
+/// the identity once at listener start-up over once per inbound connection.
 pub fn load_identity(data_dir: &Path) -> Result<Option<Identity>, IdentityStoreError> {
+    preload_vault_key_before_locks(data_dir)?;
     let _lock = acquire_identity_store_lock(data_dir)?;
     load_identity_under_lock(data_dir)
+}
+
+/// Passphrase-vault profiles (Linux without Secret Service, musl, other Unix):
+/// ask for the passphrase and run Argon2id *before* the identity lock is
+/// taken, so a person typing it never holds up `raven-node` or another `raven`
+/// waiting on that lock. The key stays in the process cache, so the vault reads
+/// under the lock (and in later session transactions) do not prompt again.
+/// Only a first `init` still asks for the *new* passphrase under the lock (the
+/// vault does not exist yet; documented in docs/design/2026-10-linux-keystore.md).
+fn preload_vault_key_before_locks(data_dir: &Path) -> Result<(), IdentityStoreError> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let vault_profile = matches!(
+            crate::keystore_select::recorded_backend(data_dir),
+            Ok(Some(
+                crate::keystore_select::KeystoreBackend::PassphraseVault
+            ))
+        );
+        if vault_profile && !locked_file_backend_requested() {
+            crate::keystore_vault::Vault::for_data_dir(data_dir)
+                .preload_key()
+                .map_err(vault_error)?;
+        }
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let _ = data_dir;
+    Ok(())
 }
 
 fn load_identity_under_lock(data_dir: &Path) -> Result<Option<Identity>, IdentityStoreError> {
@@ -1236,9 +1668,11 @@ fn load_identity_under_lock(data_dir: &Path) -> Result<Option<Identity>, Identit
 }
 
 /// Load existing identity or generate + securely persist a new one.
+/// Blocking, like [`load_identity`].
 pub fn load_or_create_identity(
     data_dir: &Path,
 ) -> Result<(Identity, IdentityStoreBackend), IdentityStoreError> {
+    preload_vault_key_before_locks(data_dir)?;
     let _lock = acquire_identity_store_lock(data_dir)?;
     if let Some((seed, backend)) = load_seed_with_migrate(data_dir)? {
         return finish_loaded_identity(data_dir, seed, backend);
@@ -1268,7 +1702,7 @@ pub fn load_or_create_identity(
     Ok((id, backend))
 }
 
-/// Require an existing identity (no create).
+/// Require an existing identity (no create). Blocking, like [`load_identity`].
 pub fn load_identity_required(data_dir: &Path) -> Result<Identity, IdentityStoreError> {
     load_identity(data_dir)?.ok_or_else(|| {
         IdentityStoreError::Io("identity missing — run init / ash init first".into())
@@ -1306,6 +1740,7 @@ fn backend_consistency_with(
                 IdentityStoreBackend::MacosKeychain
                     | IdentityStoreBackend::WindowsDpapiFile
                     | IdentityStoreBackend::LinuxSecretService
+                    | IdentityStoreBackend::PassphraseVault
             )
         ) {
             ok = false;
@@ -1380,6 +1815,10 @@ pub fn store_status(data_dir: &Path) -> Result<IdentityStoreStatus, IdentityStor
 }
 
 /// Test helper: remove platform credentials for this data_dir (best-effort).
+///
+/// Irreversibly destroys the root identity, so it only exists in unit tests
+/// and `test-helpers` builds — never in the default production API.
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn test_cleanup(data_dir: &Path) {
     let account = account_for_data_dir(data_dir);
     #[cfg(target_os = "macos")]
@@ -1391,12 +1830,93 @@ pub fn test_cleanup(data_dir: &Path) {
     let _ = std::fs::remove_file(marker_path(data_dir));
     let _ = std::fs::remove_file(binding_path(data_dir));
     let _ = std::fs::remove_file(data_dir.join(IDENTITY_STORE_LOCK_NAME));
+    let _ = std::fs::remove_file(data_dir.join(crate::keystore_vault::VAULT_FILE_NAME));
+    let _ = std::fs::remove_file(data_dir.join(crate::keystore_select::KEYSTORE_MARKER_NAME));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn wipe_seed_file_overwrites_in_place_before_unlinking() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(SEED_FILE_NAME);
+        let alias = tmp.path().join("seed-alias");
+        std::fs::write(&path, [0xA5u8; 32]).unwrap();
+        // A second name for the same inode observes what happened to the bytes.
+        std::fs::hard_link(&path, &alias).unwrap();
+        wipe_seed_file(&path).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&alias).unwrap(), vec![0u8; 32]);
+        // Missing file is not an error.
+        wipe_seed_file(&path).unwrap();
+    }
+
+    /// A legacy seed the user made read-only must still be scrubbed and removed:
+    /// refusing would keep the plaintext on disk and make every later load fail.
+    #[cfg(unix)]
+    #[test]
+    fn wipe_seed_file_scrubs_and_removes_a_read_only_legacy_seed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(SEED_FILE_NAME);
+        let alias = tmp.path().join("seed-alias");
+        std::fs::write(&path, [0xA5u8; 32]).unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        wipe_seed_file(&path).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&alias).unwrap(), vec![0u8; 32]);
+    }
+
+    /// Scrubbing is best-effort, removal is not: when the bytes cannot be
+    /// overwritten the name still goes, and only a failed unlink is an error.
+    #[cfg(unix)]
+    #[test]
+    fn wipe_seed_file_removal_is_mandatory_and_scrub_is_best_effort() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        // Unscrubbable: a symlink is never written through, only unlinked.
+        let target = tmp.path().join("user-file");
+        std::fs::write(&target, b"not raven's").unwrap();
+        let link = tmp.path().join(SEED_FILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        wipe_seed_file(&link).unwrap();
+        assert!(link.symlink_metadata().is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"not raven's");
+
+        // Unremovable (read-only directory): the error propagates.
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let path = locked.join(SEED_FILE_NAME);
+        std::fs::write(&path, [0xA5u8; 32]).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = wipe_seed_file(&path);
+        let still_there = path.exists();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Running as root bypasses the directory mode; nothing to assert then.
+        if still_there {
+            assert!(result.is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_accepts_a_read_only_legacy_seed_that_matches() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(SEED_FILE_NAME);
+        let seed = [0x5Au8; 32];
+        std::fs::write(&path, seed).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        reconcile_secure_and_raw_seed(&path, &seed).unwrap();
+        assert!(!path.exists());
+        // Idempotent once the plaintext file is gone.
+        reconcile_secure_and_raw_seed(&path, &seed).unwrap();
+    }
 
     #[test]
     fn create_load_round_trip() {
@@ -1442,7 +1962,7 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            std::fs::write(&path, &seed).unwrap();
+            std::fs::write(&path, seed).unwrap();
         }
 
         let loaded = load_identity(dir).unwrap().expect("migrate+load");
@@ -1497,8 +2017,7 @@ mod tests {
         let id = Identity::generate();
         let mut seed = id.seed_bytes();
         let err = store_seed(dir, &seed)
-            .err()
-            .expect("fresh creation must fail closed on an existing seed file");
+            .expect_err("fresh creation must fail closed on an existing seed file");
         seed.zeroize();
         assert!(matches!(err, IdentityStoreError::Io(_)));
         assert_eq!(
@@ -1517,7 +2036,7 @@ mod tests {
         let original = Identity::generate();
         let seed = original.seed_bytes();
         let path = seed_path(dir);
-        std::fs::write(&path, &seed).unwrap();
+        std::fs::write(&path, seed).unwrap();
 
         let loaded = load_identity(dir).unwrap().expect("migrate+load");
         assert_eq!(loaded.public_key_bytes(), original.public_key_bytes());
@@ -1936,5 +2455,409 @@ mod tests {
             }
         }
         test_cleanup(dir);
+    }
+
+    fn is_continuity(result: Result<(), IdentityStoreError>) -> bool {
+        matches!(result, Err(IdentityStoreError::Continuity(_)))
+    }
+
+    /// `raven-node status` / `bridge` open the forward queue and the ash menus
+    /// take the history lock on a profile that has no identity yet. Those files
+    /// used to trip the first-install tripwire permanently.
+    #[test]
+    fn first_install_tolerates_inert_files_created_by_read_only_commands() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        require_proven_first_install(dir, None).unwrap();
+
+        // `raven-node status`: an empty relay-custody database.
+        drop(crate::forward_queue::ForwardQueue::open(&dir.join("forward_queue.sqlite")).unwrap());
+        // ash Messages / outbound-stage / key-init locks and Finder metadata.
+        for lock in [
+            ".chat_history.lock.sqlite",
+            ".outbound_body_stage.lock.sqlite",
+            ".chat_history_key.lock.sqlite",
+        ] {
+            drop(crate::paths::DataDirLock::acquire(dir, lock).unwrap());
+        }
+        std::fs::write(dir.join(".DS_Store"), b"finder").unwrap();
+        std::fs::write(dir.join("bootstrap.json.corrupt"), b"{ not json").unwrap();
+        require_proven_first_install(dir, None).unwrap();
+
+        // The recorded-identity tripwires are untouched.
+        assert!(is_continuity(require_proven_first_install(
+            dir,
+            Some(IdentityStoreBackend::LockedFile)
+        )));
+    }
+
+    /// Anything that indicates an established profile still fails closed, so a
+    /// deleted or locked secure store can never mint a second identity.
+    #[test]
+    fn first_install_still_refuses_established_or_hostile_profile_state() {
+        let case = |setup: &dyn Fn(&Path)| {
+            let tmp = TempDir::new().unwrap();
+            setup(tmp.path());
+            require_proven_first_install(tmp.path(), None)
+        };
+        for stray in [
+            "queue.sqlite",
+            "contacts.json",
+            "chat_history.json",
+            "outbound_body_stage.bin",
+            "device_x25519.secret",
+            "identity.seed",
+            "somefile.lock.sqlite",
+        ] {
+            assert!(
+                is_continuity(case(&|d| std::fs::write(d.join(stray), b"x").unwrap())),
+                "{stray}"
+            );
+        }
+        // A lock database that actually holds data is not a lock.
+        assert!(is_continuity(case(&|d| std::fs::write(
+            d.join(".chat_history.lock.sqlite"),
+            b"SQLite format 3\0not empty"
+        )
+        .unwrap())));
+        // A relay queue that holds rows is state, not a stray empty file.
+        assert!(is_continuity(case(&|d| {
+            let path = d.join("forward_queue.sqlite");
+            drop(crate::forward_queue::ForwardQueue::open(&path).unwrap());
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO bridge_seen_objects_v2 (object_digest, seen_at_ms, ingress)
+                 VALUES (x'01', 1, 'lan')",
+                [],
+            )
+            .unwrap();
+        })));
+        // An unreadable or non-SQLite "queue" fails closed too.
+        assert!(is_continuity(case(&|d| std::fs::write(
+            d.join("forward_queue.sqlite"),
+            b"definitely not sqlite, long enough to be a header......"
+        )
+        .unwrap())));
+        // A sidecar without its database is not inert.
+        assert!(is_continuity(case(&|d| std::fs::write(
+            d.join("forward_queue.sqlite-wal"),
+            b"x"
+        )
+        .unwrap())));
+    }
+
+    /// `raven-node ipc --data-dir <new profile>` (the documented dedicated-IPC
+    /// start) binds its socket and instance lock before any identity exists;
+    /// they used to make the first `ash init` fail the continuity check until
+    /// they were removed by hand. Only the real artifacts are tolerated.
+    #[cfg(unix)]
+    #[test]
+    fn first_install_tolerates_the_ipc_servers_socket_lock_and_log() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // A real bound socket (an unlinked-on-exit file would be left behind
+        // by a killed server: the file type is what matters, not liveness).
+        let sock = dir.join("raven-node.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        drop(listener);
+        assert!(sock.exists(), "a dropped listener leaves its socket file");
+        // The instance lock exactly as `acquire_instance_lock` creates it.
+        std::fs::write(dir.join("raven-node.sock.lock"), b"").unwrap();
+        std::fs::write(dir.join("raven-node-service.log"), b"ipc: listening\n").unwrap();
+        require_proven_first_install(dir, None).unwrap();
+        assert!(is_continuity(require_proven_first_install(
+            dir,
+            Some(IdentityStoreBackend::LockedFile)
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_install_still_refuses_look_alike_ipc_names() {
+        let case = |setup: &dyn Fn(&Path)| {
+            let tmp = TempDir::new().unwrap();
+            setup(tmp.path());
+            require_proven_first_install(tmp.path(), None)
+        };
+        // A regular file named like the socket is state, not a socket.
+        assert!(is_continuity(case(&|d| std::fs::write(
+            d.join("raven-node.sock"),
+            b""
+        )
+        .unwrap())));
+        // So are a symlink and a directory under the socket, lock or log name.
+        assert!(is_continuity(case(&|d| {
+            std::fs::write(d.join("elsewhere"), b"").unwrap();
+            std::os::unix::fs::symlink(d.join("elsewhere"), d.join("raven-node.sock")).unwrap();
+        })));
+        assert!(is_continuity(case(&|d| {
+            std::fs::create_dir(d.join("raven-node.sock.lock")).unwrap()
+        })));
+        assert!(is_continuity(case(&|d| {
+            std::fs::write(d.join("elsewhere"), b"").unwrap();
+            std::os::unix::fs::symlink(d.join("elsewhere"), d.join("raven-node-service.log"))
+                .unwrap();
+        })));
+        // A lock file that holds data is not the O_CREAT-and-flock file.
+        assert!(is_continuity(case(&|d| std::fs::write(
+            d.join("raven-node.sock.lock"),
+            b"not empty"
+        )
+        .unwrap())));
+        // Other names that merely share the prefix stay refused.
+        for stray in [
+            "raven-node.sock.bak",
+            "raven-node.sock.lock2",
+            "raven-node.log",
+        ] {
+            assert!(
+                is_continuity(case(&|d| std::fs::write(d.join(stray), b"").unwrap())),
+                "{stray}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_install_refuses_a_symlinked_inert_name() {
+        let tmp = TempDir::new().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"").unwrap();
+        let profile = tmp.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, profile.join(".chat_history.lock.sqlite")).unwrap();
+        assert!(is_continuity(require_proven_first_install(&profile, None)));
+    }
+
+    /// End to end: files a read-only command left behind must not stop the
+    /// first identity from being created (lab backend; skipped when the
+    /// harness has not selected it, to stay clear of the real secure store).
+    #[test]
+    fn first_install_succeeds_after_read_only_commands_touched_the_profile() {
+        test_enable_locked_file_identity_backend();
+        if !locked_file_backend_requested() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        drop(crate::forward_queue::ForwardQueue::open(&dir.join("forward_queue.sqlite")).unwrap());
+        drop(crate::paths::DataDirLock::acquire(dir, ".chat_history.lock.sqlite").unwrap());
+        let (id, _) = load_or_create_identity(dir).expect("first install after status/menus");
+        let loaded = load_identity(dir).unwrap().expect("loaded");
+        assert_eq!(id.public_key_bytes(), loaded.public_key_bytes());
+        test_cleanup(dir);
+    }
+
+    #[test]
+    fn failed_seed_write_removes_the_partial_file_but_never_a_preexisting_one() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(SEED_FILE_NAME);
+        // create_new on an existing profile file must fail and leave it intact.
+        std::fs::write(&path, b"existing profile state").unwrap();
+        assert!(write_locked_seed_file(&path, &[7u8; 32]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing profile state");
+        std::fs::remove_file(&path).unwrap();
+
+        // A write/sync failure after the create leaves no short identity.seed.
+        std::fs::write(&path, [1u8; 5]).unwrap();
+        let enospc = std::io::Error::other("no space left on device");
+        assert!(finish_new_seed_file(&path, Err(enospc)).is_err());
+        assert!(!path.exists());
+
+        // The success path keeps the seed, and a retry can then proceed.
+        write_locked_seed_file(&path, &[7u8; 32]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [7u8; 32]);
+    }
+
+    /// Another raven process (blocked in a macOS Keychain dialog, say) keeps the
+    /// identity-store lock: a waiter says so once and carries on by itself when
+    /// the holder lets go.
+    #[test]
+    fn waiting_for_a_held_identity_lock_announces_itself_once_then_gets_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut holder =
+            Some(crate::paths::DataDirLock::acquire(tmp.path(), IDENTITY_STORE_LOCK_NAME).unwrap());
+        let mut notices = 0;
+        // The notice is the clock: it fires while the lock is still held, and
+        // the holder lets go inside it, so the next attempt must win.
+        let lock = acquire_identity_store_lock_with(
+            tmp.path(),
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            |_| {
+                notices += 1;
+                assert!(holder.take().is_some(), "a second notice for one wait");
+            },
+        )
+        .expect("the lock once its holder let go");
+        drop(lock);
+        assert_eq!(notices, 1);
+    }
+
+    /// The bounded wait still ends in the old lock error (ash recognises the
+    /// "database is locked" text), after exactly one notice.
+    #[test]
+    fn a_never_released_identity_lock_times_out_with_the_lock_text_after_one_notice() {
+        let tmp = TempDir::new().unwrap();
+        let _holder =
+            crate::paths::DataDirLock::acquire(tmp.path(), IDENTITY_STORE_LOCK_NAME).unwrap();
+        let mut notices = 0;
+        let started = Instant::now();
+        let err = match acquire_identity_store_lock_with(
+            tmp.path(),
+            Duration::from_millis(10),
+            Duration::from_millis(300),
+            |_| notices += 1,
+        ) {
+            Ok(_) => panic!("the lock is held"),
+            Err(e) => e,
+        };
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(
+            matches!(&err, IdentityStoreError::Io(text) if text.contains("database is locked")),
+            "{err}"
+        );
+        assert_eq!(notices, 1, "one notice per wait, not one per retry");
+    }
+
+    /// Only a held lock is waited for and announced: any other failure to take
+    /// it is reported at once.
+    #[test]
+    fn a_failure_that_is_not_a_held_lock_is_neither_retried_nor_announced() {
+        let tmp = TempDir::new().unwrap();
+        // A file where the data dir should be: the lock file cannot be created.
+        let not_a_dir = tmp.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let mut notices = 0;
+        let started = Instant::now();
+        let result = acquire_identity_store_lock_with(
+            &not_a_dir,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            |_| notices += 1,
+        );
+        assert!(matches!(result, Err(IdentityStoreError::Io(_))));
+        assert_eq!(notices, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "it kept retrying"
+        );
+    }
+
+    fn test_identity_vault(dir: &Path, passphrase: &str) -> crate::keystore_vault::Vault {
+        crate::keystore_vault::test_support::test_vault(dir, passphrase).0
+    }
+
+    #[test]
+    fn vault_identity_create_load_add_only_and_continuity() {
+        const PASS: &str = "identity vault passphrase";
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let vault = test_identity_vault(dir, PASS);
+        let path = seed_path(dir);
+        assert!(load_vault_seed_with_migrate(dir, &vault, &path, None)
+            .unwrap()
+            .is_none());
+        let id = Identity::generate();
+        let seed = id.seed_bytes();
+        assert_eq!(
+            store_vault_seed(dir, &vault, &path, &seed).unwrap(),
+            IdentityStoreBackend::PassphraseVault
+        );
+        let marker = read_marker_checked(dir).unwrap();
+        assert_eq!(marker, Some(IdentityStoreBackend::PassphraseVault));
+        let (loaded, backend) = load_vault_seed_with_migrate(dir, &vault, &path, marker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, seed);
+        let (loaded_id, _) = finish_loaded_identity(dir, loaded, backend).unwrap();
+        assert_eq!(loaded_id.public_key_bytes(), id.public_key_bytes());
+        assert!(
+            store_vault_seed(dir, &vault, &path, &[9u8; 32]).is_err(),
+            "add-only: a second create never replaces the root"
+        );
+        let reopened = test_identity_vault(dir, PASS);
+        let (again, _) = load_vault_seed_with_migrate(dir, &reopened, &path, marker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, seed);
+        let wrong = test_identity_vault(dir, "not the identity passphrase");
+        assert!(matches!(
+            load_vault_seed_with_migrate(dir, &wrong, &path, marker),
+            Err(IdentityStoreError::SecureStore(_))
+        ));
+        assert!(matches!(
+            load_vault_seed_with_migrate(
+                dir,
+                &vault,
+                &path,
+                Some(IdentityStoreBackend::LinuxSecretService)
+            ),
+            Err(IdentityStoreError::Continuity(_))
+        ));
+        vault
+            .delete(crate::keystore_vault::IDENTITY_SEED_ENTRY)
+            .unwrap();
+        assert!(matches!(
+            load_vault_seed_with_migrate(dir, &vault, &path, marker),
+            Err(IdentityStoreError::Continuity(_))
+        ));
+    }
+
+    #[test]
+    fn vault_identity_migrates_legacy_plaintext_and_refuses_unmarked_vault_state() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let original = Identity::generate().seed_bytes();
+        let path = seed_path(dir);
+        crate::paths::create_new_private(&path, &original).unwrap();
+        let vault = test_identity_vault(dir, "migration passphrase");
+        let (seed, backend) = load_vault_seed_with_migrate(dir, &vault, &path, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seed, original);
+        assert_eq!(backend, IdentityStoreBackend::PassphraseVault);
+        assert!(!path.exists(), "plaintext seed is wiped after migration");
+        assert_eq!(
+            read_marker_checked(dir).unwrap(),
+            Some(IdentityStoreBackend::PassphraseVault)
+        );
+
+        // A vault that holds other secrets but no identity is established
+        // state, never a first install.
+        let other = TempDir::new().unwrap();
+        let other_vault = test_identity_vault(other.path(), "other passphrase");
+        other_vault
+            .put(crate::keystore_vault::CHAT_HISTORY_KEY_ENTRY, &[1u8; 32])
+            .unwrap();
+        assert!(matches!(
+            load_vault_seed_with_migrate(
+                other.path(),
+                &other_vault,
+                &seed_path(other.path()),
+                None
+            ),
+            Err(IdentityStoreError::Continuity(_))
+        ));
+        // The keystore marker and the vault lock alone are inert.
+        std::fs::write(
+            other
+                .path()
+                .join(crate::keystore_select::KEYSTORE_MARKER_NAME),
+            "passphrase-vault\n",
+        )
+        .unwrap();
+        assert!(first_install_entry_is_inert(
+            other.path(),
+            crate::keystore_select::KEYSTORE_MARKER_NAME
+        ));
+        assert!(first_install_entry_is_inert(
+            other.path(),
+            crate::keystore_vault::VAULT_LOCK_NAME
+        ));
+        assert!(!first_install_entry_is_inert(
+            other.path(),
+            crate::keystore_vault::VAULT_FILE_NAME
+        ));
     }
 }

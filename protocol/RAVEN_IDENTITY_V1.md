@@ -40,6 +40,24 @@ them into one:
 - A device key is worthless to a verifier on its own — it only means anything
   once bound to a user identity by a `RavenDeviceCertificateV1` (§2).
 
+### 1.3 Signature verification is strict
+
+Every Ed25519 check in this family — device certificates, revocations,
+PairInit/PairResponse, envelope `sender_authentication`, alias, profile,
+introduction, contact-request/accept and ACK records — MUST use strict
+verification: reject a public key `A` of small order ("weak" keys), reject a
+signature whose `R` is of small order, and require canonical `s < L`
+(RFC 8032 §5.1.7 plus the small-order checks, e.g. ed25519-dalek
+`verify_strict`). Every key in this family is attacker-suppliable on the wire,
+and under a weak key such as the identity point the pair `(R = identity,
+s = 0)` satisfies the cofactorless equation for *every* message, so a lenient
+verifier would accept a "signature" over arbitrary cert, pairing or record
+bytes from someone holding no private key. Honestly generated keys and
+signatures never trip these checks, so strictness changes no valid vector.
+Reference: `raven_core::identity::Identity::verify`. The Python reference's
+`verify()` helpers call OpenSSL's Ed25519 verify, which accepts the weak-key
+forgery above; they are not yet an oracle for this rule.
+
 ## 2. `RavenDeviceCertificateV1`
 
 The user-signs-device certificate. Possession of a valid certificate signed by
@@ -125,11 +143,33 @@ one is current.
 1. `h = SHA-256(edPub_raw_32)`; take `h[:9]` (9 bytes).
 2. Encode those 9 bytes with **standard** Base64 (RFC 4648 §4 alphabet `A–Za–z0–9+/`).
    9 bytes → exactly 12 Base64 chars, no `=` padding. **Do not use Base64URL** (`-_`).
-3. **Remove** every `+` and `/` character. Because a `+`/`/` may or may not be
-   present, the result is 10–12 chars. Do **not** re-pad and do **not** truncate
-   to 12 *before* stripping.
+3. **Remove** every `+` and `/` character. Do **not** re-pad and do **not**
+   truncate to 12 *before* stripping. Each of the 12 characters is `+` or `/`
+   with probability 1/32, independently, so the length of the result is **not**
+   bounded below by 10: it is 12 chars for ~68.3% of keys, 11 for ~26.4%, 10
+   for ~4.7%, and 9 or fewer for ~0.54% (any number of characters may be
+   stripped; 0 chars remain with probability 2⁻⁶⁰). A port MUST handle every
+   length from 0 to 12 and MUST NOT assume a minimum.
 4. Insert `-` after every 4th character of the **remaining** string (so a
-   12-char result is `XXXX-XXXX-XXXX`; an 11-char result is `XXXX-XXXX-XXX`).
+   12-char result is `XXXX-XXXX-XXXX`; an 11-char result is `XXXX-XXXX-XXX`;
+   a 9-char result is `XXXX-XXXX-X`).
+
+**Strength (known V1 limitation).** This is a short human cross-check, not a
+cryptographic safety number. It carries at most 72 bits of `SHA-256(edPub)`,
+and because deleting `+`/`/` discards *which* positions held them, the
+mapping is not injective: for the ~31.7% of keys that lose a character, the
+number of distinct 72-bit prefixes rendering to the same string grows with
+each deletion (a key that loses three characters shows only 9 characters,
+at most ~54 bits of direct content). There is no key stretching and no
+pairwise binding of the two parties' keys, and a multi-target attacker gains a
+further factor of the number of targets. A second preimage still needs an
+Ed25519 keygen per attempt at ≳2⁶⁷ work for the stripped branch, so this is a
+margin concern rather than a practical MITM today — but V1 fingerprints MUST
+NOT be described as providing more than ~72 bits, and a successor
+verification string (e.g. an iterated-hash pairwise safety number over both
+identities of ≥ 100 bits) is required before this is presented as a
+high-assurance MITM check. The derivation above is frozen and MUST NOT be
+changed in place.
 
 For alice's RFC-8032 test key (`d75a98…511a`): clean 12-char branch → `If4x-36FU-omFi`
 (MeshV1 hex deprecated: `21FE-31DF-A154`). For dave's key
@@ -137,8 +177,8 @@ For alice's RFC-8032 test key (`d75a98…511a`): clean 12-char branch → `If4x-
 fingerprint is the 11-char `NN72-hvSx-N7W`.
 
 **Vectors:** `shared-vectors/rvn1/identities/fingerprint_alice.json` (clean
-branch) and `…/fingerprint_dave.json` (the `+`/`/` strip branch — ~31% of real
-keys hit it; it is pinned so no port can silently diverge on it). Each carries
+branch) and `…/fingerprint_dave.json` (the `+`/`/` strip branch — ~31.7% of
+real keys hit it; it is pinned so no port can silently diverge on it). Each carries
 the deprecated MeshV1 hex value too, purely as a migration check.
 
 **The machine identity is the `RavenAddressV1`** ([`RAVEN_ADDRESS_V1.md`](RAVEN_ADDRESS_V1.md)),

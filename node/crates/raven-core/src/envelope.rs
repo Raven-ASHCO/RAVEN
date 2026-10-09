@@ -1,6 +1,7 @@
 //! RavenEnvelopeV1 — pack/unpack + signing bytes (mutable-field rule).
 
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 use crate::identity::Identity;
 
@@ -36,6 +37,20 @@ impl EnvType {
     }
 }
 
+/// A locally built envelope that cannot be encoded canonically. Encoders fail
+/// closed instead of wrapping a length into its fixed-width field.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeEncodeError {
+    #[error("ratchet header does not fit the u16 hdr_len field")]
+    HeaderTooLong,
+    #[error("message ciphertext does not fit the u32 body_len field")]
+    BodyTooLong,
+    #[error("sender authentication does not fit the u16 auth_len field")]
+    AuthenticationTooLong,
+    #[error("envelope exceeds MAX_WIRE_ENVELOPE_BYTES")]
+    TooLarge,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
     pub env_type: u8,
@@ -54,7 +69,58 @@ pub struct Envelope {
 }
 
 impl Envelope {
+    fn body_lengths(&self) -> Result<(u16, u32), EnvelopeEncodeError> {
+        let hdr_len = u16::try_from(self.ratchet_header_ciphertext.len())
+            .map_err(|_| EnvelopeEncodeError::HeaderTooLong)?;
+        let body_len = u32::try_from(self.message_ciphertext.len())
+            .map_err(|_| EnvelopeEncodeError::BodyTooLong)?;
+        Ok((hdr_len, body_len))
+    }
+
+    fn length_fields(&self) -> Result<(u16, u32, u16), EnvelopeEncodeError> {
+        let (hdr_len, body_len) = self.body_lengths()?;
+        let auth_len = u16::try_from(self.sender_authentication.len())
+            .map_err(|_| EnvelopeEncodeError::AuthenticationTooLong)?;
+        Ok((hdr_len, body_len, auth_len))
+    }
+
+    fn check_canonical_size(&self, auth_len: usize) -> Result<(), EnvelopeEncodeError> {
+        let total = PREFIX_LEN
+            .checked_add(self.ratchet_header_ciphertext.len())
+            .and_then(|total| total.checked_add(self.message_ciphertext.len()))
+            .and_then(|total| total.checked_add(auth_len))
+            .ok_or(EnvelopeEncodeError::TooLarge)?;
+        if total > MAX_WIRE_ENVELOPE_BYTES {
+            return Err(EnvelopeEncodeError::TooLarge);
+        }
+        Ok(())
+    }
+
+    /// Fail-closed canonical encoder: rejects any length that does not fit its
+    /// wire field and any envelope above [`MAX_WIRE_ENVELOPE_BYTES`].
+    pub fn try_pack(&self) -> Result<Vec<u8>, EnvelopeEncodeError> {
+        let lengths = self.length_fields()?;
+        self.check_canonical_size(self.sender_authentication.len())?;
+        Ok(self.pack_with(lengths))
+    }
+
+    /// Encodes the envelope. Size policy (the 1 MiB ceiling) is left to the
+    /// caller or [`Self::try_pack`].
+    ///
+    /// # Panics
+    ///
+    /// If a length does not fit its fixed-width field (header or
+    /// authentication above 65,535 bytes, body above `u32::MAX`). Emitting a
+    /// wrapped length would corrupt field boundaries. Envelopes produced by
+    /// [`Self::unpack`] can never trigger this.
     pub fn pack(&self) -> Vec<u8> {
+        let lengths = self
+            .length_fields()
+            .unwrap_or_else(|error| panic!("RVN1 pack: {error}"));
+        self.pack_with(lengths)
+    }
+
+    fn pack_with(&self, (hdr_len, body_len, auth_len): (u16, u32, u16)) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             PREFIX_LEN
                 + self.ratchet_header_ciphertext.len()
@@ -73,9 +139,9 @@ impl Envelope {
         out.push(self.hop_limit);
         out.push(self.replication_budget);
         out.extend_from_slice(&self.anti_replay_nonce);
-        out.extend_from_slice(&(self.ratchet_header_ciphertext.len() as u16).to_be_bytes());
-        out.extend_from_slice(&(self.message_ciphertext.len() as u32).to_be_bytes());
-        out.extend_from_slice(&(self.sender_authentication.len() as u16).to_be_bytes());
+        out.extend_from_slice(&hdr_len.to_be_bytes());
+        out.extend_from_slice(&body_len.to_be_bytes());
+        out.extend_from_slice(&auth_len.to_be_bytes());
         out.extend_from_slice(&self.ratchet_header_ciphertext);
         out.extend_from_slice(&self.message_ciphertext);
         out.extend_from_slice(&self.sender_authentication);
@@ -146,8 +212,28 @@ impl Envelope {
         })
     }
 
+    /// Fail-closed signing bytes: rejects lengths that do not fit their
+    /// fields and any envelope whose canonical encoding (with a 64-byte
+    /// signature) would exceed [`MAX_WIRE_ENVELOPE_BYTES`].
+    pub fn try_signing_bytes(&self) -> Result<Vec<u8>, EnvelopeEncodeError> {
+        let lengths = self.body_lengths()?;
+        self.check_canonical_size(ED25519_SIGNATURE_LEN)?;
+        Ok(self.signing_bytes_with(lengths))
+    }
+
     /// Signing bytes: mutable fields zeroed, auth_len fixed to 64, ciphertext blobs by hash.
+    ///
+    /// # Panics
+    ///
+    /// Under the same field-width condition as [`Self::pack`].
     pub fn signing_bytes(&self) -> Vec<u8> {
+        let lengths = self
+            .body_lengths()
+            .unwrap_or_else(|error| panic!("RVN1 signing bytes: {error}"));
+        self.signing_bytes_with(lengths)
+    }
+
+    fn signing_bytes_with(&self, (hdr_len, body_len): (u16, u32)) -> Vec<u8> {
         let mut prefix = Vec::with_capacity(PREFIX_LEN);
         prefix.extend_from_slice(MAGIC);
         prefix.push(VERSION);
@@ -161,8 +247,8 @@ impl Envelope {
         prefix.push(0); // hop_limit
         prefix.push(0); // replication_budget
         prefix.extend_from_slice(&self.anti_replay_nonce);
-        prefix.extend_from_slice(&(self.ratchet_header_ciphertext.len() as u16).to_be_bytes());
-        prefix.extend_from_slice(&(self.message_ciphertext.len() as u32).to_be_bytes());
+        prefix.extend_from_slice(&hdr_len.to_be_bytes());
+        prefix.extend_from_slice(&body_len.to_be_bytes());
         prefix.extend_from_slice(&64u16.to_be_bytes()); // canonical auth_len
         debug_assert_eq!(prefix.len(), PREFIX_LEN);
 
@@ -181,9 +267,13 @@ impl Envelope {
         if self.sender_authentication.len() != ED25519_SIGNATURE_LEN {
             return false;
         }
+        // A non-canonical (unencodable or oversized) envelope never verifies.
+        let Ok(signing) = self.try_signing_bytes() else {
+            return false;
+        };
         let mut sig = [0u8; 64];
         sig.copy_from_slice(&self.sender_authentication);
-        Identity::verify(signer_ed_pub, &self.signing_bytes(), &sig)
+        Identity::verify(signer_ed_pub, &signing, &sig)
     }
 }
 
@@ -254,6 +344,56 @@ mod tests {
 
         env.expires_at = env.created_at - 1;
         assert!(Envelope::unpack(&env.pack()).is_none());
+    }
+
+    #[test]
+    fn encoders_fail_closed_instead_of_wrapping_lengths() {
+        let identity = Identity::from_seed(&[0x61; 32]);
+        let mut header_overflow = structurally_valid_envelope();
+        header_overflow.ratchet_header_ciphertext = vec![0x44; usize::from(u16::MAX) + 1];
+        assert_eq!(
+            header_overflow.try_pack(),
+            Err(EnvelopeEncodeError::HeaderTooLong)
+        );
+        assert_eq!(
+            header_overflow.try_signing_bytes(),
+            Err(EnvelopeEncodeError::HeaderTooLong)
+        );
+        assert!(std::panic::catch_unwind(|| header_overflow.pack()).is_err());
+        assert!(std::panic::catch_unwind(|| header_overflow.signing_bytes()).is_err());
+        // Previously these wrapped hdr_len to 0 and signed/emitted the result.
+        // Verification of such a value is a clean `false`, never a panic.
+        let mut signed_overflow = header_overflow.clone();
+        signed_overflow.sender_authentication = vec![0x11; ED25519_SIGNATURE_LEN];
+        assert!(!signed_overflow.verify(&identity.public_key_bytes()));
+
+        let mut auth_overflow = structurally_valid_envelope();
+        auth_overflow.sender_authentication = vec![0; usize::from(u16::MAX) + 1];
+        assert_eq!(
+            auth_overflow.try_pack(),
+            Err(EnvelopeEncodeError::AuthenticationTooLong)
+        );
+
+        let mut oversized = structurally_valid_envelope();
+        oversized.message_ciphertext = vec![0x55; MAX_WIRE_ENVELOPE_BYTES];
+        assert_eq!(oversized.try_pack(), Err(EnvelopeEncodeError::TooLarge));
+        assert_eq!(
+            oversized.try_signing_bytes(),
+            Err(EnvelopeEncodeError::TooLarge)
+        );
+        oversized.sign_with(&identity);
+        assert!(!oversized.verify(&identity.public_key_bytes()));
+        // The size policy of `pack` itself is unchanged; receivers reject it.
+        assert!(Envelope::unpack(&oversized.pack()).is_none());
+
+        let mut canonical = structurally_valid_envelope();
+        canonical.sign_with(&identity);
+        assert_eq!(canonical.try_pack().unwrap(), canonical.pack());
+        assert_eq!(
+            canonical.try_signing_bytes().unwrap(),
+            canonical.signing_bytes()
+        );
+        assert!(canonical.verify(&identity.public_key_bytes()));
     }
 
     #[test]

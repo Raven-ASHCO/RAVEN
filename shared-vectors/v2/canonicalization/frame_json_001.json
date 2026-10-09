@@ -1,0 +1,36 @@
+{
+  "name": "Feature-frame v2 signing input (RFC 8785)",
+  "description": "v1 frame_json_001's frame: drop `s`/`spk`, canonicalize with RFC 8785 (JCS), prefix magic + kind 0x03. For this all-ASCII, integer-only frame the JCS text equals the v1 canonical text.",
+  "protocol_version": "v2-draft",
+  "spec_reference": "MESH_PROTOCOL_v2.md §3 + RFC 8785",
+  "created_at": "2026-05-15T00:00:00Z",
+  "deterministic": true,
+  "inputs": {
+    "raw_frame": {
+      "mk": "raven.example.v1",
+      "p": {
+        "x": 1,
+        "y": "hello"
+      },
+      "sid": "alice-device-1",
+      "mid": "frame-001",
+      "hc": 0,
+      "hl": 10,
+      "sc": 5,
+      "ts": 1700000000000,
+      "rp": [],
+      "ttl": 86400,
+      "s": "PLACEHOLDER_SIG_b64",
+      "spk": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+    },
+    "signer": "alice"
+  },
+  "expected": {
+    "canonical_utf8": "{\"hc\":0,\"hl\":10,\"mid\":\"frame-001\",\"mk\":\"raven.example.v1\",\"p\":{\"x\":1,\"y\":\"hello\"},\"rp\":[],\"sc\":5,\"sid\":\"alice-device-1\",\"ts\":1700000000000,\"ttl\":86400}",
+    "canonical_hex": "7b226863223a302c22686c223a31302c226d6964223a226672616d652d303031222c226d6b223a22726176656e2e6578616d706c652e7631222c2270223a7b2278223a312c2279223a2268656c6c6f227d2c227270223a5b5d2c227363223a352c22736964223a22616c6963652d6465766963652d31222c227473223a313730303030303030303030302c2274746c223a38363430307d",
+    "signing_bytes_hex": "ff52564d45534832037b226863223a302c22686c223a31302c226d6964223a226672616d652d303031222c226d6b223a22726176656e2e6578616d706c652e7631222c2270223a7b2278223a312c2279223a2268656c6c6f227d2c227270223a5b5d2c227363223a352c22736964223a22616c6963652d6465766963652d31222c227473223a313730303030303030303030302c2274746c223a38363430307d",
+    "signature_hex": "d78e9ab017f9b214dee2d0775c493393148bc24115e5ded22610e0bedf30187d0af42c7d7a7360060c29e8228a20ca2a754a89f6d56997628df7f6effaf08502",
+    "signature_b64": "146asBf5shTe4tB3XEkzkxSLwkEV5d7SJhDgvt8wGH0K9Cx9enNgBgwp6CKKIMoqdUqJ9tVpl2KN9/bv+vCFAg=="
+  },
+  "notes": "DRAFT (docs/MESH_PROTOCOL_v2.md): no port ships v2 yet; frozen once v2 is adopted."
+}

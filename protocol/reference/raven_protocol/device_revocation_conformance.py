@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .device_revocation import (
+    FIXED_PREFIX_LEN,
     CorruptMarker,
     DeviceRevocationV1,
     ExhaustedMarker,
@@ -224,9 +225,11 @@ def apply_verified_claim(
     return {"result": "applied", "claim_digest_hex": cd_h, "store": store.snapshot_dict()}
 
 
-CORRUPT_TRUNCATED = 1
-CORRUPT_DIGEST_MISMATCH = 2
-CORRUPT_BAD_SIGNATURE = 3
+# Frozen corrupt-marker reason codes (RAVEN_DEVICE_REVOCATION_V1 §6.0); they
+# are hashed into revocation_store_hash, so every implementation must agree.
+CORRUPT_TRUNCATED = 1  # journal bytes are not one complete canonical RVDR1 record
+CORRUPT_DIGEST_MISMATCH = 2  # journal claim_digest != SHA-256(exact bytes)
+CORRUPT_BAD_SIGNATURE = 3  # parses, but identity signature/address binding fails
 
 
 def expand_quota(store: ConformanceStore, new_max: int) -> None:
@@ -261,42 +264,46 @@ def reverify_journal(
         store.journal["exact_record_bytes_hex"]
     )
     reason: str | None = None
-    try:
-        if len(wire) < 54:
+    rec = None
+    cd = claim_digest(wire)
+    if len(wire) < FIXED_PREFIX_LEN:
+        reason = "truncated"
+    else:
+        try:
+            rec = decode(wire)
+        except (ValueError, IndexError):
+            # Any strict-parse failure (short tail, bad magic/version, lp out of
+            # range, trailing bytes) is "not a complete record": code 1.
             reason = "truncated"
-            raise ValueError(reason)
-        rec = decode(wire)
-        cd = claim_digest(wire)
-        if claimed_digest is not None and claimed_digest != cd:
+    if reason is None and claimed_digest is not None and claimed_digest != cd:
+        reason = "digest_mismatch"
+    if reason is None and store.journal is not None:
+        # Exact lowercase-hex compare, as the Rust implementation does.
+        if store.journal.get("claim_digest_hex") != cd.hex():
             reason = "digest_mismatch"
-            raise ValueError(reason)
-        if store.journal and store.journal.get("claim_digest_hex"):
-            if bytes.fromhex(store.journal["claim_digest_hex"]) != cd:
-                reason = "digest_mismatch"
-                raise ValueError(reason)
-        if not verify(rec, identity_ed_pub):
+    if reason is None:
+        try:
+            ok = verify(rec, identity_ed_pub)
+        except (ValueError, TypeError):
+            ok = False
+        if not ok:
             reason = "bad_signature"
-            raise ValueError(reason)
+    if reason is None:
         return {"result": "ok", "claim_digest_hex": cd.hex()}
-    except Exception:
-        if reason is None:
-            reason = "reverify_failed"
-        reason_code = {
-            "truncated": CORRUPT_TRUNCATED,
-            "digest_mismatch": CORRUPT_DIGEST_MISMATCH,
-            "bad_signature": CORRUPT_BAD_SIGNATURE,
-        }.get(reason, 9)
-        store.corrupt.append(
-            CorruptMarker(scope=store.identity_address, reason_code=reason_code)
-        )
-        store.journal = None
-        store.generation += 1
-        return {
-            "result": "corrupt",
-            "reason": reason,
-            "reason_code": reason_code,
-            "store": store.snapshot_dict(),
-        }
+    reason_code = {
+        "truncated": CORRUPT_TRUNCATED,
+        "digest_mismatch": CORRUPT_DIGEST_MISMATCH,
+        "bad_signature": CORRUPT_BAD_SIGNATURE,
+    }[reason]
+    store.corrupt.append(CorruptMarker(scope=store.identity_address, reason_code=reason_code))
+    store.journal = None
+    store.generation += 1
+    return {
+        "result": "corrupt",
+        "reason": reason,
+        "reason_code": reason_code,
+        "store": store.snapshot_dict(),
+    }
 
 
 def authorize_device(

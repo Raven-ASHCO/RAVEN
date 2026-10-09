@@ -18,6 +18,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/lib/o6_ipc_guard.sh
+source "$ROOT/scripts/lib/o6_ipc_guard.sh"
+if [[ "${1:-}" == "--self-test" ]]; then
+  o6_ipc_guard_selftest
+  exit 0
+fi
 LABEL="NON-RELEASE"
 BOARD="docs/engineering/baseline-freeze/o6-raven-rdap-try-phase-gap-board.md"
 CONTRACT="docs/engineering/baseline-freeze/o6-m1-same-rvn1-bind-contract.md"
@@ -66,12 +72,15 @@ grep -q 'Harness green ≠ HOLD lift' "$BOARD" \
   || fail_reg "$BOARD missing harness-green ≠ HOLD-lifted rule"
 grep -q 'Daemon never seals here' "$IPC" \
   || fail_reg "$IPC missing EnqueueSealed sealed-frame-only invariant"
-if grep -Eq 'enum IpcRequest' -A 50 "$IPC" | grep -Eqi 'SealPlaintext|SealPayload|EnqueuePlain'; then
-  fail_reg "$IPC grew a plaintext-seal op; Crypto owns M2 — out of this PR"
-fi
-if grep -Eq 'enum IpcRequest' -A 50 "$IPC" | grep -Eq 'Whoami'; then
-  fail_reg "$IPC grew Whoami op; M1 uses ash whoami, not a new IPC surface"
-fi
+ipc_guard_rc=0
+o6_ipc_guard "$IPC" || ipc_guard_rc=$?
+case "$ipc_guard_rc" in
+  0) ;;
+  2) fail_reg "$IPC: 'pub enum IpcRequest' not found; the IPC-surface guard would be a silent no-op" ;;
+  3) fail_reg "$IPC grew a plaintext-seal op (other than the reviewed SealUnderSession); ADR 0004 D4 / Crypto review required" ;;
+  4) fail_reg "$IPC grew Whoami op; M1 uses ash whoami, not a new IPC surface" ;;
+  *) fail_reg "$IPC: IPC-surface guard failed unexpectedly (status $ipc_guard_rc)" ;;
+esac
 if [[ -d "$ROOT/team_agents" ]]; then
   fail_reg "team_agents/ appeared in RAVEN; RDAP code does not belong here"
 fi

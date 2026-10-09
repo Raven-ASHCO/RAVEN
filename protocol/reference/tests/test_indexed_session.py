@@ -111,3 +111,23 @@ def test_rvna1_v3_ack_is_143_bytes_and_binds_outer_message_id():
         indexed_session.open_ack(ROOT, ALICE, BOB, 1, bytes(wrong_id), wire)
     with pytest.raises(InvalidTag):
         indexed_session.open_ack(ROOT, ALICE, BOB, 0, outer_id, wire)
+
+
+def test_stateless_index_work_is_bounded_before_authentication():
+    limit = indexed_session.MAX_STATELESS_CHAIN_INDEX
+    assert limit == 4_096
+    indexed_session.message_key_at_index(ROOT, ALICE, BOB, 0, limit)
+    for index in (limit + 1, 0xFFFFFFFF):
+        with pytest.raises(ValueError):
+            indexed_session.message_key_at_index(ROOT, ALICE, BOB, 0, index)
+        with pytest.raises(ValueError):
+            indexed_session.ack_key_at_index(ROOT, ALICE, BOB, 0, index)
+    record, signature = _signed_ack()
+    plaintext = indexed_session.encode_signed_ack(record, signature)
+    outer_id = bytes(range(16))
+    wire = indexed_session.seal_ack(
+        ROOT, ALICE, BOB, 1, 0, outer_id, plaintext, bytes([0xCD]) * 12
+    )
+    forged = wire[:10] + (0xFFFFFFFF).to_bytes(4, "big") + wire[14:]
+    with pytest.raises(ValueError, match="stateless derivation bound"):
+        indexed_session.open_ack(ROOT, ALICE, BOB, 1, outer_id, forged)

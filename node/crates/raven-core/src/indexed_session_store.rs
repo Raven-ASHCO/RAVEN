@@ -1,29 +1,42 @@
-//! Durable, production-disabled state for the ATSAM Indexed Session Profile V1.
+//! Durable state for the ATSAM Indexed Session Profile V1.
 //!
-//! This module is intentionally not connected to live networking. Secret
-//! roots, chain keys, skipped message keys, and the write-ahead acceptance
-//! journal live in a platform-protected backend. SQLite contains public
-//! binding/dedup metadata plus locally sealed inbox and ACK-intent records.
+//! This is the session store behind the LAN-direct and internet-direct
+//! indexed-message paths. `lan_dispatch` (PairInit handling, message and ACK
+//! acceptance, sending), the preflight of raven-node's `lan_direct` and
+//! `internet_direct`, and the ash PairInit, chat-poll and inbox commands all
+//! open it, usually once per message or poll. The store itself enforces no
+//! live gate. Live use is gated per slice by those callers
+//! (`lan_direct_live_enabled`, `internet_direct_live_enabled`, and
+//! `RAVEN_LAB_TEST_A` for the lab flows), while
+//! [`INDEXED_SESSION_STORE_PRODUCTION_ENABLED`] stays `false`.
+//!
+//! Secret roots, chain keys, skipped message keys, and the write-ahead
+//! acceptance journal live in a platform-protected backend. SQLite contains
+//! public binding/dedup metadata plus locally sealed inbox and ACK-intent
+//! records.
 //!
 //! Mutation ordering is deliberately asymmetric: the protected head is
 //! replaced first and SQLite commits second. A crash between those operations
 //! can burn an outbound index, but reopening only fast-forwards metadata and
 //! therefore never rolls a ratchet back or reuses a send key. Inbound endpoint
 //! acceptance uses a protected pending journal to bridge the protected-store /
-//! SQLite commit boundary without ever journaling plaintext.
+//! SQLite commit boundary without ever journaling plaintext. Journaled
+//! mutations write their SQLite rows into the still-open transaction before
+//! the protected replacement, so a journal is only ever written for rows that
+//! already satisfied every database constraint; the journal is cleared later
+//! under a fresh write lock and only if it is still the current one.
 //!
 //! ACK intent creation, origin-side ACK acceptance, outbound message
 //! preparation, and ACK materialization are implemented here. Outbound paths
 //! use the same protected-journal ordering and only hand immutable ciphertext
-//! to an idempotent durable queue callback. The entire actor remains
-//! production-disabled and has no live transport callsite.
+//! to an idempotent durable queue callback.
 
 #[cfg(test)]
-use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -35,7 +48,7 @@ use rand::{CryptoRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::ack::Ack;
 use crate::atsam_indexed_session::{
@@ -55,9 +68,14 @@ use crate::pair_init::{
     PairInitTrust, PairResponse,
 };
 
-/// Live networking must not instantiate or consume this store yet.
+/// Global production tripwire; stays `false`. It is not consulted by
+/// [`IndexedSessionStore::open`]: callers gate live use per slice
+/// (`lan_direct_live_enabled`, `internet_direct_live_enabled`) or through
+/// [`live_enabled`] for the Lab Test A flows, and the gate tests assert it
+/// stays off.
 pub const INDEXED_SESSION_STORE_PRODUCTION_ENABLED: bool = false;
 
+/// True only for the Lab Test A flows (`RAVEN_LAB_TEST_A`, debug builds).
 pub fn live_enabled() -> bool {
     INDEXED_SESSION_STORE_PRODUCTION_ENABLED || crate::pair_init::lab_test_a_enabled()
 }
@@ -68,6 +86,11 @@ pub const MAX_ENDPOINT_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_ENDPOINT_FUTURE_SKEW_MS: u64 = 5 * 60 * 1_000;
 pub const MAX_ENDPOINT_ENVELOPE_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
+/// `PRAGMA user_version` of the SQLite metadata schema. Databases created
+/// before versioning report 0 and were created by these same
+/// `CREATE ... IF NOT EXISTS` statements, so they are stamped as version 1.
+/// A newer version is refused rather than silently used under old constraints.
+const METADATA_SCHEMA_VERSION: i64 = 1;
 const STORE_MAGIC: &[u8; 8] = b"RVNISS01";
 const LEGACY_STORE_VERSION: u8 = 1;
 const ACCEPTANCE_STORE_VERSION: u8 = 2;
@@ -597,6 +620,8 @@ pub enum IndexedSessionStoreError {
     AckNonceConflict,
     #[error("PairInit verification failed: {0}")]
     PairInit(#[from] PairInitError),
+    #[error("indexed session metadata schema version {0} is newer than this build supports")]
+    UnsupportedMetadataSchema(i64),
     #[cfg(test)]
     #[error("test crash after protected write")]
     InjectedCrashAfterProtectedWrite,
@@ -856,6 +881,7 @@ enum EndpointFaultPoint {
     AfterAckEnqueue,
     BeforeOutboundQueueHandoff,
     AfterOutboundQueueHandoff,
+    AfterPruneSecretDelete,
 }
 
 impl EndpointFaultPoint {
@@ -874,8 +900,19 @@ impl EndpointFaultPoint {
             Self::AfterAckEnqueue => "after ACK enqueue",
             Self::BeforeOutboundQueueHandoff => "before outbound queue handoff",
             Self::AfterOutboundQueueHandoff => "after outbound queue handoff",
+            Self::AfterPruneSecretDelete => "after prune secret delete",
         }
     }
+}
+
+/// Identity of the single protected write-ahead journal a session may carry:
+/// its kind plus the exact object digest it describes. Used to clear only the
+/// journal a caller wrote or replayed, never a newer one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectedJournal {
+    Acceptance([u8; 32]),
+    AckAcceptance([u8; 32]),
+    Outbound([u8; 32]),
 }
 
 fn maybe_injected_endpoint_fault(
@@ -899,13 +936,28 @@ trait ProtectedSessionBackend: Send + Sync {
     fn delete(&self, account: &str) -> Result<(), IndexedSessionStoreError>;
 }
 
-fn force_locked_file_session_backend() -> bool {
-    for key in ["RAVEN_SESSION_BACKEND", "RAVEN_IDENTITY_BACKEND"] {
-        if std::env::var_os(key).is_some_and(|v| v == "locked-file") {
-            return true;
-        }
+/// Whether the lab-only plaintext session-secret backend was requested. It
+/// stores roots and ratchet keys as plain 0600 files, so, like the identity
+/// store, Release builds refuse the override instead of silently honoring it
+/// (a stale CI `RAVEN_IDENTITY_BACKEND` must not downgrade a shipped node).
+/// Test builds are always allowed.
+fn force_locked_file_session_backend() -> Result<bool, IndexedSessionStoreError> {
+    let requested = ["RAVEN_SESSION_BACKEND", "RAVEN_IDENTITY_BACKEND"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|v| v == "locked-file"));
+    locked_file_session_backend_gate(requested, cfg!(debug_assertions) || cfg!(test))
+}
+
+fn locked_file_session_backend_gate(
+    requested: bool,
+    lab_build: bool,
+) -> Result<bool, IndexedSessionStoreError> {
+    if requested && !lab_build {
+        return Err(IndexedSessionStoreError::ProtectedStore(
+            "locked-file session backend is forbidden in Release builds".into(),
+        ));
     }
-    false
+    Ok(requested)
 }
 
 struct LockedFileSessionBackend {
@@ -952,6 +1004,49 @@ impl ProtectedSessionBackend for LockedFileSessionBackend {
                 .map_err(|error| IndexedSessionStoreError::ProtectedStore(error.to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// Session secrets in the profile's passphrase vault (non-macOS Unix without
+/// a reachable Secret Service; docs/design/2026-10-linux-keystore.md). Every
+/// test build compiles it so the adapter is exercised on all CI hosts.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+struct VaultSessionBackend {
+    vault: crate::keystore_vault::Vault,
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+impl VaultSessionBackend {
+    fn entry(account: &str) -> String {
+        format!("{}{account}", crate::keystore_vault::SESSION_ENTRY_PREFIX)
+    }
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn vault_session_error(error: crate::keystore_vault::VaultError) -> IndexedSessionStoreError {
+    IndexedSessionStoreError::ProtectedStore(format!("passphrase vault: {error}"))
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+impl ProtectedSessionBackend for VaultSessionBackend {
+    fn get(&self, account: &str) -> Result<Option<Vec<u8>>, IndexedSessionStoreError> {
+        Ok(self
+            .vault
+            .get(&Self::entry(account))
+            .map_err(vault_session_error)?
+            .map(|mut value| std::mem::take(&mut *value)))
+    }
+
+    fn put(&self, account: &str, value: &[u8]) -> Result<(), IndexedSessionStoreError> {
+        self.vault
+            .put(&Self::entry(account), value)
+            .map_err(vault_session_error)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), IndexedSessionStoreError> {
+        self.vault
+            .delete(&Self::entry(account))
+            .map_err(vault_session_error)
     }
 }
 
@@ -1066,8 +1161,12 @@ impl ProtectedSessionBackend for PlatformProtectedSessionBackend {
 #[cfg(target_os = "macos")]
 impl ProtectedSessionBackend for PlatformProtectedSessionBackend {
     fn get(&self, account: &str) -> Result<Option<Vec<u8>>, IndexedSessionStoreError> {
+        use crate::macos_keychain::{guarded, KeychainWhat};
         use security_framework::passwords::get_generic_password;
-        match get_generic_password(PLATFORM_SERVICE, &self.scoped_account(account)) {
+        let scoped = self.scoped_account(account);
+        match guarded(KeychainWhat::SessionSecret, || {
+            get_generic_password(PLATFORM_SERVICE, &scoped)
+        }) {
             Ok(value) => Ok(Some(value)),
             Err(error) if error.code() == -25_300 => Ok(None),
             Err(error) => Err(IndexedSessionStoreError::ProtectedStore(format!(
@@ -1077,17 +1176,24 @@ impl ProtectedSessionBackend for PlatformProtectedSessionBackend {
     }
 
     fn put(&self, account: &str, value: &[u8]) -> Result<(), IndexedSessionStoreError> {
+        use crate::macos_keychain::{guarded, KeychainWhat};
         use security_framework::passwords::set_generic_password;
-        set_generic_password(PLATFORM_SERVICE, &self.scoped_account(account), value).map_err(
-            |error| {
-                IndexedSessionStoreError::ProtectedStore(format!("keychain update failed: {error}"))
-            },
-        )
+        let scoped = self.scoped_account(account);
+        guarded(KeychainWhat::SessionSecret, || {
+            set_generic_password(PLATFORM_SERVICE, &scoped, value)
+        })
+        .map_err(|error| {
+            IndexedSessionStoreError::ProtectedStore(format!("keychain update failed: {error}"))
+        })
     }
 
     fn delete(&self, account: &str) -> Result<(), IndexedSessionStoreError> {
+        use crate::macos_keychain::{guarded, KeychainWhat};
         use security_framework::passwords::delete_generic_password;
-        match delete_generic_password(PLATFORM_SERVICE, &self.scoped_account(account)) {
+        let scoped = self.scoped_account(account);
+        match guarded(KeychainWhat::SessionSecret, || {
+            delete_generic_password(PLATFORM_SERVICE, &scoped)
+        }) {
             Ok(()) => Ok(()),
             Err(error) if error.code() == -25_300 => Ok(()),
             Err(error) => Err(IndexedSessionStoreError::ProtectedStore(format!(
@@ -1363,6 +1469,9 @@ fn dpapi_unprotect(value: &[u8]) -> Result<Vec<u8>, IndexedSessionStoreError> {
     let bytes = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) };
     let result = bytes.to_vec();
     unsafe {
+        // The output buffer holds the decrypted session state (roots, chain
+        // and skipped keys); wipe it before handing it back to the allocator.
+        std::ptr::write_bytes(output.pbData, 0, output.cbData as usize);
         LocalFree(output.pbData as _);
     }
     Ok(result)
@@ -1393,6 +1502,89 @@ fn replace_file_windows(temp: &Path, target: &Path) -> Result<(), IndexedSession
     Ok(())
 }
 
+/// The metadata database holds the public communication graph (addresses,
+/// device keys, message IDs, timestamps, delivery states) and outbox
+/// ciphertext. Create it owner-only before SQLite does: SQLite gives the
+/// `-wal`/`-shm` files it creates the database file's mode.
+fn precreate_owner_only_metadata_file(metadata_path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(metadata_path);
+    }
+    #[cfg(not(unix))]
+    let _ = metadata_path;
+}
+
+/// Tightens a database (and its WAL/SHM side files) that an earlier build
+/// created under the process umask. Best effort, like the data-dir lock
+/// files: a filesystem without POSIX modes must not make sessions unreachable.
+fn restrict_metadata_file_permissions(metadata_path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = metadata_path.as_os_str().to_owned();
+            candidate.push(suffix);
+            let candidate = PathBuf::from(candidate);
+            if candidate.exists() {
+                let _ =
+                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = metadata_path;
+}
+
+/// How often one operation re-runs protected-journal recovery because another
+/// store instance staged a journal after the previous recovery finished.
+const MAX_JOURNAL_RECOVERY_ATTEMPTS: usize = 5;
+
+/// Replays any protected journal for `$record_key`, then opens the operation's
+/// IMMEDIATE transaction and loads the session. Evaluates to
+/// `(Transaction, ProtectedSessionState)` where the state carries no pending
+/// journal.
+///
+/// Recovery runs in its own transaction, so between it and the operation's
+/// transaction the write lock is free. Another store instance can commit a
+/// journaled mutation in that window and not yet have run its own journal
+/// clear: the journal is healthy, not corruption. Replaying it inline would
+/// write the protected backend before this transaction commits, which is not
+/// crash-safe, so the transaction is dropped, the journal is replayed by the
+/// normal recovery path, and the load is retried. Only a journal that survives
+/// `MAX_JOURNAL_RECOVERY_ATTEMPTS` completed recoveries is reported as
+/// `CorruptProtectedState`.
+///
+/// A macro rather than a method because the transaction borrows `$store.conn`:
+/// a method that returns it from inside the retry loop cannot re-borrow the
+/// store for the next recovery.
+macro_rules! begin_journal_free_tx {
+    ($store:expr, $backend:expr, $account:expr, $record_key:expr) => {{
+        let mut attempt = 1usize;
+        loop {
+            $store.recover_pending_for_digest(&$record_key)?;
+            #[cfg(test)]
+            $store.run_after_recovery_hook();
+            let tx = $store
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let state = load_and_reconcile(&tx, $backend.as_ref(), &$account, &$record_key)?;
+            if protected_journal(&state)?.is_none() {
+                break (tx, state);
+            }
+            if attempt >= MAX_JOURNAL_RECOVERY_ATTEMPTS {
+                return Err(IndexedSessionStoreError::CorruptProtectedState);
+            }
+            attempt += 1;
+        }
+    }};
+}
+
 pub struct IndexedSessionStore {
     conn: Connection,
     backend: Arc<dyn ProtectedSessionBackend>,
@@ -1400,14 +1592,32 @@ pub struct IndexedSessionStore {
     crash_after_protected_write: bool,
     #[cfg(test)]
     endpoint_fault: Cell<Option<EndpointFaultPoint>>,
+    /// Runs once after the next journal recovery, in the window before the
+    /// caller's own transaction, so a test can interleave a second instance.
+    #[cfg(test)]
+    after_recovery_hook: RefCell<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl IndexedSessionStore {
-    /// Opens the platform implementation. GNU/Linux requires Secret Service;
-    /// unsupported platforms fail closed. There is no plaintext file fallback.
+    /// Opens the platform implementation. GNU/Linux uses Secret Service or,
+    /// per the profile's recorded keystore, the passphrase vault; musl/other
+    /// Unix the vault; unsupported platforms fail closed. There is no
+    /// plaintext file fallback:
+    /// the lab-only `locked-file` backend (`RAVEN_SESSION_BACKEND` or
+    /// `RAVEN_IDENTITY_BACKEND`) is honored in debug builds only and is
+    /// refused in Release builds.
     pub fn open(data_dir: &Path) -> Result<Self, IndexedSessionStoreError> {
-        if force_locked_file_session_backend() {
+        if force_locked_file_session_backend()? {
             let backend = Arc::new(LockedFileSessionBackend::new(data_dir)?);
+            return Self::open_with_backend(&data_dir.join(INDEXED_SESSION_METADATA_FILE), backend);
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if crate::keystore_select::uses_vault(data_dir, true)
+            .map_err(IndexedSessionStoreError::ProtectedStore)?
+        {
+            let backend = Arc::new(VaultSessionBackend {
+                vault: crate::keystore_vault::Vault::for_data_dir(data_dir),
+            });
             return Self::open_with_backend(&data_dir.join(INDEXED_SESSION_METADATA_FILE), backend);
         }
         let backend = Arc::new(PlatformProtectedSessionBackend::new(data_dir)?);
@@ -1422,13 +1632,23 @@ impl IndexedSessionStore {
             std::fs::create_dir_all(parent)
                 .map_err(|error| IndexedSessionStoreError::ProtectedStore(error.to_string()))?;
         }
+        precreate_owner_only_metadata_file(metadata_path);
         let conn = Connection::open(metadata_path)?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
-             PRAGMA foreign_keys=ON;
-             CREATE TABLE IF NOT EXISTS indexed_session_heads (
+             PRAGMA foreign_keys=ON;",
+        )?;
+        restrict_metadata_file_permissions(metadata_path);
+        let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if schema_version > METADATA_SCHEMA_VERSION {
+            return Err(IndexedSessionStoreError::UnsupportedMetadataSchema(
+                schema_version,
+            ));
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS indexed_session_heads (
                record_key BLOB PRIMARY KEY NOT NULL CHECK(length(record_key) = 32),
                binding_digest BLOB NOT NULL CHECK(length(binding_digest) = 32),
                profile_id BLOB NOT NULL,
@@ -1531,6 +1751,9 @@ impl IndexedSessionStore {
                FOREIGN KEY(session_id) REFERENCES indexed_session_heads(session_id)
              );",
         )?;
+        if schema_version < METADATA_SCHEMA_VERSION {
+            conn.execute_batch(&format!("PRAGMA user_version = {METADATA_SCHEMA_VERSION};"))?;
+        }
         let mut store = Self {
             conn,
             backend,
@@ -1538,6 +1761,8 @@ impl IndexedSessionStore {
             crash_after_protected_write: false,
             #[cfg(test)]
             endpoint_fault: Cell::new(None),
+            #[cfg(test)]
+            after_recovery_hook: RefCell::new(None),
         };
         store.recover_all_pending_acceptances()?;
         Ok(store)
@@ -1552,23 +1777,23 @@ impl IndexedSessionStore {
         binding: IndexedSessionBinding,
         root: [u8; 32],
     ) -> Result<(), IndexedSessionStoreError> {
-        self.create_trusted_session(binding, root)
+        let root = Zeroizing::new(root);
+        self.create_trusted_session(binding, &root)
     }
 
     fn create_trusted_session(
         &mut self,
         binding: IndexedSessionBinding,
-        mut root: [u8; 32],
+        root: &[u8; 32],
     ) -> Result<(), IndexedSessionStoreError> {
-        let result = self.create_session_inner(binding, &root);
-        root.zeroize();
-        result
+        self.create_session_inner(binding, root)
     }
 
     /// Verifies the signed PairInit and its exact trust records, derives all
     /// public record identifiers through the frozen PairInit module, and then
-    /// persists the supplied already-derived provisional root. Networking is
-    /// still deliberately not wired to this API.
+    /// persists the supplied already-derived provisional root. Live: the
+    /// LAN-direct PairInit initiator and responder (`lan_dispatch`) create
+    /// their sessions through it in default builds.
     pub fn create_verified_pair_init_session(
         &mut self,
         init: &PairInit,
@@ -1577,6 +1802,8 @@ impl IndexedSessionStore {
         local_role: LocalRole,
         root: [u8; 32],
     ) -> Result<IndexedSessionRecordKey, IndexedSessionStoreError> {
+        // Wiped on every return path, including a refused PairInit.
+        let root = Zeroizing::new(root);
         verify_init(init, trust, now_ms)?;
         let key = IndexedSessionRecordKey {
             profile_id: PROFILE_ID.to_vec(),
@@ -1602,7 +1829,7 @@ impl IndexedSessionStore {
             lifecycle: SessionLifecycle::Provisional,
             response_hash: None,
         };
-        self.create_trusted_session(binding, root)?;
+        self.create_trusted_session(binding, &root)?;
         Ok(key)
     }
 
@@ -1670,8 +1897,34 @@ impl IndexedSessionStore {
         if self.crash_after_protected_write {
             return Err(IndexedSessionStoreError::InjectedCrashAfterProtectedWrite);
         }
-        insert_metadata(&tx, &record_key, &state)?;
-        tx.commit()?;
+        // The blob was proven absent under this IMMEDIATE transaction, so this
+        // call created it. If its head cannot be recorded, delete it again:
+        // nothing enumerates the keystore, so an unreferenced root would
+        // otherwise live there forever. Best effort; a crash cannot clean up.
+        if let Err(error) = insert_metadata(&tx, &record_key, &state) {
+            drop(tx);
+            let _ = backend.delete(&account);
+            return Err(error);
+        }
+        if let Err(error) = tx.commit() {
+            // A failed commit can be ambiguous about durability. Deleting the
+            // secret of a head that did commit would strand the session on
+            // `ProtectedStateMissing`, so delete only when the head is
+            // provably absent.
+            let head_absent = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM indexed_session_heads WHERE record_key = ?1",
+                    params![record_key.as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .is_ok_and(|head| head.is_none());
+            if head_absent {
+                let _ = backend.delete(&account);
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -1819,7 +2072,6 @@ impl IndexedSessionStore {
         {
             return Err(IndexedSessionStoreError::EndpointNotCurrentlyValid);
         }
-        self.recover_pending_for_key(key)?;
         #[cfg(test)]
         let endpoint_fault = self.endpoint_fault.take();
         #[cfg(not(test))]
@@ -1828,10 +2080,7 @@ impl IndexedSessionStore {
         let record_key = record_key_digest(key)?;
         let account = hex::encode(record_key);
         let backend = Arc::clone(&self.backend);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut state = load_and_reconcile(&tx, backend.as_ref(), &account, &record_key)?;
+        let (tx, mut state) = begin_journal_free_tx!(self, backend, account, record_key);
         let authorization_index = u32::try_from(state.ratchets.message_send.next_index)
             .map_err(|_| IndexedSessionStoreError::IndexExhausted)?;
         validate_outbound_session_and_signer(
@@ -1845,7 +2094,13 @@ impl IndexedSessionStore {
             now_ms,
         )?;
         ensure_no_pending_protected_mutation(&state)?;
-        if prepared_outbound_exists(&tx, &state.binding.session_id)? {
+        // One prepared object per lane: a prepared ACK never blocks text and
+        // a prepared message never blocks ACKs (independent ratchet lanes).
+        if prepared_outbound_exists(
+            &tx,
+            &state.binding.session_id,
+            EndpointOutboundKind::Message,
+        )? {
             return Err(IndexedSessionStoreError::OutboundPending);
         }
 
@@ -1921,37 +2176,20 @@ impl IndexedSessionStore {
             public_generation: state.generation,
         });
 
-        maybe_injected_endpoint_fault(
-            endpoint_fault,
-            EndpointFaultPoint::BeforeProtectedReplacement,
-        )?;
-        write_mutation(
+        let journal = stage_journaled_mutation(
             &tx,
             backend.as_ref(),
             &account,
             &record_key,
             &state,
-            #[cfg(test)]
-            false,
-        )?;
-        maybe_injected_endpoint_fault(
             endpoint_fault,
-            EndpointFaultPoint::AfterProtectedReplacement,
-        )?;
-        insert_pending_outbound(
-            &tx,
-            &state,
-            state
-                .pending_outbound
-                .as_ref()
-                .ok_or(IndexedSessionStoreError::CorruptProtectedState)?,
         )?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::BeforeDatabaseCommit)?;
         tx.commit()?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::AfterDatabaseCommit)?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::BeforeJournalClear)?;
         state.pending_outbound = None;
-        put_protected_state(backend.as_ref(), &account, &state)?;
+        self.clear_protected_journal(&account, &record_key, state.generation, journal)?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::AfterJournalClear)?;
         self.handoff_endpoint_outbound(
             &state,
@@ -1989,7 +2227,6 @@ impl IndexedSessionStore {
         {
             return Err(IndexedSessionStoreError::EndpointNotCurrentlyValid);
         }
-        self.recover_pending_for_key(key)?;
         #[cfg(test)]
         let endpoint_fault = self.endpoint_fault.take();
         #[cfg(not(test))]
@@ -1998,10 +2235,7 @@ impl IndexedSessionStore {
         let record_key = record_key_digest(key)?;
         let account = hex::encode(record_key);
         let backend = Arc::clone(&self.backend);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut state = load_and_reconcile(&tx, backend.as_ref(), &account, &record_key)?;
+        let (tx, mut state) = begin_journal_free_tx!(self, backend, account, record_key);
         let authorization_index = u32::try_from(state.ratchets.ack_send.next_index)
             .map_err(|_| IndexedSessionStoreError::IndexExhausted)?;
         validate_outbound_session_and_signer(
@@ -2026,6 +2260,7 @@ impl IndexedSessionStore {
         {
             return Err(IndexedSessionStoreError::OutboundBindingMismatch);
         }
+        retire_expired_prepared_acks(&tx, &state.binding.session_id, now_ms)?;
         if intent.state == EndpointAckIntentState::Queued {
             let existing =
                 outbound_by_ack_intent(&tx, &state.binding.session_id, intent_object_digest)?
@@ -2053,10 +2288,18 @@ impl IndexedSessionStore {
                 enqueue_idempotently,
             );
         }
-        if intent.immutable_ack_bytes.is_some() {
+        if let Some(bytes) = intent.immutable_ack_bytes.as_deref() {
+            // Materialized bytes without an outbox row: the object expired
+            // while still prepared and was retired. It is never re-materialized
+            // under a second object for the same intent.
+            if Envelope::unpack(bytes).is_some_and(|envelope| envelope.expires_at <= now_ms) {
+                tx.commit()?;
+                return Err(IndexedSessionStoreError::EndpointNotCurrentlyValid);
+            }
             return Err(IndexedSessionStoreError::OutboundBindingMismatch);
         }
-        if prepared_outbound_exists(&tx, &state.binding.session_id)? {
+        if prepared_outbound_exists(&tx, &state.binding.session_id, EndpointOutboundKind::Ack)? {
+            tx.commit()?;
             return Err(IndexedSessionStoreError::OutboundPending);
         }
 
@@ -2147,37 +2390,20 @@ impl IndexedSessionStore {
             public_generation: state.generation,
         });
 
-        maybe_injected_endpoint_fault(
-            endpoint_fault,
-            EndpointFaultPoint::BeforeProtectedReplacement,
-        )?;
-        write_mutation(
+        let journal = stage_journaled_mutation(
             &tx,
             backend.as_ref(),
             &account,
             &record_key,
             &state,
-            #[cfg(test)]
-            false,
-        )?;
-        maybe_injected_endpoint_fault(
             endpoint_fault,
-            EndpointFaultPoint::AfterProtectedReplacement,
-        )?;
-        insert_pending_outbound(
-            &tx,
-            &state,
-            state
-                .pending_outbound
-                .as_ref()
-                .ok_or(IndexedSessionStoreError::CorruptProtectedState)?,
         )?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::BeforeDatabaseCommit)?;
         tx.commit()?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::AfterDatabaseCommit)?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::BeforeJournalClear)?;
         state.pending_outbound = None;
-        put_protected_state(backend.as_ref(), &account, &state)?;
+        self.clear_protected_journal(&account, &record_key, state.generation, journal)?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::AfterJournalClear)?;
         self.handoff_endpoint_outbound(
             &state,
@@ -2514,8 +2740,10 @@ impl IndexedSessionStore {
         })
     }
 
-    /// Executes the production-disabled endpoint acceptance transaction from
-    /// `ATSAM_ENDPOINT_TRANSACTION_V1.md`. No live transport calls this API.
+    /// Executes the endpoint acceptance transaction from
+    /// `ATSAM_ENDPOINT_TRANSACTION_V1.md`. Live: `lan_dispatch` calls it for
+    /// every inbound LAN-direct message in default builds (the generic
+    /// [`INDEXED_SESSION_STORE_PRODUCTION_ENABLED`] tripwire stays `false`).
     #[allow(clippy::too_many_arguments)]
     pub fn accept_message_envelope(
         &mut self,
@@ -2544,14 +2772,10 @@ impl IndexedSessionStore {
         #[cfg(not(test))]
         let endpoint_fault = None;
 
-        self.recover_pending_for_key(key)?;
         let record_key = record_key_digest(key)?;
         let account = hex::encode(record_key);
         let backend = Arc::clone(&self.backend);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut state = load_and_reconcile(&tx, backend.as_ref(), &account, &record_key)?;
+        let (tx, mut state) = begin_journal_free_tx!(self, backend, account, record_key);
         if &state.binding.key != key {
             return Err(IndexedSessionStoreError::BindingConflict);
         }
@@ -2564,14 +2788,11 @@ impl IndexedSessionStore {
         {
             return Err(IndexedSessionStoreError::CorruptProtectedState);
         }
-        if now_ms < state.binding.created_at_ms
-            || now_ms >= state.binding.expires_at_ms
-            || env.created_at < state.binding.created_at_ms
-            || env.expires_at > state.binding.expires_at_ms
-        {
-            return Err(IndexedSessionStoreError::EndpointNotCurrentlyValid);
-        }
-
+        // ATSAM_ENDPOINT_TRANSACTION_V1 §1 step 4: direction, device hint and route
+        // tag select the session; only then do this session's own checks apply.
+        // A window check first would refuse a valid envelope sealed under another
+        // live session with this peer (for example the older of two sessions
+        // after crossed pairing) before the caller could try that session.
         let direction = state.binding.local_role.inbound_direction();
         let local_device = local_device_for_binding(&state.binding);
         let expected_hint = endpoint_device_hint(local_device);
@@ -2586,8 +2807,15 @@ impl IndexedSessionStore {
             direction,
         )
         .map_err(|_| IndexedSessionStoreError::RouteTagMismatch)?;
-        if env.routing_tag != expected_route {
+        if !route_tag_eq(&env.routing_tag, &expected_route) {
             return Err(IndexedSessionStoreError::RouteTagMismatch);
+        }
+        if before_session_start(now_ms, state.binding.created_at_ms)
+            || now_ms >= state.binding.expires_at_ms
+            || before_session_start(env.created_at, state.binding.created_at_ms)
+            || env.expires_at > state.binding.expires_at_ms
+        {
+            return Err(IndexedSessionStoreError::EndpointNotCurrentlyValid);
         }
 
         if sender_revoked {
@@ -2671,6 +2899,7 @@ impl IndexedSessionStore {
             &remote_device,
             &plaintext,
         )?;
+        let received_at_ms = monotonic_received_at_ms(&tx, &remote_device, now_ms)?;
         state.pending_acceptance = Some(PendingAcceptance {
             session_id: state.binding.session_id,
             object_digest,
@@ -2679,38 +2908,24 @@ impl IndexedSessionStore {
             sealed_local_inbox_row,
             ack_status: 1,
             created_at_ms: env.created_at,
-            received_at_ms: now_ms,
+            received_at_ms,
             public_generation: state.generation,
         });
 
-        maybe_injected_endpoint_fault(
-            endpoint_fault,
-            EndpointFaultPoint::BeforeProtectedReplacement,
-        )?;
-        write_mutation(
+        let journal = stage_journaled_mutation(
             &tx,
             backend.as_ref(),
             &account,
             &record_key,
             &state,
-            #[cfg(test)]
-            false,
-        )?;
-        maybe_injected_endpoint_fault(
             endpoint_fault,
-            EndpointFaultPoint::AfterProtectedReplacement,
         )?;
-        let pending = state
-            .pending_acceptance
-            .as_ref()
-            .ok_or(IndexedSessionStoreError::CorruptProtectedState)?;
-        insert_pending_acceptance(&tx, &state.binding, pending)?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::BeforeDatabaseCommit)?;
         tx.commit()?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::AfterDatabaseCommit)?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::BeforeJournalClear)?;
         state.pending_acceptance = None;
-        put_protected_state(backend.as_ref(), &account, &state)?;
+        self.clear_protected_journal(&account, &record_key, state.generation, journal)?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::AfterJournalClear)?;
 
         Ok(EndpointAcceptance::Committed {
@@ -2738,56 +2953,111 @@ impl IndexedSessionStore {
         if &state.binding.key != key {
             return Err(IndexedSessionStoreError::BindingConflict);
         }
-        let raw: Option<EndpointInboxDbRow> = tx
-            .query_row(
-                "SELECT message_id, sender_device, object_digest, created_at_ms,
-                        received_at_ms, sealed_local_row
-                 FROM endpoint_inbox WHERE session_id = ?1 AND object_digest = ?2",
-                params![
-                    state.binding.session_id.as_slice(),
-                    object_digest.as_slice()
-                ],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((message_id, sender_device, stored_digest, created_at, received_at, sealed)) = raw
-        else {
-            tx.commit()?;
-            return Ok(None);
-        };
-        let message_id = exact_array::<16>(&message_id)?;
-        let sender_device = exact_array::<32>(&sender_device)?;
-        let stored_digest = exact_array::<32>(&stored_digest)?;
-        if stored_digest != *object_digest || created_at < 0 || received_at < 0 {
-            return Err(IndexedSessionStoreError::CorruptEndpointState);
-        }
-        let plaintext = open_local_inbox_row(
+        let row = read_endpoint_inbox_row(
+            &tx,
             &state.ratchets.root,
             &state.binding.session_id,
             object_digest,
-            &message_id,
-            &sender_device,
-            &sealed,
         )?;
         tx.commit()?;
-        Ok(Some(EndpointInboxRow {
-            session_id: state.binding.session_id,
-            object_digest: *object_digest,
-            message_id,
-            sender_device,
-            created_at_ms: created_at as u64,
-            received_at_ms: received_at as u64,
-            plaintext,
-        }))
+        Ok(row)
+    }
+
+    /// Reads and authenticates several committed inbox rows of one session
+    /// with a single journal recovery and a single protected-state read: all
+    /// rows of a session open under the same root, so loading it per row costs
+    /// two protected-backend reads and two write-lock transactions per message
+    /// (Secret Service creates a new D-Bus session for each read).
+    ///
+    /// The outer error is the session's own state failing to load. Row errors
+    /// are returned per row so a caller can tell a poisoned row from a
+    /// poisoned session. The write lock is held only while the state loads;
+    /// rows are decrypted afterwards, so a long listing never starves writers.
+    fn load_endpoint_inbox_rows(
+        &mut self,
+        key: &IndexedSessionRecordKey,
+        digests: &[[u8; 32]],
+    ) -> Result<
+        Vec<Result<Option<EndpointInboxRow>, IndexedSessionStoreError>>,
+        IndexedSessionStoreError,
+    > {
+        self.recover_pending_for_key(key)?;
+        let record_key = record_key_digest(key)?;
+        let account = hex::encode(record_key);
+        let backend = Arc::clone(&self.backend);
+        let (mut root, session_id) = {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let state = load_and_reconcile(&tx, backend.as_ref(), &account, &record_key)?;
+            if &state.binding.key != key {
+                return Err(IndexedSessionStoreError::BindingConflict);
+            }
+            let loaded = (state.ratchets.root, state.binding.session_id);
+            drop(state);
+            tx.commit()?;
+            loaded
+        };
+        let rows = digests
+            .iter()
+            .map(|digest| read_endpoint_inbox_row(&self.conn, &root, &session_id, digest))
+            .collect();
+        root.zeroize();
+        Ok(rows)
+    }
+
+    /// Decrypts the inbox rows named by `pending` (digests in listing order)
+    /// and returns them in that order. A session whose own state cannot be
+    /// read, or a row that fails authentication, is logged and skipped so one
+    /// poisoned session or row cannot block the listing for every healthy
+    /// session; store-wide failures still propagate.
+    ///
+    /// `unreadable` holds the record keys of sessions whose state already
+    /// failed to load during the current listing. Their rows are dropped
+    /// without another journal recovery and protected-state read, and a
+    /// session that fails here is added to it, so a paged listing loads a
+    /// poisoned session once rather than once per page.
+    fn load_pending_inbox_rows(
+        &mut self,
+        pending: &[(IndexedSessionRecordKey, [u8; 32])],
+        unreadable: &mut BTreeSet<[u8; 32]>,
+    ) -> Result<Vec<EndpointInboxRow>, IndexedSessionStoreError> {
+        let mut by_session: BTreeMap<[u8; 32], (&IndexedSessionRecordKey, Vec<usize>)> =
+            BTreeMap::new();
+        for (index, (key, _)) in pending.iter().enumerate() {
+            let record_key = record_key_digest(key)?;
+            if unreadable.contains(&record_key) {
+                continue;
+            }
+            by_session
+                .entry(record_key)
+                .or_insert_with(|| (key, Vec::new()))
+                .1
+                .push(index);
+        }
+        let mut slots: Vec<Option<EndpointInboxRow>> = pending.iter().map(|_| None).collect();
+        for (record_key, (key, indexes)) in by_session {
+            let digests: Vec<[u8; 32]> = indexes.iter().map(|index| pending[*index].1).collect();
+            let rows = match self.load_endpoint_inbox_rows(key, &digests) {
+                Ok(rows) => rows,
+                Err(error) if is_session_scoped_state_error(&error) => {
+                    log_skipped_session(&record_key, &error);
+                    unreadable.insert(record_key);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for (index, row) in indexes.into_iter().zip(rows) {
+                match row {
+                    Ok(row) => slots[index] = row,
+                    Err(error) if is_session_scoped_state_error(&error) => {
+                        log_skipped_session(&record_key, &error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(slots.into_iter().flatten().collect())
     }
 
     /// Resolve the public PairInit record key for a durable `session_id`.
@@ -2830,7 +3100,9 @@ impl IndexedSessionStore {
 
     /// Drop an undeliverable outbound message (Prepared dial-failure leftover or
     /// Queued envelope that can no longer be resent). Removes outstanding Sent
-    /// rows and the outbox ciphertext so later sends are not wedged.
+    /// rows and the outbox ciphertext so later sends are not wedged. Returns
+    /// `Ok(false)` and removes nothing when the message was acknowledged in
+    /// the meantime (the caller must not report it as dropped).
     ///
     /// Callers decide policy (expired dial vs handoff failure). This API does
     /// not re-check envelope expiry — that belongs at the send/retry boundary.
@@ -2857,6 +3129,21 @@ impl IndexedSessionStore {
         if row.state != EndpointOutboxState::Prepared && row.state != EndpointOutboxState::Queued {
             return Ok(false);
         }
+        // An ACK accepted since the caller looked at this row has already
+        // delivered the message: its ciphertext stays and the caller must not
+        // report it as dropped. A missing outstanding row is an orphan and is
+        // still cleaned up below.
+        if matches!(
+            self_delivery_state_in_connection(
+                &tx,
+                &state.binding.session_id,
+                &row.message_id,
+                &row.recipient_device,
+            )?,
+            Some(EndpointDeliveryState::Delivered | EndpointDeliveryState::Read)
+        ) {
+            return Ok(false);
+        }
         let _ = tx.execute(
             "DELETE FROM endpoint_outstanding_messages
              WHERE session_id = ?1 AND message_id = ?2 AND recipient_device = ?3
@@ -2875,6 +3162,35 @@ impl IndexedSessionStore {
                 state.binding.session_id.as_slice(),
                 object_digest.as_slice()
             ],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    /// An accepted ACK proved that this message reached its recipient while its
+    /// outbox row was still `Prepared` (the dial that carried it ended before
+    /// the reply, and the ACK came back another way). Record the handoff, the
+    /// same `Prepared -> Queued` step a successful dial records, so no retry
+    /// dials a delivered message again. Only when the outstanding row is
+    /// `Delivered` or `Read`; `Ok(true)` when a row moved.
+    pub fn settle_delivered_outbound(
+        &mut self,
+        session_id: &[u8; 32],
+        message_id: &[u8; 16],
+    ) -> Result<bool, IndexedSessionStoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE endpoint_outbox SET state = 1
+             WHERE session_id = ?1 AND message_id = ?2 AND kind = 1 AND state = 0
+               AND EXISTS (
+                 SELECT 1 FROM endpoint_outstanding_messages m
+                 WHERE m.session_id = endpoint_outbox.session_id
+                   AND m.message_id = endpoint_outbox.message_id
+                   AND m.recipient_device = endpoint_outbox.recipient_device
+                   AND m.delivery_state IN (1, 2))",
+            params![session_id.as_slice(), message_id.as_slice()],
         )?;
         tx.commit()?;
         Ok(changed > 0)
@@ -2919,23 +3235,21 @@ impl IndexedSessionStore {
         &mut self,
         key: &IndexedSessionRecordKey,
     ) -> Result<SessionLifecycle, IndexedSessionStoreError> {
-        self.recover_pending_for_key(key)?;
-        let record_key = record_key_digest(key)?;
-        let account = hex::encode(record_key);
-        let backend = Arc::clone(&self.backend);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let state = load_and_reconcile(&tx, backend.as_ref(), &account, &record_key)?;
-        let lifecycle = state.binding.lifecycle;
-        tx.commit()?;
-        Ok(lifecycle)
+        Ok(self.protected_lifecycle_and_expiry(key)?.0)
     }
 
     pub fn session_expires_at(
         &mut self,
         key: &IndexedSessionRecordKey,
     ) -> Result<u64, IndexedSessionStoreError> {
+        Ok(self.protected_lifecycle_and_expiry(key)?.1)
+    }
+
+    /// Lifecycle and expiry from one protected load.
+    fn protected_lifecycle_and_expiry(
+        &mut self,
+        key: &IndexedSessionRecordKey,
+    ) -> Result<(SessionLifecycle, u64), IndexedSessionStoreError> {
         self.recover_pending_for_key(key)?;
         let record_key = record_key_digest(key)?;
         let account = hex::encode(record_key);
@@ -2944,9 +3258,28 @@ impl IndexedSessionStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let state = load_and_reconcile(&tx, backend.as_ref(), &account, &record_key)?;
-        let expires = state.binding.expires_at_ms;
+        let summary = (state.binding.lifecycle, state.binding.expires_at_ms);
+        drop(state);
         tx.commit()?;
-        Ok(expires)
+        Ok(summary)
+    }
+
+    /// PairInit-bound `device_certificate_hash` of the remote device's cert.
+    pub fn remote_certificate_digest(
+        &mut self,
+        key: &IndexedSessionRecordKey,
+    ) -> Result<[u8; 32], IndexedSessionStoreError> {
+        self.recover_pending_for_key(key)?;
+        let record_key = record_key_digest(key)?;
+        let account = hex::encode(record_key);
+        let backend = Arc::clone(&self.backend);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = load_and_reconcile(&tx, backend.as_ref(), &account, &record_key)?;
+        let digest = *remote_certificate_digest(&state.binding);
+        tx.commit()?;
+        Ok(digest)
     }
 
     /// Expiry from SQLite metadata only — does not load protected secrets.
@@ -2980,26 +3313,93 @@ impl IndexedSessionStore {
     }
 
     /// Newest non-expired Confirmed session for `peer_device`, if any.
+    ///
+    /// Expired heads are skipped from public metadata before any protected
+    /// load, so an expired head whose secret a prune already deleted cannot
+    /// break the lookup. Live candidates are still checked (lifecycle and
+    /// expiry) against the protected binding. A live candidate whose own
+    /// protected state is missing, corrupt or rolled back (a moved data dir or
+    /// restored database) is logged and skipped: not selecting it is as safe
+    /// as failing, and failing would leave a healthy newer session for the
+    /// same peer unreachable. Store-wide failures (SQLite, protected backend)
+    /// still fail the lookup.
     pub fn find_confirmed_session_for_peer_at(
         &mut self,
         peer_device: &[u8; 32],
         now_ms: u64,
     ) -> Result<Option<IndexedSessionRecordKey>, IndexedSessionStoreError> {
-        let keys = self.list_record_keys()?;
-        let mut found = None;
-        for key in keys {
-            if key.initiator_device_ed25519 != *peer_device
-                && key.responder_device_ed25519 != *peer_device
-            {
-                continue;
+        Ok(self
+            .find_confirmed_sessions_for_peer_at(peer_device, now_ms)?
+            .into_iter()
+            .next())
+    }
+
+    /// Every non-expired Confirmed session for `peer_device`, **newest first**
+    /// (the order [`Self::find_confirmed_session_for_peer_at`] takes its answer
+    /// from), under the same per-session skipping rules.
+    ///
+    /// Two peers that pair at the same moment each hold *two* confirmed sessions
+    /// with each other, and a message can be sealed under either (a sender uses
+    /// the session its own pairing produced). The newest-first order is the same
+    /// on both nodes: the head's `created_at_ms` is the init's stamp, equal on
+    /// both sides, and ties break on `init_id`, which is also identical on both.
+    /// Breaking ties on the node-local `rowid` made the two nodes select
+    /// *different* sessions on an exact tie, which wedged the pair for good.
+    /// The receive path resolves the session by route tag over this list.
+    pub fn find_confirmed_sessions_for_peer_at(
+        &mut self,
+        peer_device: &[u8; 32],
+        now_ms: u64,
+    ) -> Result<Vec<IndexedSessionRecordKey>, IndexedSessionStoreError> {
+        let cutoff = i64::try_from(now_ms).unwrap_or(i64::MAX);
+        // One statement, so the candidate list is a consistent snapshot even
+        // while another process prunes.
+        let candidates: Vec<(Vec<u8>, Option<IndexedSessionRecordKey>)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT record_key, profile_id, initiator_address, responder_address,
+                        initiator_device, responder_device, init_id
+                 FROM indexed_session_heads
+                 WHERE (initiator_device = ?1 OR responder_device = ?1)
+                   AND expires_at_ms > ?2
+                 ORDER BY created_at_ms DESC, init_id DESC",
+            )?;
+            let rows = statement.query_map(params![peer_device.as_slice(), cutoff], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (record_key, profile_id, ia, ra, id, rd, init_id) = row?;
+                out.push((
+                    record_key,
+                    record_key_from_columns(profile_id, ia, ra, &id, &rd, &init_id).ok(),
+                ));
             }
-            if self.session_lifecycle(&key)? != SessionLifecycle::Confirmed {
+            out
+        };
+        let mut found = Vec::new();
+        for (record_key, key) in candidates {
+            let Some(key) = key else {
+                log_skipped_session(&record_key, &IndexedSessionStoreError::CorruptEndpointState);
                 continue;
+            };
+            match self.protected_lifecycle_and_expiry(&key) {
+                Ok((SessionLifecycle::Confirmed, expires_at_ms)) if expires_at_ms > now_ms => {
+                    found.push(key);
+                }
+                Ok(_) => {}
+                Err(error) if is_session_scoped_state_error(&error) => {
+                    log_skipped_session(&record_key, &error);
+                }
+                Err(error) => return Err(error),
             }
-            if self.session_expires_at(&key)? <= now_ms {
-                continue;
-            }
-            found = Some(key);
         }
         Ok(found)
     }
@@ -3009,55 +3409,76 @@ impl IndexedSessionStore {
         &mut self,
         now_ms: u64,
     ) -> Result<std::collections::HashSet<[u8; 16]>, IndexedSessionStoreError> {
+        let cutoff = i64::try_from(now_ms).unwrap_or(i64::MAX);
+        // A single statement: listing keys first and then querying each one
+        // fails with `QueryReturnedNoRows` when another process prunes a head
+        // in between.
+        let mut statement = self
+            .conn
+            .prepare("SELECT init_id FROM indexed_session_heads WHERE expires_at_ms > ?1")?;
+        let rows = statement.query_map(params![cutoff], |row| row.get::<_, Vec<u8>>(0))?;
         let mut live = std::collections::HashSet::new();
-        for key in self.list_record_keys()? {
-            let expires: i64 = self.conn.query_row(
-                "SELECT expires_at_ms FROM indexed_session_heads WHERE init_id = ?1",
-                params![key.init_id.as_slice()],
-                |row| row.get(0),
-            )?;
-            if (expires as u64) > now_ms {
-                live.insert(key.init_id);
-            }
+        for row in rows {
+            live.insert(exact_array::<16>(&row?)?);
         }
         Ok(live)
     }
 
     /// Delete expired session metadata + protected blobs. Returns removed head count.
     ///
-    /// Order: delete protected secret first, then SQLite metadata. This avoids
-    /// orphan Keychain/Secret Service blobs after metadata is gone. A crash after
-    /// secret delete still leaves metadata that a later prune can finish (delete
-    /// is idempotent when the secret is already absent). Callers must archive
-    /// inbox plaintext to ChatHistory before invoking this.
+    /// Each session is removed under one IMMEDIATE transaction: its SQLite
+    /// rows are deleted, then the protected secret, then the transaction
+    /// commits. Deleting the secret before the commit means no failure can
+    /// leave a Keychain/Secret Service blob whose metadata is gone (nothing
+    /// would ever find it again). A crash or failed commit after the secret
+    /// delete leaves an expired head without a secret; that expired head is
+    /// the tombstone: `open()` tolerates it, lookups skip it by metadata
+    /// expiry, and the next prune selects it again and finishes (the backend
+    /// delete is idempotent). Callers must archive inbox plaintext to
+    /// ChatHistory before invoking this.
     pub fn prune_expired_sessions(
         &mut self,
         now_ms: u64,
     ) -> Result<usize, IndexedSessionStoreError> {
-        type ExpiredRow = (Vec<u8>, Vec<u8>, Vec<u8>);
+        type ExpiredRow = (Vec<u8>, Vec<u8>);
+        let cutoff = i64::try_from(now_ms).unwrap_or(i64::MAX);
         let rows: Vec<ExpiredRow> = {
             let mut statement = self.conn.prepare(
-                "SELECT record_key, session_id, init_id FROM indexed_session_heads
+                "SELECT record_key, session_id FROM indexed_session_heads
                  WHERE expires_at_ms <= ?1",
             )?;
-            let mapped = statement.query_map(params![now_ms as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
+            let mapped =
+                statement.query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?;
             let mut out = Vec::new();
             for row in mapped {
                 out.push(row?);
             }
             out
         };
+        #[cfg(test)]
+        let endpoint_fault = self.endpoint_fault.take();
+        #[cfg(not(test))]
+        let endpoint_fault = None;
         let mut removed = 0usize;
-        for (record_key, session_id, _init_id) in rows {
+        for (record_key, session_id) in rows {
             let account = hex::encode(&record_key);
-            // Protected secret first — never leave a Keychain blob after metadata is gone.
-            self.backend.delete(&account)?;
-
             let tx = self
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Another store instance may have pruned it since the listing.
+            let still_expired = tx
+                .query_row(
+                    "SELECT 1 FROM indexed_session_heads
+                     WHERE record_key = ?1 AND session_id = ?2 AND expires_at_ms <= ?3",
+                    params![record_key.as_slice(), session_id.as_slice(), cutoff],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some();
+            if !still_expired {
+                tx.commit()?;
+                continue;
+            }
             let _ = tx.execute(
                 "DELETE FROM endpoint_outbox WHERE session_id = ?1",
                 params![session_id.as_slice()],
@@ -3085,6 +3506,11 @@ impl IndexedSessionStore {
             let _ = tx.execute(
                 "DELETE FROM indexed_session_heads WHERE session_id = ?1",
                 params![session_id.as_slice()],
+            )?;
+            self.backend.delete(&account)?;
+            maybe_injected_endpoint_fault(
+                endpoint_fault,
+                EndpointFaultPoint::AfterPruneSecretDelete,
             )?;
             tx.commit()?;
             removed += 1;
@@ -3123,15 +3549,22 @@ impl IndexedSessionStore {
             tx.commit()?;
             out
         };
+        if digests.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One session, strict: an unreadable session or row is an error here
+        // (callers such as the expiry archive match on it), never skipped.
         let mut inbox = Vec::new();
-        for digest in digests {
-            if let Some(row) = self.load_endpoint_inbox(key, &digest)? {
+        for row in self.load_endpoint_inbox_rows(key, &digests)? {
+            if let Some(row) = row? {
                 inbox.push(row);
             }
         }
         Ok(inbox)
     }
 
+    /// Every committed inbox row, oldest first. Rows of a session that cannot
+    /// be read are logged and skipped rather than failing the whole listing.
     pub fn list_endpoint_inbox(
         &mut self,
     ) -> Result<Vec<EndpointInboxRow>, IndexedSessionStoreError> {
@@ -3148,6 +3581,12 @@ impl IndexedSessionStore {
 
     /// Like [`Self::list_endpoint_inbox_for_sender`], but only rows strictly after
     /// `(after_received_at_ms, after_message_id)` with a hard `limit` (decrypt budget).
+    ///
+    /// Rows of a session that cannot be read are logged and skipped. Paging
+    /// continues past them, so a poisoned session at the head of the order
+    /// cannot keep the healthy rows behind it from ever being returned. Each
+    /// call loads such a session once, however many pages its rows span, and
+    /// the log line is written once per process (callers poll this).
     pub fn list_endpoint_inbox_for_sender_after(
         &mut self,
         sender_device: &[u8; 32],
@@ -3158,65 +3597,76 @@ impl IndexedSessionStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let after_mid = after_message_id.map(|m| m.as_slice());
-        let mut statement = self.conn.prepare(
-            "SELECT h.profile_id, h.initiator_address, h.responder_address,
-                    h.initiator_device, h.responder_device, h.init_id,
-                    i.object_digest
-             FROM endpoint_inbox i
-             JOIN indexed_session_heads h ON h.session_id = i.session_id
-             WHERE i.sender_device = ?1
-               AND (
-                 i.received_at_ms > ?2
-                 OR (?3 IS NULL AND i.received_at_ms >= ?2)
-                 OR (?3 IS NOT NULL AND i.received_at_ms = ?2 AND i.message_id > ?3)
-               )
-             ORDER BY i.received_at_ms ASC, i.message_id ASC
-             LIMIT ?4",
-        )?;
-        let pending = {
-            let rows = statement.query_map(
-                params![
-                    sender_device.as_slice(),
-                    after_received_at_ms as i64,
-                    after_mid,
-                    limit as i64
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
-                        row.get::<_, Vec<u8>>(5)?,
-                        row.get::<_, Vec<u8>>(6)?,
-                    ))
-                },
-            )?;
-            let mut pending = Vec::new();
-            for row in rows {
-                let (profile_id, ia, ra, id, rd, init_id, digest) = row?;
-                pending.push((
-                    IndexedSessionRecordKey {
-                        profile_id,
-                        initiator_address: ia,
-                        responder_address: ra,
-                        initiator_device_ed25519: exact_array(&id)?,
-                        responder_device_ed25519: exact_array(&rd)?,
-                        init_id: exact_array(&init_id)?,
-                    },
-                    exact_array::<32>(&digest)?,
-                ));
-            }
-            pending
-        };
-        drop(statement);
+        let mut cursor_received_at_ms = after_received_at_ms as i64;
+        let mut cursor_message_id = after_message_id.copied();
         let mut out = Vec::new();
-        for (key, digest) in pending {
-            if let Some(row) = self.load_endpoint_inbox(&key, &digest)? {
-                out.push(row);
+        let mut unreadable = BTreeSet::new();
+        loop {
+            let wanted = limit - out.len();
+            let page = {
+                let mut statement = self.conn.prepare(
+                    "SELECT h.profile_id, h.initiator_address, h.responder_address,
+                            h.initiator_device, h.responder_device, h.init_id,
+                            i.object_digest, i.received_at_ms, i.message_id
+                     FROM endpoint_inbox i
+                     JOIN indexed_session_heads h ON h.session_id = i.session_id
+                     WHERE i.sender_device = ?1
+                       AND (
+                         i.received_at_ms > ?2
+                         OR (?3 IS NULL AND i.received_at_ms >= ?2)
+                         OR (?3 IS NOT NULL AND i.received_at_ms = ?2 AND i.message_id > ?3)
+                       )
+                     ORDER BY i.received_at_ms ASC, i.message_id ASC
+                     LIMIT ?4",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        sender_device.as_slice(),
+                        cursor_received_at_ms,
+                        cursor_message_id.as_ref().map(|id| id.as_slice()),
+                        wanted as i64
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, Vec<u8>>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, Vec<u8>>(8)?,
+                        ))
+                    },
+                )?;
+                let mut page = Vec::new();
+                for row in rows {
+                    let (profile_id, ia, ra, id, rd, init_id, digest, received_at, message_id) =
+                        row?;
+                    page.push((
+                        record_key_from_columns(profile_id, ia, ra, &id, &rd, &init_id)?,
+                        exact_array::<32>(&digest)?,
+                        received_at,
+                        exact_array::<16>(&message_id)?,
+                    ));
+                }
+                page
+            };
+            let Some(&(_, _, last_received_at_ms, last_message_id)) = page.last() else {
+                break;
+            };
+            let exhausted = page.len() < wanted;
+            let pending: Vec<_> = page
+                .into_iter()
+                .map(|(key, digest, _, _)| (key, digest))
+                .collect();
+            out.extend(self.load_pending_inbox_rows(&pending, &mut unreadable)?);
+            if exhausted || out.len() >= limit {
+                break;
             }
+            cursor_received_at_ms = last_received_at_ms;
+            cursor_message_id = Some(last_message_id);
         }
         Ok(out)
     }
@@ -3251,27 +3701,14 @@ impl IndexedSessionStore {
             for row in rows {
                 let (profile_id, ia, ra, id, rd, init_id, digest) = row?;
                 pending.push((
-                    IndexedSessionRecordKey {
-                        profile_id,
-                        initiator_address: ia,
-                        responder_address: ra,
-                        initiator_device_ed25519: exact_array(&id)?,
-                        responder_device_ed25519: exact_array(&rd)?,
-                        init_id: exact_array(&init_id)?,
-                    },
+                    record_key_from_columns(profile_id, ia, ra, &id, &rd, &init_id)?,
                     exact_array::<32>(&digest)?,
                 ));
             }
             pending
         };
         drop(statement);
-        let mut out = Vec::new();
-        for (key, digest) in pending {
-            if let Some(row) = self.load_endpoint_inbox(&key, &digest)? {
-                out.push(row);
-            }
-        }
-        Ok(out)
+        self.load_pending_inbox_rows(&pending, &mut BTreeSet::new())
     }
 
     /// Returns only ACK intents in a committed SQLite transaction.
@@ -3508,14 +3945,10 @@ impl IndexedSessionStore {
         #[cfg(not(test))]
         let endpoint_fault = None;
 
-        self.recover_pending_for_key(key)?;
         let record_key = record_key_digest(key)?;
         let account = hex::encode(record_key);
         let backend = Arc::clone(&self.backend);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut state = load_and_reconcile(&tx, backend.as_ref(), &account, &record_key)?;
+        let (tx, mut state) = begin_journal_free_tx!(self, backend, account, record_key);
         if &state.binding.key != key {
             return Err(IndexedSessionStoreError::BindingConflict);
         }
@@ -3528,14 +3961,8 @@ impl IndexedSessionStore {
         {
             return Err(IndexedSessionStoreError::CorruptProtectedState);
         }
-        if now_ms < state.binding.created_at_ms
-            || now_ms >= state.binding.expires_at_ms
-            || env.created_at < state.binding.created_at_ms
-            || env.expires_at > state.binding.expires_at_ms
-        {
-            return Err(IndexedSessionStoreError::EndpointNotCurrentlyValid);
-        }
-
+        // Candidate selection first (see accept_message_envelope), then this
+        // session's own validity window.
         let direction = state.binding.local_role.inbound_direction();
         let expected_hint = endpoint_device_hint(local_device_for_binding(&state.binding));
         if env.dest_device_hint != 0 && env.dest_device_hint != expected_hint {
@@ -3549,8 +3976,15 @@ impl IndexedSessionStore {
             direction,
         )
         .map_err(|_| IndexedSessionStoreError::RouteTagMismatch)?;
-        if env.routing_tag != expected_route {
+        if !route_tag_eq(&env.routing_tag, &expected_route) {
             return Err(IndexedSessionStoreError::RouteTagMismatch);
+        }
+        if before_session_start(now_ms, state.binding.created_at_ms)
+            || now_ms >= state.binding.expires_at_ms
+            || before_session_start(env.created_at, state.binding.created_at_ms)
+            || env.expires_at > state.binding.expires_at_ms
+        {
+            return Err(IndexedSessionStoreError::EndpointNotCurrentlyValid);
         }
         if sender_revoked {
             return Err(IndexedSessionStoreError::RevokedDevice);
@@ -3576,7 +4010,7 @@ impl IndexedSessionStore {
             if existing.outer_message_id != env.message_id || existing.remote_device != remote {
                 return Err(IndexedSessionStoreError::CorruptEndpointState);
             }
-            let delivery_state = self_delivery_state_in_tx(
+            let delivery_state = self_delivery_state_in_connection(
                 &tx,
                 &state.binding.session_id,
                 &existing.acked_message_id,
@@ -3590,6 +4024,17 @@ impl IndexedSessionStore {
                 acked_message_id: existing.acked_message_id,
                 delivery_state,
             });
+        }
+        // Mirrors the message lane's logical-ID gate: the outer message ID is
+        // unique per (session, remote device) in `endpoint_ack_receipts`, so a
+        // different authenticated ACK object reusing it is a sender integrity
+        // conflict, rejected before the receive ratchet or any journal moves.
+        if let Some(existing_digest) =
+            ack_outer_message_object(&tx, &state.binding.session_id, &remote, &env.message_id)?
+        {
+            if existing_digest != object_digest {
+                return Err(IndexedSessionStoreError::LogicalMessageConflict);
+            }
         }
 
         let (sender, recipient) = endpoints_for_direction(&state.binding, direction);
@@ -3614,7 +4059,7 @@ impl IndexedSessionStore {
         if !signed.record.verify(&signed.signature, &remote) {
             return Err(IndexedSessionStoreError::AckInnerSignatureInvalid);
         }
-        let Some(existing_state) = self_delivery_state_in_tx(
+        let Some(existing_state) = self_delivery_state_in_connection(
             &tx,
             &state.binding.session_id,
             &signed.record.acked_message_id,
@@ -3650,34 +4095,20 @@ impl IndexedSessionStore {
             created_at_ms: env.created_at,
             public_generation: state.generation,
         });
-        maybe_injected_endpoint_fault(
-            endpoint_fault,
-            EndpointFaultPoint::BeforeProtectedReplacement,
-        )?;
-        write_mutation(
+        let journal = stage_journaled_mutation(
             &tx,
             backend.as_ref(),
             &account,
             &record_key,
             &state,
-            #[cfg(test)]
-            false,
-        )?;
-        maybe_injected_endpoint_fault(
             endpoint_fault,
-            EndpointFaultPoint::AfterProtectedReplacement,
         )?;
-        let pending = state
-            .pending_ack_acceptance
-            .as_ref()
-            .ok_or(IndexedSessionStoreError::CorruptProtectedState)?;
-        insert_pending_ack_acceptance(&tx, &state.binding, pending)?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::BeforeDatabaseCommit)?;
         tx.commit()?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::AfterDatabaseCommit)?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::BeforeJournalClear)?;
         state.pending_ack_acceptance = None;
-        put_protected_state(backend.as_ref(), &account, &state)?;
+        self.clear_protected_journal(&account, &record_key, state.generation, journal)?;
         maybe_injected_endpoint_fault(endpoint_fault, EndpointFaultPoint::AfterJournalClear)?;
         Ok(EndpointAckAcceptance::Committed {
             session_id: state.binding.session_id,
@@ -3687,6 +4118,15 @@ impl IndexedSessionStore {
         })
     }
 
+    /// Replays every protected journal before SQLite-only readers run.
+    ///
+    /// Failures scoped to one session (an expired head whose secret a crashed
+    /// prune already deleted, a switched backend or moved data dir, a corrupt
+    /// or rolled-back blob) do not fail `open()`: that would make every other
+    /// session, and the prune that cleans such heads up, unreachable. Every
+    /// per-session operation repeats this recovery first and still fails
+    /// closed for that session. Store-wide SQLite and protected-backend
+    /// failures still fail `open()`.
     fn recover_all_pending_acceptances(&mut self) -> Result<(), IndexedSessionStoreError> {
         let record_keys = {
             let mut statement = self
@@ -3700,9 +4140,43 @@ impl IndexedSessionStore {
             keys
         };
         for record_key in record_keys {
-            self.recover_pending_for_digest(&record_key)?;
+            if !self.protected_journal_present(&record_key)? {
+                continue;
+            }
+            match self.recover_pending_for_digest(&record_key) {
+                Ok(()) => {}
+                Err(
+                    error @ (IndexedSessionStoreError::Sqlite(_)
+                    | IndexedSessionStoreError::ProtectedStore(_)),
+                ) => return Err(error),
+                Err(_) => {}
+            }
         }
         Ok(())
+    }
+
+    /// Lock-free peek used only by `open()`: most sessions carry no journal,
+    /// and taking the database-wide write lock across one protected-backend
+    /// read per session would serialize every store user behind Keychain /
+    /// Secret Service latency. A journal seen here is replayed under the lock,
+    /// which re-reads the blob; one written after this peek belongs to a live
+    /// writer that clears it itself, or to the next per-session recovery.
+    /// Missing or undecodable blobs have nothing to replay; per-session
+    /// operations report them under the lock.
+    fn protected_journal_present(
+        &self,
+        record_key: &[u8; 32],
+    ) -> Result<bool, IndexedSessionStoreError> {
+        let Some(mut encoded) = self.backend.get(&hex::encode(record_key))? else {
+            return Ok(false);
+        };
+        let decoded = decode_protected_state(&encoded);
+        encoded.zeroize();
+        Ok(decoded.is_ok_and(|state| {
+            state.pending_acceptance.is_some()
+                || state.pending_ack_acceptance.is_some()
+                || state.pending_outbound.is_some()
+        }))
     }
 
     fn recover_pending_for_key(
@@ -3721,33 +4195,57 @@ impl IndexedSessionStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut state = load_and_reconcile(&tx, backend.as_ref(), &account, record_key)?;
-        let Some(pending) = state.pending_acceptance.as_ref() else {
-            if let Some(pending_ack) = state.pending_ack_acceptance.as_ref() {
-                if state.pending_outbound.is_some() {
-                    return Err(IndexedSessionStoreError::CorruptProtectedState);
-                }
-                insert_pending_ack_acceptance(&tx, &state.binding, pending_ack)?;
-                tx.commit()?;
-                state.pending_ack_acceptance = None;
-                return put_protected_state(backend.as_ref(), &account, &state);
-            }
-            if let Some(pending_outbound) = state.pending_outbound.as_ref() {
-                insert_pending_outbound(&tx, &state, pending_outbound)?;
-                tx.commit()?;
-                state.pending_outbound = None;
-                return put_protected_state(backend.as_ref(), &account, &state);
-            }
+        let state = load_and_reconcile(&tx, backend.as_ref(), &account, record_key)?;
+        let Some(journal) = protected_journal(&state)? else {
             tx.commit()?;
             return Ok(());
         };
-        if state.pending_ack_acceptance.is_some() || state.pending_outbound.is_some() {
-            return Err(IndexedSessionStoreError::CorruptProtectedState);
+        match apply_protected_journal(&tx, &state) {
+            Ok(()) => tx.commit()?,
+            Err(error) if journal_replay_is_unrecoverable(&error) => {
+                // A journal that deterministically conflicts with committed
+                // rows can never replay; keeping it would fail every later
+                // operation on this session. Roll the partial replay back and
+                // quarantine the journal: the protected ratchet stays advanced
+                // (an index is burned, never reused), no row or ACK becomes
+                // visible, and the conflicting object is treated as rejected.
+                drop(tx);
+            }
+            Err(error) => return Err(error),
         }
-        insert_pending_acceptance(&tx, &state.binding, pending)?;
+        let generation = state.generation;
+        drop(state);
+        self.clear_protected_journal(&account, record_key, generation, journal)
+    }
+
+    /// Clears a protected journal whose rows are committed (or which was
+    /// quarantined). The protected write runs under a fresh IMMEDIATE
+    /// transaction, serialized with every other protected writer, and only
+    /// clears the exact journal at the exact generation it was written with.
+    /// If another store instance already replayed and cleared it, or has since
+    /// advanced the session, this is a no-op: writing this instance's stale
+    /// in-memory copy instead would roll the protected head behind metadata
+    /// and fail every later access with `RollbackDetected`.
+    fn clear_protected_journal(
+        &mut self,
+        account: &str,
+        record_key: &[u8; 32],
+        generation: u64,
+        journal: ProtectedJournal,
+    ) -> Result<(), IndexedSessionStoreError> {
+        let backend = Arc::clone(&self.backend);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut state = load_and_reconcile(&tx, backend.as_ref(), account, record_key)?;
+        if state.generation == generation && protected_journal(&state)? == Some(journal) {
+            state.pending_acceptance = None;
+            state.pending_ack_acceptance = None;
+            state.pending_outbound = None;
+            put_protected_state(backend.as_ref(), account, &state)?;
+        }
         tx.commit()?;
-        state.pending_acceptance = None;
-        put_protected_state(backend.as_ref(), &account, &state)
+        Ok(())
     }
 
     #[cfg(test)]
@@ -3820,14 +4318,12 @@ impl IndexedSessionStore {
         key: &IndexedSessionRecordKey,
         response_hash: [u8; 32],
     ) -> Result<(), IndexedSessionStoreError> {
-        self.recover_pending_for_key(key)?;
         let record_key = record_key_digest(key)?;
         let account = hex::encode(record_key);
         let backend = Arc::clone(&self.backend);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut state = load_and_reconcile(&tx, backend.as_ref(), &account, &record_key)?;
+        // `write_mutation` re-encodes the whole state with a bumped generation,
+        // so it must never run over another instance's pending journal.
+        let (tx, mut state) = begin_journal_free_tx!(self, backend, account, record_key);
         match (state.binding.lifecycle, state.binding.response_hash) {
             (SessionLifecycle::Confirmed, Some(existing)) if existing == response_hash => {
                 tx.commit()?;
@@ -3864,17 +4360,62 @@ impl IndexedSessionStore {
     }
 
     #[cfg(test)]
+    fn inject_after_recovery_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_recovery_hook.borrow_mut() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_after_recovery_hook(&self) {
+        let hook = self.after_recovery_hook.borrow_mut().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
     fn inject_endpoint_fault(&self, point: EndpointFaultPoint) {
         self.endpoint_fault.set(Some(point));
     }
 }
 
+/// The legacy recipient hint `SHA-256("rvn1/device-hint/v1" || device_pub)[:8]`.
+///
+/// Anyone holding the recipient's public key (its address) can compute it, so
+/// a relay, store or bridge holding the envelope would recognise the recipient.
+/// New outbound envelopes and ACKs therefore carry [`OUTBOUND_DEST_DEVICE_HINT`]
+/// (`0`, "no hint"; ATSAM endpoint transaction erratum 2026-10-08). Receivers
+/// and stored-outbound validation still accept this value from senders and
+/// outbox rows that predate the change.
 pub fn endpoint_device_hint(device_ed25519: &[u8; 32]) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update(b"rvn1/device-hint/v1");
     hasher.update(device_ed25519);
     let digest = hasher.finalize();
     u64::from_be_bytes(digest[..8].try_into().expect("fixed SHA-256 prefix"))
+}
+
+/// `dest_device_hint` this node writes into every new outbound envelope and
+/// sealed ACK: `0` names nobody. The field is outside the envelope signature
+/// and the object digest (`RAVEN_ENVELOPE_V1.md` §2), so this changes no
+/// signed or digested byte.
+pub const OUTBOUND_DEST_DEVICE_HINT: u64 = 0;
+
+/// Stored outbound bytes are valid with the current hint (`0`) or with the
+/// legacy recipient hint of rows queued before the 2026-10-08 change (their
+/// exact bytes are retried unchanged and must keep validating).
+fn stored_outbound_hint_ok(hint: u64, recipient_device: &[u8; 32]) -> bool {
+    hint == OUTBOUND_DEST_DEVICE_HINT || hint == endpoint_device_hint(recipient_device)
+}
+
+/// Constant-time route-tag equality. The expected tag is derived from the
+/// session root, so an early-exit comparison would leak through timing how
+/// many leading bytes of an attacker-chosen tag already match.
+fn route_tag_eq(received: &[u8; 16], expected: &[u8; 16]) -> bool {
+    let mut diff = 0u8;
+    for (a, b) in received.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 fn local_device_for_binding(binding: &IndexedSessionBinding) -> &[u8; 32] {
@@ -3940,9 +4481,9 @@ fn validate_outbound_session_and_signer(
                 && ratchet_index == 0 => {}
         SessionLifecycle::Provisional => return Err(IndexedSessionStoreError::SessionNotConfirmed),
     }
-    if now_ms < state.binding.created_at_ms
+    if before_session_start(now_ms, state.binding.created_at_ms)
         || now_ms >= state.binding.expires_at_ms
-        || created_at_ms < state.binding.created_at_ms
+        || before_session_start(created_at_ms, state.binding.created_at_ms)
         || expires_at_ms > state.binding.expires_at_ms
     {
         return Err(IndexedSessionStoreError::EndpointNotCurrentlyValid);
@@ -4037,15 +4578,57 @@ fn ensure_fresh_outbound_coordinates(
 fn prepared_outbound_exists(
     conn: &Connection,
     session_id: &[u8; 32],
+    kind: EndpointOutboundKind,
 ) -> Result<bool, IndexedSessionStoreError> {
     Ok(conn
         .query_row(
-            "SELECT 1 FROM endpoint_outbox WHERE session_id = ?1 AND state = 0 LIMIT 1",
-            params![session_id.as_slice()],
+            "SELECT 1 FROM endpoint_outbox
+             WHERE session_id = ?1 AND kind = ?2 AND state = 0 LIMIT 1",
+            params![session_id.as_slice(), kind as u8],
             |row| row.get::<_, i64>(0),
         )
         .optional()?
         .is_some())
+}
+
+/// Retires prepared ACK objects whose envelope expired before a successful
+/// queue handoff. Retry refuses expired objects, so such a row could never
+/// leave the prepared state and would block the ACK lane until the session
+/// expires. The intent keeps its immutable bytes, so it is never
+/// re-materialized under a second object (at most one materialized object per
+/// intent); the consumed ACK ratchet index stays burned.
+fn retire_expired_prepared_acks(
+    tx: &Transaction<'_>,
+    session_id: &[u8; 32],
+    now_ms: u64,
+) -> Result<(), IndexedSessionStoreError> {
+    let prepared: Vec<(Vec<u8>, Vec<u8>)> = {
+        let mut statement = tx.prepare(
+            "SELECT object_digest, immutable_envelope_bytes FROM endpoint_outbox
+             WHERE session_id = ?1 AND kind = 2 AND state = 0",
+        )?;
+        let rows = statement.query_map(params![session_id.as_slice()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        out
+    };
+    for (object_digest, bytes) in prepared {
+        let envelope =
+            Envelope::unpack(&bytes).ok_or(IndexedSessionStoreError::CorruptEndpointState)?;
+        if envelope.expires_at > now_ms {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM endpoint_outbox
+             WHERE session_id = ?1 AND object_digest = ?2 AND kind = 2 AND state = 0",
+            params![session_id.as_slice(), object_digest.as_slice()],
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4073,7 +4656,7 @@ fn outbound_envelope(
         flags: OUTBOUND_FLAGS,
         message_id,
         routing_tag,
-        dest_device_hint: endpoint_device_hint(remote_device_for_binding(&state.binding)),
+        dest_device_hint: OUTBOUND_DEST_DEVICE_HINT,
         created_at: created_at_ms,
         expires_at: expires_at_ms,
         hop_limit: OUTBOUND_HOP_LIMIT,
@@ -4119,6 +4702,102 @@ fn exact_array<const N: usize>(value: &[u8]) -> Result<[u8; N], IndexedSessionSt
     value
         .try_into()
         .map_err(|_| IndexedSessionStoreError::CorruptEndpointState)
+}
+
+fn record_key_from_columns(
+    profile_id: Vec<u8>,
+    initiator_address: String,
+    responder_address: String,
+    initiator_device: &[u8],
+    responder_device: &[u8],
+    init_id: &[u8],
+) -> Result<IndexedSessionRecordKey, IndexedSessionStoreError> {
+    Ok(IndexedSessionRecordKey {
+        profile_id,
+        initiator_address,
+        responder_address,
+        initiator_device_ed25519: exact_array(initiator_device)?,
+        responder_device_ed25519: exact_array(responder_device)?,
+        init_id: exact_array(init_id)?,
+    })
+}
+
+/// Failures scoped to one session's own protected or metadata state (secret
+/// gone after a moved data dir or a restored database, corrupt or rolled-back
+/// blob, a tampered local row). Operations that span sessions skip such a
+/// session instead of failing for every healthy one. Store-wide failures
+/// (SQLite, the protected backend being locked or unavailable) are never
+/// scoped to a session and are always propagated: skipping them would hide a
+/// session that is only temporarily unreadable.
+fn is_session_scoped_state_error(error: &IndexedSessionStoreError) -> bool {
+    matches!(
+        error,
+        IndexedSessionStoreError::ProtectedStateMissing
+            | IndexedSessionStoreError::CorruptProtectedState
+            | IndexedSessionStoreError::RollbackDetected
+            | IndexedSessionStoreError::NotFound
+            | IndexedSessionStoreError::CorruptEndpointState
+            | IndexedSessionStoreError::LocalInboxAuthenticationFailed
+            | IndexedSessionStoreError::InvalidBinding
+            | IndexedSessionStoreError::UnsupportedProfile
+            | IndexedSessionStoreError::BindingConflict
+    )
+}
+
+/// Upper bound on the skipped-session log lines remembered by the process.
+const MAX_LOGGED_SKIPPED_SESSIONS: usize = 256;
+
+/// Which skipped-session log lines this process has already written. The ash
+/// chat poller reopens the store every 500 ms and an unreadable session stays
+/// unreadable, so without this memory the same line would repeat on the
+/// terminal (in the middle of whatever the user is typing) twice a second.
+/// Keyed on the record key and the redacted error text, so a session that
+/// starts failing differently is reported again.
+struct SkippedSessionLog {
+    seen: BTreeSet<(Vec<u8>, String)>,
+}
+
+impl SkippedSessionLog {
+    const fn new() -> Self {
+        Self {
+            seen: BTreeSet::new(),
+        }
+    }
+
+    /// True the first time this `(record key, error text)` pair is reported.
+    /// The memory is bounded: when full it starts over, which at worst repeats
+    /// a line.
+    fn first_report(&mut self, record_key: &[u8], error_text: &str) -> bool {
+        let entry = (record_key.to_vec(), error_text.to_owned());
+        if self.seen.contains(&entry) {
+            return false;
+        }
+        if self.seen.len() >= MAX_LOGGED_SKIPPED_SESSIONS {
+            self.seen.clear();
+        }
+        self.seen.insert(entry);
+        true
+    }
+}
+
+static SKIPPED_SESSION_LOG: Mutex<SkippedSessionLog> = Mutex::new(SkippedSessionLog::new());
+
+/// A skipped session must not be silent, but it is reported once per process
+/// rather than once per listing (see [`SkippedSessionLog`]). The record key is
+/// a public digest and the error text never carries protected bytes.
+fn log_skipped_session(record_key: &[u8], error: &IndexedSessionStoreError) {
+    let error_text = error.redacted_display();
+    let first = SKIPPED_SESSION_LOG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .first_report(record_key, &error_text);
+    if first {
+        let digest = hex::encode(record_key);
+        eprintln!(
+            "raven: indexed session store: skipping unreadable session {}: {error_text}",
+            &digest[..digest.len().min(16)],
+        );
+    }
 }
 
 fn decode_endpoint_outbound_row(
@@ -4284,9 +4963,12 @@ fn insert_pending_outbound(
     )
     .map_err(|_| IndexedSessionStoreError::OutboundBindingMismatch)?;
     if !envelope.verify(local_device_for_binding(binding))
-        || envelope.dest_device_hint != endpoint_device_hint(remote_device_for_binding(binding))
-        || envelope.routing_tag != expected_route
-        || envelope.created_at < binding.created_at_ms
+        || !stored_outbound_hint_ok(
+            envelope.dest_device_hint,
+            remote_device_for_binding(binding),
+        )
+        || !route_tag_eq(&envelope.routing_tag, &expected_route)
+        || before_session_start(envelope.created_at, binding.created_at_ms)
         || envelope.expires_at > binding.expires_at_ms
     {
         return Err(IndexedSessionStoreError::OutboundBindingMismatch);
@@ -4381,7 +5063,7 @@ fn insert_pending_outbound(
                     pending.recipient_device.as_slice()
                 ],
             )?;
-            if self_delivery_state_in_tx(
+            if self_delivery_state_in_connection(
                 tx,
                 &pending.session_id,
                 &pending.message_id,
@@ -4455,10 +5137,12 @@ fn validate_committed_outbound(
     };
     if envelope.flags != OUTBOUND_FLAGS
         || envelope.message_id != row.message_id
-        || envelope.routing_tag != expected_route
-        || envelope.dest_device_hint
-            != endpoint_device_hint(remote_device_for_binding(&state.binding))
-        || envelope.created_at < state.binding.created_at_ms
+        || !route_tag_eq(&envelope.routing_tag, &expected_route)
+        || !stored_outbound_hint_ok(
+            envelope.dest_device_hint,
+            remote_device_for_binding(&state.binding),
+        )
+        || before_session_start(envelope.created_at, state.binding.created_at_ms)
         || envelope.expires_at > state.binding.expires_at_ms
         || !endpoint_time_window_valid(
             envelope.created_at,
@@ -4609,32 +5293,6 @@ fn endpoint_receipt_by_object(
     )))
 }
 
-fn self_delivery_state_in_tx(
-    tx: &Transaction<'_>,
-    session_id: &[u8; 32],
-    message_id: &[u8; 16],
-    recipient_device: &[u8; 32],
-) -> Result<Option<EndpointDeliveryState>, IndexedSessionStoreError> {
-    let raw: Option<i64> = tx
-        .query_row(
-            "SELECT delivery_state FROM endpoint_outstanding_messages
-             WHERE session_id = ?1 AND message_id = ?2 AND recipient_device = ?3",
-            params![
-                session_id.as_slice(),
-                message_id.as_slice(),
-                recipient_device.as_slice()
-            ],
-            |row| row.get(0),
-        )
-        .optional()?;
-    raw.map(|value| {
-        u8::try_from(value)
-            .map_err(|_| IndexedSessionStoreError::CorruptEndpointState)
-            .and_then(EndpointDeliveryState::from_u8)
-    })
-    .transpose()
-}
-
 fn endpoint_ack_receipt(
     tx: &Transaction<'_>,
     session_id: &[u8; 32],
@@ -4679,6 +5337,27 @@ fn ack_nonce_object(
     raw.map(|value| exact_array(&value)).transpose()
 }
 
+fn ack_outer_message_object(
+    tx: &Transaction<'_>,
+    session_id: &[u8; 32],
+    remote_device: &[u8; 32],
+    outer_message_id: &[u8; 16],
+) -> Result<Option<[u8; 32]>, IndexedSessionStoreError> {
+    let raw: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT object_digest FROM endpoint_ack_receipts
+             WHERE session_id = ?1 AND remote_device = ?2 AND outer_message_id = ?3",
+            params![
+                session_id.as_slice(),
+                remote_device.as_slice(),
+                outer_message_id.as_slice()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    raw.map(|value| exact_array(&value)).transpose()
+}
+
 fn insert_pending_ack_acceptance(
     tx: &Transaction<'_>,
     binding: &IndexedSessionBinding,
@@ -4700,7 +5379,7 @@ fn insert_pending_ack_acceptance(
     if metadata_generation < 0 || metadata_generation as u64 != pending.public_generation {
         return Err(IndexedSessionStoreError::CorruptEndpointState);
     }
-    let existing_state = self_delivery_state_in_tx(
+    let existing_state = self_delivery_state_in_connection(
         tx,
         &pending.session_id,
         &pending.acked_message_id,
@@ -4717,6 +5396,16 @@ fn insert_pending_ack_acceptance(
     )? {
         if existing_object != pending.object_digest {
             return Err(IndexedSessionStoreError::AckNonceConflict);
+        }
+    }
+    if let Some(existing_object) = ack_outer_message_object(
+        tx,
+        &pending.session_id,
+        &pending.remote_device,
+        &pending.outer_message_id,
+    )? {
+        if existing_object != pending.object_digest {
+            return Err(IndexedSessionStoreError::LogicalMessageConflict);
         }
     }
     if endpoint_ack_receipt(tx, &pending.session_id, &pending.object_digest)?.is_none() {
@@ -4950,6 +5639,33 @@ fn insert_pending_acceptance(
     Ok(())
 }
 
+/// `received_at_ms` is the paging cursor of
+/// `list_endpoint_inbox_for_sender_after`. `now_ms` is captured by each
+/// handler before it queues for the write lock (and wall clocks can step
+/// back), so commit order does not follow it: a row committed after a poll
+/// advanced the cursor could carry a smaller value and never be returned.
+/// Stamping inside the IMMEDIATE transaction, strictly after the sender's
+/// latest row, makes the cursor monotonic per sender. Every validity check
+/// still uses the caller's `now_ms`; only the stored stamp is raised.
+fn monotonic_received_at_ms(
+    conn: &Connection,
+    sender_device: &[u8; 32],
+    now_ms: u64,
+) -> Result<u64, IndexedSessionStoreError> {
+    let latest: Option<i64> = conn.query_row(
+        "SELECT MAX(received_at_ms) FROM endpoint_inbox WHERE sender_device = ?1",
+        params![sender_device.as_slice()],
+        |row| row.get(0),
+    )?;
+    let Some(latest) = latest else {
+        return Ok(now_ms);
+    };
+    let floor = u64::try_from(latest)
+        .map_err(|_| IndexedSessionStoreError::CorruptEndpointState)?
+        .saturating_add(1);
+    Ok(now_ms.max(floor).min(i64::MAX as u64))
+}
+
 fn local_storage_key(root: &[u8; 32], session_id: &[u8; 32]) -> [u8; 32] {
     let hkdf = Hkdf::<Sha256>::new(None, root);
     let mut info = Vec::with_capacity(LOCAL_STORAGE_LABEL.len() + 1 + session_id.len());
@@ -5034,6 +5750,61 @@ fn open_local_inbox_row(
     );
     key.zeroize();
     result.map_err(|_| IndexedSessionStoreError::LocalInboxAuthenticationFailed)
+}
+
+/// Reads and authenticates one committed inbox row of a session whose `root`
+/// the caller already loaded. `Ok(None)` means no such row.
+fn read_endpoint_inbox_row(
+    conn: &Connection,
+    root: &[u8; 32],
+    session_id: &[u8; 32],
+    object_digest: &[u8; 32],
+) -> Result<Option<EndpointInboxRow>, IndexedSessionStoreError> {
+    let raw: Option<EndpointInboxDbRow> = conn
+        .query_row(
+            "SELECT message_id, sender_device, object_digest, created_at_ms,
+                    received_at_ms, sealed_local_row
+             FROM endpoint_inbox WHERE session_id = ?1 AND object_digest = ?2",
+            params![session_id.as_slice(), object_digest.as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((message_id, sender_device, stored_digest, created_at, received_at, sealed)) = raw
+    else {
+        return Ok(None);
+    };
+    let message_id = exact_array::<16>(&message_id)?;
+    let sender_device = exact_array::<32>(&sender_device)?;
+    let stored_digest = exact_array::<32>(&stored_digest)?;
+    if stored_digest != *object_digest || created_at < 0 || received_at < 0 {
+        return Err(IndexedSessionStoreError::CorruptEndpointState);
+    }
+    let plaintext = open_local_inbox_row(
+        root,
+        session_id,
+        object_digest,
+        &message_id,
+        &sender_device,
+        &sealed,
+    )?;
+    Ok(Some(EndpointInboxRow {
+        session_id: *session_id,
+        object_digest: *object_digest,
+        message_id,
+        sender_device,
+        created_at_ms: created_at as u64,
+        received_at_ms: received_at as u64,
+        plaintext,
+    }))
 }
 
 fn put_protected_state(
@@ -5424,6 +6195,92 @@ fn write_mutation(
     update_metadata(tx, record_key, state)
 }
 
+/// Stages one journaled endpoint mutation in the still-open IMMEDIATE
+/// transaction. The public metadata advance and every SQLite row the journal
+/// describes are written first, so any deterministic UNIQUE/CHECK/binding
+/// failure rejects the operation before anything durable changes; only then
+/// is the protected head (carrying the journal) replaced. The caller's commit
+/// stays the durability point after the protected replacement, so a crash in
+/// between is recovered by replaying the journal.
+fn stage_journaled_mutation(
+    tx: &Transaction<'_>,
+    backend: &dyn ProtectedSessionBackend,
+    account: &str,
+    record_key: &[u8; 32],
+    state: &ProtectedSessionState,
+    endpoint_fault: Option<EndpointFaultPoint>,
+) -> Result<ProtectedJournal, IndexedSessionStoreError> {
+    let journal =
+        protected_journal(state)?.ok_or(IndexedSessionStoreError::CorruptProtectedState)?;
+    update_metadata(tx, record_key, state)?;
+    apply_protected_journal(tx, state)?;
+    maybe_injected_endpoint_fault(
+        endpoint_fault,
+        EndpointFaultPoint::BeforeProtectedReplacement,
+    )?;
+    put_protected_state(backend, account, state)?;
+    maybe_injected_endpoint_fault(
+        endpoint_fault,
+        EndpointFaultPoint::AfterProtectedReplacement,
+    )?;
+    Ok(journal)
+}
+
+fn protected_journal(
+    state: &ProtectedSessionState,
+) -> Result<Option<ProtectedJournal>, IndexedSessionStoreError> {
+    match (
+        &state.pending_acceptance,
+        &state.pending_ack_acceptance,
+        &state.pending_outbound,
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(pending), None, None) => {
+            Ok(Some(ProtectedJournal::Acceptance(pending.object_digest)))
+        }
+        (None, Some(pending), None) => {
+            Ok(Some(ProtectedJournal::AckAcceptance(pending.object_digest)))
+        }
+        (None, None, Some(pending)) => Ok(Some(ProtectedJournal::Outbound(pending.object_digest))),
+        _ => Err(IndexedSessionStoreError::CorruptProtectedState),
+    }
+}
+
+/// Idempotently writes the SQLite rows described by the session's journal.
+fn apply_protected_journal(
+    tx: &Transaction<'_>,
+    state: &ProtectedSessionState,
+) -> Result<(), IndexedSessionStoreError> {
+    match (
+        &state.pending_acceptance,
+        &state.pending_ack_acceptance,
+        &state.pending_outbound,
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(pending), None, None) => insert_pending_acceptance(tx, &state.binding, pending),
+        (None, Some(pending), None) => insert_pending_ack_acceptance(tx, &state.binding, pending),
+        (None, None, Some(pending)) => insert_pending_outbound(tx, state, pending),
+        _ => Err(IndexedSessionStoreError::CorruptProtectedState),
+    }
+}
+
+/// Replay failures that are a deterministic conflict with committed rows and
+/// can never succeed on retry. Transient SQLite/backend failures and
+/// corruption signals are deliberately excluded and keep failing closed.
+fn journal_replay_is_unrecoverable(error: &IndexedSessionStoreError) -> bool {
+    match error {
+        IndexedSessionStoreError::Sqlite(error) => {
+            error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)
+        }
+        IndexedSessionStoreError::LogicalMessageConflict
+        | IndexedSessionStoreError::AckNonceConflict
+        | IndexedSessionStoreError::AckOutstandingMismatch
+        | IndexedSessionStoreError::OutboundCollision
+        | IndexedSessionStoreError::OutboundBindingMismatch => true,
+        _ => false,
+    }
+}
+
 fn store_integrity_key(root: &[u8; 32], session_id: &[u8; 32]) -> [u8; 32] {
     let hkdf = Hkdf::<Sha256>::new(None, root);
     let mut info = Vec::with_capacity(STORE_INTEGRITY_LABEL.len() + 1 + session_id.len());
@@ -5469,7 +6326,7 @@ fn encode_protected_state(
     mac.update(&writer.value);
     writer.bytes(&mac.finalize().into_bytes());
     integrity_key.zeroize();
-    Ok(writer.value)
+    Ok(writer.into_bytes())
 }
 
 fn decode_protected_state(
@@ -5993,6 +6850,10 @@ fn decode_receive_ratchet(
     })
 }
 
+/// Encoder for protected session state. The buffer holds roots, chain keys
+/// and skipped keys, so it never lets `Vec` reallocate on its own (which would
+/// free earlier copies unwiped) and is zeroized on drop, including on error
+/// paths that abandon a partial encoding.
 struct BinaryWriter {
     value: Vec<u8>,
 }
@@ -6005,11 +6866,23 @@ impl BinaryWriter {
     }
 
     fn bytes(&mut self, value: &[u8]) {
+        let required = self.value.len().saturating_add(value.len());
+        if required > self.value.capacity() {
+            let mut grown =
+                Vec::with_capacity(required.max(self.value.capacity().saturating_mul(2)));
+            grown.extend_from_slice(&self.value);
+            self.value.zeroize();
+            self.value = grown;
+        }
         self.value.extend_from_slice(value);
     }
 
     fn u8(&mut self, value: u8) {
-        self.value.push(value);
+        self.bytes(&[value]);
+    }
+
+    fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.value)
     }
 
     fn u16(&mut self, value: u16) {
@@ -6048,6 +6921,12 @@ impl BinaryWriter {
         self.u32(value.len() as u32);
         self.bytes(value);
         Ok(())
+    }
+}
+
+impl Drop for BinaryWriter {
+    fn drop(&mut self) {
+        self.value.zeroize();
     }
 }
 
@@ -6118,6 +6997,17 @@ impl<'a> BinaryReader<'a> {
     }
 }
 
+/// True when `t_ms` lies before the session's start, its signed PairInit
+/// `created_at_ms`. That instant comes from the INITIATOR's clock, and PairInit
+/// and PairResponse verification already tolerate `MAX_PREKEY_FUTURE_SKEW_MS`
+/// of peer clock skew; the session windows use the same bound for their start,
+/// or a peer whose clock is a little behind would accept and confirm the session
+/// and then be unable to send, receive or acknowledge in it until its clock
+/// caught up. Expiry bounds stay exact.
+fn before_session_start(t_ms: u64, session_created_at_ms: u64) -> bool {
+    t_ms.saturating_add(crate::prekey_lifecycle::MAX_PREKEY_FUTURE_SKEW_MS) < session_created_at_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6137,9 +7027,63 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Barrier, Mutex};
+    use std::sync::{mpsc, Condvar, Mutex};
     use std::thread;
     use tempfile::tempdir;
+
+    /// Upper bound on every test rendezvous. A peer that never arrives (an
+    /// early error, a changed number of protected writes) fails the test with
+    /// a message instead of hanging `cargo test` forever.
+    const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn route_tag_comparison_checks_every_bit() {
+        let tag: [u8; 16] = std::array::from_fn(|i| (i as u8).wrapping_mul(37) ^ 0xA5);
+        assert!(route_tag_eq(&tag, &tag));
+        for byte in 0..16 {
+            for bit in 0..8 {
+                let mut other = tag;
+                other[byte] ^= 1 << bit;
+                assert!(!route_tag_eq(&other, &tag), "byte {byte} bit {bit}");
+                assert!(!route_tag_eq(&tag, &other), "byte {byte} bit {bit}");
+            }
+        }
+    }
+
+    /// Single-use start barrier whose `wait` panics on timeout.
+    struct TimedBarrier {
+        parties: usize,
+        arrived: Mutex<usize>,
+        all_arrived: Condvar,
+    }
+
+    impl TimedBarrier {
+        fn new(parties: usize) -> Arc<Self> {
+            Arc::new(Self {
+                parties,
+                arrived: Mutex::new(0),
+                all_arrived: Condvar::new(),
+            })
+        }
+
+        fn wait(&self, what: &str) {
+            self.wait_for(what, RENDEZVOUS_TIMEOUT);
+        }
+
+        fn wait_for(&self, what: &str, timeout: Duration) {
+            let mut arrived = self.arrived.lock().expect("barrier lock");
+            *arrived += 1;
+            self.all_arrived.notify_all();
+            let (_arrived, result) = self
+                .all_arrived
+                .wait_timeout_while(arrived, timeout, |arrived| *arrived < self.parties)
+                .expect("barrier lock");
+            assert!(
+                !result.timed_out(),
+                "{what}: peers never arrived within {timeout:?}"
+            );
+        }
+    }
 
     struct ScriptedCryptoRng {
         bytes: Vec<u8>,
@@ -6227,17 +7171,88 @@ mod tests {
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 
+    /// Busy-handler invocations of the connection `count_busy_wait` is
+    /// installed on, so a test can observe a store instance waiting for the
+    /// write lock instead of guessing how long that takes. Only the
+    /// late-journal-clear test installs it, one instance at a time.
+    static SECOND_INSTANCE_BUSY_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Same bound as the store's own 10 s busy timeout, plus the count.
+    fn count_busy_wait(attempt: i32) -> bool {
+        SECOND_INSTANCE_BUSY_WAITS.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(1));
+        attempt < 10_000
+    }
+
+    /// Backend half of a scheduled put pause: the put number it parks, the
+    /// channel that announces the parked writer and the one that releases it.
+    type PutPause = (usize, mpsc::Sender<()>, mpsc::Receiver<()>);
+
+    /// Test half of a scheduled put pause.
+    struct PutPauseHandle {
+        parked: mpsc::Receiver<()>,
+        resume: mpsc::Sender<()>,
+    }
+
+    impl PutPauseHandle {
+        /// Waits until the writer parks on the paused put. A worker that
+        /// finishes first never reached it (it failed or the number of
+        /// protected writes changed), which is reported instead of waited for.
+        fn wait_until_parked<T>(&self, worker: &thread::JoinHandle<T>) {
+            self.wait_until_parked_for(worker, RENDEZVOUS_TIMEOUT);
+        }
+
+        fn wait_until_parked_for<T>(&self, worker: &thread::JoinHandle<T>, timeout: Duration) {
+            let started = std::time::Instant::now();
+            loop {
+                match self.parked.recv_timeout(Duration::from_millis(20)) {
+                    Ok(()) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        assert!(
+                            !worker.is_finished(),
+                            "the worker finished without reaching the paused protected write"
+                        );
+                        assert!(
+                            started.elapsed() < timeout,
+                            "the worker never reached the paused protected write"
+                        );
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("the paused protected write was dropped")
+                    }
+                }
+            }
+        }
+
+        fn resume(&self) {
+            self.resume.send(()).expect("the parked writer is gone");
+        }
+    }
+
     #[derive(Default)]
     struct MemoryProtectedBackend {
         values: Mutex<HashMap<String, Vec<u8>>>,
         fail_next_put: AtomicBool,
         put_count: AtomicUsize,
         fail_on_put: Mutex<Option<usize>>,
+        pause_on_put: Mutex<Option<PutPause>>,
     }
 
     impl MemoryProtectedBackend {
         fn fail_next_put(&self) {
             self.fail_next_put.store(true, Ordering::SeqCst);
+        }
+
+        /// Blocks the `offset`-th future put before it lands: the writer
+        /// announces itself on the handle (so the test knows it is parked) and
+        /// then waits, bounded by `RENDEZVOUS_TIMEOUT`, for `resume`.
+        fn pause_nth_future_put(&self, offset: usize) -> PutPauseHandle {
+            assert!(offset > 0);
+            let target = self.put_count.load(Ordering::SeqCst) + offset;
+            let (parked_tx, parked) = mpsc::channel();
+            let (resume, resume_rx) = mpsc::channel();
+            *self.pause_on_put.lock().expect("pause lock") = Some((target, parked_tx, resume_rx));
+            PutPauseHandle { parked, resume }
         }
 
         fn fail_nth_future_put(&self, offset: usize) {
@@ -6266,6 +7281,27 @@ mod tests {
 
         fn put(&self, account: &str, value: &[u8]) -> Result<(), IndexedSessionStoreError> {
             let put_number = self.put_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let pause = {
+                let mut pause_on_put = self.pause_on_put.lock().expect("pause lock");
+                if pause_on_put
+                    .as_ref()
+                    .is_some_and(|(target, _, _)| *target == put_number)
+                {
+                    pause_on_put.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, parked, resume)) = pause {
+                // A vanished test (dropped handle) or a missed resume fails
+                // the parked put instead of blocking the writer forever.
+                let _ = parked.send(());
+                if resume.recv_timeout(RENDEZVOUS_TIMEOUT).is_err() {
+                    return Err(IndexedSessionStoreError::ProtectedStore(
+                        "paused write was never resumed".into(),
+                    ));
+                }
+            }
             let scheduled_failure = {
                 let mut fail_on_put = self.fail_on_put.lock().expect("failure lock");
                 if *fail_on_put == Some(put_number) {
@@ -6534,8 +7570,32 @@ mod tests {
         status: u8,
         ack_nonce: [u8; 12],
     ) -> Envelope {
+        inbound_ack_envelope_in_window(
+            fixture,
+            index,
+            outer_message_id,
+            acked_message_id,
+            status,
+            ack_nonce,
+            fixture.now_ms,
+            fixture.now_ms + 60_000,
+        )
+    }
+
+    /// Like `inbound_ack_envelope`, with an explicit validity window. The
+    /// signed inner record carries the same `created_at` as the outer envelope.
+    #[allow(clippy::too_many_arguments)]
+    fn inbound_ack_envelope_in_window(
+        fixture: &EndpointFixture,
+        index: u32,
+        outer_message_id: [u8; 16],
+        acked_message_id: [u8; 16],
+        status: u8,
+        ack_nonce: [u8; 12],
+        created_at: u64,
+        expires_at: u64,
+    ) -> Envelope {
         let direction = Direction::ResponderToInitiator;
-        let created_at = fixture.now_ms;
         let record = Ack {
             acked_message_id,
             status,
@@ -6580,7 +7640,7 @@ mod tests {
             .unwrap(),
             dest_device_hint: endpoint_device_hint(&fixture.key.initiator_device_ed25519),
             created_at,
-            expires_at: created_at + 60_000,
+            expires_at,
             hop_limit: 8,
             replication_budget: 2,
             anti_replay_nonce: [0xB1; 12],
@@ -6745,7 +7805,7 @@ mod tests {
         drop(creator);
 
         const WORKERS: usize = 24;
-        let barrier = Arc::new(Barrier::new(WORKERS));
+        let barrier = TimedBarrier::new(WORKERS);
         let mut stores = Vec::new();
         for _ in 0..WORKERS {
             stores.push(open_test_store(&path, Arc::clone(&backend)));
@@ -6755,7 +7815,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             let key = key.clone();
             handles.push(thread::spawn(move || {
-                barrier.wait();
+                barrier.wait("reservation workers");
                 let reservation = store.reserve_send_key(&key, RatchetLane::Message).unwrap();
                 (reservation.index, reservation.key)
             }));
@@ -7186,7 +8246,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_time_text_and_receive_window_boundaries_are_exact() {
+    fn endpoint_time_and_text_boundaries_are_exact() {
         let now = 1_700_000_000_000;
         assert!(endpoint_time_window_valid(
             now + MAX_ENDPOINT_FUTURE_SKEW_MS,
@@ -7208,11 +8268,26 @@ mod tests {
             now + MAX_ENDPOINT_ENVELOPE_LIFETIME_MS + 1,
             now,
         ));
+        // The expiry instant itself is already expired; the next millisecond
+        // is the last valid one.
+        assert!(!endpoint_time_window_valid(now - 1, now, now));
+        assert!(endpoint_time_window_valid(now - 1, now + 1, now));
+        // An envelope must expire strictly after it was created (checked in the
+        // future so the not-yet-expired clause cannot reject it first).
+        assert!(!endpoint_time_window_valid(now + 1, now + 1, now));
+        assert!(endpoint_time_window_valid(now + 1, now + 2, now));
+        assert!(!endpoint_time_window_valid(now + 2, now + 1, now));
         assert!(valid_endpoint_text(b"space tab\tline\nreturn\r"));
         assert!(!valid_endpoint_text(b"nul\0"));
         assert!(!valid_endpoint_text(b"escape\x1b"));
         assert!(!valid_endpoint_text(b"delete\x7f"));
         assert!(!valid_endpoint_text(&[0xFF]));
+        assert!(!valid_endpoint_text(b""));
+        assert!(valid_endpoint_text(&vec![b'a'; MAX_ENDPOINT_TEXT_BYTES]));
+        assert!(!valid_endpoint_text(&vec![
+            b'a';
+            MAX_ENDPOINT_TEXT_BYTES + 1
+        ]));
     }
 
     #[test]
@@ -7501,16 +8576,54 @@ mod tests {
                 fixture.now_ms,
             )
             .unwrap();
-        assert_eq!(
+        let delivery_state = |store: &IndexedSessionStore| {
             store
                 .outstanding_delivery_state(
                     &fixture.binding.session_id,
                     &outbound_id,
                     &fixture.key.responder_device_ed25519,
                 )
+                .unwrap()
+        };
+        assert_eq!(delivery_state(&store), Some(EndpointDeliveryState::Read));
+
+        // A late, reordered "delivered" ACK (fresh outer id, nonce and ACK
+        // index) is authentic and accepted, but must not regress a message
+        // that was already read.
+        let late_delivered =
+            inbound_ack_envelope(&fixture, 2, [0xE5; 16], outbound_id, 1, [0xE6; 12]);
+        assert!(matches!(
+            store
+                .accept_ack_envelope(
+                    &fixture.key,
+                    &late_delivered.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
                 .unwrap(),
-            Some(EndpointDeliveryState::Read)
-        );
+            EndpointAckAcceptance::Committed {
+                delivery_state: EndpointDeliveryState::Read,
+                ..
+            }
+        ));
+        assert_eq!(delivery_state(&store), Some(EndpointDeliveryState::Read));
+        assert!(matches!(
+            store
+                .accept_ack_envelope(
+                    &fixture.key,
+                    &late_delivered.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .unwrap(),
+            EndpointAckAcceptance::Duplicate {
+                delivery_state: EndpointDeliveryState::Read,
+                ..
+            }
+        ));
+        assert_eq!(delivery_state(&store), Some(EndpointDeliveryState::Read));
     }
 
     #[test]
@@ -7701,42 +8814,136 @@ mod tests {
             EndpointAcceptance::Committed { object_digest, .. } => object_digest,
             _ => unreachable!(),
         };
+        let persisted = |digest: &[u8; 32]| -> (i64, Option<Vec<u8>>) {
+            Connection::open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT state, immutable_ack_bytes FROM endpoint_ack_intents
+                     WHERE object_digest = ?1",
+                    params![digest.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        const ACK_BYTES: &[u8] = b"immutable-ack-envelope";
+        const OTHER_BYTES: &[u8] = b"a different ack envelope";
+        let pending_state = EndpointAckIntentState::Pending as i64;
+        let queued_state = EndpointAckIntentState::Queued as i64;
+
         store.inject_endpoint_fault(EndpointFaultPoint::AfterAckEnqueue);
         let mut enqueued = Vec::new();
         assert!(matches!(
-            store.enqueue_endpoint_ack(
-                &fixture.binding.session_id,
-                &digest,
-                b"immutable-ack-envelope",
-                |bytes| {
-                    enqueued.push(bytes.to_vec());
-                    Ok(())
-                },
-            ),
+            store.enqueue_endpoint_ack(&fixture.binding.session_id, &digest, ACK_BYTES, |bytes| {
+                enqueued.push(bytes.to_vec());
+                Ok(())
+            }),
             Err(IndexedSessionStoreError::InjectedEndpointFailure(_))
         ));
+        assert_eq!(
+            persisted(&digest),
+            (pending_state, Some(ACK_BYTES.to_vec())),
+            "the bytes are persisted before the queue is invoked"
+        );
         assert!(matches!(
-            store.enqueue_endpoint_ack(
-                &fixture.binding.session_id,
-                &digest,
-                b"immutable-ack-envelope",
-                |_| Err("injected queue failure".into()),
-            ),
+            store.enqueue_endpoint_ack(&fixture.binding.session_id, &digest, ACK_BYTES, |_| Err(
+                "injected queue failure".into()
+            )),
             Err(IndexedSessionStoreError::AckEnqueue)
         ));
         store
+            .enqueue_endpoint_ack(&fixture.binding.session_id, &digest, ACK_BYTES, |bytes| {
+                enqueued.push(bytes.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            enqueued,
+            vec![ACK_BYTES.to_vec(), ACK_BYTES.to_vec()],
+            "every retry hands the queue the exact persisted bytes"
+        );
+        assert_eq!(persisted(&digest), (queued_state, Some(ACK_BYTES.to_vec())));
+
+        // A Queued intent is immutable: different bytes conflict, never reach
+        // the queue and never overwrite the stored ones.
+        let mut queue_invoked = false;
+        assert!(matches!(
+            store.enqueue_endpoint_ack(&fixture.binding.session_id, &digest, OTHER_BYTES, |_| {
+                queue_invoked = true;
+                Ok(())
+            }),
+            Err(IndexedSessionStoreError::AckBytesConflict)
+        ));
+        assert!(!queue_invoked);
+        assert_eq!(persisted(&digest), (queued_state, Some(ACK_BYTES.to_vec())));
+
+        // The same holds while the intent is still Pending with its bytes
+        // already persisted (a crash before the queue call).
+        let second = inbound_message_envelope(&fixture, 1, [0xF4; 16], b"second ack-intent");
+        let second_digest = match store
+            .accept_message_envelope(
+                &fixture.key,
+                &second.pack(),
+                &fixture.remote_certificate,
+                false,
+                fixture.now_ms,
+            )
+            .unwrap()
+        {
+            EndpointAcceptance::Committed { object_digest, .. } => object_digest,
+            _ => unreachable!(),
+        };
+        store.inject_endpoint_fault(EndpointFaultPoint::BeforeAckEnqueue);
+        assert!(matches!(
+            store.enqueue_endpoint_ack(
+                &fixture.binding.session_id,
+                &second_digest,
+                ACK_BYTES,
+                |_| {
+                    queue_invoked = true;
+                    Ok(())
+                }
+            ),
+            Err(IndexedSessionStoreError::InjectedEndpointFailure(_))
+        ));
+        assert!(!queue_invoked);
+        assert_eq!(
+            persisted(&second_digest),
+            (pending_state, Some(ACK_BYTES.to_vec()))
+        );
+        assert!(matches!(
+            store.enqueue_endpoint_ack(
+                &fixture.binding.session_id,
+                &second_digest,
+                OTHER_BYTES,
+                |_| {
+                    queue_invoked = true;
+                    Ok(())
+                }
+            ),
+            Err(IndexedSessionStoreError::AckBytesConflict)
+        ));
+        assert!(!queue_invoked);
+        assert_eq!(
+            persisted(&second_digest),
+            (pending_state, Some(ACK_BYTES.to_vec()))
+        );
+        let mut retried = Vec::new();
+        store
             .enqueue_endpoint_ack(
                 &fixture.binding.session_id,
-                &digest,
-                b"immutable-ack-envelope",
+                &second_digest,
+                ACK_BYTES,
                 |bytes| {
-                    enqueued.push(bytes.to_vec());
+                    retried.push(bytes.to_vec());
                     Ok(())
                 },
             )
             .unwrap();
-        assert_eq!(enqueued.len(), 2);
-        assert_eq!(enqueued[0], enqueued[1]);
+        assert_eq!(retried, vec![ACK_BYTES.to_vec()]);
+        assert_eq!(
+            persisted(&second_digest),
+            (queued_state, Some(ACK_BYTES.to_vec()))
+        );
     }
 
     #[test]
@@ -8044,10 +9251,9 @@ mod tests {
         let envelope = Envelope::unpack(&outbound.immutable_envelope_bytes).unwrap();
         assert_eq!(envelope.env_type, EnvType::Message as u8);
         assert_eq!(envelope.flags, OUTBOUND_FLAGS);
-        assert_eq!(
-            envelope.dest_device_hint,
-            endpoint_device_hint(&fixture.key.responder_device_ed25519)
-        );
+        // F1: no recipient-identifying hint on new outbound envelopes.
+        assert_eq!(envelope.dest_device_hint, OUTBOUND_DEST_DEVICE_HINT);
+        assert_eq!(envelope.dest_device_hint, 0);
         assert!(envelope.verify(&fixture.local_identity.public_key_bytes()));
         let key = message_key_at_index(
             &fixture.root,
@@ -8181,6 +9387,25 @@ mod tests {
                 .unwrap(),
             None
         );
+        assert_eq!(outbound.ratchet_index, 0);
+        let mut next_queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+        let next = store
+            .send_message_envelope(
+                &fixture.key,
+                "after queued abandon",
+                &local_device,
+                fixture.now_ms,
+                fixture.now_ms + 60_000,
+                fixture.now_ms,
+                &mut rng,
+                &mut next_queue,
+            )
+            .unwrap();
+        assert_eq!(
+            next.ratchet_index,
+            outbound.ratchet_index + 1,
+            "an abandoned index stays consumed; its message key is never reused"
+        );
     }
 
     #[test]
@@ -8252,6 +9477,8 @@ mod tests {
         ));
         let pending = store.pending_endpoint_outbound().unwrap().remove(0);
         assert_eq!(pending.state, EndpointOutboxState::Prepared);
+        let abandoned_index = pending.ratchet_index;
+        assert_eq!(abandoned_index, 0);
         assert!(store
             .abandon_undelivered_outbound(&fixture.key, &pending.object_digest)
             .unwrap());
@@ -8271,6 +9498,11 @@ mod tests {
             .unwrap();
         assert_eq!(next.state, EndpointOutboxState::Queued);
         assert_ne!(next.object_digest, pending.object_digest);
+        assert_eq!(
+            next.ratchet_index,
+            abandoned_index + 1,
+            "an abandoned index stays consumed; its message key is never reused"
+        );
     }
 
     #[test]
@@ -8300,14 +9532,26 @@ mod tests {
             Err(IndexedSessionStoreError::OutboundQueueHandoff)
         ));
         let pending = store.pending_endpoint_outbound().unwrap().remove(0);
+        let message_id = pending.message_id;
         let account = hex::encode(record_key_digest(&fixture.key).unwrap());
         backend.corrupt(&account);
         assert!(matches!(
             store.abandon_undelivered_outbound(&fixture.key, &pending.object_digest),
             Err(IndexedSessionStoreError::CorruptProtectedState)
-                | Err(IndexedSessionStoreError::ProtectedStore(_))
-                | Err(IndexedSessionStoreError::AuthenticationFailed)
         ));
+        // The refusal happens before any delete: the prepared object and its
+        // outstanding row are still there for a later, healthy retry.
+        assert_eq!(store.pending_endpoint_outbound().unwrap(), vec![pending]);
+        assert_eq!(
+            store
+                .outstanding_delivery_state(
+                    &fixture.binding.session_id,
+                    &message_id,
+                    &fixture.key.responder_device_ed25519,
+                )
+                .unwrap(),
+            Some(EndpointDeliveryState::Sent)
+        );
     }
 
     #[test]
@@ -8939,9 +10183,12 @@ mod tests {
             assert_eq!(sent.ratchet_index, 0);
         }
 
-        // If the journal replacement succeeded but the database table is
-        // unavailable, reopening recreates schema and materializes the exact
-        // protected bytes.
+        // A database failure while staging the outbox rows happens before the
+        // protected replacement: no journal is written and the ratchet index
+        // is not consumed, because no bytes could have reached a queue.
+        // (Previously the journal was written first and replayed on reopen;
+        // that ordering let a deterministically failing insert strand an
+        // unreplayable journal.)
         {
             let temp = tempdir().unwrap();
             let path = temp.path().join("sessions.sqlite");
@@ -8952,6 +10199,8 @@ mod tests {
             store
                 .create_session(fixture.binding.clone(), fixture.root)
                 .unwrap();
+            let account = hex::encode(record_key_digest(&fixture.key).unwrap());
+            let before = backend.get(&account).unwrap().unwrap();
             store
                 .conn
                 .execute_batch(
@@ -8960,7 +10209,8 @@ mod tests {
                      BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END;",
                 )
                 .unwrap();
-            let mut rng = StdRng::from_seed([0xC2; 32]);
+            let seed = [0xC2; 32];
+            let mut rng = StdRng::from_seed(seed);
             let mut no_queue = |_digest: &[u8; 32], _bytes: &[u8]| -> Result<[u8; 32], ()> {
                 panic!("database failure must not queue")
             };
@@ -8977,30 +10227,29 @@ mod tests {
                 ),
                 Err(IndexedSessionStoreError::Sqlite(_))
             ));
+            assert_eq!(backend.get(&account).unwrap().unwrap(), before);
             store
                 .conn
                 .execute("DROP TRIGGER fail_endpoint_outbox_insert", [])
                 .unwrap();
             drop(store);
             let mut reopened = open_test_store(&path, backend);
-            let pending = reopened.pending_endpoint_outbound().unwrap();
-            assert_eq!(pending.len(), 1);
-            let exact = pending[0].immutable_envelope_bytes.clone();
-            let mut queued = Vec::new();
-            let mut queue = |digest: &[u8; 32], bytes: &[u8]| {
-                queued.push((*digest, bytes.to_vec()));
-                Ok(*digest)
-            };
-            reopened
-                .retry_endpoint_outbound(
+            assert!(reopened.pending_endpoint_outbound().unwrap().is_empty());
+            let mut retry_rng = StdRng::from_seed(seed);
+            let mut queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+            let sent = reopened
+                .send_message_envelope(
                     &fixture.key,
-                    &pending[0].object_digest,
+                    "database failure",
                     &local_device,
                     fixture.now_ms,
+                    fixture.now_ms + 60_000,
+                    fixture.now_ms,
+                    &mut retry_rng,
                     &mut queue,
                 )
                 .unwrap();
-            assert_eq!(queued[0].1, exact);
+            assert_eq!(sent.ratchet_index, 0);
         }
 
         // A failure while clearing the protected journal occurs only after the
@@ -9409,7 +10658,7 @@ mod tests {
         let pending = store.pending_endpoint_outbound().unwrap().remove(0);
         drop(store);
 
-        let barrier = Arc::new(Barrier::new(2));
+        let barrier = TimedBarrier::new(2);
         let observations = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::new();
         for _ in 0..2 {
@@ -9427,7 +10676,9 @@ mod tests {
                         .lock()
                         .expect("observation lock")
                         .push((*digest, bytes.to_vec()));
-                    barrier.wait();
+                    // Both instances must still see the object as Prepared and
+                    // hand it off before either one marks it Queued.
+                    barrier.wait("both retries reach the queue callback");
                     Ok(*digest)
                 };
                 store
@@ -9525,6 +10776,96 @@ mod tests {
         assert_eq!(state, EndpointOutboxState::Prepared as i64);
     }
 
+    /// F1 migration: a row queued before the hint change carries the legacy
+    /// recipient hint. Its exact bytes must keep validating (and be retried
+    /// unchanged); any other non-zero hint is still a binding mismatch. The
+    /// hint is outside the signature and the object digest, so both rows share
+    /// one digest.
+    #[test]
+    fn stored_outbound_accepts_zero_and_legacy_hint_only() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let local_device = authorized_local_device(&fixture);
+        let mut store = open_test_store(&path, backend);
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let mut rng = StdRng::from_seed([0xCE; 32]);
+        let mut ok_queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+        let outbound = store
+            .send_message_envelope(
+                &fixture.key,
+                "legacy hint row",
+                &local_device,
+                fixture.now_ms,
+                fixture.now_ms + 60_000,
+                fixture.now_ms,
+                &mut rng,
+                &mut ok_queue,
+            )
+            .unwrap();
+        let current = Envelope::unpack(&outbound.immutable_envelope_bytes).unwrap();
+        assert_eq!(current.dest_device_hint, 0);
+        let legacy_hint = endpoint_device_hint(&fixture.key.responder_device_ed25519);
+        let rewrite = |hint: u64| {
+            let mut env = current.clone();
+            env.dest_device_hint = hint;
+            assert!(env.verify(&fixture.local_identity.public_key_bytes()));
+            assert_eq!(
+                crate::bridge::authenticated_object_digest(&env),
+                outbound.object_digest
+            );
+            let packed = env.pack();
+            Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "UPDATE endpoint_outbox SET immutable_envelope_bytes = ?1
+                     WHERE object_digest = ?2",
+                    params![packed.as_slice(), outbound.object_digest.as_slice()],
+                )
+                .unwrap();
+            packed
+        };
+        let legacy = rewrite(legacy_hint);
+        let mut seen = Vec::new();
+        let mut record = |digest: &[u8; 32], bytes: &[u8]| {
+            seen.push(bytes.to_vec());
+            Ok(*digest)
+        };
+        let retried = store
+            .retry_endpoint_outbound(
+                &fixture.key,
+                &outbound.object_digest,
+                &local_device,
+                fixture.now_ms,
+                &mut record,
+            )
+            .expect("a pre-upgrade row with the legacy hint still validates");
+        assert_eq!(retried.immutable_envelope_bytes, legacy, "exact bytes");
+        rewrite(legacy_hint ^ 1);
+        assert!(matches!(
+            store.retry_endpoint_outbound(
+                &fixture.key,
+                &outbound.object_digest,
+                &local_device,
+                fixture.now_ms,
+                &mut ok_queue,
+            ),
+            Err(IndexedSessionStoreError::OutboundBindingMismatch)
+        ));
+        assert!(stored_outbound_hint_ok(0, &[7; 32]));
+        assert!(stored_outbound_hint_ok(
+            endpoint_device_hint(&[7; 32]),
+            &[7; 32]
+        ));
+        assert!(!stored_outbound_hint_ok(
+            endpoint_device_hint(&[8; 32]),
+            &[7; 32]
+        ));
+    }
+
     #[test]
     fn pending_outbound_rejects_short_sealed_body_without_panicking() {
         let message_id = [0xCB; 16];
@@ -9603,19 +10944,3376 @@ mod tests {
             .unwrap();
         drop(store);
 
-        for candidate in [
-            path.clone(),
-            PathBuf::from(format!("{}-wal", path.display())),
-            PathBuf::from(format!("{}-shm", path.display())),
-        ] {
-            if let Ok(bytes) = std::fs::read(candidate) {
-                assert!(!bytes.windows(root.len()).any(|window| window == root));
-                assert!(!String::from_utf8_lossy(&bytes).contains(&hex::encode(root)));
-            }
-        }
+        // The main file must be readable and non-empty: an unreadable database
+        // is a failure here, never a clean scan.
+        assert_eq!(
+            secrets_found_in_sqlite_files(&path, &[("root".to_string(), root)]),
+            Vec::<String>::new()
+        );
         assert!(std::fs::read_dir(temp.path())
             .unwrap()
             .filter_map(Result::ok)
             .all(|entry| entry.path().extension().and_then(|v| v.to_str()) != Some("json")));
+    }
+
+    /// (protected generation, protected journal present, metadata generation)
+    fn protected_and_metadata_generation(
+        path: &Path,
+        backend: &MemoryProtectedBackend,
+        key: &IndexedSessionRecordKey,
+    ) -> (u64, bool, u64) {
+        let record_key = record_key_digest(key).unwrap();
+        let encoded = backend.get(&hex::encode(record_key)).unwrap().unwrap();
+        let state = decode_protected_state(&encoded).unwrap();
+        let summary = (
+            state.generation,
+            state.pending_acceptance.is_some()
+                || state.pending_ack_acceptance.is_some()
+                || state.pending_outbound.is_some(),
+        );
+        drop(state);
+        let metadata: i64 = Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT generation FROM indexed_session_heads WHERE record_key = ?1",
+                params![record_key.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (summary.0, summary.1, metadata as u64)
+    }
+
+    #[test]
+    fn ack_outer_message_id_reuse_is_rejected_before_any_protected_write() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let mut store = open_test_store(&path, Arc::clone(&backend));
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let first_outbound = [0xA1; 16];
+        let second_outbound = [0xA2; 16];
+        for outbound in [first_outbound, second_outbound] {
+            store
+                .register_outstanding_message(&fixture.key, &outbound)
+                .unwrap();
+        }
+        let reused_outer = [0xA3; 16];
+        let first = inbound_ack_envelope(&fixture, 0, reused_outer, first_outbound, 1, [0xA4; 12]);
+        store
+            .accept_ack_envelope(
+                &fixture.key,
+                &first.pack(),
+                &fixture.remote_certificate,
+                false,
+                fixture.now_ms,
+            )
+            .unwrap();
+        let account = hex::encode(record_key_digest(&fixture.key).unwrap());
+        let before = backend.get(&account).unwrap().unwrap();
+
+        // Next ACK-lane index, fresh ACK nonce, valid AEAD and both device
+        // signatures, but the outer message ID of the ACK accepted above.
+        let reused =
+            inbound_ack_envelope(&fixture, 1, reused_outer, second_outbound, 1, [0xA5; 12]);
+        assert!(matches!(
+            store.accept_ack_envelope(
+                &fixture.key,
+                &reused.pack(),
+                &fixture.remote_certificate,
+                false,
+                fixture.now_ms,
+            ),
+            Err(IndexedSessionStoreError::LogicalMessageConflict)
+        ));
+        assert_eq!(
+            backend.get(&account).unwrap().unwrap(),
+            before,
+            "a rejected ACK must not write protected state or a journal"
+        );
+        assert_eq!(
+            store
+                .outstanding_delivery_state(
+                    &fixture.binding.session_id,
+                    &second_outbound,
+                    &fixture.key.responder_device_ed25519,
+                )
+                .unwrap(),
+            Some(EndpointDeliveryState::Sent)
+        );
+        drop(store);
+
+        // The store still opens and the rejected ACK did not consume index 1.
+        let mut reopened = open_test_store(&path, Arc::clone(&backend));
+        let valid = inbound_ack_envelope(&fixture, 1, [0xA6; 16], second_outbound, 1, [0xA5; 12]);
+        assert!(matches!(
+            reopened
+                .accept_ack_envelope(
+                    &fixture.key,
+                    &valid.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .unwrap(),
+            EndpointAckAcceptance::Committed {
+                delivery_state: EndpointDeliveryState::Delivered,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unreplayable_protected_journal_is_quarantined_instead_of_failing_open() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let first_outbound = [0xB1; 16];
+        let second_outbound = [0xB2; 16];
+        let reused_outer = [0xB3; 16];
+        {
+            let mut store = open_test_store(&path, Arc::clone(&backend));
+            store
+                .create_session(fixture.binding.clone(), fixture.root)
+                .unwrap();
+            for outbound in [first_outbound, second_outbound] {
+                store
+                    .register_outstanding_message(&fixture.key, &outbound)
+                    .unwrap();
+            }
+            let first =
+                inbound_ack_envelope(&fixture, 0, reused_outer, first_outbound, 1, [0xB4; 12]);
+            store
+                .accept_ack_envelope(
+                    &fixture.key,
+                    &first.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .unwrap();
+        }
+
+        // What an earlier build could leave behind: a protected head one
+        // generation ahead of metadata (crash before commit) whose ACK journal
+        // reuses that outer message ID for a different object, so its replay
+        // can never satisfy UNIQUE(session_id, remote_device, outer_message_id).
+        let account = hex::encode(record_key_digest(&fixture.key).unwrap());
+        let mut state = decode_protected_state(&backend.get(&account).unwrap().unwrap()).unwrap();
+        let generation = state.generation + 1;
+        state.generation = generation;
+        state.pending_ack_acceptance = Some(PendingAckAcceptance {
+            session_id: fixture.binding.session_id,
+            object_digest: [0xB5; 32],
+            outer_message_id: reused_outer,
+            remote_device: fixture.key.responder_device_ed25519,
+            acked_message_id: second_outbound,
+            status: 1,
+            ack_nonce: [0xB6; 12],
+            created_at_ms: fixture.now_ms,
+            public_generation: generation,
+        });
+        // The journaled ACK had consumed ACK index 1 before the crash: the
+        // ratchet advances before the journal is staged. Advance the real
+        // ratchet (the chain key moves with the index) so the crafted head is
+        // what a crashed acceptance would have left.
+        let (sender, recipient) =
+            endpoints_for_direction(&state.binding, state.binding.local_role.inbound_direction());
+        let mut consumed =
+            prepare_receive_key(&mut state.ratchets.ack_receive, 1, sender, recipient).unwrap();
+        consumed.zeroize();
+        backend
+            .put(&account, &encode_protected_state(&state).unwrap())
+            .unwrap();
+        drop(state);
+
+        let mut reopened = open_test_store(&path, Arc::clone(&backend));
+        assert_eq!(
+            protected_and_metadata_generation(&path, &backend, &fixture.key),
+            (generation, false, generation)
+        );
+        assert_eq!(
+            reopened
+                .outstanding_delivery_state(
+                    &fixture.binding.session_id,
+                    &second_outbound,
+                    &fixture.key.responder_device_ed25519,
+                )
+                .unwrap(),
+            Some(EndpointDeliveryState::Sent)
+        );
+        // Quarantine keeps the protected ratchet advanced: the burned index is
+        // never accepted again, the next one is.
+        let burned = inbound_ack_envelope(&fixture, 1, [0xB7; 16], second_outbound, 2, [0xB8; 12]);
+        assert!(matches!(
+            reopened.accept_ack_envelope(
+                &fixture.key,
+                &burned.pack(),
+                &fixture.remote_certificate,
+                false,
+                fixture.now_ms,
+            ),
+            Err(IndexedSessionStoreError::Replay)
+        ));
+        let valid = inbound_ack_envelope(&fixture, 2, [0xB9; 16], second_outbound, 2, [0xBA; 12]);
+        assert!(matches!(
+            reopened
+                .accept_ack_envelope(
+                    &fixture.key,
+                    &valid.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .unwrap(),
+            EndpointAckAcceptance::Committed {
+                delivery_state: EndpointDeliveryState::Read,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn only_deterministic_replay_conflicts_quarantine_a_journal() {
+        let sqlite = |code| {
+            IndexedSessionStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+        };
+        assert!(journal_replay_is_unrecoverable(&sqlite(
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        )));
+        assert!(journal_replay_is_unrecoverable(
+            &IndexedSessionStoreError::LogicalMessageConflict
+        ));
+        assert!(journal_replay_is_unrecoverable(
+            &IndexedSessionStoreError::AckOutstandingMismatch
+        ));
+        assert!(!journal_replay_is_unrecoverable(&sqlite(
+            rusqlite::ffi::SQLITE_BUSY
+        )));
+        assert!(!journal_replay_is_unrecoverable(&sqlite(
+            rusqlite::ffi::SQLITE_IOERR
+        )));
+        assert!(!journal_replay_is_unrecoverable(
+            &IndexedSessionStoreError::ProtectedStore("unavailable".into())
+        ));
+        assert!(!journal_replay_is_unrecoverable(
+            &IndexedSessionStoreError::CorruptEndpointState
+        ));
+        assert!(!journal_replay_is_unrecoverable(
+            &IndexedSessionStoreError::CorruptProtectedState
+        ));
+    }
+
+    #[test]
+    fn prune_crash_after_secret_delete_keeps_store_open_and_is_finished_later() {
+        for injected in [false, true] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("sessions.sqlite");
+            let backend = Arc::new(MemoryProtectedBackend::default());
+            let fixture = endpoint_fixture();
+            let mut expired = fixture.binding.clone();
+            expired.key.init_id = [0x34; 16];
+            expired.init_hash = [0x52; 32];
+            expired.session_id = session_id(&expired.init_hash);
+            expired.expires_at_ms = fixture.now_ms - 1;
+            let expired_account = hex::encode(record_key_digest(&expired.key).unwrap());
+            {
+                let mut store = open_test_store(&path, Arc::clone(&backend));
+                store.create_session(expired.clone(), [0xB9; 32]).unwrap();
+                store
+                    .create_session(fixture.binding.clone(), fixture.root)
+                    .unwrap();
+                store
+                    .register_outstanding_message(&expired.key, &[0xBA; 16])
+                    .unwrap();
+                if injected {
+                    store.inject_endpoint_fault(EndpointFaultPoint::AfterPruneSecretDelete);
+                    assert!(matches!(
+                        store.prune_expired_sessions(fixture.now_ms),
+                        Err(IndexedSessionStoreError::InjectedEndpointFailure(_))
+                    ));
+                } else {
+                    // The durable state an earlier prune left when it died
+                    // between deleting the secret and deleting the rows.
+                    backend.delete(&expired_account).unwrap();
+                }
+            }
+            assert!(backend.get(&expired_account).unwrap().is_none());
+
+            let mut reopened = open_test_store(&path, Arc::clone(&backend));
+            assert_eq!(reopened.list_record_keys().unwrap().len(), 2);
+            assert!(matches!(
+                reopened.session_lifecycle(&expired.key),
+                Err(IndexedSessionStoreError::ProtectedStateMissing)
+            ));
+            assert_eq!(
+                reopened
+                    .find_confirmed_session_for_peer_at(
+                        &fixture.key.responder_device_ed25519,
+                        fixture.now_ms,
+                    )
+                    .unwrap(),
+                Some(fixture.key.clone())
+            );
+            assert_eq!(reopened.prune_expired_sessions(fixture.now_ms).unwrap(), 1);
+            assert_eq!(
+                reopened.list_record_keys().unwrap(),
+                vec![fixture.key.clone()]
+            );
+            let leftover: i64 = reopened
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM endpoint_outstanding_messages WHERE session_id = ?1",
+                    params![expired.session_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(leftover, 0);
+            assert_eq!(reopened.prune_expired_sessions(fixture.now_ms).unwrap(), 0);
+            let inbound = inbound_message_envelope(&fixture, 0, [0xBB; 16], b"after prune");
+            reopened
+                .accept_message_envelope(
+                    &fixture.key,
+                    &inbound.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn prepared_objects_only_gate_their_own_lane() {
+        let fixture = endpoint_fixture();
+        let local_device = authorized_local_device(&fixture);
+        let now = fixture.now_ms;
+        let accept = |store: &mut IndexedSessionStore, index: u32, message_id: [u8; 16]| {
+            let inbound = inbound_message_envelope(&fixture, index, message_id, b"acknowledge me");
+            match store
+                .accept_message_envelope(
+                    &fixture.key,
+                    &inbound.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    now,
+                )
+                .unwrap()
+            {
+                EndpointAcceptance::Committed { object_digest, .. } => object_digest,
+                _ => unreachable!(),
+            }
+        };
+        let mut queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+
+        // A reply left prepared because the peer was unreachable must not
+        // stop inbound messages from being acknowledged.
+        {
+            let temp = tempdir().unwrap();
+            let mut store = open_test_store(
+                &temp.path().join("sessions.sqlite"),
+                Arc::new(MemoryProtectedBackend::default()),
+            );
+            store
+                .create_session(fixture.binding.clone(), fixture.root)
+                .unwrap();
+            let mut rng = StdRng::from_seed([0xD1; 32]);
+            let mut offline = |_digest: &[u8; 32], _bytes: &[u8]| Err(());
+            assert!(matches!(
+                store.send_message_envelope(
+                    &fixture.key,
+                    "peer offline",
+                    &local_device,
+                    now,
+                    now + 60_000,
+                    now,
+                    &mut rng,
+                    &mut offline,
+                ),
+                Err(IndexedSessionStoreError::OutboundQueueHandoff)
+            ));
+            let intent = accept(&mut store, 0, [0xD2; 16]);
+            let mut ack_rng = StdRng::from_seed([0xD3; 32]);
+            let ack = store
+                .enqueue_committed_ack(
+                    &fixture.key,
+                    &intent,
+                    &local_device,
+                    now,
+                    now + 60_000,
+                    now,
+                    &mut ack_rng,
+                    &mut queue,
+                )
+                .unwrap();
+            assert_eq!(ack.kind, EndpointOutboundKind::Ack);
+            assert_eq!(ack.state, EndpointOutboxState::Queued);
+            let mut second_rng = StdRng::from_seed([0xD4; 32]);
+            assert!(matches!(
+                store.send_message_envelope(
+                    &fixture.key,
+                    "message lane still gated",
+                    &local_device,
+                    now,
+                    now + 60_000,
+                    now,
+                    &mut second_rng,
+                    &mut queue,
+                ),
+                Err(IndexedSessionStoreError::OutboundPending)
+            ));
+        }
+
+        // A prepared ACK must not block text.
+        {
+            let temp = tempdir().unwrap();
+            let mut store = open_test_store(
+                &temp.path().join("sessions.sqlite"),
+                Arc::new(MemoryProtectedBackend::default()),
+            );
+            store
+                .create_session(fixture.binding.clone(), fixture.root)
+                .unwrap();
+            let intent = accept(&mut store, 0, [0xD5; 16]);
+            store.inject_endpoint_fault(EndpointFaultPoint::AfterOutboundQueueHandoff);
+            let mut ack_rng = StdRng::from_seed([0xD6; 32]);
+            assert!(matches!(
+                store.enqueue_committed_ack(
+                    &fixture.key,
+                    &intent,
+                    &local_device,
+                    now,
+                    now + 60_000,
+                    now,
+                    &mut ack_rng,
+                    &mut queue,
+                ),
+                Err(IndexedSessionStoreError::InjectedEndpointFailure(_))
+            ));
+            assert_eq!(store.pending_endpoint_outbound().unwrap().len(), 1);
+            let mut rng = StdRng::from_seed([0xD7; 32]);
+            let sent = store
+                .send_message_envelope(
+                    &fixture.key,
+                    "text after a prepared ACK",
+                    &local_device,
+                    now,
+                    now + 60_000,
+                    now,
+                    &mut rng,
+                    &mut queue,
+                )
+                .unwrap();
+            assert_eq!(sent.state, EndpointOutboxState::Queued);
+        }
+
+        // An ACK that expired while prepared can never be retried. It is
+        // retired instead of wedging the ACK lane, and is never re-materialized.
+        {
+            let temp = tempdir().unwrap();
+            let mut store = open_test_store(
+                &temp.path().join("sessions.sqlite"),
+                Arc::new(MemoryProtectedBackend::default()),
+            );
+            store
+                .create_session(fixture.binding.clone(), fixture.root)
+                .unwrap();
+            let first_intent = accept(&mut store, 0, [0xD8; 16]);
+            let second_intent = accept(&mut store, 1, [0xD9; 16]);
+            store.inject_endpoint_fault(EndpointFaultPoint::AfterOutboundQueueHandoff);
+            let mut ack_rng = StdRng::from_seed([0xDA; 32]);
+            assert!(matches!(
+                store.enqueue_committed_ack(
+                    &fixture.key,
+                    &first_intent,
+                    &local_device,
+                    now,
+                    now + 1,
+                    now,
+                    &mut ack_rng,
+                    &mut queue,
+                ),
+                Err(IndexedSessionStoreError::InjectedEndpointFailure(_))
+            ));
+            let later = now + 2;
+            let mut forbidden = |_digest: &[u8; 32], _bytes: &[u8]| -> Result<[u8; 32], ()> {
+                panic!("an expired ACK must never reach the queue")
+            };
+            for _ in 0..2 {
+                let mut unused_rng = StdRng::from_seed([0xDB; 32]);
+                assert!(matches!(
+                    store.enqueue_committed_ack(
+                        &fixture.key,
+                        &first_intent,
+                        &local_device,
+                        later,
+                        later + 60_000,
+                        later,
+                        &mut unused_rng,
+                        &mut forbidden,
+                    ),
+                    Err(IndexedSessionStoreError::EndpointNotCurrentlyValid)
+                ));
+                assert!(store.pending_endpoint_outbound().unwrap().is_empty());
+            }
+            let mut next_rng = StdRng::from_seed([0xDC; 32]);
+            let next = store
+                .enqueue_committed_ack(
+                    &fixture.key,
+                    &second_intent,
+                    &local_device,
+                    later,
+                    later + 60_000,
+                    later,
+                    &mut next_rng,
+                    &mut queue,
+                )
+                .unwrap();
+            assert_eq!(next.state, EndpointOutboxState::Queued);
+            assert_eq!(
+                next.ratchet_index, 1,
+                "the retired ACK's index stays consumed"
+            );
+        }
+    }
+
+    #[test]
+    fn late_journal_clear_never_rolls_back_a_concurrent_instance() {
+        #[derive(Debug, Clone, Copy)]
+        enum FirstMutation {
+            AcceptMessage,
+            AcceptAck,
+            SendMessage,
+        }
+        for first in [
+            FirstMutation::AcceptMessage,
+            FirstMutation::AcceptAck,
+            FirstMutation::SendMessage,
+        ] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("sessions.sqlite");
+            let backend = Arc::new(MemoryProtectedBackend::default());
+            let fixture = endpoint_fixture();
+            let outstanding = [0xE0; 16];
+            {
+                let mut store = open_test_store(&path, Arc::clone(&backend));
+                store
+                    .create_session(fixture.binding.clone(), fixture.root)
+                    .unwrap();
+                store
+                    .register_outstanding_message(&fixture.key, &outstanding)
+                    .unwrap();
+            }
+
+            // The second instance is opened while no journal exists, so its
+            // open takes no write lock, and its busy handler is counted: a
+            // journal-clearing writer that holds the write lock makes the
+            // second instance observably wait for it.
+            let mut second_store = open_test_store(&path, Arc::clone(&backend));
+            second_store
+                .conn
+                .busy_handler(Some(count_busy_wait))
+                .unwrap();
+            SECOND_INSTANCE_BUSY_WAITS.store(0, Ordering::SeqCst);
+
+            // Park the first instance on its second protected write, which is
+            // its journal clear, after its database commit.
+            let pause = backend.pause_nth_future_put(2);
+            let first_handle = {
+                let path = path.clone();
+                let backend = Arc::clone(&backend);
+                thread::spawn(move || {
+                    let fixture = endpoint_fixture();
+                    let local_device = authorized_local_device(&fixture);
+                    let mut store = open_test_store(&path, backend);
+                    let now = fixture.now_ms;
+                    match first {
+                        FirstMutation::AcceptMessage => {
+                            let inbound =
+                                inbound_message_envelope(&fixture, 0, [0xE1; 16], b"first");
+                            store
+                                .accept_message_envelope(
+                                    &fixture.key,
+                                    &inbound.pack(),
+                                    &fixture.remote_certificate,
+                                    false,
+                                    now,
+                                )
+                                .map(|_| ())
+                        }
+                        FirstMutation::AcceptAck => {
+                            let ack = inbound_ack_envelope(
+                                &fixture,
+                                0,
+                                [0xE2; 16],
+                                outstanding,
+                                1,
+                                [0xE3; 12],
+                            );
+                            store
+                                .accept_ack_envelope(
+                                    &fixture.key,
+                                    &ack.pack(),
+                                    &fixture.remote_certificate,
+                                    false,
+                                    now,
+                                )
+                                .map(|_| ())
+                        }
+                        FirstMutation::SendMessage => {
+                            let mut rng = StdRng::from_seed([0xE4; 32]);
+                            let mut queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+                            store
+                                .send_message_envelope(
+                                    &fixture.key,
+                                    "first",
+                                    &local_device,
+                                    now,
+                                    now + 60_000,
+                                    now,
+                                    &mut rng,
+                                    &mut queue,
+                                )
+                                .map(|_| ())
+                        }
+                    }
+                })
+            };
+            pause.wait_until_parked(&first_handle);
+
+            // A second instance runs a complete mutation of the same session
+            // while the first one is parked.
+            let (second_done_tx, second_done) = mpsc::channel();
+            let second_handle = {
+                thread::spawn(move || {
+                    let fixture = endpoint_fixture();
+                    let inbound = inbound_message_envelope(&fixture, 1, [0xE5; 16], b"second");
+                    let result = second_store
+                        .accept_message_envelope(
+                            &fixture.key,
+                            &inbound.pack(),
+                            &fixture.remote_certificate,
+                            false,
+                            fixture.now_ms,
+                        )
+                        .map(|_| ());
+                    let _ = second_done_tx.send(());
+                    result
+                })
+            };
+            // Release the parked journal clear only once the second instance
+            // is observed either waiting for the write lock the parked writer
+            // holds (the expected, serialized outcome) or already finished
+            // (a writer that parks outside the lock): the late clear is then
+            // really late, with no sleep standing in for that ordering.
+            let started = std::time::Instant::now();
+            while SECOND_INSTANCE_BUSY_WAITS.load(Ordering::SeqCst) == 0 {
+                if second_done.recv_timeout(Duration::from_millis(5)).is_ok() {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < RENDEZVOUS_TIMEOUT,
+                    "{first:?}: the second instance neither waited for the lock nor finished"
+                );
+            }
+            pause.resume();
+            first_handle.join().unwrap().unwrap();
+            second_handle.join().unwrap().unwrap();
+
+            let (protected_generation, journal, metadata_generation) =
+                protected_and_metadata_generation(&path, &backend, &fixture.key);
+            assert!(!journal, "{first:?}");
+            assert_eq!(
+                protected_generation, metadata_generation,
+                "{first:?}: a late journal clear rolled the protected head back"
+            );
+            let mut reopened = open_test_store(&path, Arc::clone(&backend));
+            let inbound = inbound_message_envelope(&fixture, 2, [0xE6; 16], b"still usable");
+            reopened
+                .accept_message_envelope(
+                    &fixture.key,
+                    &inbound.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn passphrase_vault_backend_keeps_session_secrets_across_handles() {
+        use crate::keystore_vault::test_support::test_vault;
+        const PASS: &str = "session vault passphrase";
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let path = dir.join("sessions.sqlite");
+        let vault_backend = |passphrase: &str| {
+            Arc::new(VaultSessionBackend {
+                vault: test_vault(dir, passphrase).0,
+            })
+        };
+        let binding = fixture_binding();
+        let key = binding.key.clone();
+        {
+            let mut store = IndexedSessionStore::open_with_backend(&path, vault_backend(PASS))
+                .expect("open vault-backed store");
+            store.create_session(binding, [0xA7; 32]).unwrap();
+        }
+        let names = test_vault(dir, PASS).0.entry_names().unwrap();
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with(crate::keystore_vault::SESSION_ENTRY_PREFIX)),
+            "{names:?}"
+        );
+        assert!(!names.is_empty());
+        {
+            let mut store =
+                IndexedSessionStore::open_with_backend(&path, vault_backend(PASS)).unwrap();
+            assert_eq!(
+                store.session_lifecycle(&key).unwrap(),
+                SessionLifecycle::Provisional
+            );
+        }
+        // A wrong passphrase fails closed as soon as protected state is read.
+        let error = match IndexedSessionStore::open_with_backend(
+            &path,
+            vault_backend("a wrong passphrase"),
+        ) {
+            Err(error) => error,
+            Ok(mut wrong) => wrong.session_lifecycle(&key).unwrap_err(),
+        };
+        assert!(error.to_string().contains("passphrase"), "{error}");
+        let backend = vault_backend(PASS);
+        backend.delete("00").unwrap();
+        backend.put("00", b"x").unwrap();
+        assert_eq!(backend.get("00").unwrap().as_deref(), Some(&b"x"[..]));
+        backend.delete("00").unwrap();
+        assert!(backend.get("00").unwrap().is_none());
+    }
+
+    #[test]
+    fn open_does_not_take_the_write_lock_for_sessions_without_a_journal() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        {
+            let mut store = open_test_store(&path, Arc::clone(&backend));
+            store.create_session(fixture_binding(), [0xA7; 32]).unwrap();
+        }
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let started = std::time::Instant::now();
+        let store = IndexedSessionStore::open_with_backend(&path, backend)
+            .expect("open must not wait for another writer when nothing needs recovery");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(store);
+        writer.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_database_and_side_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |file: &Path| std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let mut store = open_test_store(&path, Arc::clone(&backend));
+        store.create_session(fixture_binding(), [0xA7; 32]).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let file = PathBuf::from(format!("{}{suffix}", path.display()));
+            assert_eq!(mode(&file), 0o600, "{}", file.display());
+        }
+        drop(store);
+        // A database an earlier build left world-readable is tightened.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _reopened = open_test_store(&path, backend);
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn metadata_schema_is_versioned_and_newer_versions_are_refused() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let binding = fixture_binding();
+        let key = binding.key.clone();
+        {
+            let mut store = open_test_store(&path, Arc::clone(&backend));
+            store.create_session(binding, [0xA7; 32]).unwrap();
+        }
+        let version = |path: &Path| -> i64 {
+            Connection::open(path)
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&path), METADATA_SCHEMA_VERSION);
+
+        // A database from before versioning keeps its sessions and is stamped.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 0;")
+            .unwrap();
+        {
+            let mut store = open_test_store(&path, Arc::clone(&backend));
+            assert_eq!(
+                store.session_lifecycle(&key).unwrap(),
+                SessionLifecycle::Provisional
+            );
+        }
+        assert_eq!(version(&path), METADATA_SCHEMA_VERSION);
+
+        // A database written by a newer schema is refused, not reinterpreted.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                "PRAGMA user_version = {};",
+                METADATA_SCHEMA_VERSION + 1
+            ))
+            .unwrap();
+        assert!(matches!(
+            IndexedSessionStore::open_with_backend(&path, backend),
+            Err(IndexedSessionStoreError::UnsupportedMetadataSchema(found))
+                if found == METADATA_SCHEMA_VERSION + 1
+        ));
+    }
+
+    #[test]
+    fn protected_state_writer_growth_preserves_every_byte() {
+        let chunk: Vec<u8> = (0..=u8::MAX).collect();
+        let mut writer = BinaryWriter::new();
+        for _ in 0..40 {
+            writer.bytes(&chunk);
+        }
+        writer.u8(0x5A);
+        let bytes = writer.into_bytes();
+        assert_eq!(bytes.len(), 40 * chunk.len() + 1);
+        assert!(bytes[..40 * chunk.len()]
+            .chunks(chunk.len())
+            .all(|part| part == chunk.as_slice()));
+        assert_eq!(bytes[bytes.len() - 1], 0x5A);
+    }
+
+    #[test]
+    fn one_unreadable_session_does_not_make_the_store_unopenable() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let mut other = fixture.binding.clone();
+        other.key.init_id = [0x35; 16];
+        other.init_hash = [0x53; 32];
+        other.session_id = session_id(&other.init_hash);
+        {
+            let mut store = open_test_store(&path, Arc::clone(&backend));
+            store.create_session(other.clone(), [0xC7; 32]).unwrap();
+            store
+                .create_session(fixture.binding.clone(), fixture.root)
+                .unwrap();
+        }
+        backend.corrupt(&hex::encode(record_key_digest(&other.key).unwrap()));
+
+        let mut reopened = open_test_store(&path, Arc::clone(&backend));
+        assert!(matches!(
+            reopened.session_lifecycle(&other.key),
+            Err(IndexedSessionStoreError::CorruptProtectedState)
+        ));
+        let inbound = inbound_message_envelope(&fixture, 0, [0xC8; 16], b"healthy session");
+        reopened
+            .accept_message_envelope(
+                &fixture.key,
+                &inbound.pack(),
+                &fixture.remote_certificate,
+                false,
+                fixture.now_ms,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn inbox_listings_are_ordered_filtered_and_bounded() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let mut store = open_test_store(&path, backend);
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let message_ids = [[0xF1; 16], [0xF2; 16], [0xF3; 16]];
+        for (offset, message_id) in message_ids.iter().enumerate() {
+            let inbound = inbound_message_envelope(&fixture, offset as u32, *message_id, b"listed");
+            store
+                .accept_message_envelope(
+                    &fixture.key,
+                    &inbound.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms + offset as u64,
+                )
+                .unwrap();
+        }
+        let ids = |rows: Vec<EndpointInboxRow>| {
+            rows.into_iter()
+                .map(|row| row.message_id)
+                .collect::<Vec<_>>()
+        };
+        let remote = fixture.key.responder_device_ed25519;
+        assert_eq!(ids(store.list_endpoint_inbox().unwrap()), message_ids);
+        assert_eq!(
+            ids(store.list_endpoint_inbox_for_sender(&remote).unwrap()),
+            message_ids
+        );
+        assert!(store
+            .list_endpoint_inbox_for_sender(&[0xF4; 32])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            ids(store.list_endpoint_inbox_for_record(&fixture.key).unwrap()),
+            message_ids
+        );
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(
+                    &remote,
+                    fixture.now_ms,
+                    Some(&message_ids[0]),
+                    1,
+                )
+                .unwrap()),
+            vec![message_ids[1]]
+        );
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(&remote, fixture.now_ms + 1, None, 10)
+                .unwrap()),
+            vec![message_ids[1], message_ids[2]]
+        );
+        assert!(store
+            .list_endpoint_inbox_for_sender_after(&remote, 0, None, 0)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .list_endpoint_inbox()
+            .unwrap()
+            .iter()
+            .all(|row| row.plaintext == b"listed" && row.sender_device == remote));
+    }
+    // --- Regression tests for the connection/reliability fixes ---
+
+    /// Delegates to a memory backend, counting reads and optionally failing
+    /// them, so a test can tell a store-wide failure from a per-session one
+    /// and bound the number of protected-backend reads an operation makes.
+    struct ObservedBackend {
+        inner: Arc<MemoryProtectedBackend>,
+        gets: AtomicUsize,
+        fail_gets: AtomicBool,
+    }
+
+    impl ObservedBackend {
+        fn new(inner: Arc<MemoryProtectedBackend>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                gets: AtomicUsize::new(0),
+                fail_gets: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl ProtectedSessionBackend for ObservedBackend {
+        fn get(&self, account: &str) -> Result<Option<Vec<u8>>, IndexedSessionStoreError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            if self.fail_gets.load(Ordering::SeqCst) {
+                return Err(IndexedSessionStoreError::ProtectedStore(
+                    "keystore locked".into(),
+                ));
+            }
+            self.inner.get(account)
+        }
+
+        fn put(&self, account: &str, value: &[u8]) -> Result<(), IndexedSessionStoreError> {
+            self.inner.put(account, value)
+        }
+
+        fn delete(&self, account: &str) -> Result<(), IndexedSessionStoreError> {
+            self.inner.delete(account)
+        }
+    }
+
+    /// A second session with the same peer: same remote device, its own
+    /// init_id, root and session id. `created_at_ms` is shifted so the order
+    /// between the two sessions is explicit.
+    fn second_session_fixture(created_at_shift_ms: i64) -> EndpointFixture {
+        let mut other = endpoint_fixture();
+        other.binding.key.init_id = [0x35; 16];
+        other.binding.init_hash = [0x53; 32];
+        other.binding.session_id = session_id(&other.binding.init_hash);
+        other.binding.created_at_ms =
+            (other.binding.created_at_ms as i64 + created_at_shift_ms) as u64;
+        other.key = other.binding.key.clone();
+        other.root = [0xC7; 32];
+        other
+    }
+
+    fn accept_text(
+        store: &mut IndexedSessionStore,
+        fixture: &EndpointFixture,
+        index: u32,
+        message_id: [u8; 16],
+        now_ms: u64,
+    ) -> [u8; 32] {
+        let inbound = inbound_message_envelope(fixture, index, message_id, b"listed");
+        match store
+            .accept_message_envelope(
+                &fixture.key,
+                &inbound.pack(),
+                &fixture.remote_certificate,
+                false,
+                now_ms,
+            )
+            .unwrap()
+        {
+            EndpointAcceptance::Committed { object_digest, .. } => object_digest,
+            other => panic!("unexpected acceptance {other:?}"),
+        }
+    }
+
+    #[test]
+    fn journal_staged_between_recovery_and_operation_is_replayed_not_reported_corrupt() {
+        #[derive(Debug, Clone, Copy)]
+        enum Operation {
+            AcceptMessage,
+            AcceptAck,
+            SendMessage,
+            EnqueueAck,
+            Confirm,
+        }
+        for operation in [
+            Operation::AcceptMessage,
+            Operation::AcceptAck,
+            Operation::SendMessage,
+            Operation::EnqueueAck,
+            Operation::Confirm,
+        ] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("sessions.sqlite");
+            let backend = Arc::new(MemoryProtectedBackend::default());
+            let fixture = endpoint_fixture();
+            let local_device = authorized_local_device(&fixture);
+            let now = fixture.now_ms;
+            let outstanding = [0xE0; 16];
+            let mut binding = fixture.binding.clone();
+            if matches!(operation, Operation::Confirm) {
+                binding.lifecycle = SessionLifecycle::Provisional;
+                binding.response_hash = None;
+            }
+            let mut store = open_test_store(&path, Arc::clone(&backend));
+            store.create_session(binding, fixture.root).unwrap();
+            store
+                .register_outstanding_message(&fixture.key, &outstanding)
+                .unwrap();
+            let intent = matches!(operation, Operation::EnqueueAck)
+                .then(|| accept_text(&mut store, &fixture, 0, [0xE8; 16], now));
+
+            // Right after this instance finishes its journal recovery, a second
+            // instance commits a journaled mutation of the same session and
+            // dies before clearing its journal. The write lock is free in
+            // that window, so this instance's own transaction sees a healthy
+            // committed-but-uncleared journal.
+            let racing_send = matches!(operation, Operation::Confirm);
+            store.inject_after_recovery_hook({
+                let path = path.clone();
+                let backend = Arc::clone(&backend);
+                move || {
+                    let fixture = endpoint_fixture();
+                    let mut other = open_test_store(&path, backend);
+                    other.inject_endpoint_fault(EndpointFaultPoint::BeforeJournalClear);
+                    let raced = if racing_send {
+                        let local_device = authorized_local_device(&fixture);
+                        let mut rng = StdRng::from_seed([0xE7; 32]);
+                        let mut queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+                        other
+                            .send_message_envelope(
+                                &fixture.key,
+                                "racing",
+                                &local_device,
+                                fixture.now_ms,
+                                fixture.now_ms + 60_000,
+                                fixture.now_ms,
+                                &mut rng,
+                                &mut queue,
+                            )
+                            .map(|_| ())
+                    } else {
+                        let inbound = inbound_message_envelope(&fixture, 1, [0xE5; 16], b"racing");
+                        other
+                            .accept_message_envelope(
+                                &fixture.key,
+                                &inbound.pack(),
+                                &fixture.remote_certificate,
+                                false,
+                                fixture.now_ms,
+                            )
+                            .map(|_| ())
+                    };
+                    assert!(
+                        matches!(raced, Err(IndexedSessionStoreError::InjectedEndpointFailure(_))),
+                        "the racing writer must stop between its commit and its journal clear: {raced:?}"
+                    );
+                }
+            });
+
+            let mut rng = StdRng::from_seed([0xE9; 32]);
+            let mut queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+            let result = match operation {
+                Operation::AcceptMessage => {
+                    let inbound = inbound_message_envelope(&fixture, 2, [0xE6; 16], b"mine");
+                    store
+                        .accept_message_envelope(
+                            &fixture.key,
+                            &inbound.pack(),
+                            &fixture.remote_certificate,
+                            false,
+                            now,
+                        )
+                        .map(|_| ())
+                }
+                Operation::AcceptAck => {
+                    let ack =
+                        inbound_ack_envelope(&fixture, 0, [0xE2; 16], outstanding, 1, [0xE3; 12]);
+                    store
+                        .accept_ack_envelope(
+                            &fixture.key,
+                            &ack.pack(),
+                            &fixture.remote_certificate,
+                            false,
+                            now,
+                        )
+                        .map(|_| ())
+                }
+                Operation::SendMessage => store
+                    .send_message_envelope(
+                        &fixture.key,
+                        "mine",
+                        &local_device,
+                        now,
+                        now + 60_000,
+                        now,
+                        &mut rng,
+                        &mut queue,
+                    )
+                    .map(|_| ()),
+                Operation::EnqueueAck => store
+                    .enqueue_committed_ack(
+                        &fixture.key,
+                        &intent.unwrap(),
+                        &local_device,
+                        now,
+                        now + 60_000,
+                        now,
+                        &mut rng,
+                        &mut queue,
+                    )
+                    .map(|_| ()),
+                Operation::Confirm => store.confirm_session(&fixture.key, [0x46; 32]),
+            };
+            result.unwrap_or_else(|error| panic!("{operation:?}: {error:?}"));
+
+            let (protected_generation, journal, metadata_generation) =
+                protected_and_metadata_generation(&path, &backend, &fixture.key);
+            assert!(!journal, "{operation:?}");
+            assert_eq!(protected_generation, metadata_generation, "{operation:?}");
+            if let Operation::Confirm = operation {
+                // The racing optimistic send survived the confirmation and
+                // its object is still retryable: the session is not wedged.
+                assert_eq!(
+                    store.session_lifecycle(&fixture.key).unwrap(),
+                    SessionLifecycle::Confirmed
+                );
+                let prepared = store.pending_endpoint_outbound().unwrap();
+                assert_eq!(prepared.len(), 1);
+                let retried = store
+                    .retry_endpoint_outbound(
+                        &fixture.key,
+                        &prepared[0].object_digest,
+                        &local_device,
+                        now,
+                        &mut queue,
+                    )
+                    .unwrap();
+                assert_eq!(retried.state, EndpointOutboxState::Queued);
+            } else {
+                // The racing writer's committed message is not lost.
+                assert!(
+                    store
+                        .list_endpoint_inbox()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row.message_id == [0xE5; 16]),
+                    "{operation:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn peer_lookup_skips_an_unreadable_live_session_but_not_a_store_wide_failure() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let memory = Arc::new(MemoryProtectedBackend::default());
+        let observed = ObservedBackend::new(Arc::clone(&memory));
+        let fixture = endpoint_fixture();
+        let old = second_session_fixture(-1_000);
+        let peer = fixture.key.responder_device_ed25519;
+        let mut store =
+            IndexedSessionStore::open_with_backend(&path, observed.clone()).expect("open");
+        store.create_session(old.binding.clone(), old.root).unwrap();
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let old_account = hex::encode(record_key_digest(&old.key).unwrap());
+        let newest = |store: &mut IndexedSessionStore| {
+            store.find_confirmed_session_for_peer_at(&peer, fixture.now_ms)
+        };
+        assert_eq!(newest(&mut store).unwrap(), Some(fixture.key.clone()));
+
+        // Only the newer session is healthy: the older head is oldest-first, so
+        // it used to abort the lookup before the newer one was considered. A
+        // missing secret and a corrupt blob are both per-session failures.
+        memory.corrupt(&old_account);
+        assert_eq!(newest(&mut store).unwrap(), Some(fixture.key.clone()));
+        memory.delete(&old_account).unwrap();
+        assert_eq!(newest(&mut store).unwrap(), Some(fixture.key.clone()));
+
+        // With the newer session unreadable too there is nothing usable.
+        memory
+            .delete(&hex::encode(record_key_digest(&fixture.key).unwrap()))
+            .unwrap();
+        assert_eq!(newest(&mut store).unwrap(), None);
+        memory
+            .put(
+                &hex::encode(record_key_digest(&fixture.key).unwrap()),
+                b"garbage",
+            )
+            .unwrap();
+        assert_eq!(newest(&mut store).unwrap(), None);
+
+        // A locked or unavailable keystore is store-wide and still fails: the
+        // newest session is only temporarily unreadable, so falling back to an
+        // older one would be wrong.
+        observed.fail_gets.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            newest(&mut store),
+            Err(IndexedSessionStoreError::ProtectedStore(_))
+        ));
+        assert!(!is_session_scoped_state_error(
+            &IndexedSessionStoreError::ProtectedStore("locked".into())
+        ));
+        assert!(is_session_scoped_state_error(
+            &IndexedSessionStoreError::ProtectedStateMissing
+        ));
+    }
+
+    /// Peers that pair at the same moment hold two confirmed sessions with each
+    /// other, and both nodes must select the *same* one. The head's
+    /// `created_at_ms` is the init's stamp (identical on both sides); on an exact
+    /// tie the order used to fall to the node-local `rowid`, so the two nodes
+    /// picked different sessions and every message was refused as a route-tag
+    /// mismatch. The tie now breaks on `init_id`, identical on both nodes.
+    #[test]
+    fn crossed_sessions_are_selected_identically_on_both_nodes() {
+        let fixture = endpoint_fixture();
+        let other = second_session_fixture(0); // same stamp, init_id 0x35 > 0x33
+        let peer = fixture.key.responder_device_ed25519;
+        assert_eq!(fixture.binding.created_at_ms, other.binding.created_at_ms);
+        assert!(other.key.init_id > fixture.key.init_id);
+
+        // Node 1 learned the sessions in one order, node 2 in the other.
+        let mut answers = Vec::new();
+        for order in [[&fixture, &other], [&other, &fixture]] {
+            let temp = tempdir().unwrap();
+            let backend = Arc::new(MemoryProtectedBackend::default());
+            let mut store = open_test_store(&temp.path().join("sessions.sqlite"), backend);
+            for f in order {
+                store.create_session(f.binding.clone(), f.root).unwrap();
+            }
+            let all = store
+                .find_confirmed_sessions_for_peer_at(&peer, fixture.now_ms)
+                .unwrap();
+            // Newest first, the answer of the single-session lookup is the head.
+            assert_eq!(all, vec![other.key.clone(), fixture.key.clone()]);
+            assert_eq!(
+                store
+                    .find_confirmed_session_for_peer_at(&peer, fixture.now_ms)
+                    .unwrap(),
+                Some(other.key.clone())
+            );
+            answers.push(all);
+        }
+        assert_eq!(answers[0], answers[1], "both nodes agree on the order");
+    }
+
+    /// ATSAM_ENDPOINT_TRANSACTION_V1 §1 step 4: the route tag selects the session
+    /// BEFORE that session's own lifetime window applies. A message sealed under
+    /// an older live session, at a time before a newer session with the same peer
+    /// even existed, must be refused by the newer session as "not this session"
+    /// (RouteTagMismatch, so the caller goes on to the older one), never as "not
+    /// currently valid", which used to end the search and lose the message.
+    #[test]
+    fn an_older_sessions_message_is_not_refused_by_a_newer_sessions_window() {
+        let older = endpoint_fixture();
+        let skew = crate::prekey_lifecycle::MAX_PREKEY_FUTURE_SKEW_MS;
+        let newer = second_session_fixture((skew + 60_000) as i64);
+        let temp = tempdir().unwrap();
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let mut store = open_test_store(&temp.path().join("sessions.sqlite"), backend);
+        store
+            .create_session(older.binding.clone(), older.root)
+            .unwrap();
+        store
+            .create_session(newer.binding.clone(), newer.root)
+            .unwrap();
+        let start = older.binding.created_at_ms;
+        let sealed_under_older =
+            retimed_message_envelope(&older, 0, [0x61; 16], start + 1_000, start + 3_600_000);
+        assert!(
+            sealed_under_older.created_at + skew < newer.binding.created_at_ms,
+            "the message predates the newer session beyond any clock skew"
+        );
+        let now = newer.binding.created_at_ms + 1_000;
+        assert!(matches!(
+            store.accept_message_envelope(
+                &newer.key,
+                &sealed_under_older.pack(),
+                &newer.remote_certificate,
+                false,
+                now,
+            ),
+            Err(IndexedSessionStoreError::RouteTagMismatch)
+        ));
+        assert!(matches!(
+            store.accept_message_envelope(
+                &older.key,
+                &sealed_under_older.pack(),
+                &older.remote_certificate,
+                false,
+                now,
+            ),
+            Ok(EndpointAcceptance::Committed { .. })
+        ));
+    }
+
+    /// A strictly newer stamp still wins over a larger `init_id`.
+    #[test]
+    fn newer_stamp_beats_a_larger_init_id() {
+        let fixture = endpoint_fixture();
+        let older_but_larger_id = second_session_fixture(-1_000);
+        assert!(older_but_larger_id.key.init_id > fixture.key.init_id);
+        let peer = fixture.key.responder_device_ed25519;
+        let temp = tempdir().unwrap();
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let mut store = open_test_store(&temp.path().join("sessions.sqlite"), backend);
+        store
+            .create_session(
+                older_but_larger_id.binding.clone(),
+                older_but_larger_id.root,
+            )
+            .unwrap();
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        assert_eq!(
+            store
+                .find_confirmed_sessions_for_peer_at(&peer, fixture.now_ms)
+                .unwrap(),
+            vec![fixture.key.clone(), older_but_larger_id.key.clone()]
+        );
+    }
+
+    #[test]
+    fn live_init_ids_lists_only_unexpired_sessions_in_one_statement() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let mut expired = second_session_fixture(0);
+        expired.binding.expires_at_ms = fixture.now_ms;
+        let mut store = open_test_store(&path, backend);
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        store
+            .create_session(expired.binding.clone(), expired.root)
+            .unwrap();
+        let live = store.live_init_ids(fixture.now_ms).unwrap();
+        assert_eq!(live.len(), 1);
+        assert!(live.contains(&fixture.key.init_id));
+        assert_eq!(store.live_init_ids(fixture.now_ms - 1).unwrap().len(), 2);
+        // A head pruned meanwhile is simply absent from the result.
+        assert_eq!(store.prune_expired_sessions(fixture.now_ms).unwrap(), 1);
+        assert_eq!(store.live_init_ids(fixture.now_ms).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn inbox_listings_skip_an_unreadable_session_and_read_each_session_once() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let memory = Arc::new(MemoryProtectedBackend::default());
+        let observed = ObservedBackend::new(Arc::clone(&memory));
+        let fixture = endpoint_fixture();
+        let poisoned = second_session_fixture(-1_000);
+        let remote = fixture.key.responder_device_ed25519;
+        let mut store =
+            IndexedSessionStore::open_with_backend(&path, observed.clone()).expect("open");
+        store
+            .create_session(poisoned.binding.clone(), poisoned.root)
+            .unwrap();
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let now = fixture.now_ms;
+        // Interleaved in time so a per-session listing would reorder them.
+        accept_text(&mut store, &poisoned, 0, [0xA1; 16], now);
+        accept_text(&mut store, &fixture, 0, [0xA2; 16], now + 1);
+        accept_text(&mut store, &poisoned, 1, [0xA3; 16], now + 2);
+        accept_text(&mut store, &fixture, 1, [0xA4; 16], now + 3);
+        accept_text(&mut store, &fixture, 2, [0xA5; 16], now + 4);
+        let ids = |rows: Vec<EndpointInboxRow>| {
+            rows.into_iter()
+                .map(|row| row.message_id)
+                .collect::<Vec<_>>()
+        };
+        let everything = [[0xA1; 16], [0xA2; 16], [0xA3; 16], [0xA4; 16], [0xA5; 16]];
+        assert_eq!(ids(store.list_endpoint_inbox().unwrap()), everything);
+
+        // The protected-backend reads do not scale with the number of rows.
+        let before = observed.gets.load(Ordering::SeqCst);
+        store.list_endpoint_inbox().unwrap();
+        let reads = observed.gets.load(Ordering::SeqCst) - before;
+        assert!(
+            reads <= 2 * 2,
+            "{reads} protected reads for 5 rows in 2 sessions"
+        );
+
+        // A session whose secret is gone (a prune that died after deleting it)
+        // is skipped by every cross-session listing; the healthy session's
+        // rows keep flowing, in order.
+        memory
+            .delete(&hex::encode(record_key_digest(&poisoned.key).unwrap()))
+            .unwrap();
+        let healthy = [[0xA2; 16], [0xA4; 16], [0xA5; 16]];
+        assert_eq!(ids(store.list_endpoint_inbox().unwrap()), healthy);
+        assert_eq!(
+            ids(store.list_endpoint_inbox_for_sender(&remote).unwrap()),
+            healthy
+        );
+        // The poisoned row is first in order: the page of one must not stall on
+        // it but continue to the first healthy row after it.
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(&remote, 0, None, 1)
+                .unwrap()),
+            vec![[0xA2; 16]]
+        );
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(&remote, 0, None, 2)
+                .unwrap()),
+            vec![[0xA2; 16], [0xA4; 16]]
+        );
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(&remote, now + 1, Some(&[0xA2; 16]), 10)
+                .unwrap()),
+            vec![[0xA4; 16], [0xA5; 16]]
+        );
+        // The per-record listing stays strict: the expiry archive matches on
+        // this exact error.
+        assert!(matches!(
+            store.list_endpoint_inbox_for_record(&poisoned.key),
+            Err(IndexedSessionStoreError::ProtectedStateMissing)
+        ));
+        assert_eq!(
+            ids(store.list_endpoint_inbox_for_record(&fixture.key).unwrap()),
+            healthy
+        );
+
+        // A keystore that is locked is store-wide, never skipped.
+        observed.fail_gets.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            store.list_endpoint_inbox(),
+            Err(IndexedSessionStoreError::ProtectedStore(_))
+        ));
+    }
+
+    #[test]
+    fn paged_inbox_listing_loads_an_unreadable_session_once_per_call() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let memory = Arc::new(MemoryProtectedBackend::default());
+        let observed = ObservedBackend::new(Arc::clone(&memory));
+        let fixture = endpoint_fixture();
+        let poisoned = second_session_fixture(-1_000);
+        let remote = fixture.key.responder_device_ed25519;
+        let mut store =
+            IndexedSessionStore::open_with_backend(&path, observed.clone()).expect("open");
+        store
+            .create_session(poisoned.binding.clone(), poisoned.root)
+            .unwrap();
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let now = fixture.now_ms;
+        // Several unreadable rows in front of the healthy ones: a poll with a
+        // small decrypt budget crosses one page per row.
+        for index in 0..3u8 {
+            accept_text(
+                &mut store,
+                &poisoned,
+                u32::from(index),
+                [0xC1 + index; 16],
+                now + u64::from(index),
+            );
+        }
+        accept_text(&mut store, &fixture, 0, [0xC8; 16], now + 3);
+        accept_text(&mut store, &fixture, 1, [0xC9; 16], now + 4);
+        memory
+            .delete(&hex::encode(record_key_digest(&poisoned.key).unwrap()))
+            .unwrap();
+        let poll = |store: &mut IndexedSessionStore, limit: usize| {
+            let before = observed.gets.load(Ordering::SeqCst);
+            let rows = store
+                .list_endpoint_inbox_for_sender_after(&remote, 0, None, limit)
+                .unwrap();
+            let reads = observed.gets.load(Ordering::SeqCst) - before;
+            (
+                rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                reads,
+            )
+        };
+
+        // One page covers every row, so each session is loaded exactly once.
+        let (all, single_page_reads) = poll(&mut store, 10);
+        assert_eq!(all, vec![[0xC8; 16], [0xC9; 16]]);
+        assert!(single_page_reads > 0);
+
+        // One row per page walks past three unreadable rows, yet the
+        // unreadable session costs no more than it did in the single page.
+        let (first, paged_reads) = poll(&mut store, 1);
+        assert_eq!(first, vec![[0xC8; 16]]);
+        assert_eq!(paged_reads, single_page_reads);
+    }
+
+    #[test]
+    fn skipped_session_log_reports_each_failure_once_and_stays_bounded() {
+        let mut log = SkippedSessionLog::new();
+        assert!(log.first_report(b"session-a", "missing"));
+        assert!(!log.first_report(b"session-a", "missing"));
+        // Another session, or the same one failing differently, is news.
+        assert!(log.first_report(b"session-b", "missing"));
+        assert!(log.first_report(b"session-a", "corrupt"));
+        assert!(!log.first_report(b"session-a", "corrupt"));
+
+        // The memory never grows past its bound; a full one starts over.
+        let mut log = SkippedSessionLog::new();
+        for index in 0..(MAX_LOGGED_SKIPPED_SESSIONS * 3) {
+            assert!(log.first_report(&index.to_be_bytes(), "missing"));
+            assert!(log.seen.len() <= MAX_LOGGED_SKIPPED_SESSIONS);
+        }
+    }
+
+    #[test]
+    fn received_stamp_is_strictly_increasing_per_sender_in_commit_order() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let remote = fixture.key.responder_device_ed25519;
+        let mut store = open_test_store(&path, backend);
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let now = fixture.now_ms;
+        // The first handler captured its clock late (or the clock stepped
+        // back): the second commit carries an earlier `now_ms`.
+        accept_text(&mut store, &fixture, 0, [0xB1; 16], now + 10);
+        let polled = store
+            .list_endpoint_inbox_for_sender_after(&remote, 0, None, 10)
+            .unwrap();
+        assert_eq!(polled.len(), 1);
+        let cursor = (polled[0].received_at_ms, polled[0].message_id);
+        accept_text(&mut store, &fixture, 1, [0xB2; 16], now);
+        accept_text(&mut store, &fixture, 2, [0xB3; 16], now);
+        let after = store
+            .list_endpoint_inbox_for_sender_after(&remote, cursor.0, Some(&cursor.1), 10)
+            .unwrap();
+        assert_eq!(
+            after.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+            vec![[0xB2; 16], [0xB3; 16]],
+            "a late-committed row must stay reachable by a cursor that already advanced"
+        );
+        let stamps: Vec<u64> = store
+            .list_endpoint_inbox_for_sender(&remote)
+            .unwrap()
+            .iter()
+            .map(|row| row.received_at_ms)
+            .collect();
+        assert_eq!(stamps, vec![now + 10, now + 11, now + 12]);
+        // A sender with no earlier rows keeps the caller's clock.
+        assert_eq!(
+            monotonic_received_at_ms(&store.conn, &[0x62; 32], now).unwrap(),
+            now
+        );
+    }
+
+    #[test]
+    fn abandon_never_deletes_the_ciphertext_of_an_acknowledged_message() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let local_device = authorized_local_device(&fixture);
+        let now = fixture.now_ms;
+        let mut store = open_test_store(&path, backend);
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let mut queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+        let mut rng = StdRng::from_seed([0xC1; 32]);
+        let outbound = store
+            .send_message_envelope(
+                &fixture.key,
+                "delivered meanwhile",
+                &local_device,
+                now,
+                now + 60_000,
+                now,
+                &mut rng,
+                &mut queue,
+            )
+            .unwrap();
+        let outbox_rows = |store: &IndexedSessionStore| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM endpoint_outbox WHERE object_digest = ?1",
+                    params![outbound.object_digest.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let remote = fixture.key.responder_device_ed25519;
+
+        // The caller listed the row as awaiting an ACK, then an ACK was accepted.
+        assert_eq!(store.awaiting_ack_endpoint_outbound().unwrap().len(), 1);
+        let ack = inbound_ack_envelope(&fixture, 0, [0xC2; 16], outbound.message_id, 1, [0xC3; 12]);
+        store
+            .accept_ack_envelope(
+                &fixture.key,
+                &ack.pack(),
+                &fixture.remote_certificate,
+                false,
+                now,
+            )
+            .unwrap();
+        assert!(!store
+            .abandon_undelivered_outbound(&fixture.key, &outbound.object_digest)
+            .unwrap());
+        assert_eq!(outbox_rows(&store), 1, "delivered ciphertext must survive");
+        assert_eq!(
+            store
+                .outstanding_delivery_state(
+                    &fixture.binding.session_id,
+                    &outbound.message_id,
+                    &remote
+                )
+                .unwrap(),
+            Some(EndpointDeliveryState::Delivered)
+        );
+
+        // An outbox row whose outstanding row is gone is an orphan: still cleaned.
+        store
+            .conn
+            .execute(
+                "DELETE FROM endpoint_outstanding_messages WHERE message_id = ?1",
+                params![outbound.message_id.as_slice()],
+            )
+            .unwrap();
+        assert!(store
+            .abandon_undelivered_outbound(&fixture.key, &outbound.object_digest)
+            .unwrap());
+        assert_eq!(outbox_rows(&store), 0);
+    }
+
+    #[test]
+    fn locked_file_session_backend_is_refused_in_release_builds() {
+        assert!(matches!(
+            locked_file_session_backend_gate(true, false),
+            Err(IndexedSessionStoreError::ProtectedStore(message))
+                if message == "locked-file session backend is forbidden in Release builds"
+        ));
+        assert!(locked_file_session_backend_gate(true, true).unwrap());
+        assert!(!locked_file_session_backend_gate(false, false).unwrap());
+        assert!(!locked_file_session_backend_gate(false, true).unwrap());
+    }
+
+    #[test]
+    fn failed_session_creation_does_not_leave_an_orphaned_secret() {
+        // Both a failing insert and a failing commit happen after the secret
+        // was written; neither may leave a root nothing will ever find again.
+        for (label, setup) in [
+            (
+                "insert",
+                "CREATE TRIGGER fail_head BEFORE INSERT ON indexed_session_heads
+                 BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END;",
+            ),
+            (
+                "commit",
+                "CREATE TABLE commit_guard(
+                   x INTEGER REFERENCES commit_anchor(x) DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TABLE commit_anchor(x INTEGER PRIMARY KEY);
+                 CREATE TRIGGER fail_commit AFTER INSERT ON indexed_session_heads
+                 BEGIN INSERT INTO commit_guard VALUES (1); END;",
+            ),
+        ] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("sessions.sqlite");
+            let backend = Arc::new(MemoryProtectedBackend::default());
+            let fixture = endpoint_fixture();
+            let account = hex::encode(record_key_digest(&fixture.key).unwrap());
+            let mut store = open_test_store(&path, Arc::clone(&backend));
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(setup)
+                .unwrap();
+            assert!(
+                matches!(
+                    store.create_session(fixture.binding.clone(), fixture.root),
+                    Err(IndexedSessionStoreError::Sqlite(_))
+                ),
+                "{label}"
+            );
+            assert!(
+                backend.get(&account).unwrap().is_none(),
+                "{label}: orphaned protected root"
+            );
+            assert!(store.list_record_keys().unwrap().is_empty(), "{label}");
+
+            // Once the fault clears, the same PairInit creates the session.
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(
+                    "DROP TRIGGER IF EXISTS fail_head; DROP TRIGGER IF EXISTS fail_commit;",
+                )
+                .unwrap();
+            store
+                .create_session(fixture.binding.clone(), fixture.root)
+                .unwrap();
+            assert!(backend.get(&account).unwrap().is_some(), "{label}");
+        }
+    }
+
+    // --- Rollback, certificate pin, session window and ordering coverage ---
+
+    /// A session whose send ratchet sits at index 2, with the protected blob
+    /// captured after index 1 (stale) and after index 2 (current).
+    struct AdvancedSession {
+        _temp: tempfile::TempDir,
+        path: PathBuf,
+        backend: Arc<MemoryProtectedBackend>,
+        store: IndexedSessionStore,
+        fixture: EndpointFixture,
+        account: String,
+        stale_blob: Vec<u8>,
+        current_blob: Vec<u8>,
+    }
+
+    fn advanced_session() -> AdvancedSession {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let account = hex::encode(record_key_digest(&fixture.key).unwrap());
+        let mut store = open_test_store(&path, Arc::clone(&backend));
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let reserve = |store: &mut IndexedSessionStore| {
+            store
+                .reserve_send_key(&fixture.key, RatchetLane::Message)
+                .unwrap()
+                .index
+        };
+        assert_eq!(reserve(&mut store), 0);
+        let stale_blob = backend.get(&account).unwrap().unwrap();
+        assert_eq!(reserve(&mut store), 1);
+        let current_blob = backend.get(&account).unwrap().unwrap();
+        assert_ne!(stale_blob, current_blob);
+        AdvancedSession {
+            _temp: temp,
+            path,
+            backend,
+            store,
+            fixture,
+            account,
+            stale_blob,
+            current_blob,
+        }
+    }
+
+    /// Public head columns of the session: (generation, binding digest).
+    fn head_columns(path: &Path, key: &IndexedSessionRecordKey) -> (i64, Vec<u8>) {
+        let record_key = record_key_digest(key).unwrap();
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT generation, binding_digest FROM indexed_session_heads
+                 WHERE record_key = ?1",
+                params![record_key.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// The error each entry point that loads the protected head returns
+    /// (reserve, receive, message acceptance, ACK acceptance).
+    fn entry_point_errors(session: &mut AdvancedSession) -> [Option<IndexedSessionStoreError>; 4] {
+        let fixture = &session.fixture;
+        let message = inbound_message_envelope(fixture, 0, [0xB0; 16], b"after the fault");
+        let ack = inbound_ack_envelope(fixture, 0, [0xB1; 16], [0xB2; 16], 1, [0xB3; 12]);
+        [
+            session
+                .store
+                .reserve_send_key(&fixture.key, RatchetLane::Message)
+                .err(),
+            session
+                .store
+                .authenticate_receive::<(), _>(&fixture.key, RatchetLane::Message, 0, |_| Some(()))
+                .err(),
+            session
+                .store
+                .accept_message_envelope(
+                    &fixture.key,
+                    &message.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .err(),
+            session
+                .store
+                .accept_ack_envelope(
+                    &fixture.key,
+                    &ack.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .err(),
+        ]
+    }
+
+    #[test]
+    fn restored_older_protected_blob_is_refused_as_rollback_and_never_adopted() {
+        let mut session = advanced_session();
+        let head = head_columns(&session.path, &session.fixture.key);
+
+        // A backup restore or replayed keychain item puts an older protected
+        // blob back: the public head is ahead of it.
+        session
+            .backend
+            .put(&session.account, &session.stale_blob)
+            .unwrap();
+        for error in entry_point_errors(&mut session) {
+            assert!(
+                matches!(error, Some(IndexedSessionStoreError::RollbackDetected)),
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            head_columns(&session.path, &session.fixture.key),
+            head,
+            "the public head must not be rewound to the stale blob"
+        );
+        assert_eq!(
+            session.backend.get(&session.account).unwrap().unwrap(),
+            session.stale_blob,
+            "the stale blob must not be repaired or rewritten"
+        );
+
+        // The refusal survives a reopen ...
+        let AdvancedSession {
+            _temp,
+            path,
+            backend,
+            store,
+            fixture,
+            account,
+            current_blob,
+            ..
+        } = session;
+        drop(store);
+        let mut reopened = open_test_store(&path, Arc::clone(&backend));
+        assert!(matches!(
+            reopened.reserve_send_key(&fixture.key, RatchetLane::Message),
+            Err(IndexedSessionStoreError::RollbackDetected)
+        ));
+        // ... and lifts once the current blob is back, resuming after the
+        // indexes already handed out (no send key is reused).
+        backend.put(&account, &current_blob).unwrap();
+        assert_eq!(
+            reopened
+                .reserve_send_key(&fixture.key, RatchetLane::Message)
+                .unwrap()
+                .index,
+            2
+        );
+    }
+
+    #[test]
+    fn metadata_generation_ahead_of_the_protected_head_is_rollback() {
+        let mut session = advanced_session();
+        let (generation, digest) = head_columns(&session.path, &session.fixture.key);
+        let metadata_path = session.path.clone();
+        let set_generation = |value: i64| {
+            Connection::open(&metadata_path)
+                .unwrap()
+                .execute(
+                    "UPDATE indexed_session_heads SET generation = ?1",
+                    params![value],
+                )
+                .unwrap();
+        };
+        set_generation(generation + 1);
+        for error in entry_point_errors(&mut session) {
+            assert!(
+                matches!(error, Some(IndexedSessionStoreError::RollbackDetected)),
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            head_columns(&session.path, &session.fixture.key),
+            (generation + 1, digest),
+            "a refused access must not touch the public head"
+        );
+        assert_eq!(
+            session.backend.get(&session.account).unwrap().unwrap(),
+            session.current_blob
+        );
+        set_generation(generation);
+        assert_eq!(
+            session
+                .store
+                .reserve_send_key(&session.fixture.key, RatchetLane::Message)
+                .unwrap()
+                .index,
+            2
+        );
+    }
+
+    #[test]
+    fn binding_digest_mismatch_at_equal_generation_is_corruption_not_rollback() {
+        let mut session = advanced_session();
+        let (generation, digest) = head_columns(&session.path, &session.fixture.key);
+        let tampered = [0xEE_u8; 32];
+        assert_ne!(digest.as_slice(), tampered.as_slice());
+        let metadata_path = session.path.clone();
+        let set_digest = |value: &[u8]| {
+            Connection::open(&metadata_path)
+                .unwrap()
+                .execute(
+                    "UPDATE indexed_session_heads SET binding_digest = ?1",
+                    params![value],
+                )
+                .unwrap();
+        };
+        set_digest(&tampered);
+        for error in entry_point_errors(&mut session) {
+            assert!(
+                matches!(error, Some(IndexedSessionStoreError::CorruptProtectedState)),
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            head_columns(&session.path, &session.fixture.key),
+            (generation, tampered.to_vec()),
+            "a refused access must not touch the public head"
+        );
+        set_digest(&digest);
+        assert_eq!(
+            session
+                .store
+                .reserve_send_key(&session.fixture.key, RatchetLane::Message)
+                .unwrap()
+                .index,
+            2
+        );
+    }
+
+    #[test]
+    fn sender_certificate_pin_is_enforced_on_message_and_ack_ingress() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let mut store = open_test_store(&path, backend);
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let outstanding = [0xC0; 16];
+        store
+            .register_outstanding_message(&fixture.key, &outstanding)
+            .unwrap();
+
+        // Every imposter is a valid, currently valid certificate. Three carry
+        // the pinned device key but hash differently from the PairInit-bound
+        // certificate, so only the digest clause can reject them; the fourth
+        // certifies another device key.
+        let remote_user = Identity::from_seed(&[0x23; 32]);
+        let pinned_device = fixture.remote_identity.public_key_bytes();
+        let issue = |issuer: &Identity, device: [u8; 32], label: &str, window: (u64, u64)| {
+            DeviceCertificate::issue(issuer, device, [0x24; 32], label, window.0, window.1, 1)
+                .unwrap()
+        };
+        let pinned_window = (1_699_999_000_000, 1_700_200_000_000);
+        let imposters = [
+            (
+                "other issuing user",
+                issue(
+                    &Identity::from_seed(&[0x66; 32]),
+                    pinned_device,
+                    "remote-device",
+                    pinned_window,
+                ),
+            ),
+            (
+                "other device label",
+                issue(
+                    &remote_user,
+                    pinned_device,
+                    "remote-device-2",
+                    pinned_window,
+                ),
+            ),
+            (
+                "other validity window",
+                issue(
+                    &remote_user,
+                    pinned_device,
+                    "remote-device",
+                    (fixture.now_ms - 1_000, fixture.now_ms + 1_000_000),
+                ),
+            ),
+            (
+                "other device key",
+                issue(
+                    &remote_user,
+                    Identity::from_seed(&[0x67; 32]).public_key_bytes(),
+                    "remote-device",
+                    pinned_window,
+                ),
+            ),
+        ];
+        let message = inbound_message_envelope(&fixture, 0, [0xC1; 16], b"pinned sender");
+        let ack = inbound_ack_envelope(&fixture, 0, [0xC2; 16], outstanding, 1, [0xC3; 12]);
+        for (label, certificate) in &imposters {
+            certificate.verify(fixture.now_ms).unwrap();
+            assert_ne!(
+                device_certificate_hash(certificate).unwrap(),
+                fixture.binding.responder_cert_digest,
+                "{label}"
+            );
+            assert!(
+                matches!(
+                    store.accept_message_envelope(
+                        &fixture.key,
+                        &message.pack(),
+                        certificate,
+                        false,
+                        fixture.now_ms,
+                    ),
+                    Err(IndexedSessionStoreError::DeviceBindingMismatch)
+                ),
+                "{label}: message"
+            );
+            assert!(
+                matches!(
+                    store.accept_ack_envelope(
+                        &fixture.key,
+                        &ack.pack(),
+                        certificate,
+                        false,
+                        fixture.now_ms,
+                    ),
+                    Err(IndexedSessionStoreError::DeviceBindingMismatch)
+                ),
+                "{label}: ack"
+            );
+        }
+        // Nothing was consumed or recorded ...
+        assert!(store.pending_endpoint_ack_intents().unwrap().is_empty());
+        assert_eq!(
+            store
+                .outstanding_delivery_state(
+                    &fixture.binding.session_id,
+                    &outstanding,
+                    &fixture.key.responder_device_ed25519,
+                )
+                .unwrap(),
+            Some(EndpointDeliveryState::Sent)
+        );
+        // ... so the pinned certificate still opens the same envelopes at index 0.
+        assert!(matches!(
+            store
+                .accept_message_envelope(
+                    &fixture.key,
+                    &message.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .unwrap(),
+            EndpointAcceptance::Committed { .. }
+        ));
+        assert!(matches!(
+            store
+                .accept_ack_envelope(
+                    &fixture.key,
+                    &ack.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .unwrap(),
+            EndpointAckAcceptance::Committed { .. }
+        ));
+    }
+
+    #[test]
+    fn expired_or_not_yet_valid_pinned_certificate_is_rejected_on_message_and_ack_ingress() {
+        // The pinned certificate itself is outside its validity window at the
+        // rejected time and inside it (inclusively) at the control time.
+        let now = endpoint_fixture().now_ms;
+        for (label, window, rejected_at, accepted_at) in [
+            (
+                "expired",
+                (now - 1_000_000, now + 10_000),
+                now + 10_001,
+                now + 10_000,
+            ),
+            (
+                "not yet valid",
+                (now + 10_000, now + 1_000_000),
+                now + 9_999,
+                now + 10_000,
+            ),
+        ] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("sessions.sqlite");
+            let backend = Arc::new(MemoryProtectedBackend::default());
+            let mut fixture = endpoint_fixture();
+            fixture.remote_certificate = DeviceCertificate::issue(
+                &Identity::from_seed(&[0x23; 32]),
+                fixture.remote_identity.public_key_bytes(),
+                [0x24; 32],
+                "remote-device",
+                window.0,
+                window.1,
+                1,
+            )
+            .unwrap();
+            fixture.binding.responder_cert_digest =
+                device_certificate_hash(&fixture.remote_certificate).unwrap();
+            let mut store = open_test_store(&path, backend);
+            store
+                .create_session(fixture.binding.clone(), fixture.root)
+                .unwrap();
+            let outstanding = [0xC4; 16];
+            store
+                .register_outstanding_message(&fixture.key, &outstanding)
+                .unwrap();
+            let message = inbound_message_envelope(&fixture, 0, [0xC5; 16], b"cert window");
+            let ack = inbound_ack_envelope(&fixture, 0, [0xC6; 16], outstanding, 1, [0xC7; 12]);
+
+            assert!(
+                matches!(
+                    store.accept_message_envelope(
+                        &fixture.key,
+                        &message.pack(),
+                        &fixture.remote_certificate,
+                        false,
+                        rejected_at,
+                    ),
+                    Err(IndexedSessionStoreError::InvalidDeviceCertificate)
+                ),
+                "{label}: message"
+            );
+            assert!(
+                matches!(
+                    store.accept_ack_envelope(
+                        &fixture.key,
+                        &ack.pack(),
+                        &fixture.remote_certificate,
+                        false,
+                        rejected_at,
+                    ),
+                    Err(IndexedSessionStoreError::InvalidDeviceCertificate)
+                ),
+                "{label}: ack"
+            );
+            assert!(
+                store.pending_endpoint_ack_intents().unwrap().is_empty(),
+                "{label}"
+            );
+            assert!(matches!(
+                store
+                    .accept_message_envelope(
+                        &fixture.key,
+                        &message.pack(),
+                        &fixture.remote_certificate,
+                        false,
+                        accepted_at,
+                    )
+                    .unwrap(),
+                EndpointAcceptance::Committed { .. }
+            ));
+            assert!(matches!(
+                store
+                    .accept_ack_envelope(
+                        &fixture.key,
+                        &ack.pack(),
+                        &fixture.remote_certificate,
+                        false,
+                        accepted_at,
+                    )
+                    .unwrap(),
+                EndpointAckAcceptance::Committed { .. }
+            ));
+        }
+    }
+
+    /// Re-times a valid inbound message envelope. The route tag is bound to
+    /// `created_at`, so it is re-derived before the envelope is re-signed; the
+    /// sealed body does not cover either timestamp.
+    fn retimed_message_envelope(
+        fixture: &EndpointFixture,
+        index: u32,
+        message_id: [u8; 16],
+        created_at: u64,
+        expires_at: u64,
+    ) -> Envelope {
+        let mut envelope = inbound_message_envelope(fixture, index, message_id, b"windowed");
+        envelope.created_at = created_at;
+        envelope.expires_at = expires_at;
+        envelope.routing_tag = derive_route_tag(
+            &fixture.root,
+            created_at,
+            index,
+            EnvType::Message as u8,
+            Direction::ResponderToInitiator,
+        )
+        .unwrap();
+        envelope.sign_with(&fixture.remote_identity);
+        envelope
+    }
+
+    /// One case of the session-lifetime gate that message acceptance, ACK
+    /// acceptance and sending share:
+    /// `binding.created <= now < binding.expires`, `created >= binding.created`
+    /// and `expires <= binding.expires`.
+    struct SessionWindowCase {
+        label: &'static str,
+        /// The session's `(created_at_ms, expires_at_ms)`.
+        session: (u64, u64),
+        /// `(now, envelope created_at, envelope expires_at)` that must be rejected.
+        rejected: (u64, u64, u64),
+        /// The same envelope shape moved to the nearest accepted boundary.
+        accepted: Option<(u64, u64, u64)>,
+    }
+
+    /// Every rejected input passes the generic endpoint time window (lifetime,
+    /// skew, not yet expired), so a session clause is what rejects it.
+    /// `now >= binding.expires_at_ms` is the one clause no input can isolate: an
+    /// envelope that is unexpired at `now` and ends within the session already
+    /// implies `now < binding.expires_at_ms`. The last case pins the behaviour
+    /// that clause stands for (a session accepts nothing at its expiry
+    /// instant), which the envelope-end clause currently enforces on its own.
+    /// The start of a session window tolerates exactly the peer clock skew that
+    /// PairInit/PairResponse verification tolerates (`before_session_start`): the
+    /// session's `created_at_ms` comes from the initiator's clock. Expiry bounds
+    /// stay exact.
+    fn session_window_cases(now: u64) -> Vec<SessionWindowCase> {
+        let skew = crate::prekey_lifecycle::MAX_PREKEY_FUTURE_SKEW_MS;
+        vec![
+            SessionWindowCase {
+                label: "session has not started yet, even allowing for clock skew",
+                session: (now + skew + 1, now + 3_600_000),
+                rejected: (now, now, now + 60_000),
+                accepted: Some((now + 1, now + 1, now + 60_001)),
+            },
+            SessionWindowCase {
+                label: "envelope predates the session by more than the clock skew",
+                session: (now, now + 3_600_000),
+                rejected: (now, now - skew - 1, now + 60_000),
+                accepted: Some((now, now - skew, now + 60_000)),
+            },
+            SessionWindowCase {
+                label: "envelope outlives the session",
+                session: (now, now + 120_000),
+                rejected: (now, now, now + 120_001),
+                accepted: Some((now, now, now + 120_000)),
+            },
+            SessionWindowCase {
+                label: "session expires at this instant",
+                session: (now - 3_600_000, now),
+                rejected: (now, now, now + 60_000),
+                accepted: None,
+            },
+        ]
+    }
+
+    struct WindowedSession {
+        _temp: tempfile::TempDir,
+        path: PathBuf,
+        backend: Arc<MemoryProtectedBackend>,
+        store: IndexedSessionStore,
+        fixture: EndpointFixture,
+    }
+
+    fn windowed_session(window: (u64, u64)) -> WindowedSession {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let mut fixture = endpoint_fixture();
+        fixture.binding.created_at_ms = window.0;
+        fixture.binding.expires_at_ms = window.1;
+        let mut store = open_test_store(&path, Arc::clone(&backend));
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        WindowedSession {
+            _temp: temp,
+            path,
+            backend,
+            store,
+            fixture,
+        }
+    }
+
+    #[test]
+    fn message_acceptance_enforces_the_session_lifetime_window() {
+        for case in session_window_cases(endpoint_fixture().now_ms) {
+            let WindowedSession {
+                _temp,
+                path,
+                backend,
+                mut store,
+                fixture,
+            } = windowed_session(case.session);
+            let head = protected_and_metadata_generation(&path, &backend, &fixture.key);
+            let (now, created, expires) = case.rejected;
+            let envelope = retimed_message_envelope(&fixture, 0, [0x91; 16], created, expires);
+            assert!(
+                matches!(
+                    store.accept_message_envelope(
+                        &fixture.key,
+                        &envelope.pack(),
+                        &fixture.remote_certificate,
+                        false,
+                        now,
+                    ),
+                    Err(IndexedSessionStoreError::EndpointNotCurrentlyValid)
+                ),
+                "{}",
+                case.label
+            );
+            assert_eq!(
+                protected_and_metadata_generation(&path, &backend, &fixture.key),
+                head,
+                "{}: a rejected envelope must not write",
+                case.label
+            );
+            assert!(store.pending_endpoint_ack_intents().unwrap().is_empty());
+            if let Some((now, created, expires)) = case.accepted {
+                let envelope = retimed_message_envelope(&fixture, 0, [0x91; 16], created, expires);
+                assert!(
+                    matches!(
+                        store
+                            .accept_message_envelope(
+                                &fixture.key,
+                                &envelope.pack(),
+                                &fixture.remote_certificate,
+                                false,
+                                now,
+                            )
+                            .unwrap_or_else(|error| panic!("{}: {error:?}", case.label)),
+                        EndpointAcceptance::Committed { .. }
+                    ),
+                    "{}: index 0 must still be unconsumed",
+                    case.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ack_acceptance_enforces_the_session_lifetime_window() {
+        for case in session_window_cases(endpoint_fixture().now_ms) {
+            let WindowedSession {
+                _temp,
+                path,
+                backend,
+                mut store,
+                fixture,
+            } = windowed_session(case.session);
+            let outstanding = [0x92; 16];
+            store
+                .register_outstanding_message(&fixture.key, &outstanding)
+                .unwrap();
+            let head = protected_and_metadata_generation(&path, &backend, &fixture.key);
+            let ack = |(_, created, expires): (u64, u64, u64)| {
+                inbound_ack_envelope_in_window(
+                    &fixture,
+                    0,
+                    [0x93; 16],
+                    outstanding,
+                    1,
+                    [0x94; 12],
+                    created,
+                    expires,
+                )
+            };
+            assert!(
+                matches!(
+                    store.accept_ack_envelope(
+                        &fixture.key,
+                        &ack(case.rejected).pack(),
+                        &fixture.remote_certificate,
+                        false,
+                        case.rejected.0,
+                    ),
+                    Err(IndexedSessionStoreError::EndpointNotCurrentlyValid)
+                ),
+                "{}",
+                case.label
+            );
+            assert_eq!(
+                protected_and_metadata_generation(&path, &backend, &fixture.key),
+                head,
+                "{}: a rejected ACK must not write",
+                case.label
+            );
+            assert_eq!(
+                store
+                    .outstanding_delivery_state(
+                        &fixture.binding.session_id,
+                        &outstanding,
+                        &fixture.key.responder_device_ed25519,
+                    )
+                    .unwrap(),
+                Some(EndpointDeliveryState::Sent),
+                "{}",
+                case.label
+            );
+            if let Some(accepted) = case.accepted {
+                assert!(
+                    matches!(
+                        store
+                            .accept_ack_envelope(
+                                &fixture.key,
+                                &ack(accepted).pack(),
+                                &fixture.remote_certificate,
+                                false,
+                                accepted.0,
+                            )
+                            .unwrap_or_else(|error| panic!("{}: {error:?}", case.label)),
+                        EndpointAckAcceptance::Committed { .. }
+                    ),
+                    "{}: ACK index 0 must still be unconsumed",
+                    case.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn send_enforces_the_session_lifetime_window() {
+        for case in session_window_cases(endpoint_fixture().now_ms) {
+            let WindowedSession {
+                _temp,
+                path,
+                backend,
+                mut store,
+                fixture,
+            } = windowed_session(case.session);
+            let local_device = authorized_local_device(&fixture);
+            let head = protected_and_metadata_generation(&path, &backend, &fixture.key);
+            let mut queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+            let mut rng = StdRng::from_seed([0x95; 32]);
+            let (now, created, expires) = case.rejected;
+            assert!(
+                matches!(
+                    store.send_message_envelope(
+                        &fixture.key,
+                        "windowed send",
+                        &local_device,
+                        created,
+                        expires,
+                        now,
+                        &mut rng,
+                        &mut queue,
+                    ),
+                    Err(IndexedSessionStoreError::EndpointNotCurrentlyValid)
+                ),
+                "{}",
+                case.label
+            );
+            assert_eq!(
+                protected_and_metadata_generation(&path, &backend, &fixture.key),
+                head,
+                "{}: a rejected send must not write",
+                case.label
+            );
+            assert!(store.pending_endpoint_outbound().unwrap().is_empty());
+            if let Some((now, created, expires)) = case.accepted {
+                let sent = store
+                    .send_message_envelope(
+                        &fixture.key,
+                        "windowed send",
+                        &local_device,
+                        created,
+                        expires,
+                        now,
+                        &mut rng,
+                        &mut queue,
+                    )
+                    .unwrap_or_else(|error| panic!("{}: {error:?}", case.label));
+                assert_eq!(
+                    sent.ratchet_index, 0,
+                    "{}: the rejected send must not have consumed an index",
+                    case.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn skipped_key_eviction_is_oldest_first_and_evicted_indices_are_replays() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let binding = fixture_binding();
+        let key = binding.key.clone();
+        let root = [0x72; 32];
+        let mut store = open_test_store(&path, Arc::clone(&backend));
+        store.create_session(binding, root).unwrap();
+        let expected = |index: u32| {
+            message_key_at_index(
+                &root,
+                &key.initiator_address,
+                &key.responder_address,
+                Direction::ResponderToInitiator,
+                index,
+            )
+            .unwrap()
+        };
+        let accept = |store: &mut IndexedSessionStore, index: u32| {
+            let wanted = expected(index);
+            store.authenticate_receive(&key, RatchetLane::Message, index, |candidate| {
+                (candidate == &wanted).then_some(())
+            })
+        };
+        // 256 skipped keys (indexes 0..=255): the cache is exactly full.
+        accept(&mut store, 256).unwrap();
+        // A two-step jump caches index 257 as the 257th key, so the oldest
+        // (index 0) must be evicted to stay at the bound.
+        accept(&mut store, 258).unwrap();
+
+        let account = hex::encode(record_key_digest(&key).unwrap());
+        let state = decode_protected_state(&backend.get(&account).unwrap().unwrap())
+            .expect("a state with an evicted cache still re-encodes and decodes");
+        let cached: Vec<u32> = state
+            .ratchets
+            .message_receive
+            .skipped_keys
+            .keys()
+            .copied()
+            .collect();
+        drop(state);
+        assert_eq!(cached.len(), MAX_SKIPPED_KEYS);
+        assert_eq!(cached.first(), Some(&1), "the oldest key goes first");
+        assert_eq!(cached.last(), Some(&257), "the newest key is kept");
+
+        assert!(matches!(
+            accept(&mut store, 0),
+            Err(IndexedSessionStoreError::Replay)
+        ));
+        accept(&mut store, 257).expect("the newest cached key still opens");
+        accept(&mut store, 1).expect("the oldest surviving key still opens");
+        assert!(matches!(
+            accept(&mut store, 1),
+            Err(IndexedSessionStoreError::Replay)
+        ));
+    }
+
+    #[test]
+    fn inbound_text_at_the_cap_is_accepted_and_one_byte_over_is_rejected() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let mut store = open_test_store(&path, backend);
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let accept = |store: &mut IndexedSessionStore, envelope: &Envelope| {
+            store.accept_message_envelope(
+                &fixture.key,
+                &envelope.pack(),
+                &fixture.remote_certificate,
+                false,
+                fixture.now_ms,
+            )
+        };
+        let oversized = inbound_message_envelope(
+            &fixture,
+            0,
+            [0xD5; 16],
+            &vec![b'a'; MAX_ENDPOINT_TEXT_BYTES + 1],
+        );
+        assert!(matches!(
+            accept(&mut store, &oversized),
+            Err(IndexedSessionStoreError::InvalidEndpointPayload)
+        ));
+        assert!(store.pending_endpoint_ack_intents().unwrap().is_empty());
+        // The rejection consumed nothing: the maximal message takes index 0.
+        let exact = inbound_message_envelope(
+            &fixture,
+            0,
+            [0xD6; 16],
+            &vec![b'a'; MAX_ENDPOINT_TEXT_BYTES],
+        );
+        match accept(&mut store, &exact).unwrap() {
+            EndpointAcceptance::Committed { plaintext, .. } => {
+                assert_eq!(plaintext.len(), MAX_ENDPOINT_TEXT_BYTES)
+            }
+            other => panic!("unexpected acceptance {other:?}"),
+        }
+        let listed = store.list_endpoint_inbox().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].plaintext.len(), MAX_ENDPOINT_TEXT_BYTES);
+    }
+
+    #[test]
+    fn inbox_listings_order_by_received_time_then_message_id() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let mut store = open_test_store(&path, backend);
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        let now = fixture.now_ms;
+        // Insertion order, message-id order and received-time order all
+        // differ, so none of them can stand in for the documented order.
+        let (p, q, r) = ([0xF2; 16], [0xF3; 16], [0xF1; 16]);
+        for (index, id) in [p, q, r].into_iter().enumerate() {
+            accept_text(&mut store, &fixture, index as u32, id, now);
+        }
+        let set_received = |id: [u8; 16], received_at_ms: u64| {
+            Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "UPDATE endpoint_inbox SET received_at_ms = ?1 WHERE message_id = ?2",
+                    params![received_at_ms as i64, id.as_slice()],
+                )
+                .unwrap();
+        };
+        let ids = |rows: Vec<EndpointInboxRow>| {
+            rows.into_iter()
+                .map(|row| row.message_id)
+                .collect::<Vec<_>>()
+        };
+        let remote = fixture.key.responder_device_ed25519;
+
+        set_received(q, now);
+        set_received(r, now + 1);
+        set_received(p, now + 2);
+        let by_time = vec![q, r, p];
+        assert_eq!(ids(store.list_endpoint_inbox().unwrap()), by_time);
+        assert_eq!(
+            ids(store.list_endpoint_inbox_for_sender(&remote).unwrap()),
+            by_time
+        );
+        assert_eq!(
+            ids(store.list_endpoint_inbox_for_record(&fixture.key).unwrap()),
+            by_time
+        );
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(&remote, 0, None, 10)
+                .unwrap()),
+            by_time
+        );
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(&remote, 0, None, 1)
+                .unwrap()),
+            vec![q]
+        );
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(&remote, now, Some(&q), 10)
+                .unwrap()),
+            vec![r, p]
+        );
+
+        // Two rows in the same millisecond: the paged listing orders them by
+        // message id, and its cursor must split the tie without skipping or
+        // repeating either row.
+        set_received(r, now + 2);
+        let tied_order = vec![q, r, p];
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(&remote, 0, None, 10)
+                .unwrap()),
+            tied_order
+        );
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(&remote, now + 2, None, 10)
+                .unwrap()),
+            vec![r, p]
+        );
+        assert_eq!(
+            ids(store
+                .list_endpoint_inbox_for_sender_after(&remote, now + 2, Some(&r), 10)
+                .unwrap()),
+            vec![p]
+        );
+        assert!(store
+            .list_endpoint_inbox_for_sender_after(&remote, now + 2, Some(&p), 10)
+            .unwrap()
+            .is_empty());
+        let mut walked = Vec::new();
+        let (mut cursor_ms, mut cursor_id) = (0, None);
+        // One more page than rows: the last one must come back empty. A bound
+        // keeps a cursor that never advances an assertion failure, not a hang.
+        for _ in 0..=tied_order.len() {
+            let page = store
+                .list_endpoint_inbox_for_sender_after(&remote, cursor_ms, cursor_id.as_ref(), 1)
+                .unwrap();
+            let Some(row) = page.into_iter().next() else {
+                break;
+            };
+            walked.push(row.message_id);
+            cursor_ms = row.received_at_ms;
+            cursor_id = Some(row.message_id);
+        }
+        assert_eq!(walked, tied_order);
+
+        // The unpaged listings carry no tiebreaker: within a tie their order
+        // is unspecified, but they list every row, oldest first.
+        for rows in [
+            store.list_endpoint_inbox().unwrap(),
+            store.list_endpoint_inbox_for_sender(&remote).unwrap(),
+            store.list_endpoint_inbox_for_record(&fixture.key).unwrap(),
+        ] {
+            assert!(rows
+                .windows(2)
+                .all(|pair| pair[0].received_at_ms <= pair[1].received_at_ms));
+            let mut listed = ids(rows);
+            listed.sort();
+            assert_eq!(listed, vec![r, p, q]);
+        }
+    }
+
+    /// Names of the secrets (raw bytes or hex, either case) found in the
+    /// metadata database or its WAL and shared-memory side files. The main file
+    /// must be readable and non-empty; only a missing side file is tolerated.
+    fn secrets_found_in_sqlite_files(path: &Path, secrets: &[(String, [u8; 32])]) -> Vec<String> {
+        let mut found = Vec::new();
+        let candidates = [
+            path.to_path_buf(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ];
+        for (position, candidate) in candidates.iter().enumerate() {
+            let bytes = match std::fs::read(candidate) {
+                Ok(bytes) => bytes,
+                Err(error) if position > 0 && error.kind() == std::io::ErrorKind::NotFound => {
+                    continue
+                }
+                Err(error) => panic!("cannot read {}: {error}", candidate.display()),
+            };
+            if position == 0 {
+                assert!(!bytes.is_empty(), "the metadata database is empty");
+            }
+            let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+            for (name, secret) in secrets {
+                if bytes.windows(secret.len()).any(|window| window == secret)
+                    || text.contains(&hex::encode(secret))
+                {
+                    found.push(format!("{name} in {}", candidate.display()));
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn sqlite_never_contains_derived_ratchet_or_storage_keys() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let mut store = open_test_store(&path, Arc::clone(&backend));
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+        // Advance every ratchet so derived material exists: a send key per
+        // lane, receive jumps that cache skipped message and ACK keys, and an
+        // accepted message whose body is sealed into the local inbox row.
+        let reserved_message = store
+            .reserve_send_key(&fixture.key, RatchetLane::Message)
+            .unwrap();
+        let reserved_ack = store
+            .reserve_send_key(&fixture.key, RatchetLane::Ack)
+            .unwrap();
+        store
+            .authenticate_receive(&fixture.key, RatchetLane::Message, 3, |_| Some(()))
+            .unwrap();
+        store
+            .authenticate_receive(&fixture.key, RatchetLane::Ack, 2, |_| Some(()))
+            .unwrap();
+        let inbound = inbound_message_envelope(&fixture, 5, [0xD7; 16], b"sealed into the row");
+        store
+            .accept_message_envelope(
+                &fixture.key,
+                &inbound.pack(),
+                &fixture.remote_certificate,
+                false,
+                fixture.now_ms,
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(store);
+
+        let account = hex::encode(record_key_digest(&fixture.key).unwrap());
+        let blob = backend.get(&account).unwrap().unwrap();
+        let state = decode_protected_state(&blob).unwrap();
+        let initial = initial_ratchets(&fixture.binding, &fixture.root);
+        let mut secrets: Vec<(String, [u8; 32])> = vec![
+            ("root".into(), fixture.root),
+            ("ack base key".into(), ack_base_key(&fixture.root)),
+            (
+                "local storage key".into(),
+                local_storage_key(&fixture.root, &fixture.binding.session_id),
+            ),
+            ("reserved message key".into(), reserved_message.key),
+            ("reserved ack key".into(), reserved_ack.key),
+            (
+                "initial message send chain".into(),
+                initial.message_send.chain_key,
+            ),
+            ("initial ack send chain".into(), initial.ack_send.chain_key),
+            (
+                "initial message receive chain".into(),
+                initial.message_receive.chain_key,
+            ),
+            (
+                "initial ack receive chain".into(),
+                initial.ack_receive.chain_key,
+            ),
+            (
+                "message send chain".into(),
+                state.ratchets.message_send.chain_key,
+            ),
+            ("ack send chain".into(), state.ratchets.ack_send.chain_key),
+            (
+                "message receive chain".into(),
+                state.ratchets.message_receive.chain_key,
+            ),
+            (
+                "ack receive chain".into(),
+                state.ratchets.ack_receive.chain_key,
+            ),
+        ];
+        for (index, skipped) in &state.ratchets.message_receive.skipped_keys {
+            secrets.push((format!("skipped message key {index}"), *skipped));
+        }
+        for (index, skipped) in &state.ratchets.ack_receive.skipped_keys {
+            secrets.push((format!("skipped ack key {index}"), *skipped));
+        }
+        assert!(
+            state.ratchets.message_receive.skipped_keys.len() == 4
+                && state.ratchets.ack_receive.skipped_keys.len() == 2,
+            "the receive jumps must have cached skipped keys to look for"
+        );
+        drop(state);
+        // Control: the grep would find these in the protected blob, so an empty
+        // result for SQLite is meaningful.
+        assert!(blob
+            .windows(fixture.root.len())
+            .any(|window| window == fixture.root));
+
+        assert_eq!(
+            secrets_found_in_sqlite_files(&path, &secrets),
+            Vec::<String>::new()
+        );
+
+        // The detector sees a chain key that did land in SQLite.
+        let leaked = secrets
+            .iter()
+            .find(|(name, _)| name == "message send chain")
+            .unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE leak(x BLOB);").unwrap();
+        conn.execute("INSERT INTO leak VALUES (?1)", params![leaked.1.as_slice()])
+            .unwrap();
+        drop(conn);
+        assert!(secrets_found_in_sqlite_files(&path, &secrets)
+            .iter()
+            .any(|found| found.starts_with("message send chain in")));
+    }
+
+    #[test]
+    fn quarantined_ack_journal_from_a_real_crash_keeps_its_index_burned() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let (first_outbound, second_outbound) = ([0xB1; 16], [0xB2; 16]);
+        let crashed_outer = [0xB5; 16];
+        {
+            let mut store = open_test_store(&path, Arc::clone(&backend));
+            store
+                .create_session(fixture.binding.clone(), fixture.root)
+                .unwrap();
+            for outbound in [first_outbound, second_outbound] {
+                store
+                    .register_outstanding_message(&fixture.key, &outbound)
+                    .unwrap();
+            }
+            let first =
+                inbound_ack_envelope(&fixture, 0, [0xB3; 16], first_outbound, 1, [0xB4; 12]);
+            store
+                .accept_ack_envelope(
+                    &fixture.key,
+                    &first.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .unwrap();
+            // ACK index 1 crashes right before its database commit: the
+            // protected head already carries the advanced ratchet and the
+            // journal, SQLite does not.
+            let crashed =
+                inbound_ack_envelope(&fixture, 1, crashed_outer, second_outbound, 2, [0xB6; 12]);
+            store.inject_endpoint_fault(EndpointFaultPoint::BeforeDatabaseCommit);
+            assert!(matches!(
+                store.accept_ack_envelope(
+                    &fixture.key,
+                    &crashed.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                ),
+                Err(IndexedSessionStoreError::InjectedEndpointFailure(_))
+            ));
+        }
+        // Another ACK object has meanwhile taken the crashed ACK's outer
+        // message id, so replaying the journal can never succeed.
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO endpoint_ack_receipts
+                 (session_id, object_digest, outer_message_id, remote_device,
+                  acked_message_id, status, ack_nonce, created_at_ms, session_generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 0)",
+                params![
+                    fixture.binding.session_id.as_slice(),
+                    [0xC9_u8; 32].as_slice(),
+                    crashed_outer.as_slice(),
+                    fixture.key.responder_device_ed25519.as_slice(),
+                    first_outbound.as_slice(),
+                    [0xCA_u8; 12].as_slice(),
+                    fixture.now_ms as i64,
+                ],
+            )
+            .unwrap();
+
+        let mut reopened = open_test_store(&path, Arc::clone(&backend));
+        let (protected, journal, metadata) =
+            protected_and_metadata_generation(&path, &backend, &fixture.key);
+        assert!(!journal, "the unreplayable journal is quarantined");
+        assert_eq!(protected, metadata);
+        assert_eq!(
+            reopened
+                .outstanding_delivery_state(
+                    &fixture.binding.session_id,
+                    &second_outbound,
+                    &fixture.key.responder_device_ed25519,
+                )
+                .unwrap(),
+            Some(EndpointDeliveryState::Sent),
+            "the quarantined ACK never became visible"
+        );
+        // The ratchet stayed advanced: index 1 is burned, index 2 is next.
+        let burned = inbound_ack_envelope(&fixture, 1, [0xB7; 16], second_outbound, 2, [0xB8; 12]);
+        assert!(matches!(
+            reopened.accept_ack_envelope(
+                &fixture.key,
+                &burned.pack(),
+                &fixture.remote_certificate,
+                false,
+                fixture.now_ms,
+            ),
+            Err(IndexedSessionStoreError::Replay)
+        ));
+        let next = inbound_ack_envelope(&fixture, 2, [0xB9; 16], second_outbound, 2, [0xBA; 12]);
+        assert!(matches!(
+            reopened
+                .accept_ack_envelope(
+                    &fixture.key,
+                    &next.pack(),
+                    &fixture.remote_certificate,
+                    false,
+                    fixture.now_ms,
+                )
+                .unwrap(),
+            EndpointAckAcceptance::Committed {
+                delivery_state: EndpointDeliveryState::Read,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn debug_output_never_prints_keys_sealed_bytes_or_identifiers() {
+        // `{:?}` of a byte array is the decimal list a derived Debug would
+        // print, so its absence shows the redacting impl is still in use.
+        fn assert_redacted(name: &str, output: &str, markers: &[&str], leaks: &[(&str, String)]) {
+            for marker in markers {
+                assert!(
+                    output.contains(marker),
+                    "{name}: missing {marker} in {output}"
+                );
+            }
+            for (field, value) in leaks {
+                assert!(
+                    !output.contains(value.as_str()),
+                    "{name}: {field} leaked into {output}"
+                );
+            }
+        }
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let local_device = authorized_local_device(&fixture);
+        let mut store = open_test_store(&path, backend);
+        store
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+
+        let reservation = store
+            .reserve_send_key(&fixture.key, RatchetLane::Message)
+            .unwrap();
+        assert_redacted(
+            "SendKeyReservation",
+            &format!("{reservation:?}"),
+            &["<redacted>"],
+            &[
+                ("key", format!("{:?}", reservation.key)),
+                ("key hex", hex::encode(reservation.key)),
+            ],
+        );
+
+        let mut rng = StdRng::from_seed([0x96; 32]);
+        let mut queue = |digest: &[u8; 32], _bytes: &[u8]| Ok(*digest);
+        let outbound = store
+            .send_message_envelope(
+                &fixture.key,
+                "debug output",
+                &local_device,
+                fixture.now_ms,
+                fixture.now_ms + 60_000,
+                fixture.now_ms,
+                &mut rng,
+                &mut queue,
+            )
+            .unwrap();
+        assert_redacted(
+            "EndpointOutbound",
+            &format!("{outbound:?}"),
+            &["<redacted>", "<ciphertext>"],
+            &[
+                ("bytes", format!("{:?}", outbound.immutable_envelope_bytes)),
+                ("session", format!("{:?}", outbound.session_id)),
+                ("object", format!("{:?}", outbound.object_digest)),
+                ("message", format!("{:?}", outbound.message_id)),
+                ("recipient", format!("{:?}", outbound.recipient_device)),
+            ],
+        );
+
+        assert_redacted(
+            "AuthorizedEndpointDevice",
+            &format!("{local_device:?}"),
+            &["<redacted>"],
+            &[
+                (
+                    "device key",
+                    format!("{:?}", fixture.local_certificate.device_ed_pub),
+                ),
+                ("device label", fixture.local_certificate.device_id.clone()),
+            ],
+        );
+
+        let pending_outbound = PendingOutbound {
+            kind: EndpointOutboundKind::Message,
+            session_id: [0x51; 32],
+            object_digest: [0x52; 32],
+            message_id: [0x53; 16],
+            recipient_device: [0x54; 32],
+            ratchet_index: 7,
+            source_ack_intent: Some([0x55; 32]),
+            ack_nonce: Some([0x56; 12]),
+            seal_nonce: [0x57; 12],
+            anti_replay_nonce: [0x58; 12],
+            immutable_envelope_bytes: vec![0x59; 48],
+            public_generation: 9,
+        };
+        assert_redacted(
+            "PendingOutbound",
+            &format!("{pending_outbound:?}"),
+            &["<redacted>", "<ciphertext>"],
+            &[
+                (
+                    "bytes",
+                    format!("{:?}", pending_outbound.immutable_envelope_bytes),
+                ),
+                ("session", format!("{:?}", pending_outbound.session_id)),
+                ("object", format!("{:?}", pending_outbound.object_digest)),
+                ("message", format!("{:?}", pending_outbound.message_id)),
+                (
+                    "recipient",
+                    format!("{:?}", pending_outbound.recipient_device),
+                ),
+                ("seal nonce", format!("{:?}", pending_outbound.seal_nonce)),
+                (
+                    "anti-replay nonce",
+                    format!("{:?}", pending_outbound.anti_replay_nonce),
+                ),
+            ],
+        );
+
+        let pending_acceptance = PendingAcceptance {
+            session_id: [0x61; 32],
+            object_digest: [0x62; 32],
+            message_id: [0x63; 16],
+            sender_device: [0x64; 32],
+            sealed_local_inbox_row: vec![0x65; 48],
+            ack_status: 1,
+            created_at_ms: 10,
+            received_at_ms: 11,
+            public_generation: 12,
+        };
+        assert_redacted(
+            "PendingAcceptance",
+            &format!("{pending_acceptance:?}"),
+            &["<redacted>", "<sealed>"],
+            &[
+                (
+                    "sealed row",
+                    format!("{:?}", pending_acceptance.sealed_local_inbox_row),
+                ),
+                ("session", format!("{:?}", pending_acceptance.session_id)),
+                ("object", format!("{:?}", pending_acceptance.object_digest)),
+                ("message", format!("{:?}", pending_acceptance.message_id)),
+                ("sender", format!("{:?}", pending_acceptance.sender_device)),
+            ],
+        );
+
+        let pending_ack = PendingAckAcceptance {
+            session_id: [0x71; 32],
+            object_digest: [0x72; 32],
+            outer_message_id: [0x73; 16],
+            remote_device: [0x74; 32],
+            acked_message_id: [0x75; 16],
+            status: 2,
+            ack_nonce: [0x76; 12],
+            created_at_ms: 20,
+            public_generation: 21,
+        };
+        assert_redacted(
+            "PendingAckAcceptance",
+            &format!("{pending_ack:?}"),
+            &["<redacted>"],
+            &[
+                ("session", format!("{:?}", pending_ack.session_id)),
+                ("object", format!("{:?}", pending_ack.object_digest)),
+                ("outer id", format!("{:?}", pending_ack.outer_message_id)),
+                ("remote", format!("{:?}", pending_ack.remote_device)),
+                ("acked id", format!("{:?}", pending_ack.acked_message_id)),
+                ("ack nonce", format!("{:?}", pending_ack.ack_nonce)),
+            ],
+        );
+    }
+
+    fn panic_message(result: Result<(), Box<dyn std::any::Any + Send>>) -> String {
+        let payload = result.expect_err("expected a panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn rendezvous_helpers_fail_with_a_message_instead_of_hanging() {
+        // A missing peer fails the barrier wait ...
+        let lonely = TimedBarrier::new(2);
+        let message = panic_message(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || lonely.wait_for("lonely party", Duration::from_millis(50)),
+        )));
+        assert!(message.contains("lonely party"), "{message}");
+        // ... while two parties release each other.
+        let pair = TimedBarrier::new(2);
+        let peer = {
+            let pair = Arc::clone(&pair);
+            thread::spawn(move || pair.wait_for("peer", RENDEZVOUS_TIMEOUT))
+        };
+        pair.wait_for("main", RENDEZVOUS_TIMEOUT);
+        peer.join().unwrap();
+
+        // A worker that ends without reaching the paused put is reported ...
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let pause = backend.pause_nth_future_put(1);
+        let idle = thread::spawn(|| ());
+        let message = panic_message(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || pause.wait_until_parked_for(&idle, Duration::from_secs(10)),
+        )));
+        assert!(message.contains("finished without reaching"), "{message}");
+        idle.join().unwrap();
+
+        // ... a worker that never finishes is reported once the bound expires ...
+        let pause = backend.pause_nth_future_put(1);
+        let (release, released) = mpsc::channel::<()>();
+        let stuck = thread::spawn(move || {
+            let _ = released.recv();
+        });
+        let message = panic_message(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || pause.wait_until_parked_for(&stuck, Duration::from_millis(60)),
+        )));
+        assert!(message.contains("never reached"), "{message}");
+        release.send(()).unwrap();
+        stuck.join().unwrap();
+
+        // ... and a parked writer whose test went away fails its put instead
+        // of blocking the writer.
+        drop(backend.pause_nth_future_put(1));
+        assert!(matches!(
+            backend.put("account", b"value"),
+            Err(IndexedSessionStoreError::ProtectedStore(_))
+        ));
+        assert!(backend.get("account").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_stale_journal_clear_never_clears_a_newer_journal() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sessions.sqlite");
+        let backend = Arc::new(MemoryProtectedBackend::default());
+        let fixture = endpoint_fixture();
+        let record_key = record_key_digest(&fixture.key).unwrap();
+        let account = hex::encode(record_key);
+        let mut stale = open_test_store(&path, Arc::clone(&backend));
+        stale
+            .create_session(fixture.binding.clone(), fixture.root)
+            .unwrap();
+
+        // The first writer commits to SQLite but stops before its journal clear.
+        let first = inbound_message_envelope(&fixture, 0, [0xE7; 16], b"first");
+        stale.inject_endpoint_fault(EndpointFaultPoint::BeforeJournalClear);
+        assert!(matches!(
+            stale.accept_message_envelope(
+                &fixture.key,
+                &first.pack(),
+                &fixture.remote_certificate,
+                false,
+                fixture.now_ms,
+            ),
+            Err(IndexedSessionStoreError::InjectedEndpointFailure(_))
+        ));
+        let (stale_generation, stale_journal) = {
+            let state = decode_protected_state(&backend.get(&account).unwrap().unwrap()).unwrap();
+            (
+                state.generation,
+                protected_journal(&state)
+                    .unwrap()
+                    .expect("the first writer's journal is still staged"),
+            )
+        };
+
+        // Another instance replays and clears it on open, then stages a newer
+        // journal and stops before committing it: the protected head is one
+        // generation ahead of SQLite and carries that newer journal.
+        let mut other = open_test_store(&path, Arc::clone(&backend));
+        assert_eq!(
+            protected_and_metadata_generation(&path, &backend, &fixture.key),
+            (stale_generation, false, stale_generation)
+        );
+        let second = inbound_message_envelope(&fixture, 1, [0xE8; 16], b"second");
+        other.inject_endpoint_fault(EndpointFaultPoint::BeforeDatabaseCommit);
+        assert!(matches!(
+            other.accept_message_envelope(
+                &fixture.key,
+                &second.pack(),
+                &fixture.remote_certificate,
+                false,
+                fixture.now_ms,
+            ),
+            Err(IndexedSessionStoreError::InjectedEndpointFailure(_))
+        ));
+        assert_eq!(
+            protected_and_metadata_generation(&path, &backend, &fixture.key),
+            (stale_generation + 1, true, stale_generation)
+        );
+
+        // The first writer's late clear names the journal and generation it
+        // staged. Neither matches the head any more, so it must leave the newer
+        // journal alone: clearing it would lose a message whose rows were never
+        // committed.
+        stale
+            .clear_protected_journal(&account, &record_key, stale_generation, stale_journal)
+            .unwrap();
+        let (protected_generation, journal_present, _) =
+            protected_and_metadata_generation(&path, &backend, &fixture.key);
+        assert_eq!(protected_generation, stale_generation + 1);
+        assert!(journal_present, "a stale clear dropped a newer journal");
+
+        // The newer journal is still replayed by the next open.
+        drop(other);
+        let mut reopened = open_test_store(&path, Arc::clone(&backend));
+        assert_eq!(
+            protected_and_metadata_generation(&path, &backend, &fixture.key),
+            (stale_generation + 1, false, stale_generation + 1)
+        );
+        assert_eq!(reopened.list_endpoint_inbox().unwrap().len(), 2);
     }
 }

@@ -9,7 +9,7 @@
 
 > **Coordination note.** Sprint 0 checklist assigns Trust boundaries to **#1, #17, #6**. This file is the Architect (#1) draft. Security Board (#17) and Identity (#6) are invited to mark gaps, reclassify residual risk, and reject undocumented assumptions before this row is treated as an assurance artifact. #1 will not self-merge any follow-up R3 change that *implements* a boundary.
 
-Cross-links: [`architecture-dependency-map.md`](architecture-dependency-map.md), [`risk-classes.md`](risk-classes.md), [`approval-matrix.md`](approval-matrix.md), [`org-structure.md`](org-structure.md), [`docs/THREAT_MODEL.md`](../../THREAT_MODEL.md), [`protocol/SECURITY_ERRATA_RVN1_2026-08-13.md`](../../../protocol/SECURITY_ERRATA_RVN1_2026-08-13.md). Identity SoT on `main` (landed [PR#5](https://github.com/Raven-ASHCO/RAVEN/pull/5)): [`SPRINT0_IDENTITY_THREAT_MODEL.md`](../../SPRINT0_IDENTITY_THREAT_MODEL.md), [`G5_CROSS_STACK_REVOKE_POLICY.md`](../../G5_CROSS_STACK_REVOKE_POLICY.md). Raven↔RDAP confidential path + Appendix G5: ADR 0004 ([PR#3](https://github.com/Raven-ASHCO/RAVEN/pull/3); not yet on `main`).
+Cross-links: [`architecture-dependency-map.md`](architecture-dependency-map.md), [`risk-classes.md`](risk-classes.md), [`approval-matrix.md`](approval-matrix.md), [`org-structure.md`](org-structure.md), [`docs/THREAT_MODEL.md`](../../THREAT_MODEL.md), [`protocol/SECURITY_ERRATA_RVN1_2026-08-13.md`](../../../protocol/SECURITY_ERRATA_RVN1_2026-08-13.md). Identity SoT on `main` (landed [PR#5](https://github.com/Raven-ASHCO/RAVEN/pull/5)): [`SPRINT0_IDENTITY_THREAT_MODEL.md`](../SPRINT0_IDENTITY_THREAT_MODEL.md), [`G5_CROSS_STACK_REVOKE_POLICY.md`](../G5_CROSS_STACK_REVOKE_POLICY.md). Raven↔RDAP confidential path + Appendix G5: ADR 0004 ([PR#3](https://github.com/Raven-ASHCO/RAVEN/pull/3); now on `main`: [`docs/adr/0004-raven-rdap-atsam-transport.md`](../../adr/0004-raven-rdap-atsam-transport.md)).
 
 ---
 
@@ -30,13 +30,13 @@ For each boundary:
 
 ## TB1 — Process / IPC boundary (client ↔ raven-node)
 
-**Cut:** A user-facing process (`ash` / `raven`, future RDAP helper, **UNKNOWN** iOS/Windows hosts) talks to the `raven-node` daemon. Unix: UDS `data_dir/raven-node.sock`. Windows: documented named pipe `\\.\pipe\raven-node` — **client not landed** (`node/scripts/install/WINDOWS_SERVICE.md`).
+**Cut:** A user-facing process (`ash` / `raven`, future RDAP helper, **UNKNOWN** iOS/Windows hosts) talks to the `raven-node` daemon. Unix: UDS `data_dir/raven-node.sock`, or, when that path would not fit `sun_path` (about 100 bytes), `/tmp/raven-<euid>/raven-<hash of the canonical data dir>.sock` in a verified owner-only directory (`raven doctor` prints the real `ipc_endpoint=`). Windows: per-user named pipe `\\.\pipe\raven-node-<user SID>`; the `ash` client verifies the pipe server runs as the same user (`node/scripts/install/WINDOWS_SERVICE.md`).
 
 | | |
 |--|--|
 | **Trusted** | `raven-node` process (same euid as the connecting client). OS peer-cred. Data-dir owner. |
 | **Untrusted** | Any other local process, other UIDs, stale sockets, malicious `IpcRequest` bytes, argv/`ps` observers. |
-| **Must validate** | `IPC_VERSION == 1`; frame ≤ `MAX_IPC_FRAME` (256 KiB); JSON tag `op`; **refuse** substrings `seed` / `private_key` / `plaintext` / `recovery`; envelope decode on `EnqueueSealed`; `expected_pub_hex` on `LanDial`; UID match via `SO_PEERCRED` / `getpeereid`. Socket mode `0600`, unlink/rebind on start. |
+| **Must validate** | `IPC_VERSION == 1`; frame ≤ `MAX_IPC_FRAME` (256 KiB); JSON tag `op`; **refuse** JSON object keys containing `seed` / `private_key` / `plaintext` / `recovery` (keys only — base64/dial *values* are opaque); envelope decode on `EnqueueSealed`; `expected_pub_hex` on `LanDial`; UID match via `SO_PEERCRED` / `getpeereid` (unknown Unix: refuse). Socket bound `0600` atomically in a directory owned by the daemon user (the data dir, or the verified `/tmp/raven-<euid>` fallback directory); the endpoint and its single-instance lock (`<sock>.lock`) are a function of the *canonical* data dir, never of how the path was spelled; a stale socket is unlinked only if nothing answers on it. |
 | **Evidence** | `node/crates/raven-core/src/ipc.rs`; `node/crates/raven-node/src/ipc_server.rs`; ADR 0003; `protocol/RAVEN_ERROR_CODES_V1.md` (`IPC_*`). |
 | **Owners** | #7 Core Runtime (IPC/daemon), #1 (boundary shape), #17 if authz/peer-cred changes. Identity #6 if IPC ever carried credentials (it must not). |
 | **THREAT_MODEL** | §3.7 stolen unlocked device (out of scope once attacker is the user); §3.16 local malware (out of scope); MASTER checklist “Local IPC Security” in `node/MASTER_ENGINEERING_CHECKLIST.md` §19. |
@@ -49,7 +49,7 @@ For each boundary:
 | ID | Gap | Assumption if unreviewed |
 |----|-----|--------------------------|
 | G1 | Same-UID is the entire local authz model | Any code running as the user is the user (`THREAT_MODEL` §3.16). No macOS/Windows code-signing check of the client binary. |
-| G2 | Windows named-pipe client missing | Windows path is `--send-stdin` spawn (plaintext on a pipe to a child — still local, but **not** the UDS auth story). |
+| G2 | Windows named pipe is a machine-wide namespace | Per-user pipe name + `FILE_FLAG_FIRST_PIPE_INSTANCE` + client check of the server process owner SID; a squatter can still deny service (daemon fails closed) but receives no requests. |
 | G3 | `ash` also opens `queue.sqlite`, `contacts.json`, `forward_queue.sqlite` **directly** | IPC is not the only client↔node coupling. A compromised `ash` is a compromised data-dir. See undocumented deps D8. |
 | G4 | No RDAP IPC client | RDAP does not cross this boundary at all (integration gap). |
 | G5 | iOS/Watch/Windows app IPC | **UNKNOWN** — trees absent from this checkout. |
@@ -104,7 +104,7 @@ For each boundary:
 
 **Pinning today (terminal):** local `contacts.json` maps petname/tag → `rvn1…` + pub hex + optional fingerprint (`SERVERLESS_FRIEND_MESH_BRIDGE_DESIGN.md`). Friendship never uses FastAPI.
 
-**Pinning today (RDAP):** invite line `RDAP1 <name> <rvn1> <ed25519> <url>`; `trust` live-checks signed Agent Card against that pin. The RDAP pin Ed25519 is an **address-level** pin (`rvn1…` / user-identity key material). **Pin ≢ `device_ed_pub`.** RVDR1 covers **device lineage** only and does not revoke the address; a pin match is not a device-cert match ([`G5_CROSS_STACK_REVOKE_POLICY.md`](../../G5_CROSS_STACK_REVOKE_POLICY.md), ADR 0004 Appendix G5 on [PR#3](https://github.com/Raven-ASHCO/RAVEN/pull/3)). Today’s RDAP key under `.team/keys` is still a **separate store** from `raven-node` unless M1 binds the same RVN1 (ADR 0004 D3; not implemented here).
+**Pinning today (RDAP):** invite line `RDAP1 <name> <rvn1> <ed25519> <url>`; `trust` live-checks signed Agent Card against that pin. The RDAP pin Ed25519 is an **address-level** pin (`rvn1…` / user-identity key material). **Pin ≢ `device_ed_pub`.** RVDR1 covers **device lineage** only and does not revoke the address; a pin match is not a device-cert match ([`G5_CROSS_STACK_REVOKE_POLICY.md`](../G5_CROSS_STACK_REVOKE_POLICY.md), ADR 0004 Appendix G5 on [PR#3](https://github.com/Raven-ASHCO/RAVEN/pull/3)). Today’s RDAP key under `.team/keys` is still a **separate store** from `raven-node` unless M1 binds the same RVN1 (ADR 0004 D3; not implemented here).
 
 ### Gaps / assumptions (TB3)
 
@@ -112,23 +112,25 @@ For each boundary:
 |----|-----|--------------------------|
 | G12 | ATSAM session / PairInit / prekey lifecycle **production-disabled** | Default `raven-node` origination requires authenticated session; demo sealer is feature-gated. No production E2EE claim. |
 | G13 | Two identity stores (raven-node vs RDAP `.team/keys`); pin ≢ `device_ed_pub` | Address format may match; **principal / lineage is not**. An ash `contacts.json` pin does not authorize an RDAP peer and vice versa. Applied RVDR1 ⇒ **lineage-scoped data-plane fail-closed** (session/task refuse for that device lineage) — not an automatic RDAP address-deny, and not a pin-string equals `device_ed_pub` predicate. See Identity G5 + ADR 0004 Appendix G5. |
-| G14 | Linux Secret Service vs locked-file fallback | `IDENTITY_SEED_STORAGE.md` vs `identity_store.rs` comments disagree on whether locked-file is “approved fallback” or “lab/CI override only”. **Needs #6+#5 resolution.** |
+| G14 | Linux Secret Service vs locked-file fallback | **Resolved 2026-10-05 (docs follow the code).** `identity_store.rs` is the source of truth: locked-file is a debug/lab/CI override only and is refused in Release builds; GNU/Linux Secret Service *creation* is disabled before R1 (existing identities still load); musl/other Unix have no protected backend. So a Release Linux build cannot create an identity yet. `IDENTITY_SEED_STORAGE.md`, `INSTALL_Linux.md`, `SPRINT0_IDENTITY_THREAT_MODEL.md` and `THREAT_MODEL.md` §3.6 now say so; the earlier “approved fallback” wording was wrong. Open work is R1 itself (an add-only, prompt-free Linux create backend). |
 | G15 | `AfterFirstUnlockThisDeviceOnly` on iOS | Keys may be available while locked after first unlock (`THREAT_MODEL` §3.6). |
 | G16 | Windows RDAP key files lack tested DACL-equivalent to POSIX `0600` | RDAP README Windows security hold. |
 | G17 | Human QR/safety-number check is user responsibility | Crypto cannot prove the human (`THREAT_MODEL` §3.5). |
 | G18 | Full Braid / ML-KEM incremental FFI | Lab/DEBUG only; Release `compile_error!`. Still an identity-adjacent binary interface if linked. |
-| G29 | Soft-load fail-open on corrupt **denylist** | See **OPEN-ID-P0** below. Not an Architect approval of the behavior. |
+| G29 | Soft-load fail-open on corrupt **denylist** | See **OPEN-ID-P0** below (code status updated 2026-10-05: `BlockList` is now fail-closed through `load_checked` only; the remaining soft loaders have no production callers). Not an Architect approval of the behavior. |
 
 ### OPEN-ID-P0 — Soft-load fail-open if denylist is corrupt
 
-**Status:** draft / **OPEN** — Identity docs on `main` via [PR#5](https://github.com/Raven-ASHCO/RAVEN/pull/5) ([`SPRINT0_IDENTITY_THREAT_MODEL.md`](../../SPRINT0_IDENTITY_THREAT_MODEL.md) §3.2 P0 + G5, [`G5_CROSS_STACK_REVOKE_POLICY.md`](../../G5_CROSS_STACK_REVOKE_POLICY.md)); Architect ack on §2.4 + P0 note; **code held** (Manager Sprint 1 batch with Architect + Crypto). Architecture does **not** approve or implement denylist load behavior in this PR.
+**Code status update (2026-10-05, verified against the tree):** `BlockList` no longer has a lossy loader — `chat_history.rs` exposes only `BlockList::load_checked` (corrupt/oversized/unreadable → error; `save` refuses to overwrite an unreadable list). The authz paths in `lan_dispatch.rs` use `RevocationStore::load_checked` and `load_device_registry_checked`. The soft `RevocationStore::load` (`device_sync.rs`) and `load_device_registry` (`device_cert.rs`) still exist and still swallow errors to an empty default, but have no production callers (only tests reference `load_device_registry`); treat them as display-only and consider removing them or adding a CI lint. The “Where observed” row below is the original 2026-09-04 observation and is kept for history.
+
+**Status:** draft / **OPEN** (original; see update above) — Identity docs on `main` via [PR#5](https://github.com/Raven-ASHCO/RAVEN/pull/5) ([`SPRINT0_IDENTITY_THREAT_MODEL.md`](../SPRINT0_IDENTITY_THREAT_MODEL.md) §3.2 P0 + G5, [`G5_CROSS_STACK_REVOKE_POLICY.md`](../G5_CROSS_STACK_REVOKE_POLICY.md)); Architect ack on §2.4 + P0 note; **code held** (Manager Sprint 1 batch with Architect + Crypto). Architecture does **not** approve or implement denylist load behavior in this PR.
 
 | | |
 |--|--|
 | **Behavior (named)** | Soft-load **fail-open** when a local denylist / block / revocation store is **corrupt**: `load()` returns an empty default instead of refusing the operation. Empty denylist ⇒ nobody is blocked or revoked. |
 | **Where observed (cite only)** | `BlockList::load` → `load_checked(...).unwrap_or_default()` (`node/crates/raven-core/src/chat_history.rs`); test `block_list_corrupt_is_fail_closed` documents that legacy `load()` still returns empty `pub_hex` for non-LAN callers. Same soft-load shape: `RevocationStore::load` (`device_sync.rs`); `load_device_registry` (`device_cert.rs`). `load_checked` variants are the fail-closed pair. Callers that still use `load()` (e.g. `ash` `cli.rs` discovery `BlockList::load`) take the fail-open path. |
 | **Risk** | **Availability vs security.** Fail-open keeps the node usable after disk/JSON damage (availability). It **widens trust**: a corrupt or attacker-truncated denylist is treated as “no denials,” so previously blocked peers or revoked devices may be admitted until an operator notices. That is a persistence-integrity hole on TB3 (identity/authz) and TB5 (on-disk policy). Fail-closed (`load_checked`) is the opposite tradeoff (safer deny, possible denial-of-service if the file is unreadable). |
-| **THREAT_MODEL** | Identity SoT on `main` ([PR#5](https://github.com/Raven-ASHCO/RAVEN/pull/5)): [`SPRINT0_IDENTITY_THREAT_MODEL.md`](../../SPRINT0_IDENTITY_THREAT_MODEL.md) §3.2 P0 + G5; [`G5_CROSS_STACK_REVOKE_POLICY.md`](../../G5_CROSS_STACK_REVOKE_POLICY.md). Adjacent Raven TM: §3.6, §3.11, revocation freshness (partition-limited). |
+| **THREAT_MODEL** | Identity SoT on `main` ([PR#5](https://github.com/Raven-ASHCO/RAVEN/pull/5)): [`SPRINT0_IDENTITY_THREAT_MODEL.md`](../SPRINT0_IDENTITY_THREAT_MODEL.md) §3.2 P0 + G5; [`G5_CROSS_STACK_REVOKE_POLICY.md`](../G5_CROSS_STACK_REVOKE_POLICY.md). Adjacent Raven TM: §3.6, §3.11, revocation freshness (partition-limited). |
 | **Owners** | **Identity (#6) primary.** **Security Board (#17) review** still requested. **Architect (#1) ACK’d** Identity §2.4 trust boundaries and this soft-load P0 as a **documented trust-boundary defect**. That ack is **not** code approval or an R3 merge. |
 | **Architecture action now** | Status updated to PR#5 + §2.4/P0 ack. No denylist implementation, no load-path change, no R3 self-merge. |
 | **Code** | **Held** for Manager Sprint 1 batch with Architect + Crypto. Status stays OPEN until #6+#17 close the assurance item and the held fix lands. |

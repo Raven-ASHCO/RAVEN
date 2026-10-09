@@ -11,7 +11,8 @@
 //! record type frozen yet). Callers exchange sealed blobs / records OOB or
 //! via opaque store-carry.
 
-use crate::device_cert::DeviceRegistry;
+use crate::device_cert::{DeviceCertificate, DeviceRegistry, RevokedDeviceLineage};
+use crate::device_revocation::{claim_digest, DeviceRevocationV1};
 use crate::identity::Identity;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -19,11 +20,13 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 const SYNC_MAGIC: &[u8; 8] = b"RDCS1\0\0\0"; // Raven Device Contact Sync v1
 const SYNC_INFO: &[u8] = b"raven/rvn1/device-sync/contacts/v1";
 const REVOKE_DOMAIN: &[u8] = b"rvn1/devrevoke/v1";
+/// Verified RVDR1 claims (exact record bytes), kept beside `revocations.json`.
+const RVDR1_CLAIMS_FILE: &str = "device_revocations_rvdr1.json";
 
 /// Public contact fields only — never private keys.
 /// Raven Tag V1: petname (Layer C) + public_tag (Layer B) + pin.
@@ -218,25 +221,116 @@ pub fn unseal_contact_sync(user: &Identity, wire: &[u8]) -> Result<ContactSyncPl
     serde_json::from_slice(&pt).map_err(|e| e.to_string())
 }
 
+/// Allowed clock skew for a sync blob's `issued_at_ms` (sender ahead of us).
+const SYNC_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
+/// Per-sender high-water marks of imported sync blobs (`from_device_id` → ms).
+const SYNC_SEEN_FILE: &str = "device_sync_seen.json";
+const SYNC_SEEN_LOCK: &str = ".device_sync_seen.lock.sqlite";
+
+fn unseal_contact_sync_checked(
+    user: &Identity,
+    wire: &[u8],
+    now_ms: u64,
+) -> Result<ContactSyncPlaintext, String> {
+    let plain = unseal_contact_sync(user, wire)?;
+    if plain.schema != 1 {
+        return Err("SYNC_SCHEMA".into());
+    }
+    // A far-future stamp would otherwise pin every later blob as "stale".
+    if plain.issued_at_ms > now_ms.saturating_add(SYNC_FUTURE_SKEW_MS) {
+        return Err("SYNC_FROM_FUTURE".into());
+    }
+    Ok(plain)
+}
+
 /// Apply sealed sync only if source device is authorized in the local registry.
+///
+/// NOTE: the sync key derives from the identity seed and `from_device_id` is
+/// self-asserted inside the ciphertext, so this is a policy check, not device
+/// authentication. Callers that persist contacts should use
+/// [`import_contact_sync_checked`], which also refuses replayed/stale blobs.
 pub fn import_contact_sync(
     user: &Identity,
     registry: &DeviceRegistry,
     wire: &[u8],
     now_ms: u64,
 ) -> Result<Vec<SyncContact>, String> {
-    let plain = unseal_contact_sync(user, wire)?;
+    let plain = unseal_contact_sync_checked(user, wire, now_ms)?;
     if !registry.is_authorized(&plain.from_device_id, now_ms) {
         return Err("SYNC_FROM_UNAUTHORIZED_OR_REVOKED".into());
-    }
-    if plain.schema != 1 {
-        return Err("SYNC_SCHEMA".into());
     }
     Ok(plain
         .contacts
         .into_iter()
         .map(SyncContact::migrate)
         .collect())
+}
+
+/// Fail-closed import for a data dir: the device registry is loaded with the
+/// checked loader (a corrupt registry is an error, never "no devices"), the
+/// sender must be authorized — except on a data dir with no registry file yet
+/// (first import before any device cert), where only the seal key is checked —
+/// and `issued_at_ms` must be strictly newer than the last blob imported from
+/// the same `from_device_id`, so replaying an old export cannot resurrect
+/// deleted contacts. The high-water mark is recorded before returning, so a
+/// caller whose own save can still fail after this returns should use
+/// [`import_contact_sync_checked_then`] instead.
+pub fn import_contact_sync_checked(
+    data_dir: &std::path::Path,
+    user: &Identity,
+    wire: &[u8],
+    now_ms: u64,
+) -> Result<Vec<SyncContact>, String> {
+    import_contact_sync_checked_then(data_dir, user, wire, now_ms, Ok)
+}
+
+/// [`import_contact_sync_checked`] with a commit step. `apply` receives the
+/// verified contacts and persists them; the replay high-water mark is recorded
+/// only after `apply` returns `Ok`, and its value is returned.
+///
+/// If `apply` fails (an unreadable or unwritable contacts store), the mark is
+/// untouched, so the same blob is accepted again once the user has fixed the
+/// problem instead of being refused forever as `SYNC_REPLAY_OR_STALE`. The
+/// data-dir lock that guards the mark is held while `apply` runs, so imports
+/// are serialized; `apply` must not take that lock itself.
+pub fn import_contact_sync_checked_then<T>(
+    data_dir: &std::path::Path,
+    user: &Identity,
+    wire: &[u8],
+    now_ms: u64,
+    apply: impl FnOnce(Vec<SyncContact>) -> Result<T, String>,
+) -> Result<T, String> {
+    let registry = crate::device_cert::load_device_registry_checked(data_dir)?;
+    let plain = unseal_contact_sync_checked(user, wire, now_ms)?;
+    let first_import = !crate::device_cert::device_registry_path(data_dir).exists();
+    if !first_import && !registry.is_authorized(&plain.from_device_id, now_ms) {
+        return Err("SYNC_FROM_UNAUTHORIZED_OR_REVOKED".into());
+    }
+    let _lock = crate::paths::DataDirLock::acquire(data_dir, SYNC_SEEN_LOCK)?;
+    let seen_path = data_dir.join(SYNC_SEEN_FILE);
+    let mut seen: BTreeMap<String, u64> = if seen_path.exists() {
+        let raw = std::fs::read_to_string(&seen_path)
+            .map_err(|e| format!("device sync seen read: {e}"))?;
+        serde_json::from_str(&raw).map_err(|e| format!("device sync seen corrupt: {e}"))?
+    } else {
+        BTreeMap::new()
+    };
+    if let Some(last) = seen.get(&plain.from_device_id) {
+        if plain.issued_at_ms <= *last {
+            return Err("SYNC_REPLAY_OR_STALE".into());
+        }
+    }
+    let applied = apply(
+        plain
+            .contacts
+            .into_iter()
+            .map(SyncContact::migrate)
+            .collect(),
+    )?;
+    seen.insert(plain.from_device_id.clone(), plain.issued_at_ms);
+    let raw = serde_json::to_string_pretty(&seen).map_err(|e| e.to_string())?;
+    crate::paths::atomic_write_private(&seen_path, raw.as_bytes())?;
+    Ok(applied)
 }
 
 /// Persist revocation store as JSON under data dir (OOB exchangeable).
@@ -246,18 +340,42 @@ pub fn revocation_store_path(data_dir: &std::path::Path) -> std::path::PathBuf {
 
 /// Merge revocation records: sticky denylist; higher epoch wins per
 /// `(user_ed_pub, device_id)` so shared labels like `ash-primary` do not collide.
+///
+/// Legacy `rvn1/devrevoke/v1` records name only `(user_ed_pub, device_id)`.
+/// Verified `RavenDeviceRevocationV1` (RVDR1) claims name the full lineage and
+/// are union-applied (append-only, keyed by `claim_digest`); see
+/// [`RevocationStore::denies_certificate`].
 #[derive(Debug, Default, Clone)]
 pub struct RevocationStore {
     /// composite key → best (highest epoch) verified record
     by_device: HashMap<String, RevocationRecord>,
+    /// claim_digest → verified RVDR1 claim (never removed)
+    rvdr1: BTreeMap<[u8; 32], Rvdr1Claim>,
 }
 
+/// One accepted RVDR1 claim and the identity key that signed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rvdr1Claim {
+    pub identity_ed_pub: [u8; 32],
+    pub claim_digest: [u8; 32],
+    pub record: DeviceRevocationV1,
+    pub exact_record_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Rvdr1ClaimRow {
+    identity_ed_pub_hex: String,
+    record_hex: String,
+}
+
+/// `device_id` is compared as exact bytes (RAVEN_DEVICE_REVOCATION_V1 §2.3, no
+/// normalization); only the hex spelling of the user key is canonicalized.
 fn revocation_store_key(user_ed_pub_hex: &str, device_id: &str) -> String {
-    format!(
-        "{}:{}",
-        user_ed_pub_hex.trim().to_lowercase(),
-        device_id.trim()
-    )
+    format!("{}:{}", user_ed_pub_hex.trim().to_lowercase(), device_id)
+}
+
+pub fn rvdr1_claims_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(RVDR1_CLAIMS_FILE)
 }
 
 impl RevocationStore {
@@ -266,19 +384,34 @@ impl RevocationStore {
     }
 
     /// Missing file → empty store. Corrupt JSON / bad signature / epoch conflict
-    /// → error (fail-closed for policy).
+    /// → error (fail-closed for policy). RVDR1 claims are re-verified on load.
     pub fn load_checked(data_dir: &std::path::Path) -> Result<Self, String> {
-        let path = revocation_store_path(data_dir);
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let raw =
-            std::fs::read_to_string(&path).map_err(|e| format!("revocation store read: {e}"))?;
-        let recs: Vec<RevocationRecord> =
-            serde_json::from_str(&raw).map_err(|e| format!("revocation store corrupt: {e}"))?;
         let mut store = Self::default();
-        for r in recs {
-            store.apply(r)?;
+        let path = revocation_store_path(data_dir);
+        if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| format!("revocation store read: {e}"))?;
+            let recs: Vec<RevocationRecord> =
+                serde_json::from_str(&raw).map_err(|e| format!("revocation store corrupt: {e}"))?;
+            for r in recs {
+                store.apply(r)?;
+            }
+        }
+        let rvdr1_path = rvdr1_claims_path(data_dir);
+        if rvdr1_path.exists() {
+            let raw = std::fs::read_to_string(&rvdr1_path)
+                .map_err(|e| format!("rvdr1 claim store read: {e}"))?;
+            let rows: Vec<Rvdr1ClaimRow> = serde_json::from_str(&raw)
+                .map_err(|e| format!("rvdr1 claim store corrupt: {e}"))?;
+            for row in rows {
+                let identity = decode_32_hex(&row.identity_ed_pub_hex)
+                    .map_err(|e| format!("rvdr1 claim store corrupt: {e}"))?;
+                let wire = hex::decode(&row.record_hex)
+                    .map_err(|e| format!("rvdr1 claim store corrupt: {e}"))?;
+                store
+                    .apply_rvdr1(&identity, &wire)
+                    .map_err(|e| format!("rvdr1 claim store corrupt: {e}"))?;
+            }
         }
         Ok(store)
     }
@@ -288,7 +421,21 @@ impl RevocationStore {
         let path = revocation_store_path(data_dir);
         let recs: Vec<&RevocationRecord> = self.records().collect();
         let raw = serde_json::to_string_pretty(&recs).map_err(|e| e.to_string())?;
-        crate::paths::atomic_write_private(&path, raw.as_bytes())
+        crate::paths::atomic_write_private(&path, raw.as_bytes())?;
+        // Append-only: an empty in-memory claim set never truncates the file.
+        if !self.rvdr1.is_empty() {
+            let rows: Vec<Rvdr1ClaimRow> = self
+                .rvdr1
+                .values()
+                .map(|c| Rvdr1ClaimRow {
+                    identity_ed_pub_hex: hex::encode(c.identity_ed_pub),
+                    record_hex: hex::encode(&c.exact_record_bytes),
+                })
+                .collect();
+            let raw = serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?;
+            crate::paths::atomic_write_private(&rvdr1_claims_path(data_dir), raw.as_bytes())?;
+        }
+        Ok(())
     }
 
     pub fn apply(&mut self, rec: RevocationRecord) -> Result<bool, String> {
@@ -311,9 +458,69 @@ impl RevocationStore {
         }
     }
 
+    /// Authenticated ingest of one exact RVDR1 record signed by
+    /// `identity_ed_pub` (strict parse + address binding + signature).
+    /// Union semantics: a new `claim_digest` only ever adds deny coverage.
+    /// Returns `Ok(false)` for an already-applied claim.
+    pub fn apply_rvdr1(&mut self, identity_ed_pub: &[u8; 32], wire: &[u8]) -> Result<bool, String> {
+        let record = DeviceRevocationV1::decode(wire)?;
+        record.verify(identity_ed_pub)?;
+        let digest = claim_digest(wire);
+        if self.rvdr1.contains_key(&digest) {
+            return Ok(false);
+        }
+        self.rvdr1.insert(
+            digest,
+            Rvdr1Claim {
+                identity_ed_pub: *identity_ed_pub,
+                claim_digest: digest,
+                record,
+                exact_record_bytes: wire.to_vec(),
+            },
+        );
+        Ok(true)
+    }
+
     pub fn is_revoked(&self, user_ed_pub_hex: &str, device_id: &str) -> bool {
         self.by_device
             .contains_key(&revocation_store_key(user_ed_pub_hex, device_id))
+    }
+
+    /// Lineage deny (RAVEN_DEVICE_REVOCATION_V1 §2, §5.6 item 3) for `cert`
+    /// under its own identity: a legacy record for its exact `device_id`, or an
+    /// RVDR1 claim covering any of `device_id`, `device_ed_pub`, `device_x_pub`
+    /// or `device_cert_hash` — so a lineage re-certified under a new
+    /// `device_id` with reused keys stays denied.
+    pub fn denies_certificate(&self, cert: &DeviceCertificate) -> Result<bool, String> {
+        if self.is_revoked(&hex::encode(cert.user_ed_pub), &cert.device_id) {
+            return Ok(true);
+        }
+        let mut cert_hash = None;
+        for claim in self.rvdr1.values() {
+            if claim.identity_ed_pub != cert.user_ed_pub {
+                continue;
+            }
+            let r = &claim.record;
+            if r.device_id.as_slice() == cert.device_id.as_bytes()
+                || r.device_ed_pub == cert.device_ed_pub
+                || r.device_x_pub == cert.device_x_pub
+            {
+                return Ok(true);
+            }
+            let hash = match cert_hash {
+                Some(h) => h,
+                None => {
+                    let h = crate::pair_init::device_certificate_hash(cert)
+                        .map_err(|e| format!("device cert hash: {e}"))?;
+                    cert_hash = Some(h);
+                    h
+                }
+            };
+            if r.device_cert_hash == hash {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn epoch_of(&self, user_ed_pub_hex: &str, device_id: &str) -> Option<u64> {
@@ -330,10 +537,34 @@ impl RevocationStore {
                 reg.revoke(&rec.device_id);
             }
         }
+        for claim in self.rvdr1.values() {
+            if hex::encode(claim.identity_ed_pub) != want {
+                continue;
+            }
+            let r = &claim.record;
+            // Non-UTF-8 ids cannot name a DeviceCertificate; keys/hash still retire.
+            let device_id = String::from_utf8(r.device_id.clone()).unwrap_or_default();
+            if !device_id.is_empty() {
+                reg.revoke(&device_id);
+            }
+            let lineage = RevokedDeviceLineage {
+                device_id,
+                device_ed_pub: r.device_ed_pub,
+                device_x_pub: r.device_x_pub,
+                device_cert_hash: r.device_cert_hash,
+            };
+            if !reg.revoked_lineage.contains(&lineage) {
+                reg.revoked_lineage.push(lineage);
+            }
+        }
     }
 
     pub fn records(&self) -> impl Iterator<Item = &RevocationRecord> {
         self.by_device.values()
+    }
+
+    pub fn rvdr1_claims(&self) -> impl Iterator<Item = &Rvdr1Claim> {
+        self.rvdr1.values()
     }
 }
 
@@ -472,6 +703,221 @@ mod tests {
         )
         .unwrap();
         assert!(RevocationStore::load_checked(dir.path()).is_err());
+    }
+
+    fn rvdr1_wire(owner: &Identity, cert: &DeviceCertificate) -> Vec<u8> {
+        DeviceRevocationV1 {
+            identity_address: owner.address(),
+            device_id: cert.device_id.as_bytes().to_vec(),
+            device_ed_pub: cert.device_ed_pub,
+            device_x_pub: cert.device_x_pub,
+            device_cert_hash: crate::pair_init::device_certificate_hash(cert).unwrap(),
+            issuer_device_id: b"desk".to_vec(),
+            issuer_seq: 1,
+            revocation_id: [9u8; 16],
+            reason_code: 1,
+            created_at_ms: 10,
+            signature: [0u8; 64],
+        }
+        .sign(owner)
+        .unwrap()
+        .encode()
+        .unwrap()
+    }
+
+    fn cert_for(user: &Identity, ed: [u8; 32], x: [u8; 32], id: &str) -> DeviceCertificate {
+        DeviceCertificate::issue(user, ed, x, id, 1, u64::MAX / 2, 1).unwrap()
+    }
+
+    /// Every lineage identifier is enforced, not just device_id (§2.1-§2.2).
+    #[test]
+    fn rvdr1_lineage_denies_reused_keys_under_new_device_id() {
+        let user = Identity::generate();
+        let dev = Identity::generate();
+        let user_pub = user.public_key_bytes();
+        let cert = cert_for(&user, dev.public_key_bytes(), [3u8; 32], "phone");
+        let wire = rvdr1_wire(&user, &cert);
+        let mut store = RevocationStore::default();
+        assert!(store.apply_rvdr1(&user_pub, &wire).unwrap());
+        assert!(!store.apply_rvdr1(&user_pub, &wire).unwrap(), "idempotent");
+        assert!(store.denies_certificate(&cert).unwrap());
+        let same_ed = cert_for(&user, dev.public_key_bytes(), [4u8; 32], "phone-2");
+        let same_x = cert_for(
+            &user,
+            Identity::generate().public_key_bytes(),
+            [3u8; 32],
+            "phone-3",
+        );
+        let fresh = cert_for(
+            &user,
+            Identity::generate().public_key_bytes(),
+            [5u8; 32],
+            "phone-4",
+        );
+        assert!(store.denies_certificate(&same_ed).unwrap());
+        assert!(store.denies_certificate(&same_x).unwrap());
+        assert!(!store.denies_certificate(&fresh).unwrap());
+        // Scoped to the identity that signed the claim.
+        let stranger = Identity::generate();
+        let other = cert_for(&stranger, dev.public_key_bytes(), [3u8; 32], "phone");
+        assert!(!store.denies_certificate(&other).unwrap());
+        // Only the owning identity key may mint; tampered bytes are refused.
+        assert!(store
+            .apply_rvdr1(&stranger.public_key_bytes(), &wire)
+            .is_err());
+        let mut bad = wire.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(store.apply_rvdr1(&user_pub, &bad).is_err());
+
+        // Persisted beside revocations.json, re-verified on load, never truncated.
+        let dir = tempfile::tempdir().unwrap();
+        store.save(dir.path()).unwrap();
+        RevocationStore::default().save(dir.path()).unwrap();
+        let loaded = RevocationStore::load_checked(dir.path()).unwrap();
+        assert!(loaded.denies_certificate(&same_x).unwrap());
+        let mut reg = DeviceRegistry::default();
+        loaded.push_into_registry(&hex::encode(user_pub), &mut reg);
+        assert!(reg.denies_lineage(&same_ed).unwrap());
+        assert!(!reg.denies_lineage(&fresh).unwrap());
+        let rows = serde_json::json!([{
+            "identity_ed_pub_hex": hex::encode(user_pub),
+            "record_hex": hex::encode(&bad),
+        }]);
+        std::fs::write(rvdr1_claims_path(dir.path()), rows.to_string()).unwrap();
+        assert!(RevocationStore::load_checked(dir.path()).is_err());
+    }
+
+    /// RAVEN_DEVICE_REVOCATION_V1 §2.3: device_id equality is exact bytes.
+    #[test]
+    fn legacy_revocation_device_id_is_exact_bytes() {
+        let user = Identity::generate();
+        let hex_user = hex::encode(user.public_key_bytes());
+        let mut store = RevocationStore::default();
+        store
+            .apply(RevocationRecord::issue(&user, "ash-primary ", 1, 10, "x").unwrap())
+            .unwrap();
+        assert!(store.is_revoked(&hex_user, "ash-primary "));
+        assert!(!store.is_revoked(&hex_user, "ash-primary"));
+        // Distinct ids never collide into one epoch slot.
+        store
+            .apply(RevocationRecord::issue(&user, "ash-primary", 1, 11, "y").unwrap())
+            .unwrap();
+        assert!(store.is_revoked(&hex_user, "ash-primary"));
+    }
+
+    fn sync_blob(user: &Identity, from: &str, issued_at_ms: u64) -> Vec<u8> {
+        let plain = ContactSyncPlaintext {
+            schema: 1,
+            from_device_id: from.into(),
+            contacts: vec![SyncContact {
+                petname: "Bob".into(),
+                public_tag: String::new(),
+                alias: String::new(),
+                address: "rvn1qqqq".into(),
+                pub_hex: "bb".into(),
+                pinned: false,
+            }],
+            issued_at_ms,
+        };
+        seal_contact_sync(user, &plain).unwrap()
+    }
+
+    /// identity-devices#2: replayed/stale blobs and corrupt registries fail closed.
+    #[test]
+    fn checked_import_refuses_replay_future_and_corrupt_registry() {
+        let user = Identity::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000_000u64;
+        // First import on a data dir with no registry file: seal key only.
+        let old = sync_blob(&user, "ash-device", now - 10);
+        assert_eq!(
+            import_contact_sync_checked(dir.path(), &user, &old, now)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            import_contact_sync_checked(dir.path(), &user, &old, now).unwrap_err(),
+            "SYNC_REPLAY_OR_STALE"
+        );
+        let older = sync_blob(&user, "ash-device", now - 20);
+        assert_eq!(
+            import_contact_sync_checked(dir.path(), &user, &older, now).unwrap_err(),
+            "SYNC_REPLAY_OR_STALE"
+        );
+        let future = sync_blob(&user, "ash-device", now + SYNC_FUTURE_SKEW_MS + 1);
+        assert_eq!(
+            import_contact_sync_checked(dir.path(), &user, &future, now).unwrap_err(),
+            "SYNC_FROM_FUTURE"
+        );
+        assert!(import_contact_sync(&user, &DeviceRegistry::default(), &future, now).is_err());
+        let newer = sync_blob(&user, "ash-device", now - 5);
+        import_contact_sync_checked(dir.path(), &user, &newer, now).unwrap();
+
+        // A corrupt registry is an error, never an empty "first import" registry.
+        std::fs::write(
+            crate::device_cert::device_registry_path(dir.path()),
+            b"{bad",
+        )
+        .unwrap();
+        let next = sync_blob(&user, "ash-device", now - 1);
+        assert!(import_contact_sync_checked(dir.path(), &user, &next, now)
+            .unwrap_err()
+            .contains("corrupt"));
+        // An existing registry requires an authorized, unrevoked sender.
+        let mut reg = DeviceRegistry::default();
+        reg.add(issue_phone(&user, "phone-a"), 100).unwrap();
+        crate::device_cert::save_device_registry(dir.path(), &reg).unwrap();
+        assert_eq!(
+            import_contact_sync_checked(dir.path(), &user, &next, now).unwrap_err(),
+            "SYNC_FROM_UNAUTHORIZED_OR_REVOKED"
+        );
+        let from_phone = sync_blob(&user, "phone-a", now - 1);
+        import_contact_sync_checked(dir.path(), &user, &from_phone, now).unwrap();
+    }
+
+    /// A failed contacts save after the replay check must not burn the blob:
+    /// the user fixes `contacts.json` and re-runs the same import.
+    #[test]
+    fn failed_apply_does_not_burn_the_replay_high_water_mark() {
+        let user = Identity::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000_000u64;
+        let blob = sync_blob(&user, "ash-device", now - 10);
+        let seen_path = dir.path().join(SYNC_SEEN_FILE);
+
+        let err = import_contact_sync_checked_then(dir.path(), &user, &blob, now, |contacts| {
+            assert_eq!(contacts.len(), 1);
+            Err::<(), _>("contacts.json unwritable".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(err, "contacts.json unwritable");
+        assert!(!seen_path.exists(), "nothing recorded when apply fails");
+
+        // Same blob, problem fixed: accepted, and only now recorded.
+        let n = import_contact_sync_checked_then(dir.path(), &user, &blob, now, |contacts| {
+            Ok(contacts.len())
+        })
+        .unwrap();
+        assert_eq!(n, 1);
+        assert!(seen_path.exists());
+        assert_eq!(
+            import_contact_sync_checked_then(dir.path(), &user, &blob, now, |_| Ok(()))
+                .unwrap_err(),
+            "SYNC_REPLAY_OR_STALE"
+        );
+        // Replay protection is unchanged for the plain entry point.
+        assert_eq!(
+            import_contact_sync_checked(dir.path(), &user, &blob, now).unwrap_err(),
+            "SYNC_REPLAY_OR_STALE"
+        );
+        // A replayed blob never reaches `apply`.
+        let mut reached = false;
+        let _ = import_contact_sync_checked_then(dir.path(), &user, &blob, now, |_| {
+            reached = true;
+            Ok(())
+        });
+        assert!(!reached);
     }
 
     #[test]

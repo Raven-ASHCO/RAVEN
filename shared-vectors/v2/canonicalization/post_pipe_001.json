@@ -1,0 +1,38 @@
+{
+  "name": "Post v2 signing input",
+  "description": "v1 post_pipe_001's post and field list (leading \"POST\" literal kept), framed per v2 with kind 0x02.",
+  "protocol_version": "v2-draft",
+  "spec_reference": "MESH_PROTOCOL_v2.md §2 + MESH_PROTOCOL.md §C.3",
+  "created_at": "2026-05-15T00:00:00Z",
+  "deterministic": true,
+  "inputs": {
+    "post": {
+      "postId": "post-001",
+      "authorId": "alice",
+      "authorUsername": "alice_raven",
+      "authorAvatar": "https://cdn.raven.app/u/alice.png",
+      "text": "first mesh post from alice",
+      "createdAtSec": 1700000000.0,
+      "scope": "friends",
+      "signerPublicKeyB64": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+    },
+    "signer": "alice"
+  },
+  "expected": {
+    "fields": [
+      "POST",
+      "post-001",
+      "alice",
+      "alice_raven",
+      "https://cdn.raven.app/u/alice.png",
+      "first mesh post from alice",
+      "1700000000000",
+      "friends",
+      "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+    ],
+    "signing_bytes_hex": "ff52564d4553483202000900000004504f535400000008706f73742d30303100000005616c6963650000000b616c6963655f726176656e0000002168747470733a2f2f63646e2e726176656e2e6170702f752f616c6963652e706e670000001a6669727374206d65736820706f73742066726f6d20616c6963650000000d3137303030303030303030303000000007667269656e64730000002c3131715941594b7843726656532f3754795751484f6737686376506170694d6c727749616150634855526f3d",
+    "signature_hex": "e040043e37ed3504e42bf0c8f1ec128cf2d84800ab48848a4253b02138861eec5daeedb6a3b3f50252fc0f0658f36f8cfac2a8c40dff30200edd9b982b41a90d",
+    "signature_b64": "4EAEPjftNQTkK/DI8ewSjPLYSACrSISKQlOwITiGHuxdru22o7P1AlL8DwZY82+M+sKoxA3/MCAO3ZuYK0GpDQ=="
+  },
+  "notes": "DRAFT (docs/MESH_PROTOCOL_v2.md): no port ships v2 yet; frozen once v2 is adopted."
+}

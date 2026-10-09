@@ -123,9 +123,9 @@ For the frozen fixture `device_id = "bob-device-1"` (12 bytes) and `issuer_devic
 
 Wire body without magic/signature equals `signing_bytes` without the domain prefix. Signed by the **identity** key for `identity_address`.
 
-Hard reject: unknown version/suite, noncanonical address, id length out of range, zero `revocation_id`, bad signature, trailing bytes.
+Hard reject: unknown version/suite, noncanonical address, id length out of range, zero `revocation_id`, bad signature, trailing bytes, and any fixed-size field that runs past the end of the input. The minimum-length check assumes 1-byte ids, so a long `device_id` / `issuer_device_id` with a short tail passes it; decoders MUST bounds-check every field after each `lp` read and return an error (never read out of range or abort).
 
-Vectors: `shared-vectors/rvn1/device_revocation/valid_001.json`, `shared-vectors/rvn1/negative/device_revocation_wrong_signer.json`.
+Vectors: `shared-vectors/rvn1/device_revocation/valid_001.json`, `shared-vectors/rvn1/negative/device_revocation_wrong_signer.json`, `shared-vectors/rvn1/negative/device_revocation_long_id_short_tail.json`.
 
 ---
 
@@ -439,6 +439,16 @@ revocation_store_hash = SHA-256(canonical_snapshot)
 
 Vectors: `store_hash_001.json`, `store_hash_exhausted_001.json`.
 
+**Corrupt `reason_code` values (frozen).** The code is hashed into `revocation_store_hash`, so every implementation MUST emit the same value. §6.0 step 2c re-verify checks run in this order and the first failure wins:
+
+| Code | Reason | Condition |
+|---:|---|---|
+| 1 | `truncated` | Journal bytes are not one complete canonical record: shorter than 54 bytes, **or** any §3 strict-parse failure at any length (bad magic/version/suite, id length out of range, short fixed-size tail, zero `revocation_id`, trailing bytes) |
+| 2 | `digest_mismatch` | Journal `claim_digest` ≠ SHA-256(exact bytes) (exact lowercase-hex compare of the journal field) |
+| 3 | `bad_signature` | Record parses but the identity signature or `identity_address` binding fails |
+
+All other values are reserved and MUST NOT be emitted. Vectors: `corrupt_journal_truncated_001.json` (short), `corrupt_journal_malformed_001.json` (≥ 54 bytes, undecodable), `corrupt_journal_digest_mismatch_001.json`, `corrupt_journal_bad_signature_001.json`.
+
 ### 6.2 Store integrity
 
 After successful initialization (explicit empty-store initialized anchor on true first install, or at least one apply/exhausted/corrupt anchor):
@@ -518,6 +528,15 @@ Concurrent owner devices MAY mint while partitioned; verifiers union-apply (§5)
 | Local block | Always may deny; orthogonal to signed revoke |
 | Relays | Opaque; `object_digest` only |
 
+### 9.1 Current endpoint enforcement (informative)
+
+This subsection records what the node implementation enforces today; it does not change §1–§8 or the production status.
+
+- **Certificate under test.** Revocation for PairInit, envelopes, ACKs and in-daemon seal is evaluated against the exact certificate bound into the session (its `device_certificate_hash` equals the PairInit-recorded digest), never against a cached or ephemeral offer for the same key.
+- **Deny sources.** (a) Legacy local `rvn1/devrevoke/v1` records name only `(identity, device_id)` and deny that exact `device_id` (byte compare, no trimming); (b) verified RVDR1 claims (strict parse + identity signature, union by `claim_digest`) deny all four §2.1 identifiers for their identity; (c) the local device registry retains the full lineage of every local certificate it revokes, so a re-issued certificate reusing any retired identifier is refused (§2.2).
+- **Not yet implemented at the endpoint.** §6 journal / anchor / quota / corrupt-marker machinery, §6.3 cleanup work items, and any network or IPC ingest of RVDR1 objects. Legacy records cannot carry `device_ed_pub` / `device_x_pub` / `device_cert_hash`, so re-certification of a *peer* lineage under a new `device_id` is only denied once an RVDR1 claim for it has been ingested.
+- **Collapsed device tier.** The node issues its local certificate with `device_ed_pub` equal to the identity key and one X25519 device key per data directory, so all local "devices" share one lineage. Retiring any local lineage therefore retires the identity key's device role (§2.2) and the node must move to a new identity; per-device containment requires a separate per-install device key (not yet implemented). LAN peers are accepted only with self-certified certificates (`device_ed_pub == user_ed_pub == Noise-bound key`).
+
 ---
 
 ## 10. Shared vectors (conformance suite)
@@ -531,7 +550,8 @@ Concurrent owner devices MAY mint while partitioned; verifiers union-apply (§5)
 | `union_001` | Append-only union of two claims |
 | `collision_revocation_id_001` | Same `revocation_id`, different bytes → union + collision |
 | `quota_machine_001` | Exhaustion → expand → convert → replay crash windows |
-| `corrupt_journal_*` | Truncated / digest mismatch / bad signature + recovery fail-closed |
+| `corrupt_journal_*` | Truncated (short and ≥ 54-byte malformed) / digest mismatch / bad signature + recovery fail-closed |
+| `device_revocation_long_id_short_tail` | Negative decode: long id, short fixed-size tail → error, never out-of-range read |
 | `apply_gates_001` | PairInit V1/V2, Session, Message, ACK, Noise bind |
 | `pending_binding_negatives_001` | `pending_already_written` wrong bytes/digest/missing/EXHAUSTED |
 

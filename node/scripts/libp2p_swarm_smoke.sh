@@ -3,7 +3,9 @@
 # No FastAPI. Separates libp2p PeerId from Raven identity.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/target/debug"
+# shellcheck source=../../scripts/lib/harness_util.sh
+source "$ROOT/../scripts/lib/harness_util.sh"
+BIN="${RAVEN_BIN_DIR:-$ROOT/target/debug}"   # optional prebuilt debug bin dir (skips the build)
 SWARM="$BIN/raven-swarm"
 WORKDIR="${TMPDIR:-/tmp}/raven-libp2p-$$"
 mkdir -p "$WORKDIR/a" "$WORKDIR/b"
@@ -17,7 +19,13 @@ cleanup() {
 }
 trap cleanup EXIT
 source "${HOME}/.cargo/env" 2>/dev/null || true
-[[ -x "$SWARM" ]] || (cd "$ROOT" && cargo build -p raven-swarm -q)
+# Always builds (a no-op when fresh) unless RAVEN_BIN_DIR is given: an existing
+# binary used to be reused however stale, so this gate could pass against old code.
+raven_build_bins "$ROOT" raven-swarm
+if [[ ! -x "$SWARM" ]]; then
+  echo "FAIL: $SWARM is missing" >&2
+  exit 1
+fi
 
 # §30 manual-peer-only bootstrap config on dialer (no Raven-owned required)
 "$SWARM" bootstrap-init \
@@ -66,6 +74,13 @@ A_PUB=$(grep '^raven_pub_hex=' "$WORKDIR/a.log" | head -1 | cut -d= -f2)
 
 grep -q 'peer_record_verified=1' "$WORKDIR/b.log"
 grep -q 'LIBP2P SWARM DIAL+KAD OK' "$WORKDIR/b.log"
-! grep -qiE 'fastapi|localhost:8000|/api/' "$WORKDIR/a.log" "$WORKDIR/b.log"
+# Explicit if/exit: errexit never fires on a `!`-negated command. The only
+# allowed mention is the fixed "(no FastAPI)" safety banner.
+SWARM_LOGS=$(cat "$WORKDIR/a.log" "$WORKDIR/b.log" | grep -viF 'no FastAPI' || true)
+if grep -qiE 'fastapi|localhost:8000|/api/' <<<"$SWARM_LOGS"; then
+  echo "FAIL: swarm logs mention FastAPI / legacy API routing" >&2
+  grep -iE 'fastapi|localhost:8000|/api/' <<<"$SWARM_LOGS" >&2 || true
+  exit 1
+fi
 grep -q 'libp2p PeerId is domain-separated' "$WORKDIR/a.log"
 echo "=== LIBP2P SWARM SMOKE OK (TCP/Kad, no FastAPI) ==="

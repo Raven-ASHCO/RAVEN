@@ -28,6 +28,23 @@ ROUTE_TAG_DOMAIN = b"ATSAM/v2/route"
 MAILBOX_TAG_DOMAIN = b"ATSAM/v2/mailbox"
 STORE_TAG_DOMAIN = b"raven/relay-tag/v1"
 MS_PER_DAY = 86_400_000
+# ATSAM §5.1: EPOCH_TYPE = u64; increments MUST NOT wrap (fail closed).
+EPOCH_MAX = (1 << 64) - 1
+CTR_MAX = (1 << 32) - 1
+# Global retained skipped-key cap (mirrors hybrid_ratchet_v2_tr).
+MAX_MKSKIPPED_RETAINED = 2000
+
+
+def _next_epoch(epoch: int) -> int:
+    if not 0 <= epoch < EPOCH_MAX:
+        raise ValueError("SCKA epoch overflow (EPOCH_TYPE=u64 MUST NOT wrap)")
+    return epoch + 1
+
+
+def _next_ctr(ctr: int, what: str) -> int:
+    if not 0 <= ctr < CTR_MAX:
+        raise ValueError(f"{what} counter overflow")
+    return ctr + 1
 
 
 def kdf_scka_rk(rk: bytes, ss: bytes) -> tuple[bytes, bytes]:
@@ -60,8 +77,8 @@ class SckaEpochState:
             self.rk
             + self.ck_send
             + self.ck_recv
-            + self.sending_epoch.to_bytes(4, "big")
-            + self.receiving_epoch.to_bytes(4, "big")
+            + self.sending_epoch.to_bytes(8, "big")
+            + self.receiving_epoch.to_bytes(8, "big")
             + self.send_ctr.to_bytes(4, "big")
             + self.recv_ctr.to_bytes(4, "big")
         ).digest()
@@ -81,7 +98,7 @@ def scka_epoch_promote_initiator(state: SckaEpochState, ss: bytes) -> SckaEpochS
         rk=rk2,
         ck_send=ck,
         ck_recv=state.ck_recv,
-        sending_epoch=state.sending_epoch + 1,
+        sending_epoch=_next_epoch(state.sending_epoch),
         receiving_epoch=state.receiving_epoch,
         send_ctr=0,
         recv_ctr=state.recv_ctr,
@@ -96,7 +113,7 @@ def scka_epoch_promote_responder(state: SckaEpochState, ss: bytes) -> SckaEpochS
         ck_send=state.ck_send,
         ck_recv=ck,
         sending_epoch=state.sending_epoch,
-        receiving_epoch=state.receiving_epoch + 1,
+        receiving_epoch=_next_epoch(state.receiving_epoch),
         send_ctr=state.send_ctr,
         recv_ctr=0,
     )
@@ -110,7 +127,7 @@ def scka_next_send_mk(state: SckaEpochState) -> tuple[SckaEpochState, bytes]:
         ck_recv=state.ck_recv,
         sending_epoch=state.sending_epoch,
         receiving_epoch=state.receiving_epoch,
-        send_ctr=state.send_ctr + 1,
+        send_ctr=_next_ctr(state.send_ctr, "SCKA send"),
         recv_ctr=state.recv_ctr,
     )
     return out, mk
@@ -125,7 +142,7 @@ def scka_next_recv_mk(state: SckaEpochState) -> tuple[SckaEpochState, bytes]:
         sending_epoch=state.sending_epoch,
         receiving_epoch=state.receiving_epoch,
         send_ctr=state.send_ctr,
-        recv_ctr=state.recv_ctr + 1,
+        recv_ctr=_next_ctr(state.recv_ctr, "SCKA recv"),
     )
     return out, mk
 
@@ -157,7 +174,8 @@ class EcSendState:
 
 def ec_send_mk(state: EcSendState) -> tuple[EcSendState, bytes]:
     ck2, mk = kdf_ck(state.ck)
-    return EcSendState(ck=ck2, n=state.n + 1, dh_pub=state.dh_pub), mk
+    n = _next_ctr(state.n, "EC send")
+    return EcSendState(ck=ck2, n=n, dh_pub=state.dh_pub), mk
 
 
 def ec_skip_keys(state: EcRecvState, until_n: int, max_skip: int = MAX_SKIP) -> EcRecvState:
@@ -167,6 +185,8 @@ def ec_skip_keys(state: EcRecvState, until_n: int, max_skip: int = MAX_SKIP) -> 
     skip_count = until_n - state.n
     if skip_count > max_skip:
         raise ValueError("MAX_SKIP exceeded")
+    if len(state.mkskipped) + skip_count > MAX_MKSKIPPED_RETAINED:
+        raise ValueError("MAX_MKSKIPPED_RETAINED exceeded")
     ck = state.ck
     n = state.n
     skipped = dict(state.mkskipped)
@@ -189,7 +209,12 @@ def ec_try_skipped(state: EcRecvState, dh_pub: bytes, n: int) -> tuple[bytes | N
 def ec_recv_in_order(state: EcRecvState) -> tuple[EcRecvState, bytes]:
     ck2, mk = kdf_ck(state.ck)
     return (
-        EcRecvState(ck=ck2, n=state.n + 1, dh_pub=state.dh_pub, mkskipped=dict(state.mkskipped)),
+        EcRecvState(
+            ck=ck2,
+            n=_next_ctr(state.n, "EC recv"),
+            dh_pub=state.dh_pub,
+            mkskipped=dict(state.mkskipped),
+        ),
         mk,
     )
 

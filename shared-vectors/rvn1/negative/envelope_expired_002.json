@@ -1,0 +1,16 @@
+{
+  "description": "decodes (well-formed) but expires_at < validation clock",
+  "deterministic": true,
+  "expected": {
+    "drop_reason": "expired",
+    "relay_action": "drop",
+    "unpack_result": "accept"
+  },
+  "inputs": {
+    "packed_hex": "52564e310101000000000000000000000000000000000001611432077911411fb5470eb80f1ff11900000000000000000000018bcfe540f00000018bcfe564180803000000000000000000000001001400000019004052564e41312d6865616465722d6669787475726552564e53312d7365616c65642d626f64792d66697874757265011d55b3293991ae92be7a9e6b1fc20f7e243727b155de1adf4a6e20e72fb0169e690b083961f92a2e4f2df8286faffdc4f875de916d148c96168022b80f9e00",
+    "signer_ed_public_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "validation_clock_ms": 1700000000000
+  },
+  "name": "Signed envelope past expires_at must be dropped by relays",
+  "protocol_version": "rvn1"
+}

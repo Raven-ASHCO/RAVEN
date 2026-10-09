@@ -7,8 +7,14 @@ use crate::device_revocation::{
 };
 use std::collections::BTreeMap;
 
+/// Frozen corrupt-marker reason codes (RAVEN_DEVICE_REVOCATION_V1 §6.0). They
+/// are hashed into `revocation_store_hash`, so every implementation must agree.
+/// Journal bytes that are not one complete canonical RVDR1 record (short, or
+/// failing strict parse).
 pub const CORRUPT_TRUNCATED: u8 = 1;
+/// Journal `claim_digest` differs from SHA-256 of the exact bytes.
 pub const CORRUPT_DIGEST_MISMATCH: u8 = 2;
+/// Record parses but the identity signature / address binding fails.
 pub const CORRUPT_BAD_SIGNATURE: u8 = 3;
 
 pub const SURFACES: &[&str] = &[
@@ -226,6 +232,8 @@ pub fn reverify_journal(
     if wire.len() < 54 {
         return fail(store, CORRUPT_TRUNCATED);
     }
+    // Any strict-parse failure is "not a complete record" (code 1), for every
+    // length; Python and Rust must hash the same marker.
     let rec = match DeviceRevocationV1::decode(&wire) {
         Ok(r) => r,
         Err(_) => {
@@ -496,6 +504,7 @@ mod tests {
     fn corrupt_journal_matrix() {
         for (name, reason_code) in [
             ("corrupt_journal_truncated_001.json", CORRUPT_TRUNCATED),
+            ("corrupt_journal_malformed_001.json", CORRUPT_TRUNCATED),
             (
                 "corrupt_journal_digest_mismatch_001.json",
                 CORRUPT_DIGEST_MISMATCH,

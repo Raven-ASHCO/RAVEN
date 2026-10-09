@@ -29,7 +29,7 @@ use crate::hybrid_ratchet_v2_full_braid::spqr_codec::{
 };
 use crate::hybrid_ratchet_v2_full_braid::spqr_pin_audit::{CW, L_CT1, L_CT2, L_EK, L_HDR};
 use crate::hybrid_ratchet_v2_full_braid::state_codec::{
-    encode_rvfb1, ActiveSend, InboundChunk, InboundSet, Rvfb1State, TlvEntry, DIR_A2B, DIR_B2A,
+    rvfb1_encodable, ActiveSend, InboundChunk, InboundSet, Rvfb1State, TlvEntry, DIR_A2B, DIR_B2A,
     ROLE_ALICE, ROLE_BOB, SOURCE_KIND_CT1, SOURCE_KIND_CT2, SOURCE_KIND_EK, SOURCE_KIND_HDR,
 };
 use crate::hybrid_ratchet_v2_full_braid::tr_confirm::{
@@ -329,15 +329,16 @@ pub fn transition<C: BraidCrypto>(
     env: &Rvbe1,
     crypto: &mut C,
 ) -> TransitionResult {
-    if encode_rvfb1(state).is_err() {
+    if !rvfb1_encodable(state) {
         return reject_result(state, RejectReason::Parse);
     }
+    // Scratch encodings carry the plaintext body and the env seeds/coins.
     let input_bytes = match encode_rvbi1(input) {
-        Ok(bytes) => bytes,
+        Ok(bytes) => Zeroizing::new(bytes),
         Err(_) => return reject_result(state, RejectReason::Parse),
     };
     let env_bytes = match encode_rvbe1(env) {
-        Ok(bytes) => bytes,
+        Ok(bytes) => Zeroizing::new(bytes),
         Err(_) => return reject_result(state, RejectReason::Parse),
     };
     let Some(agent) = BraidAgent::from_code(state.prefix.agent) else {
@@ -402,7 +403,7 @@ pub fn transition<C: BraidCrypto>(
                 // needs_aead=1 is only legal on the SCKA-promote Accept path.
                 return reject_result(state, RejectReason::Parse);
             }
-            if encode_rvfb1(&candidate).is_err() {
+            if !rvfb1_encodable(&candidate) {
                 return reject_result(state, RejectReason::Parse);
             }
             TransitionResult {
@@ -444,7 +445,7 @@ fn terminal_result(
     reason: u16,
 ) -> TransitionResult {
     terminalize(&mut candidate, reason);
-    debug_assert!(encode_rvfb1(&candidate).is_ok());
+    debug_assert!(rvfb1_encodable(&candidate));
     TransitionResult {
         disposition: Disposition::Terminal { reason },
         candidate,
@@ -497,10 +498,15 @@ fn validate_chunk_contract(frame: &Rvbc1) -> Result<(), RejectReason> {
     Ok(())
 }
 
+/// Nested TR confirm failures are pre-commit rejections (ATSAM §4.2 step 7):
+/// RVCH1/DH/skip validation runs on attacker-controlled header fields and an
+/// AEAD failure proves nothing about the peer, so the candidate is discarded
+/// with zero durable mutation instead of terminalizing the session.
 fn map_tr_confirm(err: TrConfirmError) -> EngineFailure {
     match err {
-        TrConfirmError::Parse => EngineFailure::Reject(RejectReason::Parse),
-        TrConfirmError::TrConfirm => EngineFailure::Terminal(TERMINAL_REASON_TR_CONFIRM),
+        TrConfirmError::Parse | TrConfirmError::TrConfirm => {
+            EngineFailure::Reject(RejectReason::Parse)
+        }
     }
 }
 
@@ -522,7 +528,7 @@ fn apply_send<C: BraidCrypto>(
 
     let frame = match agent {
         BraidAgent::KeysUnsampled => {
-            let seed = fixed_array::<{ mlkem::SEED_LEN }>(&env.keygen_seed)?;
+            let seed = fixed_array_zeroizing::<{ mlkem::SEED_LEN }>(&env.keygen_seed)?;
             let material = crypto.keygen(&seed)?;
             let auth = auth_from_state(state);
             let tag = auth.mac_hdr(ep, &material.header);
@@ -545,17 +551,19 @@ fn apply_send<C: BraidCrypto>(
                 source,
             ));
             state.prefix.agent = AGENT_KEYS_SAMPLED;
-            emit_active(state)?
+            emit_active(state, env.cap_chunks)?
         }
-        BraidAgent::KeysSampled => emit_expected_active(state, WIRE_HDR)?,
-        BraidAgent::HeaderSent => emit_expected_active(state, WIRE_EK)?,
-        BraidAgent::Ct1Received => emit_expected_active(state, WIRE_EK_CT1_ACK)?,
-        BraidAgent::EkSentCt1Received
-        | BraidAgent::NoHeaderReceived
-        | BraidAgent::Ct1Acknowledged => empty_frame(state, direction, WIRE_NONE),
+        BraidAgent::KeysSampled => emit_expected_active(state, WIRE_HDR, env.cap_chunks)?,
+        BraidAgent::HeaderSent => emit_expected_active(state, WIRE_EK, env.cap_chunks)?,
+        BraidAgent::Ct1Received => emit_expected_active(state, WIRE_EK_CT1_ACK, env.cap_chunks)?,
+        // Pinned SPQR: EkSentCt1Received keeps acknowledging CT1 until Ct2 completes.
+        BraidAgent::EkSentCt1Received => empty_frame(state, direction, WIRE_CT1_ACK),
+        BraidAgent::NoHeaderReceived | BraidAgent::Ct1Acknowledged => {
+            empty_frame(state, direction, WIRE_NONE)
+        }
         BraidAgent::HeaderReceived => {
             let header = header_from_tlvs(state)?;
-            let coins = fixed_array::<{ mlkem::COINS_LEN }>(&env.encaps_coins)?;
+            let coins = fixed_array_zeroizing::<{ mlkem::COINS_LEN }>(&env.encaps_coins)?;
             let encaps = crypto.encaps1(&header, &coins)?;
             // Encaps1 → KDF_OK → Auth.Update → (optional TR AEAD) → SCKA promote.
             let mut raw_ss = encaps.shared_secret;
@@ -580,7 +588,7 @@ fn apply_send<C: BraidCrypto>(
                 encaps.ct1.to_vec(),
             ));
             state.prefix.agent = AGENT_CT1_SAMPLED;
-            let frame = emit_active(state)?;
+            let frame = emit_active(state, env.cap_chunks)?;
             if input.mutation.needs_aead == 1 {
                 let evidence = env
                     .admitted_trust
@@ -602,9 +610,9 @@ fn apply_send<C: BraidCrypto>(
             frame
         }
         BraidAgent::Ct1Sampled | BraidAgent::EkReceivedCt1Sampled => {
-            emit_expected_active(state, WIRE_CT1)?
+            emit_expected_active(state, WIRE_CT1, env.cap_chunks)?
         }
-        BraidAgent::Ct2Sampled => emit_expected_active(state, WIRE_CT2)?,
+        BraidAgent::Ct2Sampled => emit_expected_active(state, WIRE_CT2, env.cap_chunks)?,
         BraidAgent::Terminal => {
             return Err(EngineFailure::Reject(RejectReason::TerminalStateOp));
         }
@@ -736,10 +744,15 @@ fn apply_receive<C: BraidCrypto>(
                         } else {
                             None
                         };
+                        // The peer sealed its confirm once, at HeaderReceived, bound to the
+                        // first CT1 frame it emitted. Rebuild that exact RVBC1 so both
+                        // sides share one AD and each (ec_mk, scka_mk) seals exactly one
+                        // ciphertext (no second seal under the same key/nonce).
+                        let confirm_frame = first_ct1_frame(state, direction, ep, &ct1[..])?;
                         confirm_before_scka_promote(
                             state,
                             input,
-                            frame,
+                            &confirm_frame,
                             &output_key,
                             ep,
                             evidence,
@@ -824,7 +837,7 @@ fn apply_receive<C: BraidCrypto>(
                 }
                 apply_first_ct1_ack(state, crypto)?;
                 let ek = tlv_array::<{ mlkem::EK_VECTOR_LEN }>(state, 4)?;
-                finish_encaps2(state, &ek, crypto)?;
+                finish_encaps2(state, &ek[..], crypto)?;
                 true
             }
         }
@@ -891,28 +904,47 @@ fn fixed_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], EngineFailure> {
         .map_err(|_| EngineFailure::Reject(RejectReason::Parse))
 }
 
-fn tlv_entry(tag: u16, value: &[u8]) -> TlvEntry {
+/// Like [`fixed_array`] for secret material (host-supplied seeds/coins, the
+/// ML-KEM `dk`, Encaps1 state): the copy is filled in place in a wipe-on-drop
+/// buffer instead of passing through a plain, never-wiped array.
+fn fixed_array_zeroizing<const N: usize>(
+    bytes: &[u8],
+) -> Result<Zeroizing<[u8; N]>, EngineFailure> {
+    if bytes.len() != N {
+        return Err(EngineFailure::Reject(RejectReason::Parse));
+    }
+    let mut out = Zeroizing::new([0u8; N]);
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+fn tlv_entry<T: AsRef<[u8]> + ?Sized>(tag: u16, value: &T) -> TlvEntry {
     TlvEntry {
         tag,
-        value: value.to_vec(),
+        value: value.as_ref().to_vec(),
     }
 }
 
-fn tlv_array<const N: usize>(state: &Rvfb1State, tag: u16) -> Result<[u8; N], EngineFailure> {
+/// Wipe-on-drop fixed-size copy of a TLV value (the ML-KEM `dk` and Encaps1
+/// state live in TLVs).
+fn tlv_array<const N: usize>(
+    state: &Rvfb1State,
+    tag: u16,
+) -> Result<Zeroizing<[u8; N]>, EngineFailure> {
     let value = state
         .tlvs
         .iter()
         .find(|entry| entry.tag == tag)
         .ok_or(EngineFailure::Reject(RejectReason::Parse))?;
-    fixed_array::<N>(&value.value)
+    fixed_array_zeroizing::<N>(&value.value)
 }
 
 fn header_from_tlvs(state: &Rvfb1State) -> Result<[u8; mlkem::HEADER_LEN], EngineFailure> {
     let rho = tlv_array::<32>(state, 2)?;
     let hek = tlv_array::<32>(state, 3)?;
     let mut header = [0u8; mlkem::HEADER_LEN];
-    header[..32].copy_from_slice(&rho);
-    header[32..].copy_from_slice(&hek);
+    header[..32].copy_from_slice(&rho[..]);
+    header[32..].copy_from_slice(&hek[..]);
     Ok(header)
 }
 
@@ -935,31 +967,30 @@ fn new_active_send(
     }
 }
 
-fn emit_expected_active(state: &mut Rvfb1State, wire_type: u8) -> Result<Rvbc1, EngineFailure> {
+fn emit_expected_active(
+    state: &mut Rvfb1State,
+    wire_type: u8,
+    cap_chunks: u32,
+) -> Result<Rvbc1, EngineFailure> {
     if state.active_send.as_ref().map(|active| active.wire_type) != Some(wire_type) {
         return Err(EngineFailure::Reject(RejectReason::Parse));
     }
-    emit_active(state)
+    emit_active(state, cap_chunks)
 }
 
-fn emit_active(state: &mut Rvfb1State) -> Result<Rvbc1, EngineFailure> {
+fn emit_active(state: &mut Rvfb1State, cap_chunks: u32) -> Result<Rvbc1, EngineFailure> {
     let active = state
         .active_send
         .as_mut()
         .ok_or(EngineFailure::Reject(RejectReason::Parse))?;
     if active.epoch != state.prefix.braid_agent_epoch
         || active.direction != send_direction(state.prefix.role)?
-        || active.next_spqr_index > BRAID_MAX_CHUNK_INDEX
+        || active.next_spqr_index > BRAID_MAX_CHUNKS_PER_EPOCH as u32
     {
         return Err(EngineFailure::Reject(RejectReason::Parse));
     }
-    let index = active.next_spqr_index;
-    let mut encoder = BraidEncoder::encode(&active.source_bytes)
-        .map_err(|_| EngineFailure::Reject(RejectReason::Parse))?;
-    let payload = encoder
-        .chunk_at(index)
-        .map_err(|_| EngineFailure::Reject(RejectReason::Parse))?
-        .to_vec();
+    let index = cursor_index(active.next_spqr_index, cap_chunks);
+    let payload = encoded_chunk(&active.source_bytes, index)?;
     let frame = Rvbc1 {
         epoch: active.epoch,
         chunk_type: active.wire_type,
@@ -974,11 +1005,68 @@ fn emit_active(state: &mut Rvfb1State) -> Result<Rvbc1, EngineFailure> {
         ),
         payload,
     };
-    active.next_spqr_index = index
-        .checked_add(1)
-        .filter(|next| *next <= BRAID_MAX_CHUNKS_PER_EPOCH as u32)
-        .ok_or(EngineFailure::Reject(RejectReason::Parse))?;
+    // The index space is bounded by the receivers' inbound cap, so the cursor
+    // cycles instead of stalling: a re-sent index carries the identical
+    // deterministic payload and is applied by the peer as a decoder no-op.
+    // It wraps at the host's `cap_chunks` (never above 64): wrapping only at 64
+    // would walk into `enforce_env_caps` under a tightened cap and wedge every
+    // later Send, so a lost low index could never be re-sent.
+    active.next_spqr_index = (index + 1) % cursor_modulus(cap_chunks);
     Ok(frame)
+}
+
+/// Size of the chunk-index space a sender cycles through: the host's inbound
+/// `cap_chunks` clamped to `1..=BRAID_MAX_CHUNKS_PER_EPOCH`. A zero cap still
+/// maps to 1 (no `% 0`); such a Send is refused as `ERR_NEED_CAPACITY` by the
+/// pipeline's cap checks instead of being emitted.
+pub(crate) fn cursor_modulus(cap_chunks: u32) -> u32 {
+    cap_chunks.clamp(1, BRAID_MAX_CHUNKS_PER_EPOCH as u32)
+}
+
+/// Chunk index emitted for a persisted cursor (`64` is the legacy exhausted
+/// sentinel and wraps to index 0). A cursor persisted under a larger cap than
+/// the current one is folded into the current index space.
+pub(crate) fn cursor_index(next_spqr_index: u32, cap_chunks: u32) -> u32 {
+    let index = if next_spqr_index > BRAID_MAX_CHUNK_INDEX {
+        0
+    } else {
+        next_spqr_index
+    };
+    index % cursor_modulus(cap_chunks)
+}
+
+fn encoded_chunk(source: &[u8], index: u32) -> Result<Vec<u8>, EngineFailure> {
+    let mut encoder =
+        BraidEncoder::encode(source).map_err(|_| EngineFailure::Reject(RejectReason::Parse))?;
+    Ok(encoder
+        .chunk_at(index)
+        .map_err(|_| EngineFailure::Reject(RejectReason::Parse))?
+        .to_vec())
+}
+
+/// The first CT1 frame (index 0) an encapsulator emits for `epoch`; its nested
+/// TR confirm is bound to exactly this RVBC1 (see `apply_send` HeaderReceived).
+fn first_ct1_frame(
+    state: &Rvfb1State,
+    direction: u8,
+    epoch: u64,
+    ct1: &[u8],
+) -> Result<Rvbc1, EngineFailure> {
+    let payload = encoded_chunk(ct1, 0)?;
+    Ok(Rvbc1 {
+        epoch,
+        chunk_type: WIRE_CT1,
+        index: 0,
+        binding_digest: binding_digest(
+            direction,
+            epoch,
+            WIRE_CT1,
+            0,
+            &payload,
+            &state.prefix.session_id,
+        ),
+        payload,
+    })
 }
 
 fn empty_frame(state: &Rvfb1State, direction: u8, wire_type: u8) -> Rvbc1 {
@@ -1067,8 +1155,11 @@ fn decoder_insert(
         .binary_search_by_key(&frame.index, |chunk| chunk.index)
     {
         Ok(index) => {
+            // Chunks are deterministic per (epoch, kind, index), so a differing
+            // payload is unauthenticated noise or injection: drop it without
+            // commit rather than letting one bad chunk terminalize the session.
             if set.chunks[index].payload != frame.payload {
-                return Err(EngineFailure::Terminal(TERMINAL_REASON_CONFLICT));
+                return Err(EngineFailure::Reject(RejectReason::Parse));
             }
         }
         Err(index) => {
@@ -1198,7 +1289,8 @@ fn insert_chain(chain: &mut Vec<SckaChainEntry>, entry: SckaChainEntry) {
     }
 }
 
-fn terminalize(state: &mut Rvfb1State, reason: u16) {
+/// Single terminalization routine (engine terminals and pipeline repairs).
+pub(crate) fn terminalize(state: &mut Rvfb1State, reason: u16) {
     state.prefix.agent = AGENT_TERMINAL;
     state.prefix.terminal_reason = reason;
     state.prefix.flags = FLAG_TERMINAL;
@@ -1543,15 +1635,17 @@ mod tests {
 
         let mut input = send_input(DIR_B2A);
         input.mutation = seal_mutation_for(&bob, DIR_B2A);
-        // Wrong expected_ct → TR_CONFIRM before promote; SCKA/EC must stay put.
+        // Wrong expected_ct fails the confirm before promote: a no-commit Reject
+        // (§4.2 step 7), not a durable terminal; SCKA/EC must stay put.
         let result = transition(&bob, &input, &bob_env, &mut bob_crypto);
         assert_eq!(
             result.disposition,
-            Disposition::Terminal {
-                reason: TERMINAL_REASON_TR_CONFIRM
+            Disposition::Reject {
+                reason: RejectReason::Parse
             }
         );
-        assert_eq!(result.candidate.prefix.agent, AGENT_TERMINAL);
+        assert_eq!(result.candidate, bob);
+        assert_eq!(result.candidate.prefix.agent, AGENT_HEADER_RECEIVED);
         assert_eq!(bob.tr.scka_sending_epoch, before_scka);
         assert_eq!(bob.tr.ec_ns, before_ec_ns);
         assert!(result.ch_out.is_none());
@@ -1887,6 +1981,57 @@ mod tests {
     }
 
     #[test]
+    fn spqr_ct1_ack_is_emitted_and_completes_the_encapsulator() {
+        let mut alice = test_state(AGENT_KEYS_UNSAMPLED, ROLE_ALICE);
+        let mut bob = test_state(AGENT_NO_HEADER_RECEIVED, ROLE_BOB);
+        bob.inbound_sets = vec![inbound_set(DIR_A2B, 1, SOURCE_KIND_HDR, Vec::new())];
+        let mut alice_env = Rvbe1::default_caps(0);
+        alice_env.keygen_seed = vec![0xE1; mlkem::SEED_LEN];
+        let mut bob_env = Rvbe1::default_caps(0);
+        bob_env.encaps_coins = vec![0xE2; mlkem::COINS_LEN];
+        let plain = Rvbe1::default_caps(0);
+        let mut alice_crypto = LabCrypto::default();
+        let mut bob_crypto = LabCrypto::default();
+
+        for _ in 0..N_HDR {
+            let frame = plain_send(&mut alice, DIR_A2B, &alice_env, &mut alice_crypto);
+            plain_receive(&mut bob, DIR_A2B, frame, &plain, &mut bob_crypto);
+        }
+        let first_ct1 = plain_send(&mut bob, DIR_B2A, &bob_env, &mut bob_crypto);
+        plain_receive(&mut alice, DIR_B2A, first_ct1, &plain, &mut alice_crypto);
+        assert_eq!(alice.prefix.agent, AGENT_HEADER_SENT);
+        // Full EK before any ack: Ct1Sampled → EkReceivedCt1Sampled.
+        for _ in 0..N_EK {
+            let frame = plain_send(&mut alice, DIR_A2B, &alice_env, &mut alice_crypto);
+            assert_eq!(frame.chunk_type, WIRE_EK);
+            plain_receive(&mut bob, DIR_A2B, frame, &plain, &mut bob_crypto);
+        }
+        assert_eq!(bob.prefix.agent, AGENT_EK_RECEIVED_CT1_SAMPLED);
+
+        // The pinned SPQR Ct1Ack (empty, index 0) finishes Encaps2.
+        let ack = frame(&bob, DIR_A2B, 1, WIRE_CT1_ACK, 0, Vec::new());
+        plain_receive(&mut bob, DIR_A2B, ack.clone(), &plain, &mut bob_crypto);
+        assert_eq!(bob.prefix.agent, AGENT_CT2_SAMPLED);
+        assert_eq!(bob_crypto.ack_advances(), 1);
+
+        // And a Ct1Ack before any EK chunk moves Ct1Sampled → Ct1Acknowledged.
+        let mut early = test_state(AGENT_CT1_SAMPLED, ROLE_BOB);
+        early.inbound_sets = vec![inbound_set(DIR_A2B, 1, SOURCE_KIND_EK, Vec::new())];
+        let mut crypto = LabCrypto::default();
+        let ack = frame(&early, DIR_A2B, 1, WIRE_CT1_ACK, 0, Vec::new());
+        let acked = plain_receive(&mut early, DIR_A2B, ack, &plain, &mut crypto);
+        assert_eq!(acked.candidate.prefix.agent, AGENT_CT1_ACKNOWLEDGED);
+        assert_eq!(crypto.ack_advances(), 1);
+
+        // EkSentCt1Received emits exactly that Ct1Ack frame.
+        let mut keygen = test_state(AGENT_EK_SENT_CT1_RECEIVED, ROLE_ALICE);
+        let sent = plain_send(&mut keygen, DIR_A2B, &plain, &mut LabCrypto::default());
+        assert_eq!(sent.chunk_type, WIRE_CT1_ACK);
+        assert_eq!(sent.index, 0);
+        assert!(sent.payload.is_empty());
+    }
+
+    #[test]
     fn keys_unsampled_receive_is_ignored_without_commit() {
         let state = test_state(AGENT_KEYS_UNSAMPLED, ROLE_ALICE);
         let chunk = frame(&state, DIR_B2A, 1, WIRE_NONE, 0, Vec::new());
@@ -1968,7 +2113,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_chunk_terminalizes_with_conflict_reason() {
+    fn conflicting_chunk_is_rejected_without_commit() {
         let mut state = test_state(AGENT_CT1_SAMPLED, ROLE_BOB);
         state.inbound_sets = vec![inbound_set(
             DIR_A2B,
@@ -1988,21 +2133,25 @@ mod tests {
             &mut crypto,
         );
 
+        // An unauthenticated same-index chunk must not kill the session (§4.2).
         assert_eq!(
             result.disposition,
-            Disposition::Terminal {
-                reason: TERMINAL_REASON_CONFLICT
+            Disposition::Reject {
+                reason: RejectReason::Parse
             }
         );
-        assert_eq!(result.meta.flags, META_FLAG_TERMINAL);
-        assert_eq!(result.candidate.prefix.agent, AGENT_TERMINAL);
-        assert_eq!(
-            result.candidate.prefix.terminal_reason,
-            TERMINAL_REASON_CONFLICT
+        assert_eq!(result.candidate, state);
+
+        // The honest chunk already stored still applies as a no-op afterwards.
+        let honest = frame(&state, DIR_A2B, 1, WIRE_EK, 0, vec![0x10; CW]);
+        let replayed = transition(
+            &state,
+            &receive_input(&state, DIR_A2B, honest),
+            &Rvbe1::default_caps(0),
+            &mut crypto,
         );
-        assert!(result.candidate.tlvs.is_empty());
-        assert!(result.candidate.active_send.is_none());
-        encode_rvfb1(&result.candidate).unwrap();
+        assert_eq!(replayed.disposition, Disposition::Accept);
+        assert_eq!(replayed.candidate.prefix.agent, AGENT_CT1_SAMPLED);
     }
 
     #[test]
@@ -2294,51 +2443,18 @@ mod tests {
         (input, ch, ec_mk, *scka_mk, frame)
     }
 
+    /// Receive-side confirm input: the body is exactly the peer's RVBO1
+    /// `sealed_ct` (the one ciphertext under that epoch's hybrid key).
     fn prepare_aead_receive(
         state: &Rvfb1State,
         direction: u8,
         frame: &Rvbc1,
         ch: &crate::hybrid_ratchet_v2_full_braid::wire_rvch1::Rvch1,
-        ec_mk: &[u8; 32],
-        scka_mk: &[u8; 32],
-        plaintext: &[u8],
+        sealed_ct: &[u8],
     ) -> Rvbi1 {
-        use crate::hybrid_ratchet_v2_full_braid::tr_confirm::{
-            build_effective_ad, encode_rvba1, AdmittedTrustEvidence, Rvba1,
-        };
         use crate::hybrid_ratchet_v2_full_braid::wire_rvbm1::MODE_OPEN;
-        use crate::hybrid_ratchet_v2_full_braid::wire_rvch1::encode_rvch1;
-        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
         assert_eq!(state.prefix.agent, AGENT_EK_SENT_CT1_RECEIVED);
-        let evidence = AdmittedTrustEvidence::lab_default();
-        let rvba1 = Rvba1::build(
-            state.prefix.session_id,
-            direction,
-            evidence.initiator_cert_digest,
-            evidence.initiator_identity_pub,
-            evidence.responder_cert_digest,
-            evidence.responder_identity_pub,
-        )
-        .unwrap();
-        let rvba1_bytes = encode_rvba1(&rvba1).unwrap();
-        let effective_ad = build_effective_ad(
-            &rvba1_bytes,
-            &encode_rvch1(ch),
-            &encode_rvbc1(frame).unwrap(),
-        )
-        .unwrap();
-        let (key, nonce) = crate::hybrid_ratchet_v2::kdf_hybrid(ec_mk, scka_mk);
-        let ciphertext = ChaCha20Poly1305::new((&key).into())
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad: &effective_ad,
-                },
-            )
-            .unwrap();
         Rvbi1 {
             op: OP_RECEIVE,
             direction,
@@ -2350,12 +2466,64 @@ mod tests {
                 needs_aead: 1,
                 ec_mk_oracle_len: 0,
                 ec_mk_oracle: [0; 32],
-                aad: rvba1_bytes,
+                aad: lab_rvba1_bytes(state, direction),
                 mode: MODE_OPEN,
-                body: ciphertext,
+                body: sealed_ct.to_vec(),
                 expected_ct: None,
             },
         }
+    }
+
+    fn lab_rvba1_bytes(state: &Rvfb1State, direction: u8) -> Vec<u8> {
+        use crate::hybrid_ratchet_v2_full_braid::tr_confirm::{
+            encode_rvba1, AdmittedTrustEvidence, Rvba1,
+        };
+        let evidence = AdmittedTrustEvidence::lab_default();
+        encode_rvba1(
+            &Rvba1::build(
+                state.prefix.session_id,
+                direction,
+                evidence.initiator_cert_digest,
+                evidence.initiator_identity_pub,
+                evidence.responder_cert_digest,
+                evidence.responder_identity_pub,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Seal `plaintext` under `(ec_mk, scka_mk)` with an arbitrary RVBC1 in the AD.
+    fn seal_with_frame_ad(
+        state: &Rvfb1State,
+        direction: u8,
+        ch: &crate::hybrid_ratchet_v2_full_braid::wire_rvch1::Rvch1,
+        frame: &Rvbc1,
+        ec_mk: &[u8; 32],
+        scka_mk: &[u8; 32],
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        use crate::hybrid_ratchet_v2_full_braid::tr_confirm::build_effective_ad;
+        use crate::hybrid_ratchet_v2_full_braid::wire_rvch1::encode_rvch1;
+        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+
+        let effective_ad = build_effective_ad(
+            &lab_rvba1_bytes(state, direction),
+            &encode_rvch1(ch),
+            &encode_rvbc1(frame).unwrap(),
+        )
+        .unwrap();
+        let (key, nonce) = crate::hybrid_ratchet_v2::kdf_hybrid(ec_mk, scka_mk);
+        ChaCha20Poly1305::new((&key).into())
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &effective_ad,
+                },
+            )
+            .unwrap()
     }
 
     fn run_full_exchange_two_pq_two_dh_fixture() -> FullExchangeFixture {
@@ -2440,22 +2608,50 @@ mod tests {
         assert_eq!(alice.prefix.agent, AGENT_EK_SENT_CT1_RECEIVED);
         let alice_dhr_before = alice.tr.ec_dhr_pub;
         let alice_receive_before = alice.clone();
+        let epoch1_sealed = checkpoints[0].result.sealed_ct.clone().unwrap();
+        let mut alice_receive_env = Rvbe1::default_caps(0).with_lab_trust();
+        alice_receive_env.ec_dh_seed = alice_receive_seed.to_vec();
+        // Regression (key/nonce reuse): a second ciphertext under the epoch-1
+        // hybrid key, re-sealed against the final-CT2 frame, must never open.
+        let resealed = seal_with_frame_ad(
+            &alice_receive_before,
+            DIR_B2A,
+            &bob_ch,
+            &epoch1_last_ct2,
+            &epoch1_ec_mk,
+            &epoch1_scka_mk,
+            epoch1_plaintext,
+        );
+        let rejected = transition(
+            &alice_receive_before,
+            &prepare_aead_receive(
+                &alice_receive_before,
+                DIR_B2A,
+                &epoch1_last_ct2,
+                &bob_ch,
+                &resealed,
+            ),
+            &alice_receive_env,
+            &mut alice_crypto,
+        );
+        assert_eq!(
+            rejected.disposition,
+            Disposition::Reject {
+                reason: RejectReason::Parse
+            }
+        );
+        assert_eq!(rejected.candidate, alice_receive_before);
         let alice_receive_input = prepare_aead_receive(
             &alice_receive_before,
             DIR_B2A,
             &epoch1_last_ct2,
             &bob_ch,
-            &epoch1_ec_mk,
-            &epoch1_scka_mk,
-            epoch1_plaintext,
+            &epoch1_sealed,
         );
-        assert_ne!(
-            alice_receive_input.mutation.body,
-            checkpoints[0].result.sealed_ct.clone().unwrap(),
-            "Receive must seal against its own final-CT2 RVBC1 AD"
+        assert_eq!(
+            alice_receive_input.mutation.body, epoch1_sealed,
+            "Receive opens exactly the peer's one sealed_ct"
         );
-        let mut alice_receive_env = Rvbe1::default_caps(0).with_lab_trust();
-        alice_receive_env.ec_dh_seed = alice_receive_seed.to_vec();
         let alice_receive = transition(
             &alice_receive_before,
             &alice_receive_input,
@@ -2557,19 +2753,23 @@ mod tests {
         let bob_dhr_before = bob.tr.ec_dhr_pub;
         let bob_ec_rk_before_dh2 = bob.tr.ec_rk;
         let bob_receive_before = bob.clone();
+        let epoch2_sealed = checkpoints[2].result.sealed_ct.clone().unwrap();
+        let resealed = seal_with_frame_ad(
+            &bob_receive_before,
+            DIR_A2B,
+            &alice_ch,
+            &epoch2_last_ct2,
+            &epoch2_ec_mk,
+            &epoch2_scka_mk,
+            epoch2_plaintext,
+        );
+        assert_ne!(resealed, epoch2_sealed);
         let bob_receive_input = prepare_aead_receive(
             &bob_receive_before,
             DIR_A2B,
             &epoch2_last_ct2,
             &alice_ch,
-            &epoch2_ec_mk,
-            &epoch2_scka_mk,
-            epoch2_plaintext,
-        );
-        assert_ne!(
-            bob_receive_input.mutation.body,
-            checkpoints[2].result.sealed_ct.clone().unwrap(),
-            "Receive must seal against its own final-CT2 RVBC1 AD"
+            &epoch2_sealed,
         );
         let mut bob_receive_env = Rvbe1::default_caps(0).with_lab_trust();
         // This materializes the pre-ratchet Bob key. Reusing the durable local
@@ -2640,6 +2840,16 @@ mod tests {
                 "epoch2_bob_ek_sent_ct1_received_receive",
             ]
         );
+        // Key/nonce uniqueness: every receive confirm opens the ciphertext its
+        // peer sealed (same bytes), so each hybrid key produced exactly one seal.
+        for pair in fixture.checkpoints.chunks(2) {
+            assert_eq!(pair[0].input.op, OP_SEND);
+            assert_eq!(pair[1].input.op, OP_RECEIVE);
+            assert_eq!(
+                pair[0].result.sealed_ct.as_ref(),
+                Some(&pair[1].input.mutation.body)
+            );
+        }
         for (index, checkpoint) in fixture.checkpoints.iter().enumerate() {
             assert_eq!(checkpoint.input.mutation.needs_aead, 1);
             assert!(checkpoint.env.admitted_trust.is_some());

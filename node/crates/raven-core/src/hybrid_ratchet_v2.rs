@@ -3,6 +3,8 @@
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::fmt;
+use zeroize::{Zeroize, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -19,8 +21,14 @@ pub const INIT_MAGIC_V2: &[u8; 8] = b"RVPI2\0\0\0";
 pub const INIT_MAGIC_V1: &[u8; 8] = b"RVPI1\0\0\0";
 pub const SEALED_PROTO: u8 = 0x04;
 pub const MAX_SKIP: u32 = 1000;
+/// Fixed canonical PairInit V2 wire length (spec §3.2.1; `offsets.total_len` in
+/// `shared-vectors/rvn1/atsam/pair_init_v2_001.json`; Python `INIT_WIRE_LEN`).
+pub const INIT_WIRE_LEN: usize = 2787;
 
-pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], length: usize) -> Vec<u8> {
+/// HKDF-SHA256. The returned OKM is key material: it is wiped on drop, and the
+/// intermediate PRK / `T(i)` blocks are wiped here. The buffer is sized up front
+/// so it never reallocates (which would leave an unwiped copy behind).
+pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], length: usize) -> Zeroizing<Vec<u8>> {
     let salt = if salt.is_empty() {
         &[0u8; 32][..]
     } else {
@@ -28,20 +36,24 @@ pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], length: usize) -> Vec<u
     };
     let mut mac = HmacSha256::new_from_slice(salt).expect("hmac");
     mac.update(ikm);
-    let prk = mac.finalize().into_bytes();
-    let mut okm = Vec::new();
-    let mut t = Vec::<u8>::new();
+    let mut prk: [u8; 32] = mac.finalize().into_bytes().into();
+    let mut okm = Zeroizing::new(Vec::with_capacity(length.div_ceil(32) * 32));
+    let mut t = [0u8; 32];
+    let mut t_len = 0usize;
     let mut counter = 1u8;
     while okm.len() < length {
         let mut m = HmacSha256::new_from_slice(&prk).expect("hmac");
-        m.update(&t);
+        m.update(&t[..t_len]);
         m.update(info);
         m.update(&[counter]);
-        t = m.finalize().into_bytes().to_vec();
+        t = m.finalize().into_bytes().into();
+        t_len = t.len();
         okm.extend_from_slice(&t);
         counter = counter.wrapping_add(1);
     }
     okm.truncate(length);
+    prk.zeroize();
+    t.zeroize();
     okm
 }
 
@@ -67,7 +79,8 @@ pub fn init_hash_v2(wire: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Session secrets from pair-expand: wiped on drop, redacted from Debug.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PairExpandV2 {
     pub sk_ec: [u8; 32],
     pub sk_scka: [u8; 32],
@@ -78,39 +91,62 @@ pub struct PairExpandV2 {
     pub session_id: [u8; 32],
 }
 
+impl fmt::Debug for PairExpandV2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PairExpandV2")
+            .field("transcript_hash", &self.transcript_hash)
+            .field("init_hash_v2", &self.init_hash_v2)
+            .field("session_id", &self.session_id)
+            .field("keys", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for PairExpandV2 {
+    fn drop(&mut self) {
+        self.sk_ec.zeroize();
+        self.sk_scka.zeroize();
+        self.k_route_master.zeroize();
+        self.k_confirm.zeroize();
+    }
+}
+
 pub fn pair_expand(z_x: &[u8; 32], z_pq: &[u8; 32], wire: &[u8]) -> Result<PairExpandV2, String> {
     reject_if_pair_init_v1(wire)?;
-    if wire.len() < 8 || &wire[..8] != INIT_MAGIC_V2 {
+    // Python `pair_expand`/`transcript_hash`/`init_hash_v2` require exactly this
+    // length; never derive session keys from a truncated or extended transcript.
+    if wire.len() != INIT_WIRE_LEN {
+        return Err("PairInit V2 wire length".into());
+    }
+    if &wire[..8] != INIT_MAGIC_V2 {
         return Err("bad PairInit V2 magic".into());
     }
     let th = transcript_hash(wire);
     let ih = init_hash_v2(wire);
     let mut info = PAIR_EXPAND_INFO_PREFIX.to_vec();
     info.extend_from_slice(&th);
-    let mut ikm = [0u8; 64];
+    let mut ikm = Zeroizing::new([0u8; 64]);
     ikm[..32].copy_from_slice(z_x);
     ikm[32..].copy_from_slice(z_pq);
-    let okm = hkdf_sha256(&ikm, &th, &info, 128);
-    let mut sk_ec = [0u8; 32];
-    let mut sk_scka = [0u8; 32];
-    let mut k_route = [0u8; 32];
-    let mut k_confirm = [0u8; 32];
-    sk_ec.copy_from_slice(&okm[0..32]);
-    sk_scka.copy_from_slice(&okm[32..64]);
-    k_route.copy_from_slice(&okm[64..96]);
-    k_confirm.copy_from_slice(&okm[96..128]);
+    let okm = hkdf_sha256(&ikm[..], &th, &info, 128);
     let mut sid_h = Sha256::new();
     sid_h.update(SESSION_ID_DOMAIN);
     sid_h.update(ih);
-    Ok(PairExpandV2 {
-        sk_ec,
-        sk_scka,
-        k_route_master: k_route,
-        k_confirm,
+    // Fill the (Drop-wiped) result in place rather than via local key copies.
+    let mut out = PairExpandV2 {
+        sk_ec: [0u8; 32],
+        sk_scka: [0u8; 32],
+        k_route_master: [0u8; 32],
+        k_confirm: [0u8; 32],
         transcript_hash: th,
         init_hash_v2: ih,
         session_id: sid_h.finalize().into(),
-    })
+    };
+    out.sk_ec.copy_from_slice(&okm[0..32]);
+    out.sk_scka.copy_from_slice(&okm[32..64]);
+    out.k_route_master.copy_from_slice(&okm[64..96]);
+    out.k_confirm.copy_from_slice(&okm[96..128]);
+    Ok(out)
 }
 
 pub fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), String> {
@@ -144,11 +180,26 @@ pub fn kdf_hybrid(ec_mk: &[u8; 32], scka_mk: &[u8; 32]) -> ([u8; 32], [u8; 12]) 
     (key, nonce)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// SCKA-INIT root/chain keys: wiped on drop, redacted from Debug.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SckaInitOut {
     pub rk: [u8; 32],
     pub ck_send: [u8; 32],
     pub ck_recv: [u8; 32],
+}
+
+impl fmt::Debug for SckaInitOut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SckaInitOut { <redacted> }")
+    }
+}
+
+impl Drop for SckaInitOut {
+    fn drop(&mut self) {
+        self.rk.zeroize();
+        self.ck_send.zeroize();
+        self.ck_recv.zeroize();
+    }
 }
 
 pub fn ratchet_init_alice_scka(sk: &[u8; 32]) -> SckaInitOut {
@@ -229,6 +280,106 @@ mod tests {
             hex::encode(e.session_id),
             v["expected"]["session_id_hex"].as_str().unwrap()
         );
+    }
+
+    #[test]
+    fn pair_expand_002_z_x_derives_from_wire_keys() {
+        use crate::hybrid_ratchet_v2_tr::{x25519_dh, x25519_public};
+
+        let v = load("pair_init_v2_002.json");
+        let wire = hex::decode(v["expected"]["pair_init_wire_hex"].as_str().unwrap()).unwrap();
+        let offsets = &v["expected"]["offsets"];
+        let at = |field: &str| {
+            let off = offsets[field].as_u64().unwrap() as usize;
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&wire[off..off + 32]);
+            out
+        };
+        let eph_priv = hex32(
+            v["inputs"]["initiator_ephemeral_x25519_priv_hex"]
+                .as_str()
+                .unwrap(),
+        );
+        let otp_priv = hex32(
+            v["inputs"]["responder_otp_x25519_priv_hex"]
+                .as_str()
+                .unwrap(),
+        );
+        let eph_pub = at("initiator_ephemeral_x25519_pub");
+        let otp_pub = at("responder_one_time_x25519_pub");
+        assert_eq!(x25519_public(&eph_priv).unwrap(), eph_pub);
+        assert_eq!(x25519_public(&otp_priv).unwrap(), otp_pub);
+        // Z_X is the DH of exactly the keys the transcript carries.
+        let z_x = x25519_dh(&eph_priv, &otp_pub).unwrap();
+        assert_eq!(z_x, x25519_dh(&otp_priv, &eph_pub).unwrap());
+        assert_eq!(hex::encode(z_x), v["expected"]["z_x_hex"].as_str().unwrap());
+        assert_eq!(
+            hex::encode(at("responder_prekey_bundle_hash")),
+            v["expected"]["responder_prekey_bundle_hash_hex"]
+                .as_str()
+                .unwrap()
+        );
+
+        let zp = hex32(v["inputs"]["z_pq_hex"].as_str().unwrap());
+        let e = pair_expand(&z_x, &zp, &wire).unwrap();
+        for (field, value) in [
+            ("sk_ec_hex", e.sk_ec),
+            ("sk_scka_hex", e.sk_scka),
+            ("k_route_master_hex", e.k_route_master),
+            ("k_confirm_hex", e.k_confirm),
+            ("session_id_hex", e.session_id),
+        ] {
+            assert_eq!(
+                hex::encode(value),
+                v["expected"][field].as_str().unwrap(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn pair_expand_rejects_non_canonical_wire_length() {
+        let v = load("pair_init_v2_001.json");
+        let wire = hex::decode(v["expected"]["pair_init_wire_hex"].as_str().unwrap()).unwrap();
+        assert_eq!(wire.len(), INIT_WIRE_LEN);
+        let zx = hex32(v["inputs"]["z_x_hex"].as_str().unwrap());
+        let zp = hex32(v["inputs"]["z_pq_hex"].as_str().unwrap());
+        assert!(pair_expand(&zx, &zp, &wire).is_ok());
+        // Truncated (still carries the RVPI2 magic) and extended wires.
+        assert!(pair_expand(&zx, &zp, &wire[..100]).is_err());
+        assert!(pair_expand(&zx, &zp, &wire[..INIT_WIRE_LEN - 1]).is_err());
+        let mut longer = wire.clone();
+        longer.push(0);
+        assert!(pair_expand(&zx, &zp, &longer).is_err());
+        assert!(pair_expand(&zx, &zp, &[]).is_err());
+        // The PairInit V1 magic keeps its specific diagnostic.
+        let mut v1 = wire.clone();
+        v1[..8].copy_from_slice(INIT_MAGIC_V1);
+        assert_eq!(
+            pair_expand(&zx, &zp, &v1).unwrap_err(),
+            "PairInit V1 must not be reinterpreted as V2"
+        );
+    }
+
+    #[test]
+    fn hkdf_sha256_matches_rfc5869_case_1_and_multi_block() {
+        // RFC 5869 A.1 (SHA-256).
+        let ikm = [0x0bu8; 22];
+        let salt = hex::decode("000102030405060708090a0b0c").unwrap();
+        let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let okm = hkdf_sha256(&ikm, &salt, &info, 42);
+        assert_eq!(
+            hex::encode(&okm[..]),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+        // Truncation and block counts agree with the reference implementation
+        // for lengths that straddle the 32-byte block boundary.
+        for len in [0usize, 1, 31, 32, 33, 64, 95, 96, 128] {
+            let full = hkdf_sha256(&ikm, &salt, &info, 128);
+            let part = hkdf_sha256(&ikm, &salt, &info, len);
+            assert_eq!(part.len(), len);
+            assert_eq!(&part[..], &full[..len]);
+        }
     }
 
     #[test]

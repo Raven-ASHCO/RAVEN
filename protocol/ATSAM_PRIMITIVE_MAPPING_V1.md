@@ -47,7 +47,7 @@ This document maps each ATSAM / sealed-content component to: primitive → purpo
 
 | Component | Primitive(s) | Purpose | Threat addressed | Test vector path | Implementation path |
 |---|---|---|---|---|---|
-| **Hybrid pairing** | X25519 ECDH + ML-KEM-768 (FIPS 203) + SHA-256 transcript | Establish shared `K_root` from an identity-signed offline prekey without trusting a message server | Passive PQ break of classical ECDH alone; transcript confusion / cross-protocol replay | `shared-vectors/rvn1/atsam/mlkem768_hybrid_kat_001.json` + production-disabled `pair_init_v1_001.json`; live carrier/state still gated | `ATSAMHybridPairing.swift` + `raven_core::atsam_mlkem` + [`RAVEN_PAIR_INIT_V1.md`](RAVEN_PAIR_INIT_V1.md) |
+| **Hybrid pairing** | X25519 ECDH + ML-KEM-768 (FIPS 203) + SHA-256 transcript | Establish shared `K_root` from an identity-signed offline prekey without trusting a message server | Passive PQ break of classical ECDH alone; transcript confusion / cross-protocol replay | `shared-vectors/rvn1/atsam/mlkem768_hybrid_kat_001.json` + production-disabled `pair_init_v1_001.json`; live carrier/state still gated | `ATSAMHybridPairing.swift` + `raven_core::atsam_mlkem` (initiator API is only the split `begin_hybrid_initiation` → `PendingHybridInitiation::finalize`; caller-coin encapsulation is test-only) + [`RAVEN_PAIR_INIT_V1.md`](RAVEN_PAIR_INIT_V1.md) |
 | **Root derivation** | HKDF-SHA256 | `K_root = HKDF(ikm=Z_X‖Z_PQ, salt=transcript, info="ATSAM/v1/pair-init"‖transcript, L=32)` | Binding pairing context into root; PRG expansion | `root_hkdf_001.json` and exact signed PairInit root in `pair_init_v1_001.json` | `ATSAMRootKey.swift` / `ATSAMRootDerivation` / pure Rust+Python PairInit |
 | **Key tree** | HKDF-SHA256 per typed label | Domain-separated sub-keys: BBE, Ghost Handshake, Ghost Route, PV-Stealth, PV seed, msg-seal seed | Cross-layer key reuse | Indexed-profile ACK/route subset: `shared-vectors/rvn1/atsam/indexed_session_v1_subkeys_001.json`; other tree branches still lack committed KATs | `ATSAMKeyTree.swift`, labels in `ATSAMConstants.swift`; additive Rust/Python reference only for indexed profile |
 | **Chain ratchet (v2)** | HKDF-SHA256 one-way chain | Intended per-direction FS only when predecessor destruction and state persistence are atomic; bounded skipped-key cache | Device compromise decrypting past traffic | Chain KDF KAT exists; crash/rollback vectors still required | `ATSAMChainRatchet.swift`, persistence in `ATSAMRootStorage.swift` |
@@ -84,6 +84,20 @@ magic(8) || proto=0x01 || suite=0x01 || nonce(12) || ciphertext || tag(16)
 
 Key: deterministic HKDF from long-lived root + sender‖recipient‖msgId — **no forward secrecy**.
 
+AAD (v1), exactly as `raven_core::atsam_aead::build_aad_v1` computes it and as
+`aad_v1_hex` in `shared-vectors/rvn1/atsam/rvna1_v2_aead_known_root_001.json`
+pins it:
+
+```
+AAD_v1 = SHA-256("ATSAM/v1/msg-seal/aad" || 0x00 || 0x00 || S || 0x00 || R || 0x00 || msgId)
+```
+
+The two leading zero bytes are the domain terminator and a zero separator (v1
+binds no proto/suite/index). `S`, `R`, and `msgId` are the raw UTF-8 bytes of
+the sender, recipient, and message-id strings, with no length prefix and no
+terminator; the single `0x00` separators are the only delimiters (KAT:
+`S = "alice"`, `R = "bob"`, `msgId = "msg-001"`).
+
 ### 3.3 RVNA1 v2 (emit)
 
 ```
@@ -97,6 +111,13 @@ magic(8) || proto=0x02 || suite=0x01 || index_be32(4) || nonce(12) || ciphertext
   - `CK_{i+1} = HKDF(CK_i, info="ATSAM/v2/chain-advance")`
 - Bounds: `maxSkippedKeys = maxForwardJump = 256`.
 - AAD (v2): `SHA-256("ATSAM/v1/msg-seal/aad" ‖ 0 ‖ proto ‖ suite ‖ index_be ‖ 0 ‖ sender ‖ 0 ‖ recipient ‖ 0 ‖ msgId)`.
+  `proto` and `suite` are one byte each and `index_be` is the 4-byte big-endian
+  chain index from the header (`build_aad_v2`; pinned by `aad_v2_hex`).
+  `sender`, `recipient`, and `msgId` are encoded as in v1: raw UTF-8 string
+  bytes, no length prefix, no terminator. Under the indexed-session profile
+  (`0x03`) they are the canonical `RavenAddressV1` strings and the 36-character
+  uppercase UUID text of the outer `message_id`
+  ([`ATSAM_INDEXED_SESSION_PROFILE_V1.md`](ATSAM_INDEXED_SESSION_PROFILE_V1.md) §3).
 
 RVNA1 v2's indexed byte layout is frozen, but its pre-profile session context
 is ambiguous. It MUST NOT be silently treated as the indexed-session profile.
@@ -115,9 +136,13 @@ AAD encoding, and the exact 101-byte signed / 143-byte sealed ACK.
 `0x03` is intentionally not accepted by live classifiers. The additive
 [`RAVEN_PAIR_INIT_V1.md`](RAVEN_PAIR_INIT_V1.md) codec negotiates
 and transcript-binds profile identifier `ATSAM/indexed-session/v1`, but it and
-this profile remain disabled pending the documented carrier/state gates.
+this profile remain disabled pending the documented carrier/state gates. The
+single recorded exception is the LAN-direct slice under the owner waiver
+[`WAIVER-LAN-DIRECT-2026-10-07`](../docs/WAIVER_LAN_DIRECT_INDEXED_SESSION_2026-10-07.md), which keeps PairInit V1 and RVNA1 `0x03`
+live for LAN direct between two `raven-node` services only; every other path
+stays disabled.
 
-### 3.4 Root (pairing)
+### 3.5 Root (pairing)
 
 ```
 ikm = Z_X || Z_PQ          # 32 ‖ 32
@@ -161,7 +186,7 @@ Transcript domain: `"ATSAM/v1/transcript"` prepended before SHA-256 (`ATSAMConst
 | ATSAM v2 chain HKDF labels (no AEAD) | **Proven** — `atsam/chain_kdf_001.json` (Rust `atsam_kdf` + Swift ratchet) |
 | RVNA1 header layout classify | **Proven** — `atsam/rvna1_header_layouts_001.json` |
 | RVNA1 v2 AEAD + AAD with **known** `K_root` | **Proven** — `atsam/rvna1_v2_aead_known_root_001.json` (Rust `atsam_aead`; no ML-KEM) |
-| Indexed-session subkeys, allocator, and RVNA1 `0x03` ACK with known `K_root` | **Proven as deterministic KDF/codec bytes only** — `atsam/indexed_session_v1_*.json`; production disabled pending negotiated signed PairInit |
+| Indexed-session subkeys, allocator, and RVNA1 `0x03` ACK with known `K_root` | **Proven as deterministic KDF/codec bytes only** — `atsam/indexed_session_v1_*.json`; production disabled pending negotiated signed PairInit. No forward secrecy or post-compromise security inside a session (profile §2.4) |
 | Signed offline PairInit, provisional root, and deferred key confirmation | **Proven as exact codec/KDF/signature bytes in Python, Rust, and Swift** — `atsam/pair_init_v1_001.json`; production disabled, carrier/endpoint-state/prekey-lifecycle/external review still open |
 | Envelope body bytes are real ATSAM ciphertext | **False today** for envelope fixtures (ASCII placeholders); live iOS emits real RVNA1 |
 | Rust decrypt without authenticated persisted session / ML-KEM pairing | **Not implemented** — network path relays opaque bytes and emits no endpoint ACK; KATs assume a supplied test `K_root` |

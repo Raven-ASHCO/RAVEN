@@ -13,6 +13,21 @@ If you need to fix a wire-level bug:
 3. Run both `v1/` and `v2/` consumers in parallel during the rollout.
 4. Mark `v1/` files with `"deprecated_in_v2": true` once the fleet is on v2.
 
+## Known v1 flaws (not fixed in place)
+
+- **Pipe-joined signing inputs are ambiguous** (`docs/MESH_PROTOCOL.md` §I.13):
+  the Rule 1/2/4/5 bytes in `v1/canonicalization/*_pipe_*` join fields with a
+  bare `|`, so a relay can re-split signed fields (e.g. strip a DM geo-fence)
+  without breaking the signature. The v1 vectors stay as they are; until v2,
+  receivers reject pipe-form envelopes with `|` inside a signed field
+  (MESH_PROTOCOL.md §D). Fix: `docs/MESH_PROTOCOL_v2.md` §2.
+- **Rule 3 "sorted keys" JSON is not canonical across languages** (§I.14).
+  Fix: RFC 8785, `docs/MESH_PROTOCOL_v2.md` §3.
+
+The draft fix vectors are in `v2/canonicalization/` (`"protocol_version":
+"v2-draft"`, written by `generate_v1.py`). They are not frozen until v2 is
+adopted; from then on the rules above apply to `v2/` too.
+
 ## Adding a new vector
 
 Acceptable: append a new `<name>_NNN.json` (next number) with a new edge case.

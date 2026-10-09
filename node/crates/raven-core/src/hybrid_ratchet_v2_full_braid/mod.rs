@@ -1,6 +1,13 @@
 //! Full Braid Slice 2 — lab-only module (`full-braid-lab`).
 //!
-//! Normative design: `docs/superpowers/specs/2026-08-16-full-braid-slice2-design.md` (Rev20).
+//! The `design §x` comments in this module cite the Slice 2 design document
+//! (`2026-08-16-full-braid-slice2-design.md`, Rev20). That file is NOT tracked
+//! in this repository (`docs/superpowers/specs/` only holds the iOS redesign
+//! spec), so those section numbers cannot be checked here. The in-repo
+//! normative sources are `protocol/ATSAM_HYBRID_RATCHET_V2.md` (Revision 10,
+//! §5.2 Full Braid lab rules and §6.3 SCKA KDF tables), the Python reference in
+//! `protocol/reference/raven_protocol/full_braid_*.py`, and the frozen
+//! `shared-vectors/rvn1/atsam/full_braid_*.json` / `tr_braid_*.json` vectors.
 //! Task 0 pin audit MUST pass before state-machine work.
 
 #![cfg(feature = "full-braid-lab")]
@@ -17,6 +24,8 @@ mod full_braid_vectors;
 pub mod host_lab;
 pub mod init;
 pub mod pipeline;
+#[cfg(test)]
+mod pipeline_soak;
 pub mod spqr_codec;
 pub mod spqr_pin_audit;
 pub mod state_codec;

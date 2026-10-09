@@ -1,0 +1,111 @@
+# Scheduled canary — NOT a required check.
+#  * latest-stable: the product workflows pin RUST_TOOLCHAIN; this job shows
+#    early when a new stable rustc / clippy would break them.
+#  * reliability-matrix: the looped software-path matrix behind the checklist's
+#    reliability claims (scripts/reliability_matrix_20.sh), one iteration.
+#  * fuzz: short cargo-fuzz campaign over every node/fuzz target (nightly).
+name: Raven Toolchain Canary
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.98.0"
+
+concurrency:
+  group: raven-toolchain-canary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  latest-stable:
+    name: Latest stable Rust (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RAVEN_IDENTITY_BACKEND: locked-file
+      RAVEN_ALLOW_EPHEMERAL_DATA_DIR: "1"
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: rustc version
+        run: rustc --version
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --locked -p raven-core -p ash -p raven-node -p raven-swarm --all-targets -- -D warnings
+      - name: test
+        run: cargo test --locked -p raven-core -p ash -p raven-node
+
+  reliability-matrix:
+    name: Reliability matrix (software paths, 1 iteration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: node
+          prefix-key: reliability-matrix
+      # 11 software scenarios must pass; iOS / Windows / Linux-container probes
+      # are platform SKIPs on this runner (never counted as passes).
+      - name: Run scripts/reliability_matrix_20.sh
+        env:
+          ITERS: "1"
+          MIN_TOTAL_PASS: "11"
+          SKIP_IOS: "1"
+          SKIP_DOCKER: "1"
+          SKIP_WINDOWS: "1"
+          SKIP_LINUX_CONTAINER: "1"
+        run: bash scripts/reliability_matrix_20.sh
+      - name: Upload matrix artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: reliability-matrix
+          path: |
+            node/proof_artifacts/
+            !node/proof_artifacts/LATEST_RELIABILITY
+          if-no-files-found: warn
+
+  fuzz:
+    name: cargo-fuzz short campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: node/fuzz
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Fuzz every target for 2 minutes
+        run: |
+          set -euo pipefail
+          for target in $(cargo fuzz list); do
+            echo "=== $target ==="
+            cargo fuzz run "$target" -- -max_total_time=120 -rss_limit_mb=2048
+          done
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-artifacts
+          path: node/fuzz/artifacts/
+          if-no-files-found: ignore

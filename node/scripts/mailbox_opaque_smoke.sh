@@ -41,11 +41,11 @@ print(packed.hex())
 PY
 )"
 
-RAVEN_ALLOW_EPHEMERAL_DATA_DIR=1 "$ASH" --data-dir "$TMP/store" mailbox put \
-  --k-route-hex "$K_ROUTE" --epoch "$EPOCH" --slot "$SLOT" --envelope-hex "$ENV_HEX"
+RAVEN_ALLOW_EPHEMERAL_DATA_DIR=1 RAVEN_K_ROUTE_HEX="$K_ROUTE" "$ASH" --data-dir "$TMP/store" mailbox put \
+  --epoch "$EPOCH" --slot "$SLOT" --envelope-hex "$ENV_HEX"
 
-OUT="$(RAVEN_ALLOW_EPHEMERAL_DATA_DIR=1 "$ASH" --data-dir "$TMP/store" mailbox get \
-  --k-route-hex "$K_ROUTE" --epoch "$EPOCH" --slot "$SLOT")"
+OUT="$(RAVEN_ALLOW_EPHEMERAL_DATA_DIR=1 RAVEN_K_ROUTE_HEX="$K_ROUTE" "$ASH" --data-dir "$TMP/store" mailbox get \
+  --epoch "$EPOCH" --slot "$SLOT")"
 
 echo "$OUT" | grep -q 'store_tag=' || {
   echo "FAIL: expected opaque store_tag hit"
@@ -58,8 +58,8 @@ echo "$OUT" | grep -qi 'username' && {
 }
 
 # Overlap: previous epoch should still find when epoch advanced without put.
-OUT2="$(RAVEN_ALLOW_EPHEMERAL_DATA_DIR=1 "$ASH" --data-dir "$TMP/store" mailbox get \
-  --k-route-hex "$K_ROUTE" --epoch $((EPOCH + 1)) --slot "$SLOT")"
+OUT2="$(RAVEN_ALLOW_EPHEMERAL_DATA_DIR=1 RAVEN_K_ROUTE_HEX="$K_ROUTE" "$ASH" --data-dir "$TMP/store" mailbox get \
+  --epoch $((EPOCH + 1)) --slot "$SLOT")"
 echo "$OUT2" | grep -q 'store_tag=' || {
   echo "FAIL: overlap retrieve (prev epoch) expected a hit"
   echo "$OUT2"

@@ -1,0 +1,32 @@
+{
+  "name": "ACK v2 signing input — delivered",
+  "description": "v1 ack_pipe_001's ACK framed per v2 with kind 0x04, plus the v2 ACK relay dedup key (§2.3).",
+  "protocol_version": "v2-draft",
+  "spec_reference": "MESH_PROTOCOL_v2.md §2 + MESH_PROTOCOL.md §C.4",
+  "created_at": "2026-05-15T00:00:00Z",
+  "deterministic": true,
+  "inputs": {
+    "ack": {
+      "originalMessageId": "dm-001",
+      "senderId": "bob",
+      "recipientId": "alice",
+      "status": "delivered",
+      "timestampSec": 1700000060.0
+    },
+    "signer": "bob"
+  },
+  "expected": {
+    "fields": [
+      "dm-001",
+      "bob",
+      "alice",
+      "delivered",
+      "1700000060000"
+    ],
+    "signing_bytes_hex": "ff52564d4553483204000500000006646d2d30303100000003626f6200000005616c6963650000000964656c6976657265640000000d31373030303030303630303030",
+    "signature_hex": "133724ccecf8b26b91be0e23c17971e0bb9a6e5c4e04866875f90446a6797addc5508f58a6f5cd9df83d0b76b647e06e84bbe842e7297a271b0cdd43c14b2708",
+    "signature_b64": "EzckzOz4smuRvg4jwXlx4LuablxOBIZodfkERqZ5et3FUI9YpvXNnfg9C3a2R+BuhLvoQucpeicbDN1DwUsnCA==",
+    "relay_key": "ack2:da92f530397465dc96585f14f28efdef31b4698fff8a3125787ed25029a911b3"
+  },
+  "notes": "DRAFT (docs/MESH_PROTOCOL_v2.md): no port ships v2 yet; frozen once v2 is adopted."
+}

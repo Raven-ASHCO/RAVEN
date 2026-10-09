@@ -16,7 +16,14 @@ ART="${ROOT}/artifacts/full-braid-0b3-secret-service-gate"
 mkdir -p "$ART"
 : >"$ART/summary.txt"
 
+SKIPPED=0
 pass() { echo "PASS: $*" | tee -a "$ART/summary.txt"; }
+# A step that asserts nothing must not read as PASS in the summary an independent
+# reviewer relies on: record it as SKIP with the reason.
+skip() {
+  SKIPPED=$((SKIPPED + 1))
+  echo "SKIP: $*" | tee -a "$ART/summary.txt"
+}
 
 echo "=== Clippy -D warnings ===" | tee -a "$ART/summary.txt"
 cargo clippy -p raven-core --features full-braid-durable-lab -- -D warnings \
@@ -59,29 +66,43 @@ dbus-run-session -- bash -c '
 ' 2>&1 | tee "$ART/neg-locked.log"
 pass "locked/prompt typed codes"
 
-echo "=== Multi-collection / CreateCollection policy ===" | tee -a "$ART/summary.txt"
-dbus-run-session -- bash -c '
-  set -euo pipefail
-  eval "$(printf "\n" | gnome-keyring-daemon --unlock 2>/dev/null || true)"
-  eval "$(gnome-keyring-daemon --start --components=secrets 2>/dev/null || true)"
-  if command -v busctl >/dev/null; then
-    busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
-      org.freedesktop.Secret.Service CreateCollection "a{sv}s" 0 "" \
-      >/tmp/raven-0b3-cc.out 2>/tmp/raven-0b3-cc.err || true
-    echo "CreateCollection out=$(head -c 200 /tmp/raven-0b3-cc.out 2>/dev/null || true)"
-    echo "CreateCollection err=$(head -c 200 /tmp/raven-0b3-cc.err 2>/dev/null || true)"
-  fi
-  echo "backend never calls create_collection / get_any_collection"
-' 2>&1 | tee "$ART/neg-multicol.log"
-pass "multi-collection policy (default-only)"
+echo "=== Multi-collection / CreateCollection policy (static source assertion) ===" | tee -a "$ART/summary.txt"
+# The backend must only ever use the existing default collection. A real assertion
+# over the backend sources (comments excluded): no create_collection /
+# CreateCollection / get_any_collection call may exist. Both files must be present
+# and non-empty so a rename cannot turn this into a vacuous pass.
+BACKEND_DIR="$ROOT/node/crates/raven-core/src/full_braid_durable_lab"
+BACKEND_SRCS=("$BACKEND_DIR/protected_anchor_linux_ss.rs" "$BACKEND_DIR/protected_anchor_linux.rs")
+for f in "${BACKEND_SRCS[@]}"; do
+  [[ -s "$f" ]] || { echo "FAIL: backend source missing or empty: $f" >&2; exit 1; }
+done
+COLLECTION_HITS="$(grep -nE 'create_collection|CreateCollection|get_any_collection' "${BACKEND_SRCS[@]}" \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+printf '%s\n' "$COLLECTION_HITS" >"$ART/neg-multicol.log"
+if [[ -n "$COLLECTION_HITS" ]]; then
+  echo "FAIL: backend references a collection-creating / non-default collection API:" >&2
+  echo "$COLLECTION_HITS" >&2
+  exit 1
+fi
+grep -q 'default_collection' "${BACKEND_SRCS[0]}" \
+  || { echo "FAIL: backend no longer resolves the default collection" >&2; exit 1; }
+echo "no create_collection / CreateCollection / get_any_collection in backend sources" | tee -a "$ART/neg-multicol.log"
+pass "multi-collection policy (static: backend never creates or enumerates other collections)"
 
 echo "=== Malformed metadata plant ===" | tee -a "$ART/summary.txt"
-dbus-run-session -- bash -c '
+# Plants an item whose attributes the backend must reject on load. The plant itself
+# is asserted (no `|| true`): it must be stored and visible to search. NO verifier
+# runs against the planted state (no test in the crate exercises the load path's
+# CORRUPT_ATTRIBUTES rejection yet), so this step is recorded as SKIP, never PASS.
+# The search output is captured, not piped into `grep -q` (that would SIGPIPE
+# secret-tool and trip pipefail), and never echoed: it contains the planted secret.
+# No apostrophes inside the quoted script below (it is one single-quoted string).
+MALFORMED_PLANT_STATUS="$(dbus-run-session -- bash -c '
   set -euo pipefail
   eval "$(printf "\n" | gnome-keyring-daemon --unlock 2>/dev/null || true)"
   eval "$(gnome-keyring-daemon --start --components=secrets 2>/dev/null || true)"
   if ! command -v secret-tool >/dev/null; then
-    echo "SKIP: secret-tool not installed"
+    echo "NO_SECRET_TOOL"
     exit 0
   fi
   SCOPE="$(python3 -c "import hashlib,time,os; print(hashlib.sha256(f\"m-{time.time()}-{os.getpid()}\".encode()).hexdigest())")"
@@ -90,12 +111,20 @@ dbus-run-session -- bash -c '
     protocol atsam-full-braid-v1 \
     kind seed \
     scope "$SCOPE" \
-    evil extra-key \
-    || true
-  secret-tool search scope "$SCOPE" || true
-  echo "malformed plant done; load path must CORRUPT_ATTRIBUTES on verify"
-' 2>&1 | tee "$ART/neg-malformed.log"
-pass "malformed metadata plant"
+    evil extra-key
+  FOUND="$(secret-tool search scope "$SCOPE" 2>&1)"
+  case "$FOUND" in
+    *"evil = extra-key"*) ;;
+    *) echo "planted item not returned by search" >&2; exit 1 ;;
+  esac
+  echo "PLANTED"
+' 2>"$ART/neg-malformed.err" | tail -n 1)" || { cat "$ART/neg-malformed.err" >&2; echo "FAIL: malformed-metadata plant did not store / was not searchable" >&2; exit 1; }
+echo "plant status: $MALFORMED_PLANT_STATUS" | tee "$ART/neg-malformed.log"
+case "$MALFORMED_PLANT_STATUS" in
+  PLANTED) skip "malformed metadata plant: item planted but NO verifier asserts CORRUPT_ATTRIBUTES on load (needs a protected_anchor_linux test)" ;;
+  NO_SECRET_TOOL) skip "malformed metadata plant: secret-tool not installed, nothing planted or asserted" ;;
+  *) echo "FAIL: unexpected plant status: $MALFORMED_PLANT_STATUS" >&2; exit 1 ;;
+esac
 
 echo "=== Two-thread concurrent seed (no collapse) ===" | tee -a "$ART/summary.txt"
 dbus-run-session -- bash -c '
@@ -109,5 +138,10 @@ dbus-run-session -- bash -c '
 ' 2>&1 | tee "$ART/neg-concurrent.log"
 pass "concurrent seed (preserve duplicates, no collapse)"
 
-echo "ALL GATE CHECKS COMPLETE — stop for Independent re-review (no commit/push/stage; no 0B.4)" \
-  | tee -a "$ART/summary.txt"
+if [[ "$SKIPPED" -gt 0 ]]; then
+  echo "GATE CHECKS COMPLETE WITH $SKIPPED SKIPPED STEP(S) — not every claim is asserted; see SKIP lines in summary.txt. Stop for Independent re-review (no commit/push/stage; no 0B.4)" \
+    | tee -a "$ART/summary.txt"
+else
+  echo "ALL GATE CHECKS COMPLETE — stop for Independent re-review (no commit/push/stage; no 0B.4)" \
+    | tee -a "$ART/summary.txt"
+fi

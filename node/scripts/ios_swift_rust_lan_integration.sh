@@ -30,6 +30,8 @@ cleanup() {
 trap cleanup EXIT
 
 source "${HOME}/.cargo/env" 2>/dev/null || true
+# shellcheck source=../../scripts/lib/harness_util.sh
+source "$ROOT/scripts/lib/harness_util.sh"
 export RAVEN_IDENTITY_BACKEND=locked-file
 export RAVEN_LAB_TEST_A=1
 
@@ -69,11 +71,11 @@ echo "starting Rust lan_direct listener on 127.0.0.1:${PORT}..." >&2
 NODE_PID=$!
 
 for _ in $(seq 1 80); do
-  if [[ -S "$WORKDIR/raven-node.sock" ]]; then break; fi
+  if raven_ipc_up "$ASH" "$WORKDIR"; then break; fi
   sleep 0.1
 done
-if [[ ! -S "$WORKDIR/raven-node.sock" ]]; then
-  echo "FAIL: raven-node did not start" >&2
+if ! raven_ipc_up "$ASH" "$WORKDIR"; then
+  echo "FAIL: raven-node did not start (no IPC answer)" >&2
   cat "$WORKDIR/node.log" >&2 || true
   exit 1
 fi

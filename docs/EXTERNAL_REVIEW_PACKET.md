@@ -1,9 +1,16 @@
 # External Review Packet — Raven Serverless V1
 
 **Purpose:** Hand this directory of pointers to an independent protocol/crypto reviewer.  
-**Branch:** `feature/raven-serverless-v1`  
-**Claim:** Implementation + automated proof harness complete for software-automatable §59.  
-**Not claimed:** Full §59/§60 DoD, notarization, live CGNAT, physical BLE radio matrix.
+**Branch (historical):** authored on `feature/raven-serverless-v1`; this file now lives on `main` and is a dated snapshot, not a statement about an open branch  
+**Claim:** Lab-level implementation and an automated proof harness exist for software-automatable §59 steps (harness fixed 2026-09-29; a fresh enforced run is pending, earlier green runs are INVALIDATED). This is **not** a security claim: RVN1 messaging is under a production HOLD.  
+**Not claimed:** Full §59/§60 DoD, notarization, live CGNAT, physical BLE radio matrix, any external review sign-off, or any confidentiality guarantee.
+
+> **Read first — production HOLD.** RVN1 messaging is **not approved for production** and no independent
+> security review has happened. Before using any "Protected"-style statement in this packet, read
+> [`THREAT_MODEL.md`](THREAT_MODEL.md) (current executable posture table; includes the live LAN-direct slice),
+> [`protocol/SECURITY_ERRATA_RVN1_2026-08-13.md`](../protocol/SECURITY_ERRATA_RVN1_2026-08-13.md), and
+> connectivity matrix §0 ([`network/raven-swarm-connectivity-matrix.md`](network/raven-swarm-connectivity-matrix.md)).
+> Citations tagged **OFF-MAIN** (Swift / `ios-native`) point at a tree that is not in this repository.
 
 ---
 
@@ -59,12 +66,12 @@ Primary map: [`protocol/ATSAM_PRIMITIVE_MAPPING_V1.md`](../protocol/ATSAM_PRIMIT
 
 | Layer | Primitive | Impl |
 |---|---|---|
-| Envelope auth | Ed25519 | `raven_core::envelope`, Swift `MeshCryptoService` |
+| Envelope auth | Ed25519 | `raven_core::envelope`, Swift `MeshCryptoService` (**OFF-MAIN**) |
 | Address | SHA-256[:20] → Bech32m | `raven_core::address` |
 | Routing tag | HMAC-SHA256 | `raven_core::routing_tag` |
-| Message seal RVNA1 | ChaCha20-Poly1305 | iOS ATSAM + Rust `seal` |
-| Hybrid root | X25519 ‖ ML-KEM-768 | `atsam_mlkem` + Swift hybrid pairing |
-| Chain ratchet | HKDF-SHA256 | iOS `ATSAMChainRatchet` |
+| Message seal RVNA1 | ChaCha20-Poly1305 | iOS ATSAM (**OFF-MAIN**) + Rust `seal` |
+| Hybrid root | X25519 ‖ ML-KEM-768 | `atsam_mlkem` + Swift hybrid pairing (**OFF-MAIN**) |
+| Chain ratchet | HKDF-SHA256 | iOS `ATSAMChainRatchet` (**OFF-MAIN**) |
 
 Known gaps called out in the mapping doc (PLACEHOLDER KATs, CryptoKit CT interop).
 
@@ -93,7 +100,7 @@ bash scripts/final_serverless_proof.sh
 cat node/proof_artifacts/LATEST/SUMMARY.md
 ```
 
-Expect `AUTOMATED_PROOF_GREEN`. Hardware leftovers listed in each run’s `BLOCKED.md`.
+Expect `AUTOMATED_PROOF_GREEN` (the script exits 1 otherwise; every assertion in a step is enforced and `--self-test` proves it). This is a **lab** build: transport steps use the `unsafe-demo-crypto` interim cipher, whose key any observer of the two public keys can derive. Hardware, human and lab-crypto leftovers are listed in each run’s `BLOCKED.md`.
 
 ---
 
@@ -110,7 +117,8 @@ Expect `AUTOMATED_PROOF_GREEN`. Hardware leftovers listed in each run’s `BLOCK
 - Headless CoreBluetooth radio (`raven-node --features corebluetooth` is a compile seam only)
 
 ### Software gaps / partials
-- Long fuzz campaigns beyond `fuzz_smoke`
+- Long fuzz campaigns: `node/fuzz` cargo-fuzz targets exist (envelope, RSO1, RLB1, carrier frames, PairInit, device cert, revocation, IPC, session/records) and run briefly on a weekly schedule; no sustained campaign / coverage report yet
+- Bridge confidentiality under authenticated ATSAM sessions has no automated end-to-end evidence (bridged harness paths use the lab interim cipher)
 - Full ML-KEM CT interop KATs with CryptoKit
 - MSI installer (unsigned layout exists; store packaging open)
 
@@ -118,8 +126,8 @@ Expect `AUTOMATED_PROOF_GREEN`. Hardware leftovers listed in each run’s `BLOCK
 
 ## 7. Reviewer checklist (suggested)
 
-1. Recompute `PROTOCOL_FREEZE_HASHES_V1.md`; diff against committed copy.
+1. Run `bash scripts/freeze_protocol_hashes.sh --check` (also a CI step); any drift from the committed manifest fails.
 2. Walk threat-model table; spot-check citations against code.
 3. Run Python + Rust vector suites; attach logs.
-4. Read `bridge_abc_demo` + final proof SUMMARY — confirm bridge never sees plaintext.
+4. Read `bridge_abc_demo` + final proof SUMMARY — confirm the bridge never **logs or stores** plaintext. Note the bridged paths use the lab interim cipher (key derivable from public keys), so this does not show the bridge *cannot* decrypt; review the ATSAM session path for that.
 5. File findings against branch tip SHA (local; may be unpublished).

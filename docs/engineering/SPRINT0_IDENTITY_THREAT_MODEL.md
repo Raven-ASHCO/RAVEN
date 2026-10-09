@@ -20,7 +20,7 @@ Crypto asks if a signature is valid. AuthZ asks whether the **key has authority 
 | Normative revoke wire | `RAVEN_DEVICE_REVOCATION_V1` (`RVDR1`) | APPROVED companion; **production disabled** |
 | Continuity / recovery | `RAVEN_IDENTITY_CONTINUITY_V2` | Quorum recovery; partitions; no instant global activate/revoke |
 | Prekey lifecycle | `RAVEN_PREKEY_*`, `prekey_lifecycle.rs` | Claim / grace / fail-closed exhaustion |
-| Seed storage | `IDENTITY_SEED_STORAGE.md` | Keychain/DPAPI/Secret Service; locked-file fallback |
+| Seed storage | `IDENTITY_SEED_STORAGE.md` | Keychain/DPAPI; Linux Secret Service (load existing only — creation disabled before R1); locked-file is a debug/lab/CI-only override, refused in Release |
 | RDAP authz | `team_agents/raven_identity.py`, `executor.py`, `server.py` | HTTP request auth + task delegation + address-level revoke list |
 
 ---
@@ -107,14 +107,14 @@ Crypto asks if a signature is valid. AuthZ asks whether the **key has authority 
 |------|-------|-------|
 | **OPEN MODE** | `TEAM_REQUIRE_SIGNED=0` / `require_signed_tasks=False` | Card warns `⚠ OPEN MODE`; accepts unsigned tasks. Ops risk if left on. |
 | **Missing Raven HTTP headers in open mode** | `RpcIngressLimitMiddleware` | Owner becomes `open:{client}`; `is_authenticated=False`. |
-| **Linux locked-file seed** | Headless/musl | Approved fallback; host compromise ⇒ seed compromise. |
+| **Linux locked-file seed** | Debug / lab / CI only (`RAVEN_IDENTITY_BACKEND=locked-file`) | **Not** an approved fallback and refused in Release builds (Linux Release identity creation is disabled pending R1). Where used, host compromise ⇒ seed compromise. |
 | **OTP soft anomaly** | Prekey bundle | Dual claim of same OTP logged soft, not hard-drop (availability > exclusivity). |
 
 ### 3.2 Dangerous defaults / API footguns (priority)
 
 | Sev | Risk | Evidence | Recommended fix |
 |-----|------|----------|-----------------|
-| **P0** | Soft load of device registry / revocation store **swallows corrupt JSON → empty denylist** | `load_device_registry` / `RevocationStore::load` use `unwrap_or_default()` | Authz paths MUST use `*_checked`; treat soft APIs as display-only; add lint/CI ban on soft load in crypto paths |
+| **P0** | Soft load of device registry / revocation store **swallows corrupt JSON → empty denylist** | `load_device_registry` / `RevocationStore::load` use `unwrap_or_default()` (2026-10-05: authz paths in `lan_dispatch.rs` use `*_checked`; `BlockList` has only `load_checked`; the soft loaders have no production callers, only tests) | Authz paths MUST use `*_checked`; treat soft APIs as display-only; add lint/CI ban on soft load in crypto paths |
 | **P0** | `verify_delegation(..., required=False)` default | `raven_identity.py` | Flip default to `required=True` or rename to make opt-in explicit; OPEN MODE remains the only unsigned path |
 | **P1** | Optional `revoked=None` skips revoke check | `verify_*` signatures | Require explicit empty set; never `None` meaning “don’t check” |
 | **P1** | Address-level RDAP revoke ≠ device-level RAVEN revoke | RDAP JSON list of addresses vs RVDR1 lineage | See `G5_CROSS_STACK_REVOKE_POLICY.md` |
@@ -151,7 +151,7 @@ From `MULTI_DEVICE_PARTITION_REVOCATION.md` / RVDR1 non-claim:
 | ID | Gap | Impact | Owner propose |
 |----|-----|--------|---------------|
 | G1 | RVDR1 production flags off | Full fail-closed apply / corrupt / exhausted not enforced on shipping surfaces | Identity + Crypto + Architect gate |
-| G2 | Soft `unwrap_or_default` on revoke/registry load | Corrupt file ⇒ appear unrevoked | Identity AuthZ **P0** (held for Sprint 1 batch) |
+| G2 | Soft `unwrap_or_default` on revoke/registry load | Corrupt file ⇒ appear unrevoked | Identity AuthZ **P0** (2026-10-05: mitigated in the authz paths via `*_checked`; the remaining soft loaders have no production callers — removal/lint still open) |
 | G3 | No automatic contact warning UX on device change | Social engineering / late discovery | Apple/Windows + Identity |
 | G4 | Manual OOB revoke exchange only (QR/file) | Slow propagation under partition | P2P/DTN + Identity |
 | G5 | RDAP revokes **identity address**; RAVEN revokes **device lineage** | Steal one device ≠ RDAP peer revoke; revoke RDAP peer ≠ other devices of same user | See `G5_CROSS_STACK_REVOKE_POLICY.md` |

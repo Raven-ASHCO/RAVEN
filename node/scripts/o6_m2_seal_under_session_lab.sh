@@ -37,6 +37,8 @@ export NO_COLOR=1
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 NODE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../../scripts/lib/harness_util.sh
+source "$ROOT/scripts/lib/harness_util.sh"
 BIN="$NODE_ROOT/target/debug"
 ASH="$BIN/ash"
 NODE="$BIN/raven-node"
@@ -171,7 +173,7 @@ PY
 wait_sock() {
   local dir="$1" log="$2" marker="$3"
   for _ in $(seq 1 150); do
-    if [[ -S "$dir/raven-node.sock" ]] && grep -q "$marker" "$log"; then
+    if raven_ipc_up "$ASH" "$dir" && grep -q "$marker" "$log"; then
       return 0
     fi
     if grep -Eqi 'lan_direct failed|service identity preflight failed' "$log" 2>/dev/null; then

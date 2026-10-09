@@ -116,6 +116,14 @@ has a tighter 256 KiB body ceiling. Media is outside the first serverless
 milestone and MUST use a separately versioned bounded/chunked transport rather
 than silently raising the canonical text-object limit.
 
+Encoders MUST fail closed as well: a header, body, or authentication whose
+length does not fit its fixed-width field MUST NOT be packed or signed with a
+truncated/wrapped length, which would shift every later field boundary. The
+Rust reference exposes `Envelope::try_pack` / `try_signing_bytes` (reject both
+field overflow and the 1,048,576-byte ceiling), its `pack` / `signing_bytes`
+refuse field overflow, and `verify` returns false for any envelope that could
+not be encoded canonically.
+
 > **Implemented transport guard (2026-08-13).** The legacy Go media bridge has
 > a wider 24 MiB carrier frame for old server payloads; that does not make an
 > oversized object valid RVN1. It still reserves the declared buffer before
@@ -144,7 +152,11 @@ conversation/room identifier in the clear:
 - `dest_device_hint` is explicitly a *hint*: it is mutable, excluded from the
   signature (§2), and MUST be treated by any receiver as unauthenticated —
   never as a verified recipient identity. Implementations MUST NOT put
-  anything more identifying than a small opaque hint value in it.
+  anything more identifying than a small opaque hint value in it. A value any
+  holder of the recipient's public key can compute (such as a truncated hash
+  of it) names the recipient to every relay; the indexed-session profile
+  therefore sends `0` (`ATSAM_ENDPOINT_TRANSACTION_V1.md` §4.1, erratum
+  2026-10-08).
 - Everything with actual semantic content (message text, alias claims, ACK
   status, capability bits) lives inside `ratchet_header_ciphertext` /
   `message_ciphertext`, which are opaque to any party without the session key.
@@ -169,14 +181,20 @@ opaque relay. Each stage either rejects/stops or passes to the next stage.
    implementation treats it as a decode failure, but conceptually it is its
    own forward-compatibility gate, not "malformed."
 4. **structure** — `env_type` is in the registry (§3), reserved `flags` bits
-   are zero, and the declared lengths are internally consistent (already
-   enforced by decode's total-length check, but revalidated here against
-   `env_type`-specific expectations, e.g. `auth_len == 64`).
+   are zero, `expires_at > created_at`, and the declared lengths are
+   internally consistent (already enforced by decode's total-length check, but
+   revalidated here against `env_type`-specific expectations, e.g.
+   `auth_len == 64`). The Rust and Python strict decoders reject every such
+   violation at decode. **Vectors:** `shared-vectors/rvn1/negative/envelope_*_001.json`
+   (`expires_not_after_created`, `auth_len_63`, `reserved_flag`, `env_type_0`,
+   `env_type_5`, `trailing_byte`, `truncated`, `bad_version`) — expected
+   `unpack_result: reject`.
 5. **TTL** — `expires_at` compared against the local validation clock; past
    expiry, the envelope is dropped by relays before further processing.
    **Vector:** `shared-vectors/rvn1/negative/envelope_expired.json` —
    `expires_at_ms` one second before `validation_clock_ms`; expected
-   `relay_action: drop`.
+   `relay_action: drop`. `negative/envelope_expired_002.json` carries the
+   full signed `packed_hex` (it decodes; a relay drops it at the given clock).
 6. **role/tag/session** — `routing_tag` is matched against locally-known sessions
    ([`RAVEN_ROUTING_TAG_V1.md`](RAVEN_ROUTING_TAG_V1.md)); if no local session
    recognizes the tag, the envelope is not an endpoint delivery. It may enter

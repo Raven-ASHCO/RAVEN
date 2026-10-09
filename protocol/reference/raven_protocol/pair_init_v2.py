@@ -10,10 +10,7 @@ from dataclasses import dataclass, field
 import hashlib
 import hmac
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
-from . import address, indexed_session
+from . import address, ed25519_strict, indexed_session
 from .pair_init import (
     ADDRESS_LEN,
     DEVICE_CERT_HASH_DOMAIN,
@@ -26,6 +23,7 @@ from .pair_init import (
     SIGNATURE_LEN,
     X25519_KEY_LEN,
     device_certificate_hash,
+    is_contributory_x25519,
     prekey_bundle_hash,
 )
 
@@ -181,11 +179,22 @@ def _validate_init(value: PairInitV2, require_signature: bool) -> None:
         raise ValueError("pairing_nonce must not be all-zero")
     _require_bytes(value.initiator_device_ed_pub, ED25519_KEY_LEN, "initiator_device_ed_pub")
     _require_bytes(value.responder_device_ed_pub, ED25519_KEY_LEN, "responder_device_ed_pub")
+    if (
+        value.initiator_device_ed_pub == bytes(ED25519_KEY_LEN)
+        or value.responder_device_ed_pub == bytes(ED25519_KEY_LEN)
+    ):
+        raise ValueError("PairInit device signing keys must not be all-zero")
     if value.initiator_device_ed_pub == value.responder_device_ed_pub:
         raise ValueError("PairInit device signing keys must differ")
     _require_bytes(
         value.initiator_ephemeral_x25519_pub, X25519_KEY_LEN, "initiator_ephemeral_x25519_pub"
     )
+    # Same structural hard rejects as PairInit V1 (RAVEN_PAIR_INIT_V1.md §3):
+    # never sign, hash, journal, or claim a non-contributory ephemeral.
+    if value.initiator_ephemeral_x25519_pub == bytes(X25519_KEY_LEN):
+        raise ValueError("initiator_ephemeral_x25519_pub must not be all-zero")
+    if not is_contributory_x25519(value.initiator_ephemeral_x25519_pub):
+        raise ValueError("initiator_ephemeral_x25519_pub must not be a low-order point")
     _require_bytes(
         value.responder_signed_x25519_pub, X25519_KEY_LEN, "responder_signed_x25519_pub"
     )
@@ -197,6 +206,15 @@ def _validate_init(value: PairInitV2, require_signature: bool) -> None:
     _require_bytes(value.initiator_device_cert_hash, 32, "initiator_device_cert_hash")
     _require_bytes(value.responder_device_cert_hash, 32, "responder_device_cert_hash")
     _require_bytes(value.responder_prekey_bundle_hash, 32, "responder_prekey_bundle_hash")
+    if any(
+        digest == bytes(32)
+        for digest in (
+            value.initiator_device_cert_hash,
+            value.responder_device_cert_hash,
+            value.responder_prekey_bundle_hash,
+        )
+    ):
+        raise ValueError("certificate and prekey hashes must not be all-zero")
     _u32(value.signed_prekey_id)
     if value.signed_prekey_id == 0:
         raise ValueError("signed_prekey_id must be non-zero")
@@ -207,7 +225,11 @@ def _validate_init(value: PairInitV2, require_signature: bool) -> None:
     elif value.responder_one_time_x25519_pub == bytes(X25519_KEY_LEN):
         raise ValueError("non-zero one_time_prekey_id requires a one-time X25519 key")
     _require_bytes(value.responder_mlkem768_ek, MLKEM768_EK_LEN, "responder_mlkem768_ek")
+    if value.responder_mlkem768_ek == bytes(MLKEM768_EK_LEN):
+        raise ValueError("responder_mlkem768_ek must not be all-zero")
     _require_bytes(value.mlkem768_ciphertext, MLKEM768_CT_LEN, "mlkem768_ciphertext")
+    if value.mlkem768_ciphertext == bytes(MLKEM768_CT_LEN):
+        raise ValueError("mlkem768_ciphertext must not be all-zero")
     _validate_time(value.created_at_ms, value.expires_at_ms)
     if require_signature:
         _require_bytes(value.signature, SIGNATURE_LEN, "signature")
@@ -480,21 +502,19 @@ def decode_response(wire: bytes) -> PairResponseV2:
 
 def verify_init_signature(value: PairInitV2) -> bool:
     try:
-        Ed25519PublicKey.from_public_bytes(value.initiator_device_ed_pub).verify(
-            value.signature, init_signing_bytes(value)
+        return ed25519_strict.verify(
+            value.initiator_device_ed_pub, value.signature, init_signing_bytes(value)
         )
-        return True
-    except (InvalidSignature, ValueError):
+    except ValueError:
         return False
 
 
 def verify_response_signature(value: PairResponseV2) -> bool:
     try:
-        Ed25519PublicKey.from_public_bytes(value.responder_device_ed_pub).verify(
-            value.signature, response_signing_bytes(value)
+        return ed25519_strict.verify(
+            value.responder_device_ed_pub, value.signature, response_signing_bytes(value)
         )
-        return True
-    except (InvalidSignature, ValueError):
+    except ValueError:
         return False
 
 
