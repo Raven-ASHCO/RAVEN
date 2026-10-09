@@ -38,7 +38,7 @@ rand = "0.8"
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "signal"] }
 clap = { version = "4", features = ["derive"] }
-base64 = "0.22"
+base64 = "0.23"
 zeroize = { version = "1", features = ["derive"] }
 tempfile = "3"
 ml-kem = { version = "0.3", features = ["hazmat"] }
